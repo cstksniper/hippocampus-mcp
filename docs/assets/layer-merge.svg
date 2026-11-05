@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 306" width="680" height="306" role="img" font-family="'Segoe UI','Microsoft YaHei',system-ui,sans-serif">
+<title>HippoMCP 用层合并语义</title>
+<desc>两个会话各自保存时，写前先读盘并按层做并集合并，避免互相覆盖；删除由墓碑层拦住复活。五步循环动画。</desc>
+<style>
+  .t{font-size:13px;fill:#2C2C2A}
+  .ts{font-size:12px;fill:#5F5E5A}
+  .h{font-size:15px;font-weight:500;fill:#2C2C2A}
+  .col{font-size:12px;fill:#5F5E5A}
+  .step{font-size:11px;fill:#888780}
+  .card{font-size:13px;fill:#0C447C}
+  .disk{font-size:13px;fill:#085041}
+  .bad{font-size:13px;fill:#791F1F}
+  .st{animation-duration:25s;animation-iteration-count:infinite}
+  @keyframes s0{0%{opacity:1}19%{opacity:1}20%{opacity:0}100%{opacity:0}}
+  @keyframes s1{0%{opacity:0}20%{opacity:0}21%{opacity:1}39%{opacity:1}40%{opacity:0}100%{opacity:0}}
+  @keyframes s2{0%{opacity:0}40%{opacity:0}41%{opacity:1}59%{opacity:1}60%{opacity:0}100%{opacity:0}}
+  @keyframes s3{0%{opacity:0}60%{opacity:0}61%{opacity:1}79%{opacity:1}80%{opacity:0}100%{opacity:0}}
+  @keyframes s4{0%{opacity:0}80%{opacity:0}81%{opacity:1}99%{opacity:1}100%{opacity:0}}
+  .g0{animation-name:s0}.g1{animation-name:s1}.g2{animation-name:s2}.g3{animation-name:s3}.g4{animation-name:s4}
+</style>
+
+<rect x="0" y="0" width="680" height="306" fill="#FFFFFF"/>
+<text class="h" x="40" y="32">用层合并：两个会话同时写，谁都不丢</text>
+<text class="ts" x="40" y="54">HippoMCP · 派生层「读-合并-写」，每层一套合并口径</text>
+
+<text class="col" x="135" y="80" text-anchor="middle">会话 A 内存</text>
+<text class="col" x="340" y="80" text-anchor="middle">会话 B 内存</text>
+<text class="col" x="545" y="80" text-anchor="middle">磁盘（唯一真相）</text>
+
+<rect x="40" y="88" width="190" height="84" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<rect x="245" y="88" width="190" height="84" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<rect x="450" y="88" width="190" height="84" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+
+<rect x="40" y="190" width="600" height="96" rx="12" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+
+<g class="st g0">
+  <rect x="450" y="88" width="190" height="84" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text class="card" x="135" y="124" text-anchor="middle">记下 X</text>
+  <text class="card" x="340" y="124" text-anchor="middle">记下 Y</text>
+  <text class="disk" x="545" y="124" text-anchor="middle">（空）</text>
+  <text class="step" x="60" y="212">第 1 / 5 步</text>
+  <text class="t" x="60" y="242">两个会话各记各的，互不可见。多宿主共库、多会话并行本来就是常态。</text>
+</g>
+
+<g class="st g1">
+  <text class="card" x="135" y="124" text-anchor="middle">X</text>
+  <text class="card" x="340" y="118" text-anchor="middle">Y</text>
+  <text class="card" x="340" y="142" text-anchor="middle">（内存里没有 X）</text>
+  <text class="disk" x="545" y="124" text-anchor="middle">X　A 先落盘</text>
+  <text class="step" x="60" y="212">第 2 / 5 步</text>
+  <text class="t" x="60" y="242">A 保存。B 拿到的是它保存前那份快照 —— 它的内存里根本没有 X。</text>
+</g>
+
+<g class="st g2">
+  <rect x="450" y="88" width="190" height="84" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+  <text class="card" x="135" y="124" text-anchor="middle">X</text>
+  <text class="card" x="340" y="124" text-anchor="middle">Y</text>
+  <text class="bad" x="545" y="124" text-anchor="middle">Y　X 被冲掉了</text>
+  <text class="step" x="60" y="212">第 3 / 5 步　·　这是要防的事故</text>
+  <text class="t" x="60" y="240">若按「谁最后落盘谁说了算」：B 一保存就把 X 冲掉，而且两边都不报错。</text>
+  <text class="t" x="60" y="262">纯向量库 + 覆盖式保存的做法，全都栽在这一步。</text>
+</g>
+
+<g class="st g3">
+  <text class="card" x="135" y="124" text-anchor="middle">X</text>
+  <text class="card" x="340" y="124" text-anchor="middle">Y</text>
+  <text class="disk" x="545" y="118" text-anchor="middle">X + Y</text>
+  <text class="disk" x="545" y="142" text-anchor="middle">写前读盘，并集</text>
+  <text class="step" x="60" y="212">第 4 / 5 步　·　实际做法</text>
+  <text class="t" x="60" y="240">保存前先把盘上现有的读回来，按层合并后再写回。每层合并口径不同：</text>
+  <text class="t" x="60" y="262">流水按 id 并集、待办状态只进不退、计数器取 max、删除账本取更晚那次。</text>
+</g>
+
+<g class="st g4">
+  <text class="card" x="135" y="118" text-anchor="middle">X</text>
+  <text class="card" x="135" y="142" text-anchor="middle">（已删 Z）</text>
+  <text class="card" x="340" y="118" text-anchor="middle">Y + Z</text>
+  <text class="card" x="340" y="142" text-anchor="middle">（旧快照里还在）</text>
+  <text class="disk" x="545" y="124" text-anchor="middle">X + Y，Z 未复活</text>
+  <text class="step" x="60" y="212">第 5 / 5 步　·　最后一关</text>
+  <text class="t" x="60" y="240">A 删了 Z，B 的旧快照还有 Z。层合并是纯并集，Z 会被并回来 —— 所以非派生层</text>
+  <text class="t" x="60" y="262">真删除必须立碑，合并时由墓碑层拦住复活。</text>
+</g>
+</svg>

@@ -1,0 +1,68 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告问题。**请先附上 `brain_stats()` 的输出**——
+        它的自述字段（NER 后端、嵌入模型来源、L0 悬空数、向量缺失数）
+        通常能直接定位问题。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: '`python -c "import hippocampus_mcp; print(hippocampus_mcp.__version__)"` 的输出'
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 实际行为与期望行为的差别
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现步骤
+      description: |
+        请尽量给出不依赖私有数据的复现脚本。
+        零依赖模板可参考 `examples/quickstart.py`（hash 后端，10 秒跑完）。
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: stats
+    attributes:
+      label: brain_stats() 输出
+      description: 脱敏后粘贴。特别注意 ner_backend / embedder_model_source / vectors_missing
+      render: json
+    validations:
+      required: false
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: 嵌入后端
+      options:
+        - sentence_transformer（默认）
+        - hash
+        - 其他
+    validations:
+      required: false
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: OS、Python 版本、是否装了 spaCy / sentence-transformers
+      placeholder: "Windows 11 / Python 3.11.9 / spaCy 已装"
+    validations:
+      required: false

@@ -1,0 +1,58 @@
+name: 功能建议
+description: 提出新能力或对现有能力的改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决什么问题
+      description: |
+        请描述**场景**而不是方案。
+        例如写"多跳问题召回不到第二步的证据"，
+        比写"请加图遍历"更容易讨论出好方案。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你建议怎么做
+      description: 可有初步设想，也可留空
+    validations:
+      required: false
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 涉及哪一层
+      options:
+        - 写入链路（ingest / 抽取 / 去重）
+        - 检索链路（召回 / 重排 / 过滤）
+        - 用层（get_memory_context 5 槽位）
+        - 存储与持久化
+        - MCP 工具层
+        - 评测
+        - 其他 / 不确定
+    validations:
+      required: false
+
+  - type: textarea
+    id: verify
+    attributes:
+      label: 怎么验证它有效
+      description: |
+        本项目用可核实的数字说话。如果可能，请说明你会用什么指标验证
+        （如 LoCoMo 某类 F1、Hit@3、召回耗时）。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 边界确认
+      options:
+        - label: 我的建议不依赖私有数据或个人绝对路径
+        - label: 我已检索过现有 issue，这不是重复建议或已在推进的事项
+    validations:
+      required: false

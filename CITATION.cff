@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "HippoMCP: 面向 LLM 宿主的 MCP 记忆底座"
+abstract: >-
+  一个通过 MCP（Model Context Protocol）为 LLM 宿主提供长期记忆的服务。
+  与"给应用加一层向量库"不同，它覆盖写入、检索、整理到"按槽位递给宿主"的完整链路：
+  四层记忆模型（原始流水 / 记忆 / 摘要 / 画像）、级联删除与墓碑机制、
+  superseded 状态机（不删旧事实而是标注被取代）、基于液态神经网络 CfC 的时序编码，
+  以及带独立 token 预算的 5 槽位上下文装配。
+authors:
+  - name: "cstksniper"
+    email: "cstksniper@qq.com"
+version: 0.1.0
+date-released: "2026-09-20"
+license: MIT
+repository-code: "https://github.com/cstksniper/hippocampus-mcp"
+keywords:
+  - memory
+  - MCP
+  - model-context-protocol
+  - LLM agent
+  - retrieval
+  - temporal-reasoning
+  - liquid-neural-network
+  - knowledge-management

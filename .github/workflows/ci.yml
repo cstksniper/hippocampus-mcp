@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 缓存 pip + 嵌入模型
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            .hf
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-py${{ matrix.python-version }}-
+
+      - name: 安装
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      # 预置嵌入模型，供离线回归使用；不下载 ONNX 产物。
+      - name: 预置嵌入模型（离线回归用）
+      - name: 预置嵌入模型（离线回归用）
+        env:
+          HF_HOME: ${{ github.workspace }}/.hf
+          HF_HUB_DISABLE_XET: "1"
+        run: |
+          python - <<'PY'
+          import glob
+          from huggingface_hub import snapshot_download
+
+          for repo in ("BAAI/bge-base-zh-v1.5",
+                       "sentence-transformers/all-MiniLM-L6-v2"):
+              tag = "models--" + repo.replace("/", "--")
+              if glob.glob(f".hf/hub/{tag}/snapshots/*/config.json"):
+                  print(f"[cache hit] {repo}")
+                  continue
+              print(f"[download] {repo}")
+              snapshot_download(repo, ignore_patterns=["onnx/*", "onnx_int8/*", "*.onnx"])
+          PY
+
+      - name: 回归
+        env:
+          HF_HOME: ${{ github.workspace }}/.hf
+          HF_HUB_DISABLE_XET: "1"
+          HIPPOCAMPUS_EMB_CACHE: ${{ github.workspace }}/.hf/hub
+          # 允许耗时阈值型用例在负载下非阻断失败。
+          HIPPOCAMPUS_PERF_MAX_SECONDS: "120"
+        run: |
+          python scripts/run_all_tests.py --timeout 1800 --allow-fail perf_write \
+            -v --log-dir ci-logs
+
+      # 失败时收集完整日志与 daemon 子进程日志，便于诊断。
+      - name: 收集 daemon 子进程日志（诊断）
+        if: always()
+        run: |
+          mkdir -p ci-logs/daemon
+          python - <<'PY'
+          import glob, os, tempfile
+          root = tempfile.gettempdir()
+          pats = [os.path.join(root, "daemon-*.log*"),
+                  os.path.join(root, "*", "daemon-*.log*"),
+                  os.path.join(root, "*", "*", "daemon-*.log*")]
+          srcs = [p for pat in pats for p in glob.glob(pat) if os.path.isfile(p)]
+          srcs = sorted(set(srcs), key=os.path.getmtime, reverse=True)[:12]
+          for i, p in enumerate(srcs):
+              dst = os.path.join("ci-logs", "daemon",
+                                 "%02d_%s" % (i, os.path.basename(p)))
+              with open(p, "rb") as f, open(dst, "wb") as g:
+                  g.write(f.read(65536))
+              print("copied", p, "->", dst)
+          print("collected", len(srcs), "daemon logs")
+          PY
+      - name: 列出失败套件日志（诊断）
+        if: always()
+        run: ls -laR ci-logs/ 2>/dev/null || echo "ci-logs/ 不存在"
+      - name: 上传失败套件完整日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-logs-py${{ matrix.python-version }}-attempt${{ github.run_attempt }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+  smoke:
+    # 不装 torch 的快速冒烟：只验证「包能导入 + 工具表完整」。
+    # 目的：依赖安装失败/大改时，5 分钟内就能看到一个明确的红，
+    #       不用等 60 分钟的完整回归。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # 协议层冒烟：只安装轻依赖，验证顶层导入不引入重库。
+      - name: 只装协议层依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mcp>=1.0" "numpy>=1.20"
+      - name: 顶层导入不得引重库
+        env:
+          PYTHONPATH: src
+        run: |
+          python -c "import hippocampus_mcp.server as s; print('imported ok')"
+
+  install-e2e:
+    # 站在外部用户视角验收：构建 wheel、安装、运行 quickstart、
+    # 生成宿主配置并完成 MCP 握手。
+    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 与 regression 共用 pip wheel 缓存（restore-keys 前缀可命中），
+      # 但保存时用独立 key，避免两个 job 抢同一个不可变 cache。
+      - name: 缓存 pip wheel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-py3.11-install-e2e-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-py3.11-
+
+      - name: 构建 wheel（只构建项目本身）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel . --no-deps -w dist/
+
+      - name: 全新 venv 里按用户方式安装 wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/user_venv"
+          "$RUNNER_TEMP/user_venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/user_venv/bin/pip" install dist/hippocampus_mcp-*.whl
+          "$RUNNER_TEMP/user_venv/bin/python" -m pip show mcp | head -3
+
+      # 新用户链路验收
+      - name: 新用户链路验收
+        shell: bash
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/user_venv/bin/python" scripts/verify_install_e2e.py --repo . \
+            2>&1 | tee install-e2e.log
+
+      # 上传验收日志
+      - name: 上传验收日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-e2e-logs-attempt${{ github.run_attempt }}
+          path: install-e2e.log
+          if-no-files-found: warn
+          retention-days: 7

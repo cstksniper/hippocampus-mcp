@@ -1,0 +1,169 @@
+# ==================================================================
+# HippoMCP .gitignore
+# 原则：**源码进库，数据不进库**。
+# 本仓库是研究型项目，工作目录里混有私人语料、模型缓存与实验产物，
+# 这些都必须在 push 前挡在门外。
+# ==================================================================
+
+# ------------------------------------------------------------------
+# P0 · 本地数据与训练产物不进库
+# ------------------------------------------------------------------
+# data/ 内含真实记忆库、备份快照、评测数据集与训练权重，一旦推上去无法撤回。
+data/
+
+# 个人知识系统与工作日志
+# （另有私人目录字面名在本机 .git/info/exclude——字面名不得进公开面）
+.workbuddy/
+
+# 内部流程记录与特定宿主接入单，脱敏后再公开
+docs/integration/
+docs/guides/ZCode恢复使用操作单.md
+docs/guides/ZCode操作说明.md
+docs/guides/ZCode接入指南.md
+
+# ------------------------------------------------------------------
+# P0 · 密钥（即使已改用环境变量，也防手滑留下 .env）
+# ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# ------------------------------------------------------------------
+# 依赖缓存：175M 的内置包（py3.10 编译的老包，不该进版本库）
+# ------------------------------------------------------------------
+libs/
+*.whl
+.venv/
+venv/
+env/
+
+# ------------------------------------------------------------------
+# 实验产物与代码快照
+# ------------------------------------------------------------------
+# 各版本评测结果（脚本按字面路径写入，本地保留以便复现）
+eval_v*/
+eval_t1_attribution/
+
+# 源码/脚本快照目录（本地做 A/B 对照用，不进库）
+*_snap_*/
+
+# 脱敏前的本地快照（回滚用）与公开层导出测试目录
+snap_prekeys_*/
+_public_test/
+
+# 改动前的本地快照（如 docs/TODO.md.bak-2026xxxx）。**故意不进库**：
+# 一是快照会跟正文一起漂移、污染 diff；二是 TODO 快照里同样含真实库名/项目名，
+# 而公开层白名单只认 docs/TODO.md 本体，快照漏进来就是绕过白名单。
+# 2026-09-22 加：上一轮用的 `git add -A` 会把这类文件一并扫进暂存区。
+*.bak
+*.bak-*
+*.bak_*
+
+# 评测报告产物
+hippocampus-evaluation-report/
+mem0-comparison/
+phase5-evaluation-report/
+*_report.html
+*_report_st.html
+evaluation-painpoint-analysis.html
+research-retrospective.html
+
+# ------------------------------------------------------------------
+# 实验残留：根目录散落的临时脚本与输出
+# ------------------------------------------------------------------
+# 一次性脚本（已被 scripts/ 下的版本取代）
+/run_eval.py
+/run_eval_st.py
+/run_locomo_eval.py
+/run_pro_eval.py
+/test_minimal_loop.py
+/_probe_loopback_mcp.py
+/train_cfc.py
+/train_cfc_retrieval.py
+/migrate_package.py
+/migrate_package.ps1
+/README_TEST.txt
+
+# 一次性输出
+/*.log
+/*_test.txt
+/permission_test_v2.txt
+/sandbox_test.txt
+/visibility_test.txt
+/win32_direct_test.txt
+/real_write_test.txt
+/perf_after_fix.log
+/perf_baseline_before_fix.log
+
+# 根目录散落的评测结果 JSON（正式结果统一放 eval_vXX/）
+/crl_eval_results.json
+/eval_results.json
+/eval_results_st.json
+/llm_eval_results.json
+/locomo_eval_results.json
+/p7_corrected_metrics.json
+/pro_eval_results.json
+
+# ------------------------------------------------------------------
+# 模型权重与二进制
+# ------------------------------------------------------------------
+*.pt
+*.pth
+*.onnx
+*.npz
+*.bin
+*.safetensors
+!docs/**/*.json
+
+# ------------------------------------------------------------------
+# 调试现场
+# ------------------------------------------------------------------
+_probe_out/
+mcp_server_debug.log
+
+# GitHub 建仓（B1-4）一次性注册现场：含浏览器自动化脚本、截图、cookies.txt、
+# hosts 文件，71MB，**绝不可进库**（cookies 属凭据）。注册完即弃。
+_gh_signup/
+
+# ------------------------------------------------------------------
+# Python
+# ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ------------------------------------------------------------------
+# 编辑器与系统
+# ------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------------
+# 本机宿主/引导配置（2026-10-16）
+#   .hippocampus.json 优先级高于 HIPPOCAMPUS_PERSIST_DIR，且含本机绝对路径。
+#   从仓库根跑测试时它会把「自行指定库目录」的用例静默重定向到引导库，
+#   实测造成 4 个套件假失败（10-16）。这类文件绝不进仓。
+# ------------------------------------------------------------------
+.hippocampus.json
+.mcp.json
+.zcode/

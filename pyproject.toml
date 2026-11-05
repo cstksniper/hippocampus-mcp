@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hippocampus-mcp"
+version = "0.1.0"
+description = "Long-term memory backend for AI hosts over MCP: 4-layer memory, slot-based context assembly, cascade-safe forgetting, CfC temporal encoding"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "cstksniper", email = "cstksniper@qq.com" },
+]
+maintainers = [
+    { name = "cstksniper", email = "cstksniper@qq.com" },
+]
+keywords = ["mcp", "memory", "llm", "agent", "lnn", "cfc", "retrieval"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # 上界按「实际跑通」的经验值钉死，不是拍脑袋：
+    #   mcp 2.3.0 / sentence-transformers 6.2.0 / torch 2.15.0 / transformers 5.22.1
+    #   已在干净 venv 实测：server 导入 OK、46 个工具全注册、embed_batch 出 384 维。
+    # 不加上界会让首批用户装到我没验证过的版本（2026-11-03 踩到：本机 1.29/5.6.1，
+    # 而 PyPI 最新已是 2.3/6.2）。
+    "mcp>=1.0,<3",
+    "torch>=2.0,<3",
+    "ncps>=1.0,<2",
+    "sentence-transformers>=2.0,<7",
+    "numpy>=1.20,<3",
+]
+
+[project.urls]
+# GitHub 账号已落实（2026-11-05）；首发 0.1.0 未上传 PyPI，故此处可安全补齐。
+Homepage = "https://github.com/cstksniper/hippocampus-mcp"
+Source = "https://github.com/cstksniper/hippocampus-mcp"
+Issues = "https://github.com/cstksniper/hippocampus-mcp/issues"
+
+# --- 可选依赖 ---
+# 核心服务只依赖上面的必需项。
+# 以下三者在本项目内均为「惰性导入 + 明确降级」，缺失不会崩溃，
+# 只是对应能力降级（见各处 log 与 docstring）。
+[project.optional-dependencies]
+# 评测 / 对照脚本调用外部 LLM API（任一 OpenAI 兼容端点，经 JUDGE_* 环境变量注入）
+llm = ["httpx>=0.24"]
+# spaCy NER 实体抽取（英文路径；中文走启发式 + 词库，不需要它）
+ner = ["spacy>=3.7"]
+# 跨进程写锁；缺失时降级为乐观锁，冲突仍会显式失败
+lock = ["filelock>=3.12"]
+# ONNX 推理后端：实测启动 35.0s → 12.8s。
+# 缺失不影响功能 —— onnx_backend 默认 auto，缺依赖会静默回落 torch（已核代码路径）。
+onnx = ["onnxruntime>=1.17", "tokenizers>=0.15"]
+# 开发 / 测试
+dev = ["pytest>=8.0"]
+# 一次装齐
+all = ["httpx>=0.24", "spacy>=3.7", "filelock>=3.12", "onnxruntime>=1.17", "tokenizers>=0.15"]
+
+[project.scripts]
+# 指向 cli：默认走 launcher（daemon 共享单份模型），
+# 并提供 setup / doctor 子命令，与生产入口口径一致。
+hippocampus-mcp = "hippocampus_mcp.cli:main"
+
+# src 布局的包发现配置
+[tool.hatch.build.targets.wheel]
+packages = ["src/hippocampus_mcp"]
+
+# ⚠️ sdist 是**公开可下载的**：`pip download hippocampus-mcp` 拿到的就是这个包。
+#    默认行为会把整个仓库打进去。这里用**显式白名单**，只放「从 sdist 能重建出
+#    同一个 wheel」所需的最小集，其他研发过程与私人语料一律挡在包外。
+#    要加文件进来，先问一句：这东西公开了有没有问题？
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/hippocampus_mcp",
+    "/examples",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/CITATION.cff",
+    "/CONTRIBUTING.md",
+    "/CODE_OF_CONDUCT.md",
+    "/docs/ARCHITECTURE.md",
+    "/docs/SELECTION.md",
+    "/docs/INTEGRATION.md",
+    "/docs/PRIVACY.md",
+    "/docs/BENCHMARKS.md",
+    "/docs/assets",
+]
+
+# uv 配置: 使用 CPU 版本的 PyTorch，避免下载庞大的 CUDA 包
+[tool.uv]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
