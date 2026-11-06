@@ -53,11 +53,11 @@ BLOCK_PENDING = "block_2_pending"
 BLOCK_TOPICS = "block_5_open_topics"
 
 # 装配侧的占位行：整段只有占位行 = 该段为空，不进注入。
-_PLACEHOLDERS = {"（无待办）", "（无历史会话）", "（无相关实体状态）", "（无未完结话题）"}
+_PLACEHOLDERS = {"(No todos)", "(No session history)", "(No related entity state)", "(No open topics)"}
 
-_INJECTION_HEADER = "【海马体·自动注入】与当前输入相关的既往记忆（hook 拉取，仅供参照）："
-_SECTION_HEADERS = ((BLOCK_HITS, "◆ 相关命中"), (BLOCK_PENDING, "◆ 待办未决"),
-                    (BLOCK_TOPICS, "◆ 未完结话题"))
+_INJECTION_HEADER = "[HippoMCP auto-injected memory related to the current input (fetched by hook; for reference only)]:"
+_SECTION_HEADERS = ((BLOCK_HITS, "◆ Relevant hits"), (BLOCK_PENDING, "◆ Open todos"),
+                    (BLOCK_TOPICS, "◆ Unfinished topics"))
 
 
 def format_injection(blocks: dict, *, item_max_chars: int = 150,
@@ -93,7 +93,7 @@ def format_injection(blocks: dict, *, item_max_chars: int = 150,
     if len(lines) == 1:
         return ""
     if truncated:
-        lines.append("（已按预算截断）")
+        lines.append("(Truncated to budget)")
     return "\n".join(lines)
 
 
@@ -113,11 +113,11 @@ class _LineReader:
         while b"\n" not in self._buf:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("hook_client 交换超预算")
+                raise TimeoutError("hook_client exchange exceeded budget")
             self._sock.settimeout(remaining)
             data = self._sock.recv(65536)
             if not data:
-                raise ConnectionError("daemon 提前关闭连接")
+                raise ConnectionError("daemon closed the connection early")
             self._buf += data
         raw, self._buf = self._buf.split(b"\n", 1)
         return raw.strip().decode("utf-8", "replace")
@@ -165,13 +165,13 @@ def _exchange(sock: socket.socket, *, query: str, top_k: int, token_budget: int,
                                                "scope": "project"}}})
     resp = _read_response(reader, 2)
     if resp.get("error"):
-        raise RuntimeError(f"tools/call 被拒：{resp['error']}")
+        raise RuntimeError(f"tools/call was rejected: {resp['error']}")
     result = resp.get("result") or {}
     # structured_output=False：结果在 content[0].text 里，是一层 JSON 字符串
     content = (result.get("content") or [{}])[0]
     inner = json.loads(content.get("text") or "{}")
     if not isinstance(inner, dict):
-        raise RuntimeError("get_memory_context 返回结构异常")
+        raise RuntimeError("get_memory_context returned an unexpected structure")
     return inner
 
 
@@ -202,17 +202,17 @@ def fetch_context(prompt: str, cwd: str, *, top_k: int = 3,
 
     try:
         if not prompt or not prompt.strip():
-            _note("prompt 为空")
+            _note("prompt is empty")
             return ""
         key = daemon_key(key_library, emb_model, daemon_version)
         info = read_registry(key)
         if not info:
-            _note(f"注册表不存在（key={key}）——daemon 未在跑，hook 不负责拉起")
+            _note(f"registry entry not found (key={key}); daemon is not running, hook will not start it")
             return ""
         deadline = time.monotonic() + deadline_s
         sock = try_connect(int(info["port"]), timeout=2.0)
         if sock is None:
-            _note(f"daemon 端口连不上（port={info.get('port')}）")
+            _note(f"daemon port is unreachable (port={info.get('port')})")
             return ""
         try:
             inner = _exchange(sock, query=prompt, top_k=top_k,
@@ -228,8 +228,8 @@ def fetch_context(prompt: str, cwd: str, *, top_k: int = 3,
         text = format_injection(inner.get("blocks") or {},
                                 item_max_chars=item_max_chars,
                                 token_budget=token_budget)
-        _note("装配完成" if text else "装配为空（无命中且无未决）")
+        _note("context assembled" if text else "context is empty (no hits and no pending items)")
         return text
     except Exception as exc:  # noqa: BLE001 —— fail-open：hook 故障绝不卡会话
-        _note(f"失败（{type(exc).__name__}: {exc}）")
+        _note(f"failed ({type(exc).__name__}: {exc})")
         return ""

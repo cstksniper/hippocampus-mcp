@@ -58,15 +58,15 @@ def brief_hint(*, has_alive: bool, has_vec: bool,
                has_members: bool) -> str:
     """brief 的 note 四路选择（按优先级从上到下）。"""
     if not has_alive:
-        return "这个主题的成员当前都不在 active 里，建议先看 knowledge_map"
+        return "none of this topic's members are currently active; check knowledge_map first"
     if not has_vec:
-        return ("库里还没有已算向量的记忆（嵌入模型可能未就绪），暂时出不了"
-                "素材；summarize 写回不受影响")
+        return ("the library has no vectorized memories yet (the embedding model may not be ready), "
+                "so no material can be produced for now; summarize write-back is unaffected")
     if not has_members:
-        return "这个主题的存活成员都还没算向量，暂时出不了素材"
-    return ("素材按「离质心最近」排序（最能代表这个主题）。读完用 "
-            "action=summarize 把归纳写回，并用 evidence 挂出处——"
-            "出处必须是上面列出的成员 id，凭空引用会被拒绝")
+        return "none of this topic's surviving members have vectors yet, so no material can be produced for now"
+    return ("Material is ordered by closeness to the centroid (most representative of this topic). "
+            "After reading, write the summary back with action=summarize and attach sources via evidence -- "
+            "sources must be the member ids listed above; fabricated references are rejected")
 
 
 def build_brief_payload(*, tid: str, topic: dict[str, Any],

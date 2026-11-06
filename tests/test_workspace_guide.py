@@ -169,14 +169,14 @@ def part_b() -> None:
         with_ = S._resolve_default_lib_path(base, root)
         check("B5 坏 JSON ⇒ 回退", _np(with_) == base, f"got={with_}")
         check("B5 坏 JSON 必须出声（不静默回退）",
-              any("读取失败" in m for m in warns), f"warns={warns[:2]}")
+              any("read failed" in m for m in warns), f"warns={warns[:2]}")
 
         warns.clear()
         _write_guide(root, {"library": "不存在的库"})
         got6 = S._resolve_default_lib_path(base, root)
         check("B6 解析不明 ⇒ 回退", _np(got6) == base, f"got={got6}")
         check("B6 解析不明必须出声（串库比回退危险）",
-              any("解析不明" in m for m in warns), f"warns={warns[:2]}")
+              any("unresolvable" in m for m in warns), f"warns={warns[:2]}")
 
         warns.clear()
         _write_guide(root, raw="[1,2,3]")

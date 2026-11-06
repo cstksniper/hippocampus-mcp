@@ -1,20 +1,20 @@
-name: Bug 报告
-description: 报告一个可复现的问题
+name: Bug report
+description: Report a reproducible problem
 title: "[Bug] "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        感谢报告问题。**请先附上 `brain_stats()` 的输出**——
-        它的自述字段（NER 后端、嵌入模型来源、L0 悬空数、向量缺失数）
-        通常能直接定位问题。
+        Thanks for reporting. **Please attach the output of `brain_stats()` first** —
+        its self-report fields (NER backend, embedding model source, L0 dangling count,
+        missing vector count) usually pinpoint the problem directly.
 
   - type: input
     id: version
     attributes:
-      label: 版本
-      description: '`python -c "import hippocampus_mcp; print(hippocampus_mcp.__version__)"` 的输出'
+      label: Version
+      description: 'Output of `python -c "import hippocampus_mcp; print(hippocampus_mcp.__version__)"`'
       placeholder: "0.1.0"
     validations:
       required: true
@@ -22,18 +22,18 @@ body:
   - type: textarea
     id: what-happened
     attributes:
-      label: 发生了什么
-      description: 实际行为与期望行为的差别
+      label: What happened
+      description: Difference between actual and expected behavior
     validations:
       required: true
 
   - type: textarea
     id: repro
     attributes:
-      label: 最小复现步骤
+      label: Minimal reproduction steps
       description: |
-        请尽量给出不依赖私有数据的复现脚本。
-        零依赖模板可参考 `examples/quickstart.py`（hash 后端，10 秒跑完）。
+        Please provide a reproduction script that does not depend on private data when possible.
+        A zero-dependency template is available in `examples/quickstart.py` (hash backend, runs in ~10 seconds).
       render: python
     validations:
       required: true
@@ -41,8 +41,8 @@ body:
   - type: textarea
     id: stats
     attributes:
-      label: brain_stats() 输出
-      description: 脱敏后粘贴。特别注意 ner_backend / embedder_model_source / vectors_missing
+      label: brain_stats() output
+      description: Paste after redacting sensitive details. Pay special attention to ner_backend / embedder_model_source / vectors_missing
       render: json
     validations:
       required: false
@@ -50,19 +50,19 @@ body:
   - type: dropdown
     id: backend
     attributes:
-      label: 嵌入后端
+      label: Embedding backend
       options:
-        - sentence_transformer（默认）
+        - sentence_transformer (default)
         - hash
-        - 其他
+        - other
     validations:
       required: false
 
   - type: textarea
     id: env
     attributes:
-      label: 环境
-      description: OS、Python 版本、是否装了 spaCy / sentence-transformers
-      placeholder: "Windows 11 / Python 3.11.9 / spaCy 已装"
+      label: Environment
+      description: OS, Python version, whether spaCy / sentence-transformers are installed
+      placeholder: "Windows 11 / Python 3.11.9 / spaCy installed"
     validations:
       required: false

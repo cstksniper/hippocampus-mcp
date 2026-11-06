@@ -58,13 +58,13 @@ def validate_scope(scope: str, *, allow_all: bool = True) -> str | None:
     s = str(scope or "").strip()
     if s in VALID_SCOPES:
         if s == SCOPE_ALL and not allow_all:
-            return ("scope=all 只支持 recall；get_memory_context 是 5 槽位"
-                    "装配结构，没有「项目排前、用户殿后」的落点。"
-                    "要跨库拿单库装配，请分别调 scope=project / scope=user。")
+            return ("scope=all is only supported by recall; get_memory_context is a 5-slot "
+                    "assembly structure with no place for a project-first, user-second ordering. "
+                    "For single-library assembly across libraries, call scope=project / scope=user separately.")
         return None
-    return (f"scope 取值只能是 {'/'.join(VALID_SCOPES)}，收到 {scope!r}。"
-            "project=当前库（默认）；user=用户级库；all=项目库排前、"
-            "用户级殿后（仅 recall 支持）。")
+    return (f"scope accepts only {'/'.join(VALID_SCOPES)}, got {scope!r}. "
+            "project=the current library (default); user=the user-level library; all=project library first, "
+            "user library second (recall only).")
 
 
 def merge_scope_hits(project_hits: list[dict[str, Any]],
@@ -129,9 +129,9 @@ def parse_library_spec(spec: str) -> tuple[list[str], str | None]:
     if not names:
         return [], None
     if len(names) > MAX_LIBRARY_SPEC:
-        return [], (f"libraries= 单次最多 {MAX_LIBRARY_SPEC} 个库"
-                    f"（收到 {len(names)} 个：{names!r}）。"
-                    "扇出成本随库数线性涨（每库一份 brain），多库分多次查。")
+        return [], (f"libraries= accepts at most {MAX_LIBRARY_SPEC} libraries per call "
+                    f"(got {len(names)}: {names!r}). "
+                    "Fan-out cost grows linearly with library count (one brain per library); split multi-library queries into separate calls.")
     return names, None
 
 

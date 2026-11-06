@@ -287,20 +287,20 @@ def sparkline(values: list[int]) -> str:
 
 
 def format_age(days: int | None) -> str:
-    """把「距今天数」渲染成卡面用语（今天/昨天/N天前/N个月前）。
+    """Render days-since-update as card-facing text (today/yesterday/Nd ago/Nmo ago).
 
-    None（没有时间戳可依据）⇒ 「时间未知」——卡片上不猜。月份用 30 天折算：
-    这是新鲜度信号不是日历，写「2 个月前」只为省 token。
+    ``None`` (no usable timestamp) becomes ``"unknown"``; the card must not guess.
+    Months use a 30-day approximation: this is a freshness signal, not a calendar.
     """
     if days is None:
-        return "时间未知"
+        return "unknown"
     if days <= 0:
-        return "今天"
+        return "today"
     if days == 1:
-        return "昨天"
+        return "yesterday"
     if days < 30:
-        return "%d天前" % days
-    return "%d个月前" % (days // 30)
+        return "%dd ago" % days
+    return "%dmo ago" % (days // 30)
 
 
 # 任务 token 切分：拉丁数字串为整词；CJK 连续串切**二元组**——中文没有空格，

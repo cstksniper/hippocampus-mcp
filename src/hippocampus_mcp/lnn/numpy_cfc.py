@@ -97,8 +97,8 @@ class NumpyWiredCfc:
     ):
         if layer_sizes[-1] != output_dim:
             raise ValueError(
-                f"末层必须是输出层：layer_sizes[-1]={layer_sizes[-1]} != "
-                f"output_dim={output_dim}（ncps 里 fc=Identity，输出即末层隐状态）"
+                f"the last layer must be the output layer: layer_sizes[-1]={layer_sizes[-1]} != "
+                f"output_dim={output_dim}(in ncps, fc=Identity and the output is the last layer's hidden state)"
             )
         self.input_dim = int(input_dim)
         self.layer_sizes = [int(n) for n in layer_sizes]
@@ -116,7 +116,7 @@ class NumpyWiredCfc:
                 mask = np.asarray(masks[l], dtype=np.float32)
                 if mask.shape != (h, in_l):
                     raise ValueError(
-                        f"layer{l} mask 形状 {mask.shape} != 期望 ({h}, {in_l})"
+                        f"layer{l} mask shape {mask.shape} != expected ({h}, {in_l})"
                     )
             else:
                 mask = np.ones((h, in_l), dtype=np.float32)
@@ -130,7 +130,7 @@ class NumpyWiredCfc:
                     b = np.asarray(weights[f"layer{l}.{head}.bias"], dtype=np.float32)
                     if w.shape != (h, in_l):
                         raise ValueError(
-                            f"layer{l}.{head}.weight 形状 {w.shape} "
+                            f"layer{l}.{head}.weight shape {w.shape} "
                             f"!= 期望 ({h}, {in_l})"
                         )
                     ws[head], bs[head] = w, b
@@ -150,7 +150,7 @@ class NumpyWiredCfc:
             prev_out = h
 
     # ------------------------------------------------------------------
-    # 初始化（对齐 torch：2 维权重 Xavier uniform，bias 走 Linear 默认）
+    # 初始化（对齐 torch：2D权重 Xavier uniform，bias 走 Linear 默认）
     # ------------------------------------------------------------------
     @staticmethod
     def _xavier_init(rng: np.random.Generator, out_f: int, in_f: int) -> np.ndarray:
@@ -184,7 +184,7 @@ class NumpyWiredCfc:
         if x.ndim == 2:
             x = x[:, None, :]
         if x.ndim != 3:
-            raise ValueError(f"forward 输入应为 2/3 维，得到 {x.ndim} 维")
+            raise ValueError(f"forward input must be 2/3 dimensional, got {x.ndim}D")
         batch, seq = x.shape[0], x.shape[1]
         total = sum(self.layer_sizes)
         if hx is None:
@@ -193,7 +193,7 @@ class NumpyWiredCfc:
             h = np.asarray(hx, dtype=np.float32)
             if h.shape != (batch, total):
                 raise ValueError(
-                    f"hx 形状 {h.shape} != 期望 ({batch}, {total})"
+                    f"hx shape {h.shape} != expected ({batch}, {total})"
                 )
         # 按层切分（与 torch.split(hx, layer_sizes, dim=1) 一致）
         bounds = np.cumsum([0] + self.layer_sizes)
@@ -229,7 +229,7 @@ class NumpyWiredCfc:
                     w = np.asarray(arrays[w_key], dtype=np.float32)
                     if w.shape != (h, in_l):
                         raise ValueError(
-                            f"{w_key} 形状 {w.shape} != 期望 ({h}, {in_l})"
+                            f"{w_key} shape {w.shape} != expected ({h}, {in_l})"
                         )
                     w_eff = (w * mask) if head in ("ff1", "ff2") else w
                     setattr(
@@ -242,7 +242,7 @@ class NumpyWiredCfc:
                 if b_key in arrays:
                     b = np.asarray(arrays[b_key], dtype=np.float32)
                     if b.shape != (h,):
-                        raise ValueError(f"{b_key} 形状 {b.shape} != 期望 ({h},)")
+                        raise ValueError(f"{b_key} shape {b.shape} != expected ({h},)")
                     setattr(
                         layer,
                         "b_ff1" if head == "ff1" else

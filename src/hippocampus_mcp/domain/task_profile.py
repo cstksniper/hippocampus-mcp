@@ -98,7 +98,7 @@ def task_profile(
                 continue
             topics.append({
                 "topic_id": str(t.get("id") or ""),
-                "title": str(t.get("title") or "(未命名)"),
+                "title": str(t.get("title") or "(untitled)"),
                 "size": len(members),
                 "hits": len(inter),
             })

@@ -214,10 +214,10 @@ def run(data: dict, records, now: float | None = None,
                  "truncated": bool(res["truncated"])}
         if not map_enabled(m):
             state.update({"checked": 0, "flagged": 0, "cleared": 0,
-                          "skipped": "图级关闭（mention.enabled=false）"})
+                          "skipped": "disabled at map level (mention.enabled=false)"})
             m["mention_state"] = state
             res["skipped"].append({"map": mname,
-                                   "reason": "图级关闭（mention.enabled=false）"})
+                                   "reason": "disabled at map level (mention.enabled=false)"})
             continue
         if why:
             # 判不了就明说：不判 clean、也不判漂移

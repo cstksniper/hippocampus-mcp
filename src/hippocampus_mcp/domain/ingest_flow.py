@@ -140,7 +140,7 @@ def write_sentences(
                 "memory_id": mid,
                 "content": (rec.content[:200] if rec else ""),
                 "source": (rec.source or "") if rec else "",
-                "note": "本次内容并入这条既有记忆（命中去重阈值，未新建）",
+                "note": "This content was merged into that existing memory (dedup threshold hit; no new record)",
             })
         eids = ports.link_entities(names, mid, timestamp, origins)
         if eids:

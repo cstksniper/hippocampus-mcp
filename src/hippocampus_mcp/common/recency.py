@@ -89,7 +89,7 @@ def parse_date_bound(text: str, *, end_of_day: bool = False) -> float:
             dt = dt.replace(hour=23, minute=59, second=59)
         return dt.timestamp()
     raise ValueError(
-        f"日期格式无法解析：{text!r}（应为 YYYY-MM-DD）")
+        f"unparseable date format: {text!r} (expected YYYY-MM-DD)")
 
 
 def in_time_window(timestamp: float, after: float, before: float) -> bool:

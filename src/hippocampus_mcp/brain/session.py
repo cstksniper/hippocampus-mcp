@@ -404,7 +404,7 @@ class _SessionMixin:
                     access=str(user_access or "full"))
                 us_block = render_user_scope(us_info["memories"])
             except Exception as e:  # noqa: BLE001 —— 继承槽是赠品，不炸开场
-                logger.warning("用户级继承槽装配失败（开场不受影响）：%r", e)
+                logger.warning("user-scope slot assembly failed (opening unaffected): %r", e)
                 us_info = {"ready": False, "library": None, "limit": us_n,
                            "count": 0, "memories": [],
                            "reason": "user_scope_error"}
@@ -419,7 +419,7 @@ class _SessionMixin:
                 td_info = self._task_directory_brief(td_n)
                 td_block = render_task_directory(td_info["entries"])
             except Exception as e:  # noqa: BLE001 —— 目录是赠品，不炸开场
-                logger.warning("任务目录槽装配失败（开场不受影响）：%r", e)
+                logger.warning("task-directory slot assembly failed (opening unaffected): %r", e)
                 td_info = {"ready": False, "library": None, "limit": td_n,
                            "count": 0, "total": 0, "entries": [],
                            "reason": "task_directory_error"}
@@ -515,8 +515,8 @@ class _SessionMixin:
                 # 对宿主是一次性的。键位与"指向本工具 + 提到 session_id"的语义
                 # 保持不变（tests/test_s4_session_receipt.py R6a/R6b/R6c）。
                 "resume_hint": (
-                    "上下文压缩后凭 session_id 重调 session_start 重建开场包"
-                    "（完整恢复协议见会话 instructions）。"),
+                    "After context compaction, call session_start again with session_id to rebuild the opening pack"
+                    "(full recovery protocol in the session instructions)."),
             },
         }
         if us_n > 0:
@@ -751,11 +751,11 @@ class _SessionMixin:
         if session_id:
             rec = self.sessions.get(session_id)
             if rec is None or rec.get("ended_at"):
-                return {"error": f"session_id「{session_id}」不存在或已收尾，"
-                                 "本次未做任何变更"}
+                return {"error": f"session_id {session_id!r} does not exist or is already closed; "
+                                 "no change was made"}
             if rec.get("client") != _session_key(client):
-                return {"error": "session_id 不属于本 client（不许代收），"
-                                 "本次未做任何变更"}
+                return {"error": "session_id does not belong to this client (collecting on behalf of others is not allowed); "
+                                 "no change was made"}
             sid = session_id
             # 目标恰为本路 current 才摘指针；收历史会话不动 current。
             if self._current_sessions.get(_session_key(client)) == session_id:
@@ -878,13 +878,13 @@ class _SessionMixin:
             if fr and (fr.get("stale") or fr.get("missing")):
                 bits = []
                 if fr.get("stale"):
-                    bits.append("%d 个磁盘更新未同步（最旧 %d 天前）"
+                    bits.append("%d file-registry updates not synced (oldest %d days ago)"
                                 % (fr["stale"], fr["oldest_stale_days"]))
                 if fr.get("missing"):
-                    bits.append("%d 个建档文件消失" % fr["missing"])
+                    bits.append("%d registered files have disappeared" % fr["missing"])
                 reminders.append(
-                    "文件建档：%s。相关内容重新 ingest 后跑 "
-                    "scripts/file_registry.py sync <路径> 标记同步"
+                    "File registry: %s. After re-ingesting the relevant content, run "
+                    "scripts/file_registry.py sync <path> to mark it synced"
                     % " · ".join(bits))
             # 地图有两个来源，提醒分源给动作（legacy→update_tags，
             # registry→map_set）；registry 图另有闸二产物 drift 提醒。
@@ -899,20 +899,20 @@ class _SessionMixin:
                        if m.get("drifted")]
             if legacy_stale:
                 reminders.append(
-                    "地图「%s」超过 %d 天没更新——改了状态记得走 "
-                    "update_tags 同步（一键一条，别写第二条）"
+                    "Map(s) %s not updated for over %d days -- when a status changes, sync via "
+                    "update_tags (one entry per write; do not write a second entry)"
                     % ("、".join(legacy_stale), MAP_STALE_DAYS))
             if registry_stale:
                 reminders.append(
-                    "地图「%s」超过 %d 天没更新——改了状态走 "
-                    "map_set(name, key, status) 按键更新（一键一条，"
-                    "别写第二条）"
+                    "Map(s) %s not updated for over %d days -- update per key via "
+                    "map_set(name, key, status) (one entry per write; "
+                    "do not write a second entry)"
                     % ("、".join(registry_stale), MAP_STALE_DAYS))
             if drifted:
-                bits = "、".join("%s(%d条)" % (n, c) for n, c in drifted)
+                bits = "、".join("%s(%d)" % (n, c) for n, c in drifted)
                 reminders.append(
-                    "地图%s有条目真相源已变（map_verify 检出 drift）——"
-                    "重核后 map_set 刷新即清" % bits)
+                    "Map(s) %s have entries whose source of truth changed (drift detected by map_verify) -- "
+                    "re-verify, then refresh with map_set to clear" % bits)
             # 闸三：更新之后有记忆提到「另一个状态」。这是
             # 三个信号里最弱的一个（有人说 ≠ 真相是），所以动作写成两步：
             # 先看证据，再决定 ack（没变）还是 map_set（变了）。判不了的
@@ -922,10 +922,10 @@ class _SessionMixin:
                          if m.get("mentioned")]
             if mentioned:
                 reminders.append(
-                    "地图%s有 %d 条在更新之后被提到另一个状态（疑过期，证据在"
-                    "条目 mention.quote）——核过没变用 scripts/maps.py ack "
-                    "<图> <条目>，真变了用 map_set"
-                    % ("、".join("%s(%d条)" % (n, c) for n, c in mentioned),
+                    "Map(s) %s have %d entries mentioned with a different status after their last update (possibly stale, "
+                    "evidence in entry mention.quote) -- if verified unchanged use scripts/maps.py ack "
+                    "<map> <entry>; if truly changed use map_set"
+                    % ("、".join("%s(%d)" % (n, c) for n, c in mentioned),
                        sum(c for _, c in mentioned)))
             # C 期 C1：自动 verify 的两种「说不清」。它们都不是 drift——
             # 一个是条目值解析不出（动态值/坏格式），一个是整图源读不了。
@@ -935,10 +935,10 @@ class _SessionMixin:
                           if m.get("failed")]
             if unresolved:
                 reminders.append(
-                    "地图%s有 %d 条自动 verify 无法定论（动态值/格式不认）"
-                    "——条目 note 看原因；要自动核就补 auto 配方，"
-                    "否则按人工维护走 map_set"
-                    % ("、".join("%s(%d条)" % (n, c) for n, c in unresolved),
+                    "Map(s) %s have %d entries auto-verify could not decide (dynamic values / unrecognized format) "
+                    "-- see the entry note for reasons; to verify automatically, add an auto recipe; "
+                    "otherwise maintain manually via map_set"
+                    % ("、".join("%s(%d)" % (n, c) for n, c in unresolved),
                        sum(c for _, c in unresolved)))
             broken_auto = [(m["name"], m["auto_error"]) for m in mi["maps"]
                            if m.get("auto_error")]
@@ -946,7 +946,7 @@ class _SessionMixin:
                 # 措辞不写死「读不到真相源」：C2 的失败面还有「没建档/对账
                 # 目录不存在/扫描不完整」，它们同样不该被当成已核对。
                 reminders.append(
-                    "地图「%s」的自动 verify 没能完成——%s"
+                    "Map %r: auto-verify could not complete -- %s"
                     % ("、".join(n for n, _ in broken_auto),
                        broken_auto[0][1]))
             # 目录对账的三类信号。与自动 verify 的 drift 分开报，
@@ -959,21 +959,21 @@ class _SessionMixin:
                     "地图%s有条目在数据目录里找不到（已删或改了名）——"
                     "确认真删就 map_set 改状态；整体搬过家就把 auto.root "
                     "指对再核对"
-                    % "、".join("%s(%d条)" % (n, c) for n, c in dir_miss))
+                    % "、".join("%s(%d)" % (n, c) for n, c in dir_miss))
             dir_conf = [(m["name"], m["dir_conflict"]) for m in mi["maps"]
                         if m.get("dir_conflict")]
             if dir_conf:
                 reminders.append(
                     "地图%s有条目实际所在子目录与 status 不符——"
                     "map_get 看 drift.observed 是实际位置，改状态或搬文件"
-                    % "、".join("%s(%d条)" % (n, c) for n, c in dir_conf))
+                    % "、".join("%s(%d)" % (n, c) for n, c in dir_conf))
             unmatched = [(m["name"], m["unmatched"]) for m in mi["maps"]
                          if m.get("unmatched")]
             if unmatched:
                 reminders.append(
                     "地图%s有目录里存在但没登记的键——核对后 map_set 补条目"
                     "（对账只报不填：世界多了东西，得有人告诉地图）"
-                    % "、".join("%s(%d个)" % (n, c) for n, c in unmatched))
+                    % "、".join("%s(%d)" % (n, c) for n, c in unmatched))
             # 预算超限 / 部分源没核完：同样是「这轮没核完」，不能当全 clean
             truncated = [m["name"] for m in mi["maps"]
                          if m.get("auto_incomplete")

@@ -227,10 +227,10 @@ class LibraryAdminService:
         info = resolve_library(library, libs=ports.libraries(True),
                                default_path=ports.default_path())
         if info is None:
-            raise LibraryResolutionError("library_use 必须指定库名")
+            raise LibraryResolutionError("library_use requires a library name")
         if info.backup:
             raise LibraryResolutionError(
-                f"{info.name} 是备份/快照目录，只读，不能切换过去。")
+                f"{info.name} is a backup/snapshot directory; it is read-only and cannot be switched to.")
         key = ports.binding_set(info.path, client or None)
         ports.prefetch(info.path)
         return {
@@ -238,8 +238,8 @@ class LibraryAdminService:
             "library": {"id": info.library_id, "name": info.name,
                         "path": info.path},
             "session_key": key,
-            "note": "本会话此后的读类工具调用自动落到该库；写仍钉家库"
-                    "（见 library_whoami 的 home）；单次覆盖请传 library 参数。",
+            "note": "Read tools in this session now target this library automatically; writes remain pinned to the home library "
+                    "(see library_whoami home). Pass library= for a one-call override.",
         }
 
     # ---------------------------------------------------------------- 新建
@@ -260,17 +260,17 @@ class LibraryAdminService:
         ports = self.ports
         nm = (name or "").strip()
         if not nm:
-            raise LibraryResolutionError("库名不能为空")
+            raise LibraryResolutionError("Library name cannot be empty")
         for i in ports.libraries(True):
             if not i.backup and i.name.lower() == nm.lower():
                 raise LibraryResolutionError(
-                    f"库名 {nm} 已存在（{i.path}）。重名会让寻址变歧义，请换一个。")
+                    f"Library name {nm} already exists ({i.path}). Duplicate names make addressing ambiguous; choose another.")
         target = (path or "").strip()
         if not target:
             target = os.path.join(default_roots()[0], "hippo_" + nm)
         target = normpath(os.path.expanduser(target))
         if os.path.exists(target) and not os.path.isdir(target):
-            raise LibraryResolutionError(f"{target} 已存在且不是目录")
+            raise LibraryResolutionError(f"{target} already exists and is not a directory")
         alias_list = [a.strip() for a in aliases.split(",") if a.strip()]
         info = write_manifest(target, nm, alias_list)
         # 建完先把存储初始化出来：空目录不会在下次扫描前自动成为「已就绪的库」。
@@ -299,8 +299,8 @@ class LibraryAdminService:
         if not out["directory_registered"]:
             out["directory_reason"] = str(reg.get("reason") or "unknown")
             logger.warning(
-                "任务目录登记失败（库 %s 已建好，但没进用户级任务目录：%s）——"
-                "跨库寻址按任务名找不到它，请手工补 directory.json 或检查用户库。",
+                "Task directory registration failed (library %s was created but not added to the user-level task directory: %s). "
+                "Cross-library lookup cannot find it by task name; add it to directory.json manually or check the user library.",
                 info.name, out["directory_reason"])
         if use:
             out["session_key"] = ports.binding_set(info.path, client or None)
@@ -310,13 +310,13 @@ class LibraryAdminService:
         # 在建库成功时就说清楚。提示是赠品：拿不到 home 名也不炸建库。
         try:
             out["note"] = (
-                f"写边界提示：本连接的写入仍钉在原家库"
-                f"「{self._default_info().name}」；要把首条记忆写进"
-                f"「{info.name}」，请开新会话（新连接 HELLO 会按 "
-                "workspace_root 绑到新库）。读侧可用 library_use 立即切过去。")
+                f"Write boundary note: writes on this connection remain pinned to the original home library"
+                f" ({self._default_info().name}). To write the first memory into "
+                f"{info.name}, start a new session (the new connection HELLO will bind by "
+                "workspace_root to the new library). Read side can use library_use to switch immediately.")
         except Exception:  # noqa: BLE001 —— 提示是赠品，绝不炸建库
             out["note"] = (
-                f"写边界提示：本连接的写入仍钉在原家库；要把首条记忆写进"
-                f"「{info.name}」，请开新会话（新连接 HELLO 会按 "
-                "workspace_root 绑到新库）。")
+                f"Write boundary note: writes on this connection remain pinned to the original home library; to write the first memory into "
+                f"{info.name}, start a new session (the new connection HELLO will bind by "
+                "workspace_root to the new library).")
         return out

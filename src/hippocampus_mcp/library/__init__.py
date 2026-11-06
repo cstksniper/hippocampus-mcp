@@ -329,7 +329,7 @@ def resolve_library(
         if hit is not None:
             return hit
         raise LibraryResolutionError(
-            f"找不到 id 为 {q} 的记忆库。用 library_list 看看有哪些库。"
+            f"No memory library with id {q}. Use library_list to see available libraries."
         )
 
     hit, ambiguous = _match_by_name(q, pool)
@@ -345,15 +345,15 @@ def resolve_library(
     ]
     if bak_hits:
         raise LibraryResolutionError(
-            f"{q} 是备份/快照目录，只读，不能作为写入目标（共 {len(bak_hits)} 处："
-            f"{'、'.join(i.path for i in bak_hits[:3])}）。请用真库名或 library_id 指定。"
+            f"{q} is a backup/snapshot directory and is read-only; it cannot be a write target ({len(bak_hits)} match(es): "
+            f"{', '.join(i.path for i in bak_hits[:3])}). Use a real library name or library_id."
         )
 
     if ambiguous:
-        names = "、".join(f"{i.name}({i.library_id})" for i in ambiguous)
+        names = ", ".join(f"{i.name}({i.library_id})" for i in ambiguous)
         raise LibraryResolutionError(
-            f"库名 {q} 有歧义，匹配到 {len(ambiguous)} 个库：{names}。"
-            f"请用 library_id（lib_…）或完整路径指定。"
+            f"Library name {q} is ambiguous; matched {len(ambiguous)} libraries: {names}."
+            f"Use a library_id (lib_...) or full path instead."
         )
 
     hit = _match_by_path(q, pool)
@@ -362,8 +362,8 @@ def resolve_library(
 
     # 走到这里＝"指定了但解析不明"，必须报错。给出近似名建议（编辑距离 ≤2）。
     suggestions = _suggest(q, pool)
-    tail = f"你是不是想找：{suggestions}？" if suggestions else "用 library_list 看看有哪些库。"
-    raise LibraryResolutionError(f"找不到记忆库 {q}。{tail}")
+    tail = f"Did you mean: {suggestions}?" if suggestions else "Use library_list to see available libraries."
+    raise LibraryResolutionError(f"Memory library {q} not found. {tail}")
 
 
 def _levenshtein(a: str, b: str) -> int:

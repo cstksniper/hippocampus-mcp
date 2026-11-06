@@ -60,7 +60,7 @@ def map_set(
                         "稍后重试即可" % exc}
     except unreadable_exc as exc:
         return {"status": "error", "map": name, "key": key,
-                "hint": "%s；坏文件已保留在原处，修好或显式重建再说" % exc}
+                "hint": "%s; the corrupt file was kept in place -- repair it or rebuild explicitly first" % exc}
     m, ent, notes, maps_total = got
     return {"status": "ok", "map": name, "key": key, "entry": ent,
             "notes": notes, "maps_total": maps_total,
@@ -82,8 +82,8 @@ def map_list(
     m = (data.get("maps") or {}).get(str(name))
     if m is None:
         return {"enabled": True, "found": False, "map": name,
-                "hint": "没有这张图；现有图：%s"
-                        % ("、".join(map_names_fn(data)) or "（空）")}
+                "hint": "no such map; existing maps: %s"
+                        % ("、".join(map_names_fn(data)) or "(empty)")}
     ents = m.get("entries") or {}
     rows = []
     for k in sorted(ents, key=lambda k: -float(
@@ -131,6 +131,6 @@ def map_verify(
                 "error": str(exc)}
     if res is None:
         return {"enabled": False, "checked": 0, "drifted": [],
-                "hint": "未启用地图层"}
+                "hint": "the map layer is not enabled"}
     res["enabled"] = True
     return res

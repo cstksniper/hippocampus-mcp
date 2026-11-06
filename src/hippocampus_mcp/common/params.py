@@ -40,9 +40,9 @@ def parse_tags_json(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        return None, f"不是合法 JSON: {exc}"
+        return None, f"is not valid JSON: {exc}"
     if not isinstance(loaded, dict):
-        return None, '必须是 JSON 对象，如 {"章": 43}'
+        return None, 'must be a JSON object, e.g. {"ch": 43}'
     return loaded, None
 
 
@@ -58,9 +58,9 @@ def parse_str_list(raw: str) -> tuple[list[str] | None, str | None]:
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        return None, f"不是合法 JSON: {exc}"
+        return None, f"is not valid JSON: {exc}"
     if not isinstance(loaded, list):
-        return None, '必须是 JSON 数组，如 ["域", "章"]'
+        return None, 'must be a JSON array, e.g. ["domain", "ch"]'
     return [str(x) for x in loaded], None
 
 
@@ -107,16 +107,16 @@ def parse_tagops_args(tags: str, clear_keys: str, missing_keys: str,
     """
     parsed, err = parse_tags_json(tags)
     if err:
-        return None, f"tags 解析失败：{err}"
+        return None, f"tags parse failed: {err}"
     keys, err = parse_str_list(clear_keys)
     if err:
-        return None, f"clear_keys 解析失败：{err}"
+        return None, f"clear_keys parse failed: {err}"
     mkeys, err = parse_str_list(missing_keys)
     if err:
-        return None, f"missing_keys 解析失败：{err}"
+        return None, f"missing_keys parse failed: {err}"
     ids, err = parse_str_list(memory_ids)
     if err:
-        return None, f"memory_ids 解析失败：{err}"
+        return None, f"memory_ids parse failed: {err}"
     return {"tags": parsed, "clear_keys": keys,
             "missing_keys": mkeys, "memory_ids": ids}, None
 

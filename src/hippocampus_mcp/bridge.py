@@ -143,7 +143,7 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
                         # 坏帧不能带走整条连接：跳过这一条，等下一帧。
                         # 但要吼出来——静默丢包和静默串库是一类事故。
                         print(
-                            f"[bridge] 丢弃非法 JSON-RPC 帧: {type(exc).__name__}: {exc}",
+                            f"[bridge] discarded invalid JSON-RPC frame: {type(exc).__name__}: {exc}",
                             file=sys.stderr)
                         continue
                     try:
@@ -251,16 +251,16 @@ def mcp_connection_handler(conn: Any) -> None:
                 str(hello.get("cwd") or ""),
                 session=key,
             )
-            print(f"[bridge] 会话 {key} 默认库={path}（来自 launcher 握手）",
+            print(f"[bridge] session {key} default library={path} (from launcher HELLO)",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 —— 握手失败不能让会话起不来
-            print(f"[bridge] 会话 {key} 握手处理失败（回落进程默认库）: "
+            print(f"[bridge] session {key} HELLO handling failed (falling back to process default library): "
                   f"{type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         asyncio.run(_serve_socket_session(_get_server(), sock, key))
     except RuntimeError as exc:
         # 典型：宿主把 socket 断了，而会话还在收尾
-        print(f"[bridge] 会话 {key} 结束: {type(exc).__name__}: {exc}",
+        print(f"[bridge] session {key} ended: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
 

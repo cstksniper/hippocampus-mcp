@@ -368,16 +368,16 @@ class MemoryManager:
         self._model_key = self.embedder.model_key
         if backend != "numpy":
             raise ValueError(
-                f"存储后端 {backend!r} 未接通。当前唯一受支持的后端是 'numpy'。\n"
-                f"曾经有一份基于 ChromaDB 的实验实现（backend='chroma'），实测存在下列缺陷、"
-                f"接通会静默损坏数据，故实现已从代码库移除、此处保留拒绝：\n"
-                f"  1. 换嵌入模型后，ChromaDB 内旧模型的向量会被贴上当前模型标签，"
-                f"missing_ids() 返回空 → 永不补算 → 检索用错向量（静默污染）；\n"
-                f"  2. save/load 往返丢 source_ids / entity_ids → L0 审计链与实体索引断裂；\n"
-                f"  3. update() 不同步 pin（相关修复未覆盖该路径）；\n"
-                f"  4. 无 last_load_issue / 损坏隔离（相关修复未覆盖该路径）；\n"
+                f"Storage backend {backend!r} is not wired up. The only supported backend is 'numpy'.\n"
+                f"An experimental ChromaDB-based implementation (backend='chroma') once existed; testing showed the following defects, "
+                f"so wiring it back in would silently corrupt data -- the implementation was removed and this refusal kept:\n"
+                f"  1. after switching embedding models, ChromaDB vectors from the old model get tagged with the current model name; "
+                f"missing_ids() returns empty -> never backfilled -> retrieval uses wrong vectors (silent pollution);\n"
+                f"  2. save/load round-trips lose source_ids / entity_ids -> the L0 audit chain and entity index break;\n"
+                f"  3. update() does not sync pin state (related fixes do not cover that path);\n"
+                f"  4. no last_load_issue / corruption quarantine (related fixes do not cover that path);\n"
                 f"  5. 构造即自动加载，与其他后端\"显式 load()\"的时序不一致。\n"
-                f"补齐上述 5 项并配套双后端等价回归后，方可放开此处限制。"
+                f"Once all five are fixed with dual-backend equivalence regression, this restriction can be lifted."
             )
         store_path = None
         if persist_dir:
@@ -679,8 +679,8 @@ class MemoryManager:
                         "similarity": round(float(sim), 4),
                         "missing_hard_info": sorted(_missing_hard)[:12],
                         "note": (
-                            "新文本含旧文本没有的数字/日期 → 按 C10 未合并、"
-                            "已独立新建（合并会丢掉这些信息）"
+                            "the new text contains numbers/dates absent from the old text -> not merged per C10; "
+                            "created as a separate record (merging would lose that information)"
                         ),
                         "content": existing.content[:200],
                     }
@@ -811,8 +811,8 @@ class MemoryManager:
                 self.last_save_error = f"{type(e).__name__}: {e}"
                 self.autosave_failures += 1
                 logger.warning(
-                    "自动保存失败（本批记忆仍在内存中，请显式调用 save_state 或 "
-                    "retry_save 重试）: %s", self.last_save_error,
+                    "auto-save failed (the batch of memories is still in memory; call save_state or "
+                    "retry_save explicitly to retry): %s", self.last_save_error,
                 )
 
         return memory_id
@@ -1229,9 +1229,9 @@ class MemoryManager:
             # MCP 服务启动预热时会卡在这，客户端可能直接超时断连。
             # 所以先把话说清楚，让人知道"不是在挂，是在算"。
             _stderr_print(
-                f"[MemoryManager] 模型 {self._model_key} 缺 {len(missing)} 条向量，"
-                f"开始补算（同步阻塞，请勿中断；大库请先离线跑 "
-                f"scripts/reembed.py）。",
+                f"[MemoryManager] model {self._model_key} is missing {len(missing)} vectors; "
+                f"backfilling now (synchronous and blocking -- do not interrupt; for large libraries run "
+                f"scripts/reembed.py offline first).",
                 flush=True,
             )
 
@@ -1253,7 +1253,7 @@ class MemoryManager:
                 self.store.set_vector(mid, self._model_key, vec)
                 filled += 1
             if verbose:
-                _stderr_print(f"  补算向量 {filled}/{len(missing)}", flush=True)
+                _stderr_print(f"  backfilled vectors {filled}/{len(missing)}", flush=True)
 
         if filled:
             # 只落盘向量库；不动 LNN 检查点（避免在 load 过程中覆盖待恢复的状态）
@@ -1378,7 +1378,7 @@ class MemoryManager:
                 return True
             return False
         except Exception as e:
-            _stderr_print(f"[MemoryManager] 加载训练权重失败: {e}")
+            _stderr_print(f"[MemoryManager] failed to load training weights: {e}")
             return False
 
     # ------------------------------------------------------------------
@@ -1510,7 +1510,7 @@ class MemoryManager:
                 os.fsync(f.fileno())
             os.replace(tmp, path)
         except OSError as e:
-            _stderr_print(f"[MemoryManager] 元数据保存失败: {e}")
+            _stderr_print(f"[MemoryManager] metadata save failed: {e}")
 
     def _load_meta(self) -> dict[str, Any]:
         """读取侧车元数据 JSON；不存在或损坏时返回空字典。"""
@@ -1522,7 +1522,7 @@ class MemoryManager:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError) as e:
-            _stderr_print(f"[MemoryManager] 元数据读取失败（忽略）: {e}")
+            _stderr_print(f"[MemoryManager] metadata read failed (ignored): {e}")
             return {}
 
     def _follow_store_model(self, model_key: str) -> None:
@@ -1550,7 +1550,7 @@ class MemoryManager:
                             model_dir=model_dir, model_name=model_key
                         )
                 except Exception as e:  # noqa: BLE001 - 直构失败回落包装路径
-                    _stderr_print(f"[MemoryManager] ONNX 直构失败，回落 ST 包装：{e}")
+                    _stderr_print(f"[MemoryManager] direct ONNX construction failed; falling back to the ST wrapper: {e}")
             if direct is not None:
                 self.embedder = direct
             else:
@@ -1565,7 +1565,7 @@ class MemoryManager:
                         attach(from_store=True)
                     except Exception as e:  # noqa: BLE001 - 装配失败不许让库起不来
                         _stderr_print(
-                            f"[MemoryManager] ONNX 装配失败，沿用 torch 后端：{e}"
+                            f"[MemoryManager] ONNX assembly failed; keeping the torch backend: {e}"
                         )
         else:
             self.embedder = create_embedder(backend, dim=old_dim)
@@ -1586,8 +1586,8 @@ class MemoryManager:
             "to_dim": self.embedding_dim,
         }
         _stderr_print(
-            f"[MemoryManager] 嵌入模型跟随库内数据：{old_key} → {self._model_key}"
-            f"（库内该模型已有向量，无需重算）。"
+            f"[MemoryManager] embedding model follows the library's data: {old_key} -> {self._model_key} "
+            f"(vectors for this model already exist in the library; no recomputation needed)."
         )
 
     def _sync_embedder_with_store(self) -> None:
@@ -1617,18 +1617,18 @@ class MemoryManager:
             return
         if allowed:
             _stderr_print(
-                f"[MemoryManager] {ENV_ALLOW_MODEL_SWITCH} 已开：库内是 "
-                f"{preferred}，本次仍按 {self._model_key} 运行，将补算缺失向量。"
+                f"[MemoryManager] {ENV_ALLOW_MODEL_SWITCH} enabled: the library was built with "
+                f"{preferred}; running with {self._model_key} this time and backfilling missing vectors."
             )
             return
         raise EmbedderModelMismatchError(
-            f"嵌入模型与库内数据不符：当前生效模型 {self._model_key!r}"
-            f"（来源：{source}），但库 {self.store.persist_path!r} 内的向量属于 "
-            f"{preferred!r}。\n"
-            f"用错模型会静默毁掉检索（或把整库重算一遍），故拒绝加载。处置：\n"
-            f"  1) 让它们一致（推荐）：设 HIPPOCAMPUS_EMB_MODEL={preferred}；\n"
-            f"  2) 确实要在这份数据上比对别的模型：设 "
-            f"{ENV_ALLOW_MODEL_SWITCH}=1（会为新模型补算全部向量）。"
+            f"embedding model mismatch with the library's data: the effective model is {self._model_key!r} "
+            f"(source: {source}), but the vectors in {self.store.persist_path!r} belong to "
+            f"{preferred!r}.\n"
+            f"Using the wrong model silently destroys retrieval (or triggers a full-library recompute), so loading is refused. Remedies:\n"
+            f"  1) make them consistent (recommended): set HIPPOCAMPUS_EMB_MODEL={preferred};\n"
+            f"  2) to compare other models on this data deliberately: set "
+            f"{ENV_ALLOW_MODEL_SWITCH}=1 (all vectors will be backfilled for the new model)."
         )
 
     def load(self, auto_backfill: bool = True) -> None:
@@ -1657,7 +1657,7 @@ class MemoryManager:
         meta = self._load_meta()
         if self._reference_time is None and meta.get("reference_time") is not None:
             self._reference_time = meta["reference_time"]
-            _stderr_print("[MemoryManager] reference_time 已从元数据 JSON 恢复（.pt 不可用）")
+            _stderr_print("[MemoryManager] reference_time restored from metadata JSON (.pt unavailable)")
         if not self._step_count and meta.get("step_count"):
             self._step_count = int(meta["step_count"])
 
@@ -1665,6 +1665,6 @@ class MemoryManager:
             stats = self.ensure_vectors()
             if stats["filled"]:
                 _stderr_print(
-                    f"[MemoryManager] 已为模型 {self._model_key} 补算 "
-                    f"{stats['filled']} 条向量"
+                    f"[MemoryManager] backfilled {self._model_key} vectors for model "
+                    f"{stats['filled']}"
                 )

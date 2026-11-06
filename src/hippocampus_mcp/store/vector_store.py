@@ -176,7 +176,7 @@ class VectorStore:
         model_key: 当前活跃模型标识（如 ``"BAAI/bge-base-zh-v1.5"``）。
     """
 
-    # 持久化格式版本：1 = 单向量旧格式，2 = 多模型 + 独立 .npz
+    # 持久化格式版本：1 = 单向量旧格式，2 = 多model + 独立 .npz
     FORMAT_VERSION = 2
 
     def __init__(
@@ -296,7 +296,7 @@ class VectorStore:
     def _invalidate(self) -> None:
         """整体失效矩阵缓存，下次搜索时全量重建。
 
-        只在结构性变更（删除 / 换模型 / 裁剪模型 / 加载）时调用。
+        只在结构性变更（删除 / 换model / 裁剪model / 加载）时调用。
         新增记录与原地改向量走 ``_sync_row`` 增量维护，不整体重建。
         """
         self._matrix = None
@@ -310,7 +310,7 @@ class VectorStore:
         known = self.model_dims.get(model_key)
         if known is not None and known != dim:
             raise ValueError(
-                f"模型 {model_key} 的向量维度不一致: 已记录 {known}, 本次 {dim}"
+                f"model {model_key} has inconsistent vector dimensions: recorded {known}, now {dim}"
             )
         self.model_dims[model_key] = dim
         return dim
@@ -321,7 +321,7 @@ class VectorStore:
         emb = np.asarray(embedding, dtype=np.float64).reshape(-1)
         if key == self.model_key and emb.shape[0] != self.dim:
             raise ValueError(
-                f"嵌入维度 {emb.shape[0]} 与当前模型 {key} 的维度 {self.dim} 不匹配"
+                f"embedding dimension {emb.shape[0]} 与当前model {key}'s dimension {self.dim} -- mismatch"
             )
         self._record_dim(emb, key)
         return emb
@@ -548,8 +548,8 @@ class VectorStore:
         query = np.asarray(query, dtype=np.float64).reshape(-1)
         if query.shape[0] != self.dim:
             raise ValueError(
-                f"查询向量维度 {query.shape[0]} 与当前模型 {self.model_key} 的维度 "
-                f"{self.dim} 不匹配"
+                f"query vector dimension {query.shape[0]} 与当前model {self.model_key}'s dimension "
+                f"{self.dim} -- mismatch"
             )
 
         ids, _ = self._active_matrix()
@@ -1002,23 +1002,23 @@ class VectorStore:
         if _resolve("HIPPOCAMPUS_ALLOW_STALE_SAVE",
                     "allow_stale_save", "") in ("1", "true", "True", "yes"):
             logging.warning(
-                "检测到 %s 已被其他进程改写（期望版本 %s，实际 %s），"
-                "HIPPOCAMPUS_ALLOW_STALE_SAVE=1 已设置，本次仍然覆盖保存——"
-                "另一进程的写入将会丢失。",
+                "Detected that %s was rewritten by another process (expected version %s, actual %s); "
+                "HIPPOCAMPUS_ALLOW_STALE_SAVE=1 is set, so overwriting anyway -- "
+                "the other process's writes will be lost.",
                 self.persist_path, self._disk_stamp, current,
             )
             return
 
         raise ConcurrentWriteError(
-            f"拒绝保存：{self.persist_path} 已被其他进程改写，"
-            f"本次覆盖会让对方的写入静默消失。\n"
-            f"  期望版本(load 时): {self._disk_stamp}\n"
-            f"  磁盘实际版本    : {current}\n"
-            f"  本进程内存条数  : {len(self._records)}\n"
-            f"处置方式（任选）：\n"
-            f"  1) 重新加载最新状态后再改（MCP 工具 load_state）；\n"
-            f"  2) 确认另一个进程（另一个 ZCode 窗口 / 导入脚本）已退出后重试；\n"
-            f"  3) 明知另一进程只读，可设 HIPPOCAMPUS_ALLOW_STALE_SAVE=1 强制覆盖。"
+            f"Save refused: {self.persist_path} was rewritten by another process; "
+            f"overwriting now would silently discard that process's writes.\n"
+            f"  expected version (at load): {self._disk_stamp}\n"
+            f"  actual version on disk    : {current}\n"
+            f"  in-memory record count    : {len(self._records)}\n"
+            f"Remedies (pick one):\n"
+            f"  1) reload the latest state, then retry (MCP tool load_state);\n"
+            f"  2) make sure the other process (another host window / import script) has exited, then retry;\n"
+            f"  3) if you know the other process is read-only, set HIPPOCAMPUS_ALLOW_STALE_SAVE=1 to force the overwrite."
         )
 
     # ------------------------------------------------------------------
@@ -1175,7 +1175,7 @@ class VectorStore:
             "total": len(self._records),
         }
         logging.info(
-            "多进程合并保存：吸收对方 %d 条、重放本进程 %d 条改动 / %d 条删除（合计 %d 条）",
+            "multi-process merge save: absorbed %d records from the other process, replayed %d local changes / %d local deletions (%d records total)",
             absorbed, replayed, dropped, len(self._records),
         )
         return True
@@ -1208,9 +1208,9 @@ class VectorStore:
         if _resolve("HIPPOCAMPUS_ALLOW_STALE_SAVE",
                     "allow_stale_save", "") in ("1", "true", "True", "yes"):
             logging.warning(
-                "检测到 %s 已被其他进程改写（期望版本 %s，实际 %s），"
-                "HIPPOCAMPUS_ALLOW_STALE_SAVE=1 已设置，本次仍然覆盖保存——"
-                "另一进程的写入将会丢失。",
+                "Detected that %s was rewritten by another process (expected version %s, actual %s); "
+                "HIPPOCAMPUS_ALLOW_STALE_SAVE=1 is set, so overwriting anyway -- "
+                "the other process's writes will be lost.",
                 self.persist_path, self._disk_stamp, current,
             )
             return
@@ -1218,23 +1218,23 @@ class VectorStore:
         if multi_writer_enabled() and locked:
             if self._merge_with_disk():
                 return
-            reason = "磁盘文件读不出来，无法安全合并"
+            reason = "the on-disk file could not be read, so a safe merge is impossible"
         elif not multi_writer_enabled():
-            reason = "HIPPOCAMPUS_MULTI_WRITER=0（已关闭多进程合并）"
+            reason = "HIPPOCAMPUS_MULTI_WRITER=0 (multi-process merge disabled)"
         else:
-            reason = "未能取得跨进程写锁（缺少 filelock），不敢在无锁状态下合并"
+            reason = "could not acquire the cross-process write lock (filelock missing); refusing to merge without a lock"
 
         raise ConcurrentWriteError(
-            f"拒绝保存：{self.persist_path} 已被其他进程改写，"
-            f"本次覆盖会让对方的写入静默消失。\n"
-            f"  原因：{reason}\n"
-            f"  期望版本(load 时): {self._disk_stamp}\n"
-            f"  磁盘实际版本    : {current}\n"
-            f"  本进程内存条数  : {len(self._records)}\n"
-            f"处置方式（任选）：\n"
-            f"  1) 重新加载最新状态后再改（MCP 工具 load_state）；\n"
-            f"  2) 确认另一个进程（另一个 ZCode 窗口 / 导入脚本）已退出后重试；\n"
-            f"  3) 明知另一进程只读，可设 HIPPOCAMPUS_ALLOW_STALE_SAVE=1 强制覆盖。"
+            f"Save refused: {self.persist_path} was rewritten by another process; "
+            f"overwriting now would silently discard that process's writes.\n"
+            f"  reason                    : {reason}\n"
+            f"  expected version (at load): {self._disk_stamp}\n"
+            f"  actual version on disk    : {current}\n"
+            f"  in-memory record count    : {len(self._records)}\n"
+            f"Remedies (pick one):\n"
+            f"  1) reload the latest state, then retry (MCP tool load_state);\n"
+            f"  2) make sure the other process (another host window / import script) has exited, then retry;\n"
+            f"  3) if you know the other process is read-only, set HIPPOCAMPUS_ALLOW_STALE_SAVE=1 to force the overwrite."
         )
 
     def load(self) -> None:
@@ -1295,7 +1295,7 @@ class VectorStore:
             return
         if issue is not None and issue.get("kind") == "recovered":
             logging.warning(
-                "主文件损坏，已从备份恢复；坏文件隔离为 %s",
+                "the main file was corrupt and has been restored from backup; the corrupt file quarantined as %s",
                 issue.get("quarantined"),
             )
         # 磁盘已有完整基线 ⇒ 之后的保存可以走行级增量

@@ -62,7 +62,7 @@ def undo_tag_ops(
         confirm_above: 回滚条数闸门（与写入侧同常量）。
     """
     if not ops:
-        return {"ok": False, "error": "账本是空的：没有可撤销的 update_tags 执行",
+        return {"ok": False, "error": "the ledger is empty: no reversible update_tags execution",
                 "recent_ops": []}
     want = str(target or "last").strip()
     if want in ("", "last"):
@@ -71,11 +71,11 @@ def undo_tag_ops(
         op = next((o for o in ops if str(o.get("op_id")) == want), None)
         if op is None:
             return {"ok": False,
-                    "error": f"没有这个 op：{want}",
+                    "error": f"no such op: {want}",
                     "recent_ops": brief(ops)}
     changes = [c for c in (op.get("changes") or []) if isinstance(c, dict)]
     if not changes:
-        return {"ok": False, "error": "这个 op 没有记录任何变更",
+        return {"ok": False, "error": "this op recorded no changes",
                 "op_id": op.get("op_id")}
 
     plan: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
@@ -93,7 +93,7 @@ def undo_tag_ops(
             conflicts.append({
                 "id": mid, "expected_after": after,
                 "current": dict(rec.tags or {}),
-                "note": "当前值与记录的 after 不一致（期间被改过）⇒ 跳过",
+                "note": "current value differs from the recorded after (changed in between) => skipped",
             })
             continue
         if before == after:
@@ -126,15 +126,15 @@ def undo_tag_ops(
         ],
     }
     if dry_run:
-        payload["hint"] = ("这是回滚计划，没有写入。确认后用 dry_run=false 执行"
-                           + (f"；影响 {len(plan)} 条 > "
-                              f"{confirm_above}，还需 confirm=true"
+        payload["hint"] = ("this is a rollback plan; nothing was written. Execute with dry_run=false once confirmed"
+                           + (f"; it would affect {len(plan)} entries > "
+                              f"{confirm_above}; confirm=true is also required"
                               if len(plan) > confirm_above else ""))
         return payload
     if len(plan) > confirm_above and not confirm:
         payload.update({
             "ok": False, "applied": False,
-            "error": (f"回滚 {len(plan)} 条 > {confirm_above}，"
+            "error": (f"rollback would affect {len(plan)} entries > {confirm_above}，"
                       f"拒绝执行：请先 dry_run=true 看计划，确认后加 confirm=true"),
         })
         return payload
@@ -174,6 +174,6 @@ def undo_tag_ops(
     except Exception as exc:  # noqa: BLE001
         payload["saved"] = False
         payload["save_error"] = f"{type(exc).__name__}: {exc}"
-        payload["hint"] = "标签已在内存回滚但未落盘，请调 save_state 重试"
+        payload["hint"] = "tags were rolled back in memory but not persisted; call save_state and retry"
     payload["coverage_after"] = coverage()
     return payload

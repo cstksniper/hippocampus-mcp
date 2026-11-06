@@ -71,7 +71,7 @@ class MaintainService(BaseService):
         tier = self._ua(client)
         if tier in ("masked", "none"):
             return {"error": (
-                f"用户级库的导出在当前工作区被拒（读侧档位 {tier}）：导出是"
+                f"User-library export is refused from this workspace (read level {tier}）：导出是"
                 "批量通道，masked/none 档一律拒绝。请在 home 工作区（日常"
                 "助手宿主）会话里导出。")}
         rows = self.brain.export_memories(since=since_ts, source=source or None,
@@ -123,7 +123,7 @@ class MaintainService(BaseService):
         except ConcurrentWriteError as e:
             return self._envelope(
                 {"status": "conflict", "detail": str(e),
-                 "hint": "另一个进程改写了同一个记忆库。先 load_state 拿最新状态再重做本次修改。"})
+                 "hint": "Another process rewrote the same memory library. Call load_state for the latest state, then redo this change."})
         return self._envelope({"status": "saved", "persist_dir": self.persist_dir})
 
     def load_state(self) -> dict[str, Any]:

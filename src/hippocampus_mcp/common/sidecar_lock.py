@@ -68,10 +68,10 @@ class SidecarBusy(RuntimeError):
         self.holder = holder or {}
         who = ""
         if self.holder:
-            who = "（pid=%s，持锁 %.1fs）" % (
+            who = " (pid=%s, held for %.1fs)" % (
                 self.holder.get("pid", "?"),
                 max(0.0, time.time() - float(self.holder.get("ts") or 0)))
-        super().__init__("侧车正被另一个进程写入%s：%s" % (who, path))
+        super().__init__("The sidecar is being written by another process%s: %s" % (who, path))
 
 
 class SidecarUnreadable(RuntimeError):

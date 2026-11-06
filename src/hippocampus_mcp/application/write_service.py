@@ -142,8 +142,8 @@ class WriteService(BaseService):
             # 与单条路径同口径：隔离态自曝不缺席（拆分也进待审队列）。
             out["quarantined"] = True
             out["quarantine_note"] = (
-                "本批拆分产物已全部进入 user 库**待审队列**：不进召回池、"
-                "不进 user_scope 槽；请在 drift_audit 报告中过目后转正或删除。")
+                "All cards produced by this split entered the user-library review queue: they are excluded from recall and "
+                "the user_scope slot. Review them in drift_audit, then promote or delete.")
         if sensitivity:
             # D1：打标结果自曝（拆分产物与单条同口径，家库写入也带）。
             out["sensitivity"] = sensitivity
@@ -171,8 +171,8 @@ class WriteService(BaseService):
                     "memory_id": None,
                     "hits": hits,
                     "content_preview": (content or "")[:100],
-                    "note": ("用户级库不收敏感内容。命中详情见 "
-                             "hits；改写后重发，或按提升流人工两步写入。"),
+                    "note": ("The user-level library rejects sensitive content. See "
+                             "hits for details; rewrite and resend, or use the two-step manual promotion flow."),
                 })
         # D2a/D1：目标 = user 库 ⇒ 打标（user 库自动入库默认 personal，
         # 宁枉勿纵）；非家工作区（工厂注入的隔离判据为真）⇒ 隔离标记
@@ -222,8 +222,8 @@ class WriteService(BaseService):
                 "idempotent": True,
                 "memory_id": memory_id,
                 "content_preview": content[:100],
-                "note": ("同一 idem_key 的重放：未新建、未重新嵌入，直接回既有"
-                         "记忆 id。若这次其实是新内容，说明宿主复用了键。"),
+                "note": ("Replay of the same idem_key: nothing new was created or embedded; the existing "
+                         "memory id was returned. If this was actually new content, the host reused the key."),
             })
         if quarantined or label:
             self._log_access(kind="store_memory", tool="store_memory",
@@ -246,18 +246,18 @@ class WriteService(BaseService):
         }
         if truncated:
             out["truncation_warning"] = (
-                f"本条内容 {out['content_chars']} 字超过嵌入模型 token 上限 "
-                f"{out['max_seq_length']}，仅前 {out['embedded_chars']} 字进入向量——"
-                f"其后的原文写入成功但**检索不到**。请把长内容拆成多张 <500 字的卡。"
+                f"This content is {out['content_chars']} characters, above the embedding model token limit of "
+                f"{out['max_seq_length']}; only the first {out['embedded_chars']} characters entered the vector -- "
+                f"the remainder was written but is not retrievable. Split long content into cards under 500 characters."
             )
         if quarantined:
             # 拍板①：写入返回体自曝隔离态（绝不静默）——「写成功但对所有
             # 下游通道不可见」必须当场可见，否则宿主以为记忆已生效。
             out["quarantined"] = True
             out["quarantine_note"] = (
-                "本条已进入 user 库**待审队列**（非家工作区经豁免通道的直写）："
-                "不进召回池、不进 user_scope 槽；请让用户在 drift_audit 报告中"
-                "过目后经受管通道转正或删除。")
+                "This item entered the user-library review queue (non-home direct write through the exemption channel): "
+                "it is excluded from recall and the user_scope slot. Have the user review it in drift_audit, "
+                "then promote or delete through the managed channel.")
         if label:
             # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
             out["sensitivity"] = label
@@ -282,9 +282,9 @@ class WriteService(BaseService):
                 return self._envelope({
                     "status": "error",
                     "memory_id": memory_id,
-                    "error": ("clear_quarantine 只对家库会话开放：待审转正"
-                              "是受管动作，请在 user 库的家工作区（日常助手"
-                              "宿主）会话里操作，或开逃生门 env 做运维转正。"),
+                    "error": ("clear_quarantine is allowed only from a home-library session: promotion "
+                              "is a managed action. Operate from a home workspace for the user library (daily assistant "
+                              "host), or enable the escape-hatch env for operations."),
                 })
             rec = mgr.store.get(memory_id)
             if rec is None:
@@ -293,7 +293,7 @@ class WriteService(BaseService):
             if not getattr(rec, "quarantine", False):
                 return self._envelope({
                     "status": "noop", "memory_id": memory_id,
-                    "note": "该记忆不在待审队列（quarantine=False），无需转正。"})
+                    "note": "This memory is not in the review queue (quarantine=False); no promotion needed."})
             mgr.update_memory(memory_id, quarantine=False)
             self._log_access(kind="quarantine_clear", tool="update_memory",
                              quarantined=False, sensitivity="",
@@ -301,8 +301,8 @@ class WriteService(BaseService):
                              memory_id=memory_id)
             return self._envelope({
                 "status": "quarantine_cleared", "memory_id": memory_id,
-                "note": "已转正：该记忆恢复进召回池与 user_scope 槽。"
-                        "转正动作已记 access_log。"})
+                "note": "Promoted: this memory is restored to recall and the user_scope slot. "
+                        "The promotion was recorded in access_log."})
         fields: dict[str, Any] = {}
         warnings: list[str] = []
         if content:
@@ -318,25 +318,25 @@ class WriteService(BaseService):
             if st not in allowed:
                 return self._envelope(
                     {"status": "error", "memory_id": memory_id,
-                     "error": f"非法 state: {state!r}",
+                     "error": f"Invalid state: {state!r}",
                      "allowed_states": sorted(allowed)})
             fields["state"] = st
             if st == MemoryState.SUPERSEDED.value and not superseded_by:
                 warnings.append(
-                    "已标 superseded 但未给 superseded_by：日后无法回溯是被哪条取代的"
+                    "Marked superseded without superseded_by; later traceability to the replacing record is lost"
                 )
 
         if superseded_by:
             if mgr.store.get(superseded_by) is None:
                 return self._envelope(
                     {"status": "error", "memory_id": memory_id,
-                     "error": f"superseded_by 指向的记忆不存在: {superseded_by}"})
+                     "error": f"superseded_by points to a missing memory: {superseded_by}"})
             fields["superseded_by"] = superseded_by
             if not state:
                 # 只给了 superseded_by 没给 state：按语义补齐，而不是留下
                 # "有指针但状态仍 active" 的自相矛盾状态。
                 fields["state"] = MemoryState.SUPERSEDED.value
-                warnings.append("未显式给 state，已按 superseded_by 的语义补为 superseded")
+                warnings.append("state was omitted; inferred as superseded from the superseded_by semantics")
 
         if not fields:
             # 注意：此错误体**不带** library 首键（与现行工具逐位一致）。
@@ -400,11 +400,11 @@ class WriteService(BaseService):
         解析（保字节级一致）；``entities`` / ``importance`` /
         ``cognitive_type`` 的哨兵归一无错误路径，随编排放这里。
         """
-        logger.info("[ingest] 开始: %s", text[:40])
+        logger.info("[ingest] start: %s", text[:40])
         parsed_tags, tag_err = parse_tags_json(tags)
         if tag_err:
             return self._envelope(
-                {"error": f"tags 解析失败：{tag_err}", "input": tags[:200]})
+                {"error": f"tags parse failed: {tag_err}", "input": tags[:200]})
         # D2a/D1：目标 = user 库 ⇒ 整批 L1 打标（对原文分类一次，批内共用，
         # 宁枉勿纵）；非家工作区 ⇒ 整批 L1 带隔离标记 + 审计事件。
         quarantined = bool(self.user_write_quarantine)
@@ -432,21 +432,21 @@ class WriteService(BaseService):
             if quarantined:
                 result["quarantined"] = True
                 result["quarantine_note"] = (
-                    "本批 %d 条 L1 全部进入 user 库**待审队列**（非家工作区经"
-                    "豁免通道的直写）：不进召回池、不进 user_scope 槽；请在 "
-                    "drift_audit 报告中过目后经受管通道转正或删除。"
+                    "All %d L1 records in this batch entered the user-library review queue (non-home direct "
+                    "write through the exemption channel): they are excluded from recall and the user_scope slot. "
+                    "Review them in drift_audit, then promote or delete through the managed channel."
                     % len(result.get("memory_ids", [])))
             if label:
                 # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
                 result["sensitivity"] = label
-        logger.info("[ingest] 完成: %d 条记忆", len(result.get("memory_ids", [])))
+        logger.info("[ingest] done: %d memories", len(result.get("memory_ids", [])))
         # 自动保存被并发保护拒绝时必须当场告警：宿主看到"已写入"会以为落盘了，
         # 实际这批只在内存里，进程重启即丢（此前这里完全静默 —— zcode 反馈）。
         save_err = self.manager.last_save_error
         if save_err:
             result["save_warning"] = (
-                f"自动保存失败，本批记忆仅在内存中：{save_err}。"
-                f"请调用 save_state；若报 conflict 则先 load_state 或 retry_save。"
+                f"Auto-save failed; this batch remains memory-only: {save_err}。"
+                f"Call save_state; if it reports conflict, run load_state or retry_save first."
             )
             logger.warning("[ingest] %s", result["save_warning"])
         return self._envelope(result)
@@ -464,18 +464,18 @@ class WriteService(BaseService):
         parsed_tags, tag_err = parse_tags_json(tags)
         if tag_err:
             return self._envelope(
-                {"error": f"tags 解析失败：{tag_err}", "input": tags[:200]})
+                {"error": f"tags parse failed: {tag_err}", "input": tags[:200]})
         if isinstance(items, str):
             s = items.strip()
             if not s:
                 return self._envelope(
-                    {"error": "items 为空；请传 JSON 数组字符串，如 [{\"text\":\"…\"}]"})
+                    {"error": "items is empty; pass a JSON array string such as [{\"text\":\"...\"}]"})
             try:
                 parsed_items = json.loads(s)
             except Exception as e:  # noqa: BLE001
                 # 解析失败必须显式报错——静默当空会让宿主以为整批写进去了。
                 return self._envelope(
-                    {"error": f"items JSON 解析失败：{e}", "input": s[:200]})
+                    {"error": f"items JSON parse failed: {e}", "input": s[:200]})
         else:
             parsed_items = items
         try:
@@ -509,13 +509,13 @@ class WriteService(BaseService):
             if quarantined:
                 result["quarantined"] = True
                 result["quarantine_note"] = (
-                    "本批全部条目进入 user 库**待审队列**：不进召回池、"
-                    "不进 user_scope 槽；请在 drift_audit 报告中过目后"
-                    "经受管通道转正或删除。")
+                    "All items in this batch entered the user-library review queue: they are excluded from recall and "
+                    "the user_scope slot. Review them in drift_audit, then "
+                    "promote or delete through the managed channel.")
         if label:
             # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
             result["sensitivity"] = label
-        logger.info("[ingest_batch] 完成: %d/%d 条，失败 %d",
+        logger.info("[ingest_batch] done: %d/%d items, %d failed",
                     result["count"], result["total_input"], result["failed"])
         return self._envelope(result)
 
@@ -528,7 +528,7 @@ class WriteService(BaseService):
         except ConcurrentWriteError as e:
             return self._envelope(
                 {"status": "conflict", "detail": str(e),
-                 "hint": "另一个进程改写了同一个记忆库。先 load_state 拿最新状态再重做本次修改。"})
+                 "hint": "Another process rewrote the same memory library. Run load_state to get the latest state, then redo this change."})
         return self._envelope(
             {"status": "saved", "persist_dir": self.persist_dir})
 
@@ -539,5 +539,5 @@ class WriteService(BaseService):
         except ConcurrentWriteError as e:
             return self._envelope(
                 {"status": "conflict", "detail": str(e),
-                 "hint": "冲突仍未停止：先停掉其它写入进程（关掉另一个 MCP 会话）再重试。"})
+                 "hint": "Conflict persists: stop the other writer (close the other MCP session), then retry."})
         return self._envelope({"status": "retried", **result})

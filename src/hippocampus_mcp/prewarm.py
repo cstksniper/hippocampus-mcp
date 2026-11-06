@@ -90,7 +90,7 @@ def prewarm(cwd: str = "", library: str = "", model: str = "",
             "key": key,
             "pid": before.get("pid"),      # type: ignore[union-attr]
             "port": before.get("port"),    # type: ignore[union-attr]
-            "detail": "已有可用 daemon，复用它（未新起进程）",
+            "detail": "an existing usable daemon was found; reusing it (no new process spawned)",
         }
 
     info = spawn_daemon(key, library=library, model=model, cwd=cwd)
@@ -100,7 +100,7 @@ def prewarm(cwd: str = "", library: str = "", model: str = "",
             "action": "failed",
             "key": key,
             "cwd": cwd or os.getcwd(),
-            "detail": "spawn_daemon 返回 None；详见 "
+            "detail": "spawn_daemon returned None; see "
                       f"{os.path.join(runtime_dir(), f'daemon-{key}.log')}",
         }
     return {
@@ -110,34 +110,34 @@ def prewarm(cwd: str = "", library: str = "", model: str = "",
         "pid": info.get("pid"),
         "port": info.get("port"),
         "cwd": cwd or os.getcwd(),
-        "detail": "本次拉起（创建者＝本进程，应已脱离宿主进程树）",
+        "detail": "spawned this time (creator = this process; it should have left the host process tree)",
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="hippocampus_mcp.prewarm",
-        description="预热常驻 daemon：让它的创建者不是宿主进程树。")
+        description="Prewarm the resident daemon so its creator is not inside the host process tree.")
     p.add_argument("--cwd", default="",
-                   help="daemon 的工作目录。library 为空时它决定库定位，"
-                        "预热场景应显式给出；默认取当前目录")
+                   help="the daemon's working directory. When library is empty it decides library location; "
+                        "give it explicitly for prewarm; defaults to the current directory")
     p.add_argument("--library", default="",
-                   help="库路径（对应 HIPPOCAMPUS_DAEMON_LIBRARY）")
+                   help="library path (maps to HIPPOCAMPUS_DAEMON_LIBRARY)")
     p.add_argument("--model", default="",
-                   help="嵌入模型（对应 HIPPOCAMPUS_EMB_MODEL）")
+                   help="embedding model (maps to HIPPOCAMPUS_EMB_MODEL)")
     p.add_argument("--version", default="",
-                   help="代码版本（对应 HIPPOCAMPUS_DAEMON_VERSION）")
+                   help="code version (maps to HIPPOCAMPUS_DAEMON_VERSION)")
     p.add_argument("--status", action="store_true",
-                   help="只查询不启动")
+                   help="query only, do not start")
     p.add_argument("--json", action="store_true", dest="as_json",
-                   help="输出 JSON（便于计划任务/包装脚本解析）")
+                   help="output JSON (for scheduled tasks / wrapper scripts to parse)")
     args = p.parse_args(argv)
 
     key = daemon_key(args.library, args.model, args.version)
     run_cwd = args.cwd or os.getcwd()
 
     if not os.path.isdir(run_cwd):
-        print(f"[prewarm] ✗ --cwd 不是目录: {run_cwd}", file=sys.stderr)
+        print(f"[prewarm] x --cwd is not a directory: {run_cwd}", file=sys.stderr)
         return 2
 
     if args.status:

@@ -94,7 +94,7 @@ def backend_kind() -> str:
     raw = (_resolve(BACKEND_ENV, "store_backend", "") or "json").strip().lower()
     if raw not in ("json", "sqlite"):
         raise ValueError(
-            f"{BACKEND_ENV} 取值只能是 json 或 sqlite，收到 {raw!r}"
+            f"{BACKEND_ENV} only accepts json or sqlite, got {raw!r}"
         )
     return raw
 
@@ -219,7 +219,7 @@ class StoreBackend:
         ``dst`` 必须不存在——SQLite 的 ``VACUUM INTO`` 不覆盖已存在的文件，
         所以调用方要用时间戳命名，撞名就跳过。
         """
-        raise NotImplementedError("当前后端不支持在线快照")
+        raise NotImplementedError("the current backend does not support online snapshots")
 
     # ------------------------------------------------------------------
     # FTS5（H4，可选）
@@ -308,7 +308,7 @@ class JsonBackend(StoreBackend):
             try:
                 with open(bak_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                logger.warning("已从备份 %s 恢复记忆数据", bak_path)
+                logger.warning("memory data restored from backup %s", bak_path)
             except (json.JSONDecodeError, OSError) as e:
                 bak_err = str(e)
                 data = None
@@ -338,8 +338,8 @@ class JsonBackend(StoreBackend):
             if q:
                 quarantined.append(q)
         logger.error(
-            "记忆数据不可读且无可用备份（主文件: %s；备份: %s）。"
-            "已隔离坏文件 %s，原始文件仍在磁盘上可供人工抢救。",
+            "Memory data is unreadable and no backup is available (main file: %s; backup: %s). "
+            "The corrupt file has been quarantined as %s; the original file is still on disk for manual recovery.",
             main_err or "缺失", bak_err or "缺失", quarantined or "无",
         )
         return None, {
@@ -374,14 +374,14 @@ class JsonBackend(StoreBackend):
         os.replace(tmp_path, self.memories_path)
 
     def upsert_memories(self, records: list[dict[str, Any]]) -> None:
-        raise NotImplementedError("json 后端只能整份重写")
+        raise NotImplementedError("the json backend can only be rewritten as a whole")
 
     def delete_memories(self, ids: list[str]) -> None:
-        raise NotImplementedError("json 后端只能整份重写")
+        raise NotImplementedError("the json backend can only be rewritten as a whole")
 
     def save_meta(self, meta: dict[str, Any]) -> None:
         # 元数据与记录同文件 ⇒ 只能整份重写；调用方应改走 save_memories_full
-        raise NotImplementedError("json 后端的元数据随记录整份重写")
+        raise NotImplementedError("the json backend rewrites metadata together with the records as a whole")
 
     # -- 向量 ----------------------------------------------------------
     def load_vectors(self) -> dict[str, np.ndarray] | None:
@@ -391,7 +391,7 @@ class JsonBackend(StoreBackend):
             with np.load(self.vectors_path) as npz:
                 return {k: np.asarray(npz[k]) for k in npz.files}
         except Exception as e:      # noqa: BLE001
-            logger.warning("加载向量文件 %s 失败: %s", self.vectors_path, e)
+            logger.warning("failed to load vector file %s: %s", self.vectors_path, e)
             return None
 
     def save_vectors_full(self, arrays: dict[str, np.ndarray]) -> None:
@@ -401,10 +401,10 @@ class JsonBackend(StoreBackend):
         os.replace(tmp, self.vectors_path)
 
     def upsert_vectors(self, arrays: dict[str, np.ndarray]) -> None:
-        raise NotImplementedError("json 后端只能整份重写 npz")
+        raise NotImplementedError("the json backend can only rewrite npz as a whole")
 
     def delete_vectors_for(self, memory_ids: list[str]) -> None:
-        raise NotImplementedError("json 后端只能整份重写 npz")
+        raise NotImplementedError("the json backend can only rewrite npz as a whole")
 
 
 # ======================================================================
@@ -574,7 +574,7 @@ class SqliteBackend(StoreBackend):
                 if attempt >= _INIT_RETRIES - 1:
                     raise
                 logger.warning(
-                    "sqlite 首次建库撞上并发（第 %d 次：%s），重开连接重试",
+                    "sqlite first-time creation hit concurrency (attempt %d: %s); reopening connection and retrying",
                     attempt + 1, exc,
                 )
                 time.sleep(_INIT_RETRY_SLEEP * (attempt + 1))
@@ -601,7 +601,7 @@ class SqliteBackend(StoreBackend):
             self._fts = True
         except sqlite3.Error as e:
             # FTS5 不可用（裁剪版 sqlite 没有该模块）不该让整个库打不开
-            logger.warning("FTS5 不可用，BM25 仍在内存构建: %s", e)
+            logger.warning("FTS5 unavailable; BM25 still built in memory: %s", e)
             self._fts = False
         return self._fts
 
@@ -685,7 +685,7 @@ class SqliteBackend(StoreBackend):
             ).fetchall()
         except sqlite3.Error as e:
             # 语法/分词器错误不该让召回整条路挂掉：回退内存 BM25
-            logger.warning("FTS5 查询失败（回退内存 BM25）: %s | %s", query, e)
+            logger.warning("FTS5 query failed (falling back to in-memory BM25): %s | %s", query, e)
             return None
         # bm25() 返回的是**负的**相关度（越小越相关）⇒ 取反还原
         return [(r[0], -float(r[1])) for r in rows]
@@ -1004,8 +1004,8 @@ def get_backend(directory: str) -> StoreBackend:
 
     if needs_migration(directory):
         logger.warning(
-            "目录 %s 是 JSON 老库但没有 %s：按 sqlite 打开会得到空库。"
-            "请先运行 migrate-store 迁移，老库不会自动迁移。",
+            "Directory %s is an old JSON library without %s: opening it as sqlite yields an empty library. "
+            "Run migrate-store first; old libraries are not migrated automatically.",
             directory, DB_FILENAME,
         )
     backend: StoreBackend

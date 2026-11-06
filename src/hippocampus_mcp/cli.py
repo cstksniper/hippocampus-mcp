@@ -180,9 +180,9 @@ def _read_config(path: Path) -> dict:
         # 而不是把别人的 server 条目连带覆盖掉（发现式扫描可以带伤
         # 继续，写入不行——语义差异在 host_configs.load_json_config）。
         raise SystemExit(
-            f"配置文件{err}，已停手不写：{path}\n"
-            f"  它里面可能还有别的 MCP server，覆盖掉是连带损失。"
-            f"请手工修好后再跑本命令。")
+            f"Configuration file {err}; stopped without writing: {path}\n"
+            f"  It may contain other MCP servers; overwriting it would lose them. "
+            f"Fix the file manually and rerun.")
     return cfg
 
 
@@ -207,8 +207,8 @@ def _detect_host(workspace: Path) -> str:
     if (workspace / ".mcp.json").is_file():
         return "workbuddy"
     raise SystemExit(
-        "无法判断目标宿主：工作区里既没有 .zcode/ 也没有 .mcp.json。\n"
-        f"  请显式指定 --host（可选：{', '.join(sorted(_HOSTS))}）。")
+        "Cannot determine target host: workspace has neither .zcode/ nor .mcp.json.\n"
+        f"  Specify --host explicitly (choices: {', '.join(sorted(_HOSTS))}).")
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +228,7 @@ def _stderr_tail(fh) -> str:
         return ""
     if len(txt) > 600:
         txt = "…" + txt[-600:]
-    return f"stderr 尾部：{txt}"
+    return f"stderr tail: {txt}"
 
 
 def _verify_entry(entry: dict, cwd: str = "",
@@ -263,7 +263,7 @@ def _verify_entry(entry: dict, cwd: str = "",
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=err_fh)
     except OSError as exc:
-        return False, f"起不了进程 {cmd[0]}：{type(exc).__name__}: {exc}"
+        return False, f"Cannot start process {cmd[0]}: {type(exc).__name__}: {exc}"
 
     lines_q: queue.Queue = queue.Queue()
 
@@ -279,13 +279,13 @@ def _verify_entry(entry: dict, cwd: str = "",
     def _readline(deadline: float) -> bytes:
         remain = deadline - time.monotonic()
         if remain <= 0:
-            raise TimeoutError("超时")
+            raise TimeoutError("timeout")
         try:
             item = lines_q.get(timeout=remain)
         except queue.Empty:
-            raise TimeoutError("超时") from None
+            raise TimeoutError("timeout") from None
         if item is None:
-            raise EOFError("子进程提前退出（未等到响应）")
+            raise EOFError("child process exited before a response arrived")
         return item
 
     def _send(obj: dict) -> None:
@@ -305,7 +305,7 @@ def _verify_entry(entry: dict, cwd: str = "",
             if obj.get("id") == 1:
                 break
         if "result" not in obj:
-            return False, f"initialize 返回错误：{obj.get('error')}"
+            return False, f"initialize returned error: {obj.get('error')}"
         _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         while True:
@@ -313,16 +313,16 @@ def _verify_entry(entry: dict, cwd: str = "",
             if obj.get("id") == 2:
                 break
         if "result" not in obj:
-            return False, f"tools/list 返回错误：{obj.get('error')}"
+            return False, f"tools/list returned error: {obj.get('error')}"
         tools = obj["result"].get("tools") or []
         if not tools:
-            return True, "initialize + tools/list 正常（但 0 个工具？检查剖面）"
-        return True, f"initialize + tools/list 正常，{len(tools)} 个工具可见"
+            return True, "initialize + tools/list succeeded (but 0 tools? check profile)"
+        return True, f"initialize + tools/list succeeded; {len(tools)} tools visible"
     except TimeoutError:
-        return False, (f"{timeout:.0f}s 内没等到握手响应（卡在加载或网络）——"
-                       "慢≠坏，但反复如此就要看 daemon 日志了")
+        return False, (f"No handshake response within {timeout:.0f}s (possibly model loading or network). "
+                       "Slow is not necessarily broken, but repeated failures need daemon logs.")
     except EOFError:
-        return False, (f"子进程未完成握手即退出（exit={proc.poll()}）。"
+        return False, (f"Child process exited before completing handshake (exit={proc.poll()}). "
                        f"{_stderr_tail(err_fh)}")
     except Exception as exc:  # noqa: BLE001 —— 探测器自己不能把 setup 带崩
         return False, f"{type(exc).__name__}: {exc}"
@@ -355,10 +355,10 @@ def _pick_value(value: str | None, old_value: str | None, default: str
     指不同库是合法状态，不是要被抹平的差异）。
     """
     if value:
-        return value, "命令行指定"
+        return value, "CLI argument"
     if old_value:
-        return old_value, "沿用既有配置"
-    return default, "新装默认值"
+        return old_value, "existing config"
+    return default, "fresh-install default"
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -369,7 +369,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # S4：不带 --host 时按工作区特征自动判定（有 .zcode/ → zcode；
         # 有 .mcp.json → workbuddy）。猜不出来会明确报错，绝不瞎选。
         host = _detect_host(workspace)
-        print(f"未指定 --host，按工作区特征自动判定：{host}")
+        print(f"--host omitted; inferred from workspace markers: {host}")
     spec = _HOSTS[host]
 
     if args.file:
@@ -380,8 +380,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
                  else project_config_path(host, workspace))
         if guess is None:
             raise SystemExit(
-                f"{spec['label']} 没有 {scope} 级配置位置，"
-                f"请用 --file 明确给出配置文件路径。"
+                f"{spec['label']} has no {scope}-level configuration path; "
+                f"use --file to specify the config file explicitly."
             )
         target = guess
 
@@ -412,48 +412,48 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     payload = json.dumps(cfg, ensure_ascii=False, indent=2)
 
-    print(f"宿主      : {spec['label']} ({host})")
-    print(f"配置文件  : {target}")
-    print(f"条目      : {args.name}（{'覆盖既有' if existed else '新建'}，"
-          f"其余 server 条目原样保留）")
-    print(f"解释器    : {python}")
-    print(f"库目录    : {library}  [{lib_src}]")
-    print(f"模型      : {model}  [{model_src}]")
-    print(f"工具剖面  : {profile}  [{prof_src}]")
+    print(f"Host         : {spec['label']} ({host})")
+    print(f"Config file  : {target}")
+    print(f"Entry        : {args.name} ({'overwrite existing' if existed else 'new'}; "
+          f"other server entries are preserved)")
+    print(f"Interpreter  : {python}")
+    print(f"Library dir  : {library}  [{lib_src}]")
+    print(f"Model        : {model}  [{model_src}]")
+    print(f"Tool profile : {profile}  [{prof_src}]")
     if src_dir is None:
-        print("PYTHONPATH: 未设置（包已装在 sys.path 上，不需要）")
+        print("PYTHONPATH: not set (package is already importable)")
     else:
         print(f"PYTHONPATH: {src_dir}")
 
     if args.dry_run:
-        print("\n[dry-run] 以下内容**未写入**，仅预览：\n")
+        print("\n[dry-run] The following was NOT written; preview only:\n")
         print(payload)
         return 0
 
     target.parent.mkdir(parents=True, exist_ok=True)
     bak = _backup(target)
     if bak:
-        print(f"\n已备份    : {bak}")
+        print(f"\nBackup       : {bak}")
     target.write_text(payload + "\n", encoding="utf-8")
-    print(f"\n已写入    : {target}")
+    print(f"\nWritten      : {target}")
 
     if args.no_verify:
-        print("[跳过写后即验]（--no-verify）：可用性未经验证，"
-              "重启宿主后请调 library_whoami 确认")
+        print("[Post-write verification skipped] (--no-verify): availability is unverified; "
+              "after restarting the host, call library_whoami to confirm")
     else:
         # S2 写后即验：按**刚写入**的 entry 真实握手一次。失败给原因，
         # 让"配置坏了"在 setup 当场现形，而不是等用户重启宿主后 silently 0 工具。
-        print("\n写后即验：按写入的配置真实拉起一次握手（initialize + "
-              "tools/list）……")
+        print("\nPost-write verification: performing a real handshake with the written "
+              "config (initialize + tools/list)...")
         ok, detail = _verify_entry(entry, cwd=str(workspace))
-        print(f"  {'✓ 配置已验证可用' if ok else '✗ 握手验证失败'}：{detail}")
+        print(f"  {'✓ config verified' if ok else '✗ handshake verification failed'}: {detail}")
         if not ok:
-            print("  配置已写入，但宿主里可能起不来。排查：")
+            print("  Config was written, but the host may fail to start. Diagnose:")
             print(f"    python -m hippocampus_mcp.cli doctor --host {host} "
                   f"--project {workspace}")
             return 1
 
-    print("\n下一步：")
+    print("\nNext steps:")
     # 模型不在本地时，先把话说明白：模型是首启才下的，下载失败会让宿主里
     # 「一个工具都没有」，届时人已经在会话里了，最难排查。
     missing_model = False
@@ -465,15 +465,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
     step = 0
     if missing_model:
         step += 1
-        print(f"  {step}) 先预取模型（本机还没有 {model}，首启下载失败会让宿主"
-              f"里一个工具都没有）：")
+        print(f"  {step}) Prefetch the model first ({model} is not local; a failed "
+              f"first-start download can leave the host with no tools):")
         print(f"     hippocampus-mcp models --fetch {model}")
     step += 1
-    print(f"  {step}) 重启该宿主（MCP 配置在启动时读取，改完不重启不生效）")
+    print(f"  {step}) Restart that host (MCP config is read at startup)")
     step += 1
-    print(f"  {step}) 新会话里先调 library_whoami 确认落在预期库上，别静默串库")
+    print(f"  {step}) In a new session, call library_whoami first to confirm the active library")
     step += 1
-    print(f"  {step}) 有疑问跑 hippocampus-mcp doctor")
+    print(f"  {step}) If in doubt, run hippocampus-mcp doctor")
     return 0
 
 
@@ -494,29 +494,29 @@ def cmd_sync(args: argparse.Namespace) -> int:
     """
     workspace = Path(args.workspace).expanduser().resolve()
     candidates = hc.discover_configs(workspace, entry_name=args.name)
-    action = {"mine": "更新", "new": "新增", "suspect": "新增(低置信)",
-              "broken": "停手", "skip": "跳过"}
+    action = {"mine": "update", "new": "add", "suspect": "add (low confidence)",
+              "broken": "stop", "skip": "skip"}
     targets = [c for c in candidates if c.kind in ("mine", "new", "suspect")]
 
-    print(f"sync 预览（工作区 {workspace}，"
-          f"{'--yes 将写入' if args.yes else '未写盘'}）")
+    print(f"sync preview (workspace {workspace}, "
+          f"{'--yes will write' if args.yes else 'not written'})")
     n_skipped = 0
     for c in candidates:
         if c.kind == "skip":            # 形态不符的只计数，不刷屏
             n_skipped += 1
             continue
-        note = c.reason or {"mine": "已有我方条目",
-                            "new": "有其他 server 条目"}.get(c.kind, "")
+        note = c.reason or {"mine": "our entry already exists",
+                            "new": "other server entries exist"}.get(c.kind, "")
         print(f"  [{action[c.kind]}] {c.origin:<7} {c.path}"
               f"{'  ' + note if note else ''}")
     if n_skipped:
-        print(f"  （另有 {n_skipped} 个文件因形态不符未列出）")
+        print(f"  ({n_skipped} files omitted because their shape did not match)")
     if not targets:
-        print("  没有发现可同步的宿主配置 —— 已装的宿主用 setup --host，")
-        print("  或把配置文件放到约定路径（*mcp*.json 等）后再跑。")
+        print("  No syncable host configs found -- use setup --host for installed hosts,")
+        print("  or place a config at a conventional path (e.g. *mcp*.json) and rerun.")
         return 0
     if not args.yes:
-        print("\n预览模式，未写盘。确认清单无误后加 --yes 执行写入。")
+        print("\nPreview mode; nothing was written. Confirm the list, then add --yes.")
         return 0
 
     written: list[tuple[Path, Path | None]] = []
@@ -526,7 +526,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         cfg, err = hc.load_json_config(c.path)
         if cfg is None:
             # 预览到写入之间文件可能变坏：再解析失败 = 停手跳过，绝不覆盖。
-            print(f"  ⚠ 停手 {c.path}：{err}（坏文件不写，请手工修好）")
+            print(f"  ⚠ Stopped at {c.path}: {err} (bad file not written; fix it manually)")
             continue
         key_path = c.key_path or ("mcpServers",)
         container = _dig(cfg, key_path, create=True)
@@ -548,40 +548,40 @@ def cmd_sync(args: argparse.Namespace) -> int:
         entry = build_entry(python=python, src_dir=src_dir, library=library,
                             model=model, profile=profile, offline=offline)
         if container.get(args.name) == entry:
-            print(f"  = 已是最新 {c.path}")
+            print(f"  = Already up to date {c.path}")
             continue
         container[args.name] = entry
         c.path.parent.mkdir(parents=True, exist_ok=True)
         bak = _backup(c.path)
         c.path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
                           encoding="utf-8")
-        print(f"  ✓ 已写入 {c.path}" + (f"（备份 {bak}）" if bak else ""))
+        print(f"  ✓ Written {c.path}" + (f" (backup {bak})" if bak else ""))
         written.append((c.path, bak))
         distinct[json.dumps(entry, ensure_ascii=False, sort_keys=True)] = entry
 
     if not written:
-        print("\n没有需要写入的变更。")
+        print("\nNo changes to write.")
         return 0
 
     if args.no_verify:
-        print("\n[跳过写后即验]（--no-verify）：可用性未经验证，"
-              "重启宿主后请调 library_whoami 确认")
+        print("\n[Post-write verification skipped] (--no-verify): availability is unverified; "
+              "after restarting the host, call library_whoami to confirm")
         return 0
 
-    print("\n写后即验：对去重后的每份 entry 真实拉起一次握手……")
+    print("\nPost-write verification: performing a real handshake for each unique entry...")
     failed = False
     for entry in distinct.values():
         ok, detail = _verify_entry(entry, cwd=str(workspace))
         print(f"  {'✓' if ok else '✗'} {detail}")
         failed = failed or not ok
     if failed:
-        print("\n握手验证失败 —— 已写入的文件与备份（可用备份回退）：")
+        print("\nHandshake verification failed -- written files and backups (use backups to roll back):")
         for path, bak in written:
-            print(f"  {path}" + (f"（备份 {bak}）" if bak else ""))
+            print(f"  {path}" + (f" (backup {bak})" if bak else ""))
         return 1
 
-    print("\n下一步：重启各宿主（MCP 配置在启动时读取），新会话里调 "
-          "library_whoami 确认没串库。")
+    print("\nNext: restart each host (MCP config is read at startup); in a new session, "
+          "call library_whoami to confirm libraries were not crossed.")
     return 0
 
 
@@ -595,18 +595,18 @@ def _mark(ok: bool, warn: bool = False) -> str:
 def _entry_verdict(cpath: Path, spec: dict) -> str:
     """单份配置的结论行：不存在 / 存在但没条目 / 存在且库指向哪。"""
     if not cpath.exists():
-        return "不存在（该处未接入）"
+        return "Missing (not wired up here)"
     try:
         cfg = _read_config(cpath)
     except SystemExit:
-        return f"存在但**不是合法 JSON**（修好它之前宿主读不到任何 server）—— {cpath}"
+        return f"Exists but is not valid JSON (host cannot read any server until fixed) -- {cpath}"
     ent = (_dig(cfg, spec["key_path"]) or {}).get(SERVER_NAME_DEFAULT)
     if not isinstance(ent, dict):
-        return f"存在，但没有 {SERVER_NAME_DEFAULT} 条目（未接入）"
+        return f"Exists but has no {SERVER_NAME_DEFAULT} entry (not wired up)"
     env = ent.get("env") or {}
     lib = env.get("HIPPOCAMPUS_PERSIST_DIR", "")
-    prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common(默认)"
-    return f"存在，库={lib or '(未设 → 回落默认)'}  剖面={prof}"
+    prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
+    return f"Exists; library={lib or '(unset; falls back to default)'}  profile={prof}"
 
 
 def _doctor_host_project(host: str, project: Path) -> None:
@@ -618,20 +618,20 @@ def _doctor_host_project(host: str, project: Path) -> None:
     不读**的配置文件点名出来。
     """
     spec = _HOSTS[host]
-    print(f"\n宿主×目录判定：{spec['label']} @ {project}")
+    print(f"\nHost/workspace verdict: {spec['label']} @ {project}")
     for scope, cpath in (("user", user_config_path(host)),
                          ("project", project_config_path(host, project))):
         if cpath is None:
             continue
-        print(f"  会读 {scope} 级 : {cpath}")
+        print(f"  Reads {scope} level : {cpath}")
         print(f"                → {_entry_verdict(cpath, spec)}")
     for other, ospec in _HOSTS.items():
         if other == host:
             continue
         opath = project_config_path(other, project)
         if opath is not None and opath.exists():
-            print(f"  ⚠ 存在但 {spec['label']} 不读 : {opath}"
-                  f"（{ospec['label']} 的项目级配置）")
+            print(f"  ⚠ Exists but {spec['label']} does not read it: {opath}"
+                  f" ({ospec['label']} project-level config)")
 
 
 def _doctor_workspace_binding(project: Path) -> None:
@@ -642,7 +642,7 @@ def _doctor_workspace_binding(project: Path) -> None:
     的一条命令形态。library/task_directory 都是轻导入（无 torch），
     任何失败降级为一句"查不了"，绝不炸体检。
     """
-    print("\n工作区绑定判定（C1/D3）：")
+    print("\nWorkspace binding verdict (C1/D3):")
     try:
         from .domain.task_directory import (normalize_entries,
                                             resolve_user_access,
@@ -654,30 +654,31 @@ def _doctor_workspace_binding(project: Path) -> None:
         except Exception:
             ulib = None
         if ulib is None:
-            print("  用户级库不存在——绑定/任务目录功能未启用"
-                  "（不影响单库使用）。")
+            print("  User-level library not found; binding/task-directory features are not enabled "
+                  "(single-library use is unaffected).")
             return
         data, issue = load_directory(ulib.path)
         if issue:
-            print(f"  ⚠ 任务目录不可读（{issue}）：绑定状态查不了，"
-                  "且 HELLO 反查会回落声明库。")
+            print(f"  ⚠ Task directory is unreadable ({issue}); binding status cannot be checked, "
+                  "and HELLO reverse lookup will fall back to the declared library.")
             return
         entry, status = resolve_workspace(
             normalize_entries((data or {}).get("entries")), str(project))
         if status == "bound":
-            print(f"  已绑定：本项目 → {entry['path']}（任务={entry['task']}，"
-                  f"读侧档位={entry.get('access') or 'masked'}）")
+            print(f"  Bound: this project -> {entry['path']} (task={entry['task']}, "
+                  f"read access={entry.get('access') or 'masked'})")
         elif status == "ambiguous":
-            print("  ⚠ 歧义：多条目声明了同一 workspace_root——HELLO 会回落"
-                  "声明库并自曝，请修 directory.json（一个工作区只指一个库）。")
+            print("  ⚠ Ambiguous: multiple entries declare the same workspace_root; HELLO will "
+                  "fall back to the declared library and self-report. Fix directory.json "
+                  "(one workspace should point to one library).")
         elif status == "unbound":
-            print("  未登记：本项目首次使用会自曝「未绑定」。onboarding 一条路：")
+            print("  Not registered: first use in this project will self-report as unbound. Onboarding:")
             print("    library_create(name=..., workspace_root=r'%s')"
                   % project)
         else:
-            print("  无工作区路径可判（--project 未给或为空）。")
+            print("  No workspace path to evaluate (--project was omitted or empty).")
     except Exception as exc:  # noqa: BLE001 —— 体检赠品不炸主流程
-        print(f"  （绑定状态查不了：{type(exc).__name__}: {exc}）")
+        print(f"  (Binding status unavailable: {type(exc).__name__}: {exc})")
 
 
 def _doctor_off_registry(project: Path) -> None:
@@ -687,7 +688,7 @@ def _doctor_off_registry(project: Path) -> None:
     配了 hippocampus，库指错了一样静默写错。这里把扫描发现的、_HOSTS
     没登记的配置文件点名出来（含坏文件与低置信推断，跳过的纯噪音不计）。
     """
-    print("\n表外发现的宿主配置（_HOSTS 之外的 MCP 配置文件）：")
+    print("\nOff-registry host configs discovered (MCP configs outside _HOSTS):")
     known: set[str] = set()
     for host in _HOSTS:
         for cpath in (user_config_path(host),
@@ -697,7 +698,7 @@ def _doctor_off_registry(project: Path) -> None:
     try:
         candidates = hc.discover_configs(project)
     except Exception as exc:  # noqa: BLE001 —— 体检赠品不炸主流程
-        print(f"  （扫描失败：{type(exc).__name__}: {exc}）")
+        print(f"  (Scan failed: {type(exc).__name__}: {exc})")
         return
     found = False
     for c in candidates:
@@ -708,20 +709,20 @@ def _doctor_off_registry(project: Path) -> None:
         if c.kind == "mine":
             env = (c.entry or {}).get("env") or {}
             lib = env.get("HIPPOCAMPUS_PERSIST_DIR", "")
-            prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common(默认)"
-            print(f"  {c.origin} <{c.path}> : 我方条目  库={lib or '(未设 → 回落默认)'}"
-                  f"  剖面={prof}")
+            prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
+            print(f"  {c.origin} <{c.path}> : our entry  library={lib or '(unset; falls back to default)'}"
+                  f"  profile={prof}")
         elif c.kind == "broken":
             print(f"  {c.origin} <{c.path}> : {c.reason}"
-                  f" —— 修好之前宿主读不到、也不会自动写入")
+                  f" -- host cannot read it and it will not be written automatically until fixed")
         elif c.kind == "new":
-            print(f"  {c.origin} <{c.path}> : 有其他 server 条目"
-                  f"（未接入本服务；可跑 sync --yes 写入）")
+            print(f"  {c.origin} <{c.path}> : other server entries exist"
+                  f" (not wired to this service; run sync --yes to add it)")
         else:
             print(f"  {c.origin} <{c.path}> : {c.reason}"
-                  f"（未接入本服务；可跑 sync --yes 写入）")
+                  f" (not wired to this service; run sync --yes to add it)")
     if not found:
-        print("  （没有发现表外配置）")
+        print("  (No off-registry configs found)")
 
 
 # 实测反馈 2026-10-31：库（尤其 user 库，含嵌入向量、只增不减）落系统盘会
@@ -759,16 +760,16 @@ def _system_disk_migration_hint(lib_path: Path, size_bytes: int,
         return None
     gb = size_bytes / 1024 ** 3
     if size_bytes >= LIB_ON_SYSTEM_DISK_WARN_BYTES:
-        return (f"⚠ 库在系统盘 {lib_drive}，当前体积 {gb:.1f} GB"
-                f"（嵌入向量只增不减，会持续挤占系统盘）。\n"
-                f"  迁移三步（没有 relocate 命令，手工迁移即可；库身份按"
-                f"清单名判定，不按路径）：\n"
-                f"  1) 关掉所有宿主会话（daemon 不能在搬目录时持有库文件）；\n"
-                f"  2) 把库目录整体搬到新盘，如 D:\\hippocampus\\user；\n"
-                f"  3) 改宿主配置里 HIPPOCAMPUS_PERSIST_DIR 指向新路径，"
-                f"开新会话跑 library_whoami 验证。")
-    return (f"库在系统盘 {lib_drive}，当前 {gb:.2f} GB（<1 GB，暂不必迁；"
-            f"超 1 GB 再走迁盘三步）")
+        return (f"⚠ Library is on the system drive {lib_drive}; current size {gb:.1f} GB"
+                f" (embeddings only grow and will keep consuming the system drive).\n"
+                f"  Migration steps (there is no relocate command; move manually; library identity "
+                f"is determined by manifest name, not path):\n"
+                f"  1) Stop all host sessions (the daemon must not hold library files while moving);\n"
+                f"  2) Move the library directory to the new drive, e.g. D:\\hippocampus\\user;\n"
+                f"  3) Update HIPPOCAMPUS_PERSIST_DIR in the host config, "
+                f"then verify with library_whoami in a new session.")
+    return (f"Library is on the system drive {lib_drive}; current size {gb:.2f} GB "
+            f"(<1 GB; no move needed yet; use migration steps above 1 GB)")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -785,18 +786,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     py_ok = sys.version_info >= (3, 10)
     print(f"{_mark(py_ok)} Python {sys.version.split()[0]} "
-          f"（要求 >=3.10）")
+          f" (requires >=3.10)")
 
     src_dir, pkg_dir = package_src_dir()
-    print(f"{_mark(True)} 包位置   {pkg_dir}")
-    print(f"{_mark(True)} PYTHONPATH 需求 "
-          f"{'需要：' + str(src_dir) if src_dir else '不需要（已安装到 sys.path）'}")
+    print(f"{_mark(True)} Package location   {pkg_dir}")
+    print(f"{_mark(True)} PYTHONPATH requirement "
+          f"{'required: ' + str(src_dir) if src_dir else 'not required (already importable)'}")
 
     for mod, required in (("mcp", True), ("torch", True),
                           ("numpy", True), ("sentence_transformers", False)):
         found = importlib.util.find_spec(mod) is not None
-        print(f"{_mark(found, warn=not found and not required)} 依赖 {mod}"
-              f"{'' if found else ('（缺失：核心功能不可用）' if required else '（缺失：降级）')}")
+        print(f"{_mark(found, warn=not found and not required)} Dependency {mod}"
+              f"{'' if found else (' (missing; core functionality unavailable)' if required else ' (missing; degraded)')}")
 
     # S7 自曝：shell 里裸跑 doctor 时没有宿主 env，检查的是默认库 —— 不说清楚
     # 会被误读成"宿主配置的库有问题"。模型同理。
@@ -805,15 +806,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 库 / 模型"还没有"不算故障：首次启动会自建 / 自动下载。报成 FAIL 会
     # 让人以为装坏了，所以这两项只给 WARN。
     lib_exists = library.exists()
-    print(f"{_mark(True, warn=not lib_exists)} 库目录   {library}"
-          f"{'' if lib_exists else '（还不存在：首次启动会自动建）'}")
+    print(f"{_mark(True, warn=not lib_exists)} Library dir   {library}"
+          f"{'' if lib_exists else ' (not found yet; first start will create it)'}")
     if not persist_env:
-        print("       ⚠ 未设 HIPPOCAMPUS_PERSIST_DIR：本次检查的是**默认库**，"
-              "不是任何宿主配置里的库")
+        print("       ⚠ HIPPOCAMPUS_PERSIST_DIR is not set; this checks the default library, "
+              "not a library from any host config")
     if lib_exists:
         backend = ("sqlite" if (library / "hippocampus.db").exists()
-                   else ("json" if (library / "memories.json").exists() else "空"))
-        print(f"{_mark(True)} 库后端   {backend}")
+                   else ("json" if (library / "memories.json").exists() else "empty"))
+        print(f"{_mark(True)} Library backend   {backend}")
         # 实测反馈 2026-10-31：盘符 / 体积体检（relocate 场景在此说清楚）。
         size_b = _dir_size_bytes(library)
         home_drive = (os.path.splitdrive(os.path.expanduser("~"))[0]
@@ -828,18 +829,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         Path.home() / ".cache" / "huggingface" / "hub")
     slug = "models--" + model.replace("/", "--")
     have_model = (Path(cache) / slug).exists()
-    print(f"{_mark(True, warn=not have_model)} 模型     {model}"
-          f"{'' if have_model else f'（未见于 {cache}；若是自定义模型目录属正常，首次启动也可能现下载）'}")
+    print(f"{_mark(True, warn=not have_model)} Model     {model}"
+          f"{'' if have_model else f' (not found under {cache}; normal for a custom model directory, and first start may download it)'}")
     if not model_env:
-        print("       ⚠ 未设 HIPPOCAMPUS_EMB_MODEL：本次检查的是默认模型"
-              "（实际用哪个以宿主配置 env 为准）")
+        print("       ⚠ HIPPOCAMPUS_EMB_MODEL is not set; this checks the default model "
+              "(actual model is determined by host config env)")
 
-    profile = os.environ.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common（默认）"
-    print(f"{_mark(True)} 工具剖面 {profile}")
+    profile = os.environ.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
+    print(f"{_mark(True)} Tool profile {profile}")
 
     # 最有价值的一段：**各宿主实际指向哪个库**。串库是本项目最贵的坑
     # （写进错的库不报错），逐个宿主列出来才能一眼看出来。
-    print("\n各宿主配置里的库（对照看有没有串库）：")
+    print("\nLibraries configured by host (check for crossed libraries):")
     found_any = False
     for host, spec in _HOSTS.items():
         candidates = (("user", user_config_path(host)),
@@ -852,31 +853,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 cfg = _read_config(cpath)
             except SystemExit:
                 print(f"  {spec['label']}({scope}) <{cpath}> : "
-                      f"配置不是合法 JSON，已跳过")
+                      f"config is not valid JSON; skipped")
                 continue
             cont = _dig(cfg, spec["key_path"])
             ent = (cont or {}).get(SERVER_NAME_DEFAULT)
             if not isinstance(ent, dict):
                 print(f"  {spec['label']}({scope}) <{cpath}> : "
-                      f"无 {SERVER_NAME_DEFAULT} 条目（未接入）")
+                      f"no {SERVER_NAME_DEFAULT} entry (not wired up)")
                 continue
             env = ent.get("env") or {}
             lib = env.get("HIPPOCAMPUS_PERSIST_DIR", "")
-            prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common(默认)"
+            prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
             # 每行带配置文件路径：看出来"串库/没接上"之后，下一步永远是
             # "改哪个文件" —— 路径就在眼前，不用再猜。
             print(f"  {spec['label']}({scope}) <{cpath}> : "
-                  f"库={lib or '(未设 → 回落默认)'}  剖面={prof}")
+                  f"library={lib or '(unset; falls back to default)'}  profile={prof}")
     if not found_any:
-        print("  （没找到任何宿主配置文件 —— 先跑 setup --host <宿主>）")
+        print("  (No host config files found -- run setup --host <host> first)")
 
     # 表外扫描与上面的矩阵互补：矩阵答「认识的宿主读到什么」，这段答
     # 「不认识的宿主里有没有躺着一份配置」——串库不分认识不认识。
     _doctor_off_registry(Path.cwd())
 
     print("-" * 60)
-    print("提示：本命令只做静态检查，不加载模型（所以很快）。")
-    print("      真实可用性以宿主里调 library_whoami 的结果为准。")
+    print("Note: this command performs static checks only and does not load models (so it is fast).")
+    print("      Actual availability is what library_whoami reports in the host session.")
     return 0
 
 
@@ -931,7 +932,7 @@ def cmd_models(args: argparse.Namespace) -> int:
         except Exception:                                    # noqa: BLE001
             ready = None
         if ready:
-            print(f"[已就绪] {want} 已在本地：{ready}")
+            print(f"[Ready] {want} already local: {ready}")
             return 0
 
         # setdefault 的返回值就是生效值：不必再读一次环境变量
@@ -941,9 +942,9 @@ def cmd_models(args: argparse.Namespace) -> int:
         cache = os.path.abspath(os.path.expanduser(
             args.cache or (roots[0] if roots else
                            os.path.join(_default_libs_path(), "models"))))
-        print(f"预取模型   : {want}")
-        print(f"缓存根目录 : {cache}（走 HF 镜像 {hf_endpoint}）")
-        print("首次下载约 90MB（英文基线）～400MB（中文引擎），请耐心等待……")
+        print(f"Prefetch model   : {want}")
+        print(f"Cache root       : {cache} (using HF mirror {hf_endpoint})")
+        print("First download is about 90MB (English baseline) to 400MB (Chinese engine); please wait...")
         try:
             from sentence_transformers import SentenceTransformer
             st = SentenceTransformer(want, cache_folder=cache)
@@ -952,16 +953,16 @@ def cmd_models(args: argparse.Namespace) -> int:
             vec = st.encode(["warmup"], show_progress_bar=False)
             dim = int(len(vec[0]))
         except Exception as e:                               # noqa: BLE001
-            print(f"\n[失败] {want} 下载或加载失败：{type(e).__name__}: {e}")
-            print("三条出路（按成本从低到高）：")
-            print(f"  1) 换镜像重试：设 HF_ENDPOINT=https://hf-mirror.com 后重跑"
+            print(f"\n[Failed] {want} download or load failed: {type(e).__name__}: {e}")
+            print("Three options (lowest cost first):")
+            print(f"  1) Retry with a mirror: set HF_ENDPOINT=https://hf-mirror.com and rerun"
                   f" `hippocampus-mcp models --fetch {want}`")
-            print(f"  2) 手动放：把模型目录放到 {cache}{os.sep}<模型名>/ 再重跑本命令校验")
-            print("  3) 换英文基线（88MB，中文检索会明显变差）："
+            print(f"  2) Manual placement: put the model directory under {cache}{os.sep}<model name>/ and rerun this command")
+            print("  3) Switch to the English baseline (88MB; Chinese retrieval will degrade significantly): "
                   "`hippocampus-mcp models --fetch all-MiniLM-L6-v2`，"
-                  "并在 setup 时加 --model all-MiniLM-L6-v2")
+                  "and add --model all-MiniLM-L6-v2 to setup")
             return 1
-        print(f"[完成] {want} 已就绪（{dim} 维，缓存于 {cache}）")
+        print(f"[Done] {want} is ready ({dim} dimensions, cached at {cache})")
         return 0
 
     if args.json:
@@ -990,11 +991,11 @@ def cmd_models(args: argparse.Namespace) -> int:
 
     print(MC.format_report(models, in_use=refs, protected=protected,
                            cache_roots=roots))
-    print(f"当前默认模型 : {default_id}（{default_why}）")
-    print(f"推理后端     : {backend_kind()}")
+    print(f"Current default model : {default_id} ({default_why})")
+    print(f"Inference backend     : {backend_kind()}")
 
     if not (args.prune or args.drop):
-        print("\n提示：加 --prune 看能回收多少（仍不删），再加 --yes 才真删。")
+        print("\nTip: add --prune to see reclaimable space (still no deletion); add --yes to delete.")
         return 0
 
     keep_onnx = backend_kind() != "torch"
@@ -1007,18 +1008,18 @@ def cmd_models(args: argparse.Namespace) -> int:
         for mid in [d.strip() for d in args.drop if d.strip()]:
             m = by_id.get(mid)
             if m is None:
-                print(f"[跳过] {mid}：缓存里没有这个模型")
+                print(f"[Skipped] {mid}: model is not in the cache")
                 continue
             if refs.get(mid):
-                print(f"[拒绝] {mid}：被库 {', '.join(sorted(refs[mid]))} 引用，"
-                      f"删了那个库下次启动加载不到模型")
+                print(f"[Refused] {mid}: referenced by libraries {', '.join(sorted(refs[mid]))}; "
+                      f"that library could not load the model after deletion")
                 continue
             if mid in protected:
-                print(f"[拒绝] {mid}：是当前默认模型，删了下次启动要联网重下")
+                print(f"[Refused] {mid}: this is the current default model; deleting it requires re-downloading on next start")
                 continue
             picked.append(MC.PruneAction(
                 kind=MC.KIND_MODEL, model_id=mid, path=m.path,
-                bytes_=m.total_bytes, reason="由 --drop 显式点名"))
+                bytes_=m.total_bytes, reason="explicitly selected by --drop"))
         # 保留 int8 那类「无论点名与否都可回收」的动作
         plan.actions = picked + [a for a in plan.actions
                                  if a.kind != MC.KIND_MODEL]
@@ -1029,17 +1030,17 @@ def cmd_models(args: argparse.Namespace) -> int:
         return 0
 
     if not args.yes:
-        print(f"\n[dry-run] 以上 {MC.human_size(plan.total_bytes)} 尚未删除。"
-              f"确认后加 --yes 执行。")
+        print(f"\n[dry-run] The above {MC.human_size(plan.total_bytes)} was not deleted. "
+              f"Confirm, then add --yes to execute.")
         return 0
 
     freed, errors = MC.apply_prune(plan.actions, roots)
-    print(f"\n已释放 {MC.human_size(freed)}")
+    print(f"\nFreed {MC.human_size(freed)}")
     for e in errors:
         print(f"  [FAIL] {e}")
     if errors:
         return 1
-    print("提示：下一次启动会重新统计缓存；若还想回到 ONNX 快路径，"
+    print("Note: the next start will rescan the cache; if you want the ONNX fast path back, "
           "跑 scripts/export_onnx.py 重生成 onnx/。")
     return 0
 
@@ -1085,7 +1086,7 @@ def cmd_context(args: argparse.Namespace) -> int:
         hello_library=os.environ.get("HIPPOCAMPUS_PERSIST_DIR", ""),
         trace=trace)
     if not text:
-        print("（无注入内容）", file=sys.stderr)
+        print("(No injection content)", file=sys.stderr)
         for line in trace:
             print(f"  - {line}", file=sys.stderr)
         return 1
@@ -1097,117 +1098,118 @@ def cmd_context(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hippocampus-mcp",
-        description="HippoMCP 记忆服务：启动 / 安装到宿主 / 体检。")
+        description="HippoMCP memory service: serve, install into hosts, and diagnose.")
     sub = p.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("serve", help="启动 MCP 服务（默认经 launcher 共享 daemon）")
+    sp = sub.add_parser("serve", help="Run the MCP service (shared daemon via launcher by default)")
     sp.add_argument("--direct", action="store_true",
-                    help="退回直连 server（每个会话各装一份模型，不推荐）")
+                    help="Fall back to the direct server (one model per session; not recommended)")
     sp.set_defaults(func=cmd_serve)
 
     su = sub.add_parser("setup",
-                        help="为一个宿主生成 / 合并 MCP 配置（写前自动备份，写后即验）")
+                        help="Create or merge MCP configuration for one host "
+                             "(backs up before writing, verifies afterward)")
     su.add_argument("--host", default=None, choices=sorted(_HOSTS),
-                    help="目标宿主；不填则按工作区特征自动判定"
-                         "（有 .zcode/ → zcode，有 .mcp.json → workbuddy）")
+                    help="Target host; when omitted, infer from workspace markers "
+                         "(.zcode/ -> zcode, .mcp.json -> workbuddy)")
     su.add_argument("--scope", choices=("user", "project"), default=None,
-                    help="用户级 / 工作区级；默认按宿主惯例")
+                    help="User-level or workspace-level scope; defaults follow host convention")
     su.add_argument("--workspace", default=".",
-                    help="工作区路径（project 级配置写在这里），默认当前目录")
+                    help="Workspace path for project-level configuration; defaults to current directory")
     su.add_argument("--file", default="",
-                    help="直接指定配置文件路径（覆盖 --scope 推导）")
+                    help="Explicit configuration file path (overrides --scope inference)")
     su.add_argument("--library", default=None,
-                    help="记忆库目录；不填则沿用既有配置，全新安装用 "
-                         f"{LIBRARY_DEFAULT}")
+                    help="Memory library directory; reuse existing config when present, "
+                         f"otherwise use {LIBRARY_DEFAULT}")
     su.add_argument("--model", default=None,
-                    help="嵌入模型；不填则沿用既有配置，全新安装用 "
-                         f"{MODEL_DEFAULT}（中文语料用它）")
+                    help="Embedding model; reuse existing config when present, "
+                         f"otherwise use {MODEL_DEFAULT}")
     su.add_argument("--profile", default=None,
-                    help="工具剖面；不填则沿用既有配置，全新安装用 "
-                         f"{PROFILE_DEFAULT}")
+                    help="Tool profile; reuse existing config when present, "
+                         f"otherwise use {PROFILE_DEFAULT}")
     su.add_argument("--python", default="",
-                    help="解释器绝对路径，默认取当前 sys.executable")
+                    help="Absolute interpreter path; defaults to current sys.executable")
     su.add_argument("--name", default=SERVER_NAME_DEFAULT,
-                    help=f"配置里的 server 条目名，默认 {SERVER_NAME_DEFAULT}")
+                    help=f"Server entry name in the host config; defaults to {SERVER_NAME_DEFAULT}")
     su.add_argument("--offline", action="store_true",
-                    help="加 HF_HUB_OFFLINE=1（模型已下载好时用它；"
-                         "首次安装不要加）")
+                    help="Set HF_HUB_OFFLINE=1 (use only when the model is already downloaded; "
+                         "do not use on first install)")
     su.add_argument("--dry-run", action="store_true",
-                    help="只预览将要写入的内容，不写盘")
+                    help="Preview the config that would be written; do not write it")
     su.add_argument("--no-verify", action="store_true",
-                    help="跳过写后即验（默认写完会真实握手一次验证可用）")
+                    help="Skip post-write verification (by default performs a real handshake)")
     su.set_defaults(func=cmd_setup)
 
     sy = sub.add_parser(
         "sync",
-        help="发现所有宿主配置并同步同一条目（默认预览，--yes 写入）")
+        help="Discover host configs and sync the same entry (preview by default, write with --yes)")
     sy.add_argument("--workspace", default=".",
-                    help="工作区路径（project 级配置从这里发现），默认当前目录")
+                    help="Workspace path to scan for project-level configs; defaults to current directory")
     sy.add_argument("--library", default=None,
-                    help="记忆库目录；不填则逐文件沿用既有配置，全新安装用 "
-                         f"{LIBRARY_DEFAULT}")
+                    help="Memory library directory; inherit per file when present, "
+                         f"otherwise use {LIBRARY_DEFAULT}")
     sy.add_argument("--model", default=None,
-                    help="嵌入模型；不填则逐文件沿用既有配置，全新安装用 "
-                         f"{MODEL_DEFAULT}（中文语料用它）")
+                    help="Embedding model; inherit per file when present, "
+                         f"otherwise use {MODEL_DEFAULT}")
     sy.add_argument("--profile", default=None,
-                    help="工具剖面；不填则逐文件沿用既有配置，全新安装用 "
-                         f"{PROFILE_DEFAULT}")
+                    help="Tool profile; inherit per file when present, "
+                         f"otherwise use {PROFILE_DEFAULT}")
     sy.add_argument("--python", default="",
-                    help="解释器绝对路径，默认取当前 sys.executable")
+                    help="Absolute interpreter path; defaults to current sys.executable")
     sy.add_argument("--name", default=SERVER_NAME_DEFAULT,
-                    help=f"配置里的 server 条目名，默认 {SERVER_NAME_DEFAULT}")
+                    help=f"Server entry name in the host config; defaults to {SERVER_NAME_DEFAULT}")
     sy.add_argument("--offline", action="store_true",
-                    help="加 HF_HUB_OFFLINE=1（模型已下载好时用它；"
-                         "首次安装不要加）")
+                    help="Set HF_HUB_OFFLINE=1 (use only when the model is already downloaded; "
+                         "do not use on first install)")
     sy.add_argument("--yes", action="store_true",
-                    help="真正写入（默认只预览，一个字节都不动）")
+                    help="Actually write (default is preview only)")
     sy.add_argument("--no-verify", action="store_true",
-                    help="跳过写后即验（默认写完会真实握手验证可用）")
+                    help="Skip post-write verification (by default performs a real handshake)")
     sy.set_defaults(func=cmd_sync)
 
     sd = sub.add_parser(
         "doctor",
-        help="体检：路径 / 库（含盘符体积与迁盘提示）/ 模型 / 依赖 / 宿主×目录判定")
+        help="Check paths, libraries, models, dependencies, and host/workspace binding")
     sd.add_argument("--host", default=None, choices=sorted(_HOSTS),
-                    help="给出后追加「宿主×目录」结论式判定："
-                         "该目录会被此宿主读取的配置在哪、存在与否、缺了谁")
+                    help="Add a host/workspace verdict: which config this host reads, "
+                         "whether it exists, and what is missing")
     sd.add_argument("--project", default=".",
-                    help="宿主×目录判定的目标工作区（默认当前目录）")
+                    help="Workspace used for host/workspace verdicts; defaults to current directory")
     sd.set_defaults(func=cmd_doctor)
 
     sm = sub.add_parser(
-        "models", help="本地模型缓存：占用明细 / 谁在用 / 回收冗余（默认不删）")
+        "models", help="Inspect local model cache and reclaim unused models (no deletion by default)")
     sm.add_argument("--prune", action="store_true",
-                    help="列出可回收项（仍不删，需再加 --yes）")
+                    help="List reclaimable models (still does not delete; add --yes to execute)")
     sm.add_argument("--yes", action="store_true",
-                    help="真正执行删除（必须与 --prune 或 --drop 同用）")
+                    help="Actually delete (requires --prune or --drop)")
     sm.add_argument("--drop", action="append", default=[], metavar="MODEL",
-                    help="显式指定要整体删除的模型 id，如 all-MiniLM-L6-v2"
-                         "（被库引用的会被拒绝）")
+                    help="Explicit model id to delete, such as all-MiniLM-L6-v2 "
+                         "(models referenced by a library are refused)")
     sm.add_argument("--cache", default="",
-                    help="显式指定模型缓存根目录（默认自动探测）")
+                    help="Explicit model cache root directory (auto-detected by default)")
     sm.add_argument("--fetch", nargs="?", const=True, default=None, metavar="MODEL",
-                    help="预取嵌入模型到本地缓存（不填模型名＝系统默认模型）。"
-                         "安装期跑一次：模型是首启才下的，下载失败会让 MCP "
-                         "在宿主里表现为「一个工具都没有」")
-    sm.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本消费")
+                    help="Prefetch an embedding model into the local cache (default model when omitted). "
+                         "Run once during installation; a failed first-start download can leave the host "
+                         "with no visible MCP tools")
+    sm.add_argument("--json", action="store_true", help="Output JSON for scripting")
     sm.set_defaults(func=cmd_models)
 
     cx = sub.add_parser(
         "context",
-        help="hook 注入预览：按一条 query 走 hook_client 全链路（不拉起 daemon）")
+        help="Preview hook injection by running one query through hook_client (does not start daemon)")
     cx.add_argument("query", nargs="?", default="",
-                    help="模拟的用户提示词（用作检索 query）")
+                    help="Simulated user prompt (used as the retrieval query)")
     cx.add_argument("--cwd", default=".",
-                    help="工作区根目录（C1 反查定库依据，默认当前目录）")
-    cx.add_argument("--top-k", type=int, default=3, help="命中条数（默认 3）")
+                    help="Workspace root used for library reverse lookup; defaults to current directory")
+    cx.add_argument("--top-k", type=int, default=3, help="Number of hits (default 3)")
     cx.add_argument("--budget", type=int, default=600,
-                    help="注入字符预算（默认 600）")
+                    help="Injection character budget (default 600)")
     cx.add_argument("--item-chars", type=int, default=150,
-                    help="单行截断长度（默认 150，0 = 不截）")
+                    help="Per-item truncation length (default 150; 0 disables truncation)")
     cx.add_argument("--model", default="",
-                    help="daemon key 的模型要素（默认 env HIPPOCAMPUS_EMB_MODEL "
-                         "或内置默认）")
+                    help="Embedding model component of the daemon key (defaults to env "
+                         "HIPPOCAMPUS_EMB_MODEL or the built-in default)")
     cx.set_defaults(func=cmd_context)
     return p
 

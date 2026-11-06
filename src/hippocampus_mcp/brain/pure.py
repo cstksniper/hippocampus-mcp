@@ -119,7 +119,7 @@ class _PureMixin:
             canon = line[m.end():].strip()
             if not alias or not canon:
                 # 不静默丢弃：写坏了必须让人知道（否则表现为"别名没生效"）
-                problems.append(f"第 {lineno} 行别名语法不完整: {line!r}")
+                problems.append(f"line {lineno} alias syntax incomplete: {line!r}")
                 continue
             if alias.lower() == canon.lower():
                 terms.add(canon.lower())
@@ -129,8 +129,8 @@ class _PureMixin:
             prev = aliases.get(alias.lower())
             if prev is not None and prev.lower() != canon.lower():
                 problems.append(
-                    f"第 {lineno} 行别名 {alias!r} 重复指向不同规范名"
-                    f"（已保留 {prev!r}，忽略 {canon!r}）"
+                    f"第 {lineno} line alias {alias!r} 重复指向不同规范名"
+                    f"（已保留 {prev!r}, ignored {canon!r}）"
                 )
                 continue
             aliases[alias.lower()] = canon
@@ -158,11 +158,11 @@ class _PureMixin:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 text = f.read()
         except OSError as e:
-            logger.warning("专名词库读取失败 %s: %s", path, e)
+            logger.warning("lexicon read failed %s: %s", path, e)
             return set(), {}
         terms, aliases, problems = cls._parse_lexicon_text(text)
         for p in problems:
-            logger.warning("专名词库 %s %s", path, p)
+            logger.warning("lexicon %s %s", path, p)
         return terms, aliases
 
 
@@ -440,11 +440,11 @@ class _PureMixin:
     def _render_blocks(blocks: dict[str, list[str]], token_budget: int,
                        item_max_chars: int = 200) -> str:
         labels = {
-            "block_1_current_hits": "📋 当前相关信息",
-            "block_2_pending": "❓ 待办 / 未决问题",
-            "block_3_timeline": "📍 时间线（最近会话）",
-            "block_4_entity_state": "🧠 相关实体状态",
-            "block_5_open_topics": "🔄 上次未聊完",
+            "block_1_current_hits": "📋 Current relevant memories",
+            "block_2_pending": "❓ Open todos / questions",
+            "block_3_timeline": "📍 Timeline (recent sessions)",
+            "block_4_entity_state": "🧠 Related entity state",
+            "block_5_open_topics": "🔄 Previously unfinished",
         }
         budget = max(int(token_budget) * 2, 200)  # 中文约 2 字符/token
 
@@ -606,30 +606,30 @@ class _PureMixin:
         """
         batch = min(10, max(1, pending_n))
         return {
-            "goal": ("把 %d 个知识点归纳成上层结论。**归纳智能在你这边**，"
-                     "我只能出素材、做校验、存起来——本服务生产路径不内嵌 LLM。" % pending_n),
+            "goal": ("Distill %d knowledge points into higher-level conclusions. **The summarizing intelligence is on your side** -- "
+                     "this service only produces material, validates, and stores; its production path embeds no LLM." % pending_n),
             "steps": [
-                '1) 取素材：knowledge_topic(action="brief_batch", batch=%d)'
-                '（不传 topics 就自动挑最该归纳的 %d 个）' % (batch, batch),
-                "2) 你读每个主题的素材，写成一句结论（≤2000 字，写清主体＋事实）",
-                "3) 写回：knowledge_topic(action=\"summarize_batch\", "
+                '1) Fetch material: knowledge_topic(action="brief_batch", batch=%d)'
+                '(without topics, the %d most due topics are picked automatically)' % (batch, batch),
+                "2) Read each topic's material and write one conclusion (<= 2000 chars, clear subject + facts)",
+                "3) Write back: knowledge_topic(action=\"summarize_batch\", "
                 "items='[{\"topic_id\":\"...\",\"summary\":\"...\","
-                "\"evidence\":[\"...\"]}]')（items 是 JSON 数组字符串）",
-                "4) 重复 1-3 直到 pending_count 为 0（每批会自动跳过已写好的）",
+                "\"evidence\":[\"...\"]}]') (items is a JSON array string)",
+                "4) Repeat 1-3 until pending_count is 0 (each batch automatically skips already-summarized topics)",
             ],
             "rules": [
-                "evidence 必须是该主题 brief 里列出的 id——凭空引用会**整条退回**，"
-                "一个字段都不改（改一半比不改更难查）",
-                "已有归纳且没标 ⚠️ 的会被自动跳过，别浪费力气重做；"
-                "要重写就用 topics 显式点名",
-                "写坏了一条：knowledge_topic(action=\"revert\", topic_id=...) 撤销",
-                "写回即落盘（带账本），不用另外调 save",
+                "evidence must use ids listed in that topic's brief -- fabricated references cause the whole item to be **rejected**, "
+                "changing no field (half-applied writes are harder to debug than none)",
+                "Topics already summarized and not flagged ⚠️ are skipped automatically -- do not redo them; "
+                "to rewrite, name them explicitly via topics",
+                "If one write goes wrong: undo via knowledge_topic(action=\"revert\", topic_id=...)",
+                "Write-back persists to disk (with a ledger); no separate save call needed",
                 # S3：四字段契约。写进 rules 而不是新增参数文档——宿主照菜谱
                 # 走一遍就会用；f/s 两格是已知最便宜的"假簇过滤器"。
-                "可选四字段（推荐）：item 里加 \"fras\":{\"f\":\"范畴（当标题）\","
-                "\"r\":[\"关联实体/主题\"],\"a\":\"可引用的结论\",\"s\":\"推不出来"
-                "但搞错就出事的约束\"}。四键必须齐全；s 确实没有也要写\"无\"。"
-                "只传 fras 不传 summary 时，a 就是那句话",
+                "Optional four fields (recommended): add \"fras\":{\"f\":\"category (used as title)\","
+                "\"r\":[\"related entities/topics\"],\"a\":\"the citable conclusion\",\"s\":\"constraints not derivable "
+                "but costly if wrong\"} to the item. All four keys are required; if s truly has none, write \"none\". "
+                "When fras is passed without summary, a is the sentence itself",
             ],
             "done_when": "pending_count == 0",
         }

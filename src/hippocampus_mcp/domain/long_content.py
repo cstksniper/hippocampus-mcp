@@ -134,11 +134,11 @@ def split_pieces(
         try:
             sents = [s for s in (split_facts(text) or []) if s and s.strip()]
         except Exception as exc:  # 分句器坏了不能让写入挂掉
-            note = f"分句器异常（{type(exc).__name__}），已退化为按长度硬切"
+            note = f"the splitter raised {type(exc).__name__}; degraded to hard length-based splitting"
             sents = []
     if not sents:
         if split_facts is None and not note:
-            note = "未注入分句器，按长度硬切"
+            note = "no splitter injected; hard length-based splitting"
         sents = [text]
 
     out: list[str] = []
@@ -179,26 +179,26 @@ def plan_long_content(
     if policy == POLICY_WARN:
         return LongContentPlan(
             action="write", policy=policy, pieces=(content,),
-            reason=f"内容超过嵌入模型 token 上限 {max_seq_length}，"
-                   f"其后的原文检索不到（当前策略 warn：只告警不改写）")
+            reason=f"content exceeds the embedding model's token limit {max_seq_length}; "
+                   f"text beyond it is not retrievable (policy warn: warn only, no rewrite)")
 
     if policy == POLICY_REJECT:
         return LongContentPlan(
             action="reject", policy=policy,
-            reason=f"内容超过嵌入模型 token 上限 {max_seq_length}，"
-                   f"当前策略 reject：已拒写。"
-                   f"请拆成多张 <{limit} 字的卡，或改走 ingest（默认按句拆）")
+            reason=f"content exceeds the embedding model's token limit {max_seq_length}; "
+                   f"policy reject: the write was refused. "
+                   f"Split it into cards of <{limit} chars, or use ingest (splits by sentence by default)")
 
     # split
     pieces, note = split_pieces(content, limit, split_facts)
     if len(pieces) > MAX_PIECES:
         return LongContentPlan(
             action="reject", policy=policy,
-            reason=f"内容需拆成 {len(pieces)} 张卡，超过上限 {MAX_PIECES}"
-                   f"（多半是整篇文档被当成一条记忆写入）。"
-                   f"请先用 ingest 或自行分段",
+            reason=f"the content would need {len(pieces)} cards, over the limit {MAX_PIECES} "
+                   f"(most likely a whole document was written as one memory). "
+                   f"Use ingest first, or split the text yourself",
             note=note)
     return LongContentPlan(
         action="split", policy=policy, pieces=tuple(pieces), note=note,
-        reason=f"内容超过嵌入模型 token 上限 {max_seq_length}，"
-               f"已拆成 {len(pieces)} 张卡分别写入")
+        reason=f"content exceeds the embedding model's token limit {max_seq_length}; "
+               f"split into {len(pieces)} cards written separately")

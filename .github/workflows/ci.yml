@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: 缓存 pip + 嵌入模型
+      - name: Cache pip + embedding models
         uses: actions/cache@v4
         with:
           path: |
@@ -31,14 +31,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-py${{ matrix.python-version }}-
 
-      - name: 安装
+      - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install ".[dev]"
 
-      # 预置嵌入模型，供离线回归使用；不下载 ONNX 产物。
-      - name: 预置嵌入模型（离线回归用）
-      - name: 预置嵌入模型（离线回归用）
+      # Prefetch embedding models for offline regression; ONNX artifacts are not downloaded.
+      - name: Prefetch embedding models (offline regression)
         env:
           HF_HOME: ${{ github.workspace }}/.hf
           HF_HUB_DISABLE_XET: "1"
@@ -57,19 +56,19 @@ jobs:
               snapshot_download(repo, ignore_patterns=["onnx/*", "onnx_int8/*", "*.onnx"])
           PY
 
-      - name: 回归
+      - name: Regression
         env:
           HF_HOME: ${{ github.workspace }}/.hf
           HF_HUB_DISABLE_XET: "1"
           HIPPOCAMPUS_EMB_CACHE: ${{ github.workspace }}/.hf/hub
-          # 允许耗时阈值型用例在负载下非阻断失败。
+          # Allow latency-threshold tests to fail non-blocking under load.
           HIPPOCAMPUS_PERF_MAX_SECONDS: "120"
         run: |
           python scripts/run_all_tests.py --timeout 1800 --allow-fail perf_write \
             -v --log-dir ci-logs
 
-      # 失败时收集完整日志与 daemon 子进程日志，便于诊断。
-      - name: 收集 daemon 子进程日志（诊断）
+      # On failure, collect full logs and daemon subprocess logs for diagnosis.
+      - name: Collect daemon subprocess logs (diagnostics)
         if: always()
         run: |
           mkdir -p ci-logs/daemon
@@ -89,10 +88,10 @@ jobs:
               print("copied", p, "->", dst)
           print("collected", len(srcs), "daemon logs")
           PY
-      - name: 列出失败套件日志（诊断）
+      - name: List failed-suite logs (diagnostics)
         if: always()
-        run: ls -laR ci-logs/ 2>/dev/null || echo "ci-logs/ 不存在"
-      - name: 上传失败套件完整日志
+        run: ls -laR ci-logs/ 2>/dev/null || echo "ci-logs/ does not exist"
+      - name: Upload full failed-suite logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -102,9 +101,9 @@ jobs:
           retention-days: 7
 
   smoke:
-    # 不装 torch 的快速冒烟：只验证「包能导入 + 工具表完整」。
-    # 目的：依赖安装失败/大改时，5 分钟内就能看到一个明确的红，
-    #       不用等 60 分钟的完整回归。
+    # Fast smoke without torch: only verifies "package imports + tool table is complete".
+    # Purpose: when dependency installation breaks or after major changes, a clear red
+    # appears within 5 minutes instead of waiting 60 minutes for full regression.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -112,21 +111,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # 协议层冒烟：只安装轻依赖，验证顶层导入不引入重库。
-      - name: 只装协议层依赖
+      # Protocol-layer smoke: install only light deps, verify the top-level import pulls no heavy libraries.
+      - name: Install protocol-layer dependencies only
         run: |
           python -m pip install --upgrade pip
           pip install "mcp>=1.0" "numpy>=1.20"
-      - name: 顶层导入不得引重库
+      - name: Top-level import must not pull heavy libraries
         env:
           PYTHONPATH: src
         run: |
           python -c "import hippocampus_mcp.server as s; print('imported ok')"
 
   install-e2e:
-    # 站在外部用户视角验收：构建 wheel、安装、运行 quickstart、
-    # 生成宿主配置并完成 MCP 握手。
-    runs-on: ubuntu-latest
+    # Acceptance from an external user's perspective: build the wheel, install it,
+    # run quickstart, generate host config, and complete the MCP handshake.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -135,9 +133,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 与 regression 共用 pip wheel 缓存（restore-keys 前缀可命中），
-      # 但保存时用独立 key，避免两个 job 抢同一个不可变 cache。
-      - name: 缓存 pip wheel
+      # Shares the pip wheel cache with regression (restore-keys prefix can hit),
+      # but saves under a separate key so the two jobs don't fight over one immutable cache.
+      - name: Cache pip wheels
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -145,28 +143,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-py3.11-
 
-      - name: 构建 wheel（只构建项目本身）
+      - name: Build wheel (project only)
         run: |
           python -m pip install --upgrade pip
           python -m pip wheel . --no-deps -w dist/
 
-      - name: 全新 venv 里按用户方式安装 wheel
+      - name: Install wheel the user way in a fresh venv
         run: |
           python -m venv "$RUNNER_TEMP/user_venv"
           "$RUNNER_TEMP/user_venv/bin/pip" install --upgrade pip
           "$RUNNER_TEMP/user_venv/bin/pip" install dist/hippocampus_mcp-*.whl
           "$RUNNER_TEMP/user_venv/bin/python" -m pip show mcp | head -3
 
-      # 新用户链路验收
-      - name: 新用户链路验收
+      # New-user path acceptance
+      - name: New-user path acceptance
         shell: bash
         run: |
           set -o pipefail
           "$RUNNER_TEMP/user_venv/bin/python" scripts/verify_install_e2e.py --repo . \
             2>&1 | tee install-e2e.log
 
-      # 上传验收日志
-      - name: 上传验收日志
+      # Upload acceptance logs
+      - name: Upload acceptance logs
         if: always()
         uses: actions/upload-artifact@v4
         with:

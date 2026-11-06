@@ -119,15 +119,15 @@ def _warmup_body() -> None:
     def _phase(name: str, fn: Any) -> Any:
         t0 = time.time()
         s._warmup_phase = name          # 超时时消息里要能指明"卡在哪一步"
-        logger.info("预热阶段开始: %s", name)
+        logger.info("warmup phase start: %s", name)
         try:
             return fn()
         finally:
-            logger.info("预热阶段完成: %s（%.1fs）", name, time.time() - t0)
+            logger.info("warmup phase done: %s (%.1fs)", name, time.time() - t0)
 
     try:
         try:
-            brain = _phase("加载记忆库/构造 HippoBrain", s.get_brain)
+            brain = _phase("load memory library / construct HippoBrain", s.get_brain)
         except BaseException:
             # 核心层没建起来：后续所有工具都不可能成功，标记为致命。
             s._warmup_fatal = True
@@ -142,8 +142,8 @@ def _warmup_body() -> None:
         emb = brain.manager.embedder
         # 再拆一层：模型构造函数 vs 真正算一个向量。两者卡住的原因完全不同
         # （前者多为模型路径/缺件或 DLL 加载慢，后者多为推理线程环境问题）。
-        _phase("构造嵌入模型", emb._ensure_model)
-        _phase("首次推理", lambda: emb.embed("warmup"))
+        _phase("construct embedding model", emb._ensure_model)
+        _phase("first inference", lambda: emb.embed("warmup"))
         # 后端自述必须在**启动时**就能看见。spaCy 装不上、
         # 嵌入器静默回落 MiniLM 这两类事故的共同点就是"结果变了而没人知道"，
         # 而日志是宿主侧唯一会去看的地方（brain_stats 要等人来调）。
@@ -152,13 +152,13 @@ def _warmup_body() -> None:
         # 账簿那格只取内存里的末条，代价可忽略。
         try:
             _last_save = (brain.save_ledger_view().get("last_save_at")
-                          or "从未落盘")
+                          or "never saved")
         except Exception:  # noqa: BLE001 —— 日志字段缺失不影响预热成功
             _last_save = "unknown"
         logger.info(
-            "后台预热完成: L1=%d 实体=%d（总 %.1fs）"
-            " | NER=%s | 嵌入后端=%s(%s 维, 模型来源=%s)"
-            " | 账簿: 上次保存=%s",
+            "Background warmup done: L1=%d entities=%d (total %.1fs)"
+            " | NER=%s | embedding backend=%s (%sD, model source=%s)"
+            " | ledger: last save=%s",
             brain.manager.store.count(), len(brain.entities), time.time() - t_all,
             brain.ner_backend_lazy,  # 无副作用版：别在预热日志里把 spaCy/torch 拉进进程
             brain.manager.embedder_backend,
@@ -167,8 +167,8 @@ def _warmup_body() -> None:
             _last_save,
         )
     except BaseException as e:  # noqa: BLE001 预热失败必须也不能拖垮服务
-        s._warmup_error = f"{type(e).__name__}: {e}（阶段：{s._warmup_phase}）"
-        logger.warning("后台预热失败（首次调用将自行初始化）: %s", s._warmup_error)
+        s._warmup_error = f"{type(e).__name__}: {e} (phase: {s._warmup_phase})"
+        logger.warning("background warmup failed (first call will initialize): %s", s._warmup_error)
     finally:
         # 失败也要放行，否则所有工具会一直卡到超时。
         # _store_ready 同样要置位：若 get_brain() 本身就抛错，它不会走到 set()，
@@ -189,7 +189,7 @@ def start_background_warmup() -> threading.Thread | None:
     t = threading.Thread(target=_warmup_body, name="hippo-warmup", daemon=True)
     t.start()
     s._warmup_started = True
-    logger.info("预热已转入后台线程（mode=auto，超时上限 %.0fs）", s._WARMUP_WAIT_TIMEOUT)
+    logger.info("warmup moved to background thread (mode=auto; timeout %.0fs)", s._WARMUP_WAIT_TIMEOUT)
     return t
 
 
@@ -205,10 +205,10 @@ def _warmup_library(path: str) -> None:
         emb = brain.manager.embedder
         emb._ensure_model()
         emb.embed("warmup")
-        logger.info("库预热完成: %s（L1=%d 条）", path,
+        logger.info("library warmup done: %s (L1=%d records)", path,
                     brain.manager.store.count())
     except BaseException as e:  # noqa: BLE001 —— 预热失败绝不能拖垮服务
-        logger.warning("库预热失败（首次调用将自行初始化）: %s —— %s",
+        logger.warning("library warmup failed (first call will initialize): %s -- %s",
                        type(e).__name__, e)
 
 
@@ -294,16 +294,16 @@ def _preload_import_chain() -> None:
         t0 = time.time()
         try:
             __import__(name)
-            logger.info("导入链预载: %s（%.2fs）", name, time.time() - t0)
+            logger.info("import-chain preload: %s (%.2fs)", name, time.time() - t0)
         except Exception as e:  # noqa: BLE001
-            logger.warning("导入链预载失败: %s（%s）—— 不影响启动", name, e)
+            logger.warning("import-chain preload failed: %s (%s); startup unaffected", name, e)
     used = time.time() - t_all
-    logger.info("导入链预载总耗时 %.2fs（档位=%s）", used, s._PRELOAD)
+    logger.info("import-chain preload total %.2fs (tier=%s)", used, s._PRELOAD)
     if used > s._PRELOAD_BUDGET:
         logger.warning(
-            "预载耗时 %.1fs 超出预算 %.1fs：握手会推迟到 %.1fs 左右，"
-            "有错过宿主工具注册窗口（约 15s）的风险。想缩短请调小 "
-            "HIPPOCAMPUS_PRELOAD 的预载集。",
+            "Preload took %.1fs over its %.1fs budget: the handshake will be delayed to roughly %.1fs, "
+            "risking the host tool-registration window (about 15s). To shorten, reduce "
+            "the HIPPOCAMPUS_PRELOAD preload set.",
             used, s._PRELOAD_BUDGET, used + s._HANDSHAKE_BASE_COLD,
         )
 
@@ -331,7 +331,7 @@ def _start_warmup_watchdog() -> None:
                         str(tid),
                     )
                     logger.warning(
-                        "DIAG[%.0fs] 预热未完成，线程 %s 栈:\n%s",
+                        "DIAG[%.0fs] warmup not finished; thread %s stack:\n%s",
                         deadline, tname,
                         "".join(traceback.format_stack(frame)[-14:]),
                     )
@@ -417,31 +417,31 @@ async def _await_warmup(tier: str | None = None) -> None:
         # 否则调用方会继续往下走，再撞一次更晦涩的错。
         if s._warmup_fatal and s._warmup_error:
             raise WarmupFailedError(
-                f"后端初始化失败：{s._warmup_error}。这不是超时问题——请检查记忆库"
-                f"目录、模型路径与依赖（HIPPOCAMPUS_WARMUP_DIAG=1 可拿线程栈）。"
+                f"Backend initialization failed: {s._warmup_error}. This is not a timeout issue; check the memory library"
+                f" directory, model path, and dependencies (HIPPOCAMPUS_WARMUP_DIAG=1 captures thread stacks)."
             )
         return
     started = time.time()
-    logger.info("后台预热进行中（层级=%s），本次调用等待其完成…", tier)
+    logger.info("background warmup in progress (tier=%s); this call waits for completion...", tier)
     await asyncio.to_thread(event.wait, s._WARMUP_WAIT_TIMEOUT)
     if event.is_set():
         return
     waited = time.time() - started
     if s._warmup_error:
         raise WarmupFailedError(
-            f"后端预热失败：{s._warmup_error}。这不是超时问题——请检查模型路径/"
-            f"依赖是否就绪（HIPPOCAMPUS_WARMUP_DIAG=1 可拿到各阶段耗时与线程栈）。"
+            f"Backend warmup failed: {s._warmup_error}. This is not a timeout issue; check the model path/"
+            f"dependencies (HIPPOCAMPUS_WARMUP_DIAG=1 captures phase timing and thread stacks)."
         )
     msg = (
-        f"后端仍在预热（已等待 {waited:.0f}s，当前阶段：{s._warmup_phase or '启动中'}）——"
-        f"本次调用未执行，**稍后重试即可**，不是数据或参数问题。"
-        f"若持续如此，用 HIPPOCAMPUS_WARMUP_DIAG=1 重启获取现场。"
+        f"Backend is still warming up (waited {waited:.0f}s, phase: {s._warmup_phase or 'starting'}); "
+        f"this call was not executed; retry shortly. This is not a data or parameter problem. "
+        f"If it persists, restart with HIPPOCAMPUS_WARMUP_DIAG=1 to capture the state."
     )
     if s._WARMUP_WAIT_POLICY == "raise":
-        logger.warning("等待后台预热超预算（层级=%s，%.0fs）：%s", tier, waited, msg)
+        logger.warning("background warmup exceeded budget (tier=%s, %.0fs): %s", tier, waited, msg)
         raise WarmupPendingError(msg)
     logger.warning(
-        "等待后台预热超时（层级=%s，%.0fs），按 policy=release 转由惰性初始化处理",
+        "background warmup timed out (tier=%s, %.0fs); policy=release deferred to lazy initialization",
         tier, waited,
     )
 

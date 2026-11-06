@@ -135,7 +135,7 @@ def build_items(
             })
         out_items.append({
             "topic_id": tid,
-            "title": t.get("title") or "(未命名)",
+            "title": t.get("title") or "(untitled)",
             "size": len(alive),
             "summary": summary_state(t, alive),
             "members": members,

@@ -146,7 +146,7 @@ def _resolve_embedding_dim(meta: dict, meta_file: str) -> int:
             f"{meta_file} 里没有可用的 word_embedding_dimension"
             f"（顶层与 pooling_config 嵌套两处都没有）。不猜维度——猜错会让"
             f"向量与 torch 版完全对不上且不报错。请重跑 "
-            f"python scripts/export_onnx.py --model <模型目录>，"
+            f"python scripts/export_onnx.py --model <model dir>, "
             f"或改回 {ENV_BACKEND}=torch。"
         )
     return dim
@@ -183,17 +183,17 @@ class OnnxEmbedder:
         found = find_onnx_artifacts(self.model_dir)
         if found is None:
             raise FileNotFoundError(
-                f"ONNX 后端被显式选中（{ENV_BACKEND}=onnx）但 {self.model_dir} 下没有 "
-                f"{ONNX_SUBDIR}/{ONNX_MODEL_FILE} + {ONNX_META_FILE}。\n"
-                f"先跑：python scripts/export_onnx.py --model {self.model_dir}\n"
-                f"或改回 {ENV_BACKEND}=torch。"
+                f"The ONNX backend was selected explicitly ({ENV_BACKEND}=onnx), but {self.model_dir} has no "
+                f"{ONNX_SUBDIR}/{ONNX_MODEL_FILE} + {ONNX_META_FILE}.\n"
+                f"Run first: python scripts/export_onnx.py --model {self.model_dir}\n"
+                f"or switch back to {ENV_BACKEND}=torch."
             )
         self._onnx_path, self._meta = found
 
         self._pooling = self._meta.get("pooling") or ""
         if self._pooling not in ("cls", "mean", "max"):
             raise ValueError(
-                f"{self._onnx_path} 的 onnx_meta.json 里 pooling 字段非法: "
+                f"{self._onnx_path}: invalid pooling field in onnx_meta.json at "
                 f"{self._pooling!r}（只认 cls/mean/max）。不猜 pooling —— "
                 f"猜错会让向量与 torch 版完全对不上且不报错。"
             )
@@ -234,7 +234,7 @@ class OnnxEmbedder:
         return did
 
     def __repr__(self) -> str:
-        where = self.resolved_model_path or "（尚未加载）"
+        where = self.resolved_model_path or "(not yet loaded)"
         return f"{self.model_name} @ {where} [onnx]"
 
     # -- 加载 ------------------------------------------------------------
@@ -267,7 +267,7 @@ class OnnxEmbedder:
 
         # 加载状态先行 flush 到 stderr（stdout 是 JSON-RPC 专用通道）：
         # 让"慢"与"坏"可区分 —— 冷启动几秒属正常，反复卡死看 daemon 日志。
-        print(f"[hippocampus] 正在加载嵌入模型（ONNX）：{self._onnx_path}",
+        print(f"[hippocampus] loading embedding model (ONNX): {self._onnx_path}",
               file=sys.stderr, flush=True)
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, (os.cpu_count() or 2) // 2)
@@ -292,7 +292,7 @@ class OnnxEmbedder:
 
         tok_path = os.path.join(self.model_dir, "tokenizer.json")
         if not os.path.isfile(tok_path):
-            raise FileNotFoundError(f"模型目录缺少 tokenizer.json: {tok_path}")
+            raise FileNotFoundError(f"the model directory lacks tokenizer.json: {tok_path}")
         self._tok = Tokenizer.from_file(tok_path)
         # 截断到模型硬上限：与 ST 的 max_seq_length 行为对齐（超出静默丢弃）
         # 这两个调用改的是 tokenizer 的**可变状态**，同样要过锁
@@ -316,8 +316,8 @@ class OnnxEmbedder:
         # ``_ensure_model``，而此时 ``_model_ready`` 还是 False ⇒ 无限递归
         # （实测：RecursionError，且它把真正的加载错误一起掩盖了）。
         _ = self._forward(["warmup"])
-        print(f"[hippocampus] 嵌入模型就绪（ONNX）：{self.model_name}"
-              f"（{self.dim} 维）", file=sys.stderr, flush=True)
+        print(f"[hippocampus] embedding model ready (ONNX): {self.model_name}"
+              f"（{self.dim}D)", file=sys.stderr, flush=True)
         self._model_ready = True
 
     # -- 编码 ------------------------------------------------------------

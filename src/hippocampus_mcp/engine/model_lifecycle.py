@@ -196,7 +196,7 @@ def release_models(reason: str = "idle") -> dict[str, Any]:
             try:
                 released += 1 if rel() else 0
             except Exception as exc:  # noqa: BLE001
-                logger.warning("释放嵌入器模型失败: %s: %s",
+                logger.warning("failed to release the embedder model: %s: %s",
                                type(exc).__name__, exc)
 
         # 🔴 光把嵌入器里的引用置空没用：池才是真正的持有者。
@@ -233,7 +233,7 @@ def release_models(reason: str = "idle") -> dict[str, Any]:
             "after_mb": round(after, 1),
             "reclaimed_mb": round(before - after, 1),
         }
-    logger.info("已卸载嵌入模型: %s", res)
+    logger.info("embedding model unloaded: %s", res)
     return res
 
 

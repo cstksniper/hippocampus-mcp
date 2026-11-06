@@ -160,8 +160,8 @@ def boundary_error_message(*, tool: str, target_display: str,
     而串库事故的代价是数据进错库后很难追回。
     """
     return (
-        f"{tool} 的写入被家库写边界拦下：目标库「{target_display}」不是本次"
-        f"连接的家库（home，当前为「{home_display}」）。\n"
+        f"{tool}'s write was blocked by the home-library write boundary: the target library {target_display}」不是本次"
+        f"连接的家库（home，当前为「{home_display}'). \n"
         f"library_use 只影响读落在哪，**写永远钉在家库**；跨库写只走受管"
         f"通道（user 库受管提升 / 目录登记 / 进程内部动作）。\n"
         f"要写这个库：去它自己的工作区开会话（那里的家库就是它），或联系"
@@ -171,7 +171,7 @@ def boundary_error_message(*, tool: str, target_display: str,
 
 
 def caller_tool_name(depth: int = 2) -> str:
-    """取调用链上第 ``depth`` 帧的函数名（供守卫判断「谁在写」）。
+    """取调用链上第 ``depth`` 帧的函数名（供守卫判断「谁在写'). 
 
     ``depth=3`` 对应「工具体 → 用例工厂 → 守卫 → 本函数」这条四帧链条
     （0=本函数），与设计 §2.2「守卫放服务工厂层，不在各工具体里铺开」

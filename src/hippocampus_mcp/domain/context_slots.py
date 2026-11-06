@@ -32,6 +32,13 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Sequence
 
+# Empty-slot placeholder rows. Centralized so rendering and confidence
+# scoring agree on what is *not* real content.
+BLOCK_PLACEHOLDERS = frozenset({
+    "(No todos)", "(No session history)",
+    "(No related entity state)", "(No open topics)",
+})
+
 
 def memory_context(
     *,
@@ -152,18 +159,18 @@ def memory_context(
     })
     if conflicted:
         hit_lines.append(
-            f"⚠️ 其中 {len(conflicted)} 组疑似同一事实的不同口径"
-            f"（并列保留、未折叠）：以权威来源为准；同组内 newer=true 的更近。"
+            f"⚠️ Among them, {len(conflicted)} groups look like different accounts of the same fact "
+            f"(kept side by side, not collapsed): defer to the authoritative source; within a group, newer=true is the more recent one."
         )
 
     blocks = {
         "block_1_current_hits": hit_lines,
         "block_2_pending": [
             f"[{i['status']}] {i['text']}" for i in intents if i["status"] == "open"
-        ][:5] or ["（无待办）"],
-        "block_3_timeline": [s["text"] for s in summaries[-2:]] or ["（无历史会话）"],
-        "block_4_entity_state": ent_facts or ["（无相关实体状态）"],
-        "block_5_open_topics": [t["text"] for t in open_topics[-3:]] or ["（无未完结话题）"],
+        ][:5] or ["(No todos)"],
+        "block_3_timeline": [s["text"] for s in summaries[-2:]] or ["(No session history)"],
+        "block_4_entity_state": ent_facts or ["(No related entity state)"],
+        "block_5_open_topics": [t["text"] for t in open_topics[-3:]] or ["(No open topics)"],
     }
     text = render_blocks(blocks, token_budget, item_max_chars)
     return {

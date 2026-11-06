@@ -135,14 +135,14 @@ def upsert_entry(library_path: str, entry: dict[str, Any],
     """
     item = normalize_entry(entry)
     if item is None:
-        raise TaskDirectoryError("任务目录条目缺 task 或 path，拒绝登记")
+        raise TaskDirectoryError("task-directory entry lacks task or path; registration refused")
     item["updated_at"] = float(now if now is not None else time.time())
     with _WRITE_LOCK:
         data, issue = load_directory(library_path)
         if issue:
             raise TaskDirectoryError(
-                f"{directory_path(library_path)} 不可读（{issue}）："
-                "拒绝覆盖，请先修好或备份后删除该文件")
+                f"{directory_path(library_path)} is unreadable ({issue}): "
+                "refusing to overwrite; repair the file or back it up and delete it first")
         entries: list[dict[str, Any]] = list(data.get("entries") or [])
         key = normpath(item["path"])
         created = moved = False

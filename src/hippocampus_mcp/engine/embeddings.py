@@ -159,7 +159,7 @@ ENV_ALLOW_MODEL_SWITCH = "HIPPOCAMPUS_ALLOW_MODEL_SWITCH"
 # **中文语料必须显式指定 BGE**——这个默认值不是给中文生产库用的。
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 
-#: 中文语料的默认模型（BGE-base-zh-v1.5，768 维）。
+#: 中文语料的默认模型（BGE-base-zh-v1.5，768D)。
 #: 语义是**分流**不是替换：英文/其它语言仍走 :data:`DEFAULT_MODEL_NAME`。
 #: 只在「系统语言是中文」且用户**没有**显式配置模型时作为应用默认值生效。
 ZH_DEFAULT_MODEL_NAME = "BAAI/bge-base-zh-v1.5"
@@ -347,29 +347,29 @@ def _warn_default_model(model_name: str) -> None:
     _, reason = default_model_for_system()
     if reason == "zh_unavailable":
         _emit_warning(
-            f"[embeddings] 系统语言为中文，但中文模型 {ZH_DEFAULT_MODEL_NAME} 在本地"
-            f"不存在且当前处于离线模式，已回落英文基线 {model_name}（384D）——"
-            f"中文语义检索会明显偏弱。修复：把 {ZH_DEFAULT_MODEL_NAME} 放到模型缓存"
-            f"目录（或设 {ENV_CACHE}），或去掉 HF_HUB_OFFLINE 让它联网下载。"
+            f"[embeddings] system language is Chinese, but the Chinese model {ZH_DEFAULT_MODEL_NAME} is not present "
+            f"locally and offline mode is active; falling back to the English baseline {model_name} (384D) -- "
+            f"Chinese semantic retrieval will be noticeably weaker. Fix: put {ZH_DEFAULT_MODEL_NAME} into the model "
+            f"cache directory (or set {ENV_CACHE}), or remove HF_HUB_OFFLINE to let it download."
         )
         return
     if reason == "zh_download":
         _emit_warning(
-            f"[embeddings] 系统语言为中文，默认使用 {ZH_DEFAULT_MODEL_NAME}（768D）。"
-            f"首次运行需联网下载约 400MB；离线环境会失败，建议提前预置，"
-            f"或设 HIPPOCAMPUS_EMB_MODEL={DEFAULT_MODEL_NAME} 显式使用英文基线。"
+            f"[embeddings] system language is Chinese; using {ZH_DEFAULT_MODEL_NAME} (768D) by default. "
+            f"The first run downloads about 400MB and fails in offline environments -- prefetch in advance, "
+            f"or set HIPPOCAMPUS_EMB_MODEL={DEFAULT_MODEL_NAME} to use the English baseline explicitly."
         )
         return
     if reason == "zh_local":
         logging.info(
-            "[embeddings] 系统语言为中文，默认使用 %s（768D，本地已有副本）",
+            "[embeddings] system language is Chinese; using %s by default (768D, local copy already present)",
             model_name,
         )
         return
     _emit_warning(
-        f"[embeddings] 未显式指定嵌入模型，回落默认 {model_name}"
-        f"（英文通用基线，384D）。中文语料请设 {ENV_MODEL}=BAAI/bge-base-zh-v1.5，"
-        f"或构造时显式传 model_name。"
+        f"[embeddings] no embedding model specified; falling back to the default {model_name} "
+        f"(English baseline, 384D). For Chinese corpora set {ENV_MODEL}=BAAI/bge-base-zh-v1.5, "
+        f"or pass model_name explicitly in the constructor."
     )
 
 
@@ -744,7 +744,7 @@ class SentenceTransformerEmbedder:
 
     def describe_source(self) -> str:
         """一句话说明"这个嵌入器最终会从哪加载、加载了没"。"""
-        where = self.resolved_model_path or "（尚未加载）"
+        where = self.resolved_model_path or "(not yet loaded)"
         return f"{self.model_name} @ {where}"
 
     def _attach_onnx(self, *, from_store: bool = False) -> bool:
@@ -779,7 +779,7 @@ class SentenceTransformerEmbedder:
                     "HIPPOCAMPUS_EMB_BACKEND=onnx 但 onnxruntime/tokenizers 不可用：%s" % e
                 ) from e
             logger.info(
-                "嵌入后端：torch（ONNX 依赖不可用：%s）", e,
+                "embedding backend: torch (ONNX dependencies unavailable: %s)", e,
             )
             return False
         # ONNX 路只认本地目录（它本就不联网、不碰 torch）
@@ -793,7 +793,7 @@ class SentenceTransformerEmbedder:
                     % self.model_name
                 )
             logger.info(
-                "嵌入后端：torch（%s 无本地模型目录，待模型名确定后再试）",
+                "embedding backend: torch (%s has no local model directory; retry once the model name is fixed)",
                 self.model_name,
             )
             return False
@@ -805,9 +805,9 @@ class SentenceTransformerEmbedder:
                     % (model_dir, model_dir)
                 )
             logger.info(
-                "嵌入后端：torch（%s 下没有 ONNX 产物%s）",
+                "embedding backend: torch (no ONNX artifacts under %s%s)",
                 model_dir,
-                "，且模型名尚未最终确定" if not from_store else "",
+                ", and the model name is not final yet" if not from_store else "",
             )
             return False
         # F6：命中共享池就不新建 session / 不重读 tokenizer.json。
@@ -822,8 +822,8 @@ class SentenceTransformerEmbedder:
         # 池里的实例可能已被别的库加载过；路径自曝取实例自己的（未加载时
         # 是 None，与"本实例还没 encode"的事实一致）。
         self.resolved_model_path = getattr(self._onnx, "resolved_model_path", None)
-        logger.info("嵌入后端：ONNX（%s）%s，运行期不加载 torch/ST",
-                    model_dir, "（复用进程内共享实例）" if self.shared_from_pool else "")
+        logger.info("embedding backend: ONNX (%s) %s; torch/ST are not loaded at runtime",
+                    model_dir, "(reusing the in-process shared instance)" if self.shared_from_pool else "")
         return True
 
     def _ensure_model(self) -> None:
@@ -925,7 +925,7 @@ class SentenceTransformerEmbedder:
                 self._model_ready = True
                 self.shared_from_pool = True
                 logger.info(
-                    "嵌入模型复用进程内共享实例：%s（%d 维），跳过加载",
+                    "嵌入模型复用进程内共享实例：%s（%dD)，跳过加载",
                     load_path, self.dim,
                 )
                 return
@@ -933,8 +933,8 @@ class SentenceTransformerEmbedder:
         # 加载模型
         # 加载要几十秒，先 flush 一行 stderr 状态 —— 让"慢"与"坏"可区分
         # （stdout 是 JSON-RPC 专用通道，状态只能走 stderr，同 launcher._diag）。
-        print(f"[hippocampus] 正在加载嵌入模型：{load_path}"
-              f"（冷启动数十秒属正常；反复卡死看 daemon 日志）",
+        print(f"[hippocampus] loading embedding model: {load_path}"
+              f"(tens of seconds of cold start is normal; for repeated hangs check the daemon log)",
               file=sys.stderr, flush=True)
         self._model = SentenceTransformer(
             load_path,
@@ -958,7 +958,7 @@ class SentenceTransformerEmbedder:
         with _ENCODE_LOCK:
             test_vec = self._model.encode("test", normalize_embeddings=True)
         self.dim = len(test_vec)
-        print(f"[hippocampus] 嵌入模型就绪：{load_path}（{self.dim} 维）",
+        print(f"[hippocampus] embedding model ready: {load_path}（{self.dim}D)",
               file=sys.stderr, flush=True)
         # **最后**才置位：在此之前 ``self._model`` 已经非空，若没有这个标志，
         # 另一个线程会在 ``_ensure_model`` 的快路径上直接放行，与本线程尚未
@@ -1169,7 +1169,7 @@ def embedding_coverage(embedder: object, text: str) -> dict:
         "truncated": None, "total_chars": len(text or ""),
         "embedded_chars": None, "tokens": None,
         "max_seq_length": None, "dropped_ratio": None,
-        "error": "嵌入器未提供 embedding_coverage，无法判定是否截断",
+        "error": "the embedder does not provide embedding_coverage; truncation cannot be determined",
     }
 
 # ==================================================================
@@ -1217,6 +1217,6 @@ def create_embedder(
     ]
     if missing:
         raise TypeError(
-            f"嵌入后端 {backend!r} 不满足嵌入器协议，缺少: {', '.join(missing)}"
+            f"embedding backend {backend!r} does not satisfy the embedder protocol; missing: {', '.join(missing)}"
         )
     return embedder

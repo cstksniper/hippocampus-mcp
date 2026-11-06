@@ -59,21 +59,21 @@ async def _hippo_help() -> str:
 
     hidden = [n for n in s._TOOL_GROUPS if not s._tool_enabled(n)]
     if not hidden:
-        return "当前剖面已暴露全部工具，不需要 hippo_extra。"
-    lines = [f"本会话共 {len(hidden)} 个扩展功能需通过 hippo_extra 调用：", ""]
+        return "The current profile already exposes every tool; hippo_extra is unnecessary."
+    lines = [f"This session has {len(hidden)} extension actions available through hippo_extra:", ""]
     for name in hidden:
         fn = vars(s).get(name)
         if not callable(fn):
             continue
         doc = (getattr(fn, "__doc__", "") or "").strip().splitlines()
-        brief = doc[0].strip() if doc else "(无说明)"
+        brief = doc[0].strip() if doc else "(no description)"
         try:
             params = list(inspect.signature(fn).parameters)
         except (TypeError, ValueError):  # pragma: no cover
             params = []
         lines.append(f"- {name}({', '.join(params)}): {brief}")
     lines.append("")
-    lines.append('调用：hippo_extra(action="名字", args=\'{"参数": 值}\')')
+    lines.append('Call: hippo_extra(action="name", args=\'{"argument": value}\')')
     return "\n".join(lines)
 
 
@@ -87,7 +87,7 @@ async def _hippo_extra(action: str, args: str = "{}") -> str:
     s = _srv()
     fn = s._dispatch_map().get(action)
     if fn is None:
-        return (f"未知 action {action!r}。可用 action："
+        return (f"Unknown action {action!r}. Available actions:"
                 f"{', '.join(sorted(s._dispatch_map()))}")
     # 同上，派发器的结构性例外：**目标层级取决于 action**，只能运行时算。
     # 零参数约定在这里不适用（按 _hippo_extra 自身名字推断只会得到一个固定层级）。
@@ -98,9 +98,9 @@ async def _hippo_extra(action: str, args: str = "{}") -> str:
         try:
             kwargs = json.loads(text)
         except json.JSONDecodeError as exc:
-            return f"args 不是合法 JSON：{exc}"
+            return f"args is not valid JSON: {exc}"
         if not isinstance(kwargs, dict):
-            return "args 必须是 JSON 对象"
+            return "args must be a JSON object"
     try:
         allowed = set(inspect.signature(fn).parameters)
     except (TypeError, ValueError):  # pragma: no cover
@@ -108,8 +108,8 @@ async def _hippo_extra(action: str, args: str = "{}") -> str:
     if allowed is not None:
         bad = [k for k in kwargs if k not in allowed]
         if bad:
-            return f"{action} 不接受参数 {bad}；可用参数：{', '.join(sorted(allowed))}"
+            return f"{action} accepts no arguments {bad}; available arguments: {', '.join(sorted(allowed))}"
     try:
         return await fn(**kwargs)
     except TypeError as exc:
-        return f"调用 {action} 失败（参数不对）：{exc}"
+        return f"Call {action} failed (bad arguments): {exc}"

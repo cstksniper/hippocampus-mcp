@@ -78,7 +78,7 @@ def un_supersede(
     if not memory_ids and not all and source is None:
         return {
             "ok": False,
-            "error": "必须指定范围：memory_ids / all=True / source 三者之一",
+            "error": "a scope must be given: one of memory_ids / all=True / source",
         }
 
     targets = []

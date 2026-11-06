@@ -232,7 +232,7 @@ _SUPERSEDE = load_config().supersede
 # 预热线程并发构造 HippoBrain——见 ``get_brain`` 的单例锁。
 _WARMUP_MODE = load_config().warmup.strip().lower()
 if _WARMUP_MODE not in ("auto", "off", "sync"):
-    logger.warning("未知的 HIPPOCAMPUS_WARMUP=%r，回退 auto", _WARMUP_MODE)
+    logger.warning("Unknown HIPPOCAMPUS_WARMUP=%r; falling back to auto", _WARMUP_MODE)
     _WARMUP_MODE = "auto"
 # 工具调用等待后台预热的上限。
 #
@@ -250,7 +250,7 @@ _WARMUP_WAIT_TIMEOUT = load_config().warmup_timeout
 #                 只有明确知道模型加载就是很慢、且宿主超时足够长时才用。
 _WARMUP_WAIT_POLICY = load_config().warmup_wait.strip().lower()
 if _WARMUP_WAIT_POLICY not in ("raise", "release"):
-    logger.warning("未知的 HIPPOCAMPUS_WARMUP_WAIT=%r，回退 raise", _WARMUP_WAIT_POLICY)
+    logger.warning("Unknown HIPPOCAMPUS_WARMUP_WAIT=%r; falling back to raise", _WARMUP_WAIT_POLICY)
     _WARMUP_WAIT_POLICY = "raise"
 
 # 进程起点时间戳：自曝「spawn → 站到 server.run() 之前」的**真实**耗时。
@@ -346,15 +346,15 @@ _HANDSHAKE_BASE_COLD = 5.7
 #: 这类说明对宿主是**一次性**的——挪到 instructions 只付一次。返回体
 #: `receipt.resume_hint` 只留一句指向本工具的指针（键位不动，形状探针仍绿）。
 _INSTRUCTIONS = (
-    "本服务是 AI Agent 的记忆底座。"
-    "写用 ingest、读用 get_memory_context、裸检索用 recall、"
-    "开会话用 session_start / 收尾用 session_end；"
-    "remember_intent / consolidate 等工具若不在本次会话的工具列表里，"
-    "先 hippo_help 拿目录、再 hippo_extra(action=\"名字\", args=\"{...}\") 调用，能力一个不少。"
-    "宿主上下文若发生过压缩（compaction）：不要抄记忆正文，只保留 session_start "
-    "返回体 receipt 里的身份信息（session_id / assembled_at / blocks / memory_active / "
-    "knowledge_epoch），凭 session_id 重新调一次 session_start 即可重建开场包；"
-    "memory_active 或 knowledge_epoch 与离线前不一致 ⇒ 库已被别的会话改过，以本次递送为准。"
+    "This service is a memory layer for AI agents. "
+    "Write with ingest, read with get_memory_context, raw retrieval with recall, "
+    "open sessions with session_start and close them with session_end. "
+    "If tools such as remember_intent / consolidate are not in this session's tool list, "
+    "call hippo_help for the catalog, then invoke via hippo_extra(action=\"name\", args=\"{...}\") -- no capability is lost. "
+    "If the host context was compacted: do not copy memory content; keep only the identity fields from the session_start "
+    "receipt (session_id / assembled_at / blocks / memory_active / "
+    "knowledge_epoch) and call session_start once more with session_id to rebuild the opening pack;"
+    "If memory_active or knowledge_epoch differs from before going offline, the library was changed by another session; trust this delivery."
 )
 
 
@@ -364,7 +364,7 @@ def _create_server() -> Any:
         return MCPServer(
             name="hippocampus-mcp",
             version="0.1.0",
-            description="智能体的记忆底座：四层记忆 + 实体索引 + 会话生命周期",
+            description="Agent memory layer: four-layer memory + entity index + session lifecycle",
             instructions=_INSTRUCTIONS,
         )
     except TypeError:
@@ -395,20 +395,20 @@ async def store_memory(
     memory_type: str = "general", library: str = "",
     idem_key: str = "",
 ) -> str:
-    """    「记住 X / 记一下 X」→ 本工具（单条事实；长文走 `ingest`）。裸写入：无 L0 溯源、不建实体。
+    """Store one fact without raw-log provenance or entity linking.
+For long text or conversation transcripts, prefer ``ingest``.
 
-    **返回体含截断自曝**：嵌入 512 token 硬上限，超出对向量零贡献——写入成功却检索不见。
-    `truncated=true` 时仅前 `embedded_chars` 字入向量，余下拆成多张 <500 字卡另写。
+Returns include truncation self-report: embeddings have a 512-token hard limit.
+If ``truncated=true``, only the first ``embedded_chars`` characters contributed to
+the vector; the remaining text is split into additional <500-character cards.
 
-    Args:
-        content: 记忆的文本内容（必填）。
-        importance: 0.0~1.0，默认 0.5。
-        memory_type: episodic / semantic / procedural / general，默认 general。
-        idem_key: 幂等键（P0-2）：同键重放**不新建、不重嵌入**，直接回既有
-            `memory_id`（返回体 `status=duplicate`）。键应按**请求**唯一
-            （重试沿用同一个），不要按内容哈希——内容哈希会把"两次真的写了
-            同一句话"也当成重放。
-
+Args:
+    content: Memory text (required).
+    importance: 0.0 to 1.0; default 0.5.
+    memory_type: episodic / semantic / procedural / general; default general.
+    idem_key: Idempotency key. Retrying the same request key does not create a
+        duplicate or re-embed; it returns the existing ``memory_id`` with
+        ``status=duplicate``. Key by request, not by content hash.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -432,38 +432,28 @@ async def recall(
     scope: str = "project", libraries: str = "",
     occurred_after: str = "", occurred_before: str = "",
 ) -> str:
-    """「之前说的 X 是什么 / 有没提到 Y」→ 本工具（语义检索）。
+    """Semantic search for prior memories.
+Combines vector search, BM25 (RRF), MMR deduplication, entity boosts, and a hard
+relevance floor. By default ``superseded`` and ``archived`` records are filtered out.
 
-    向量 + BM25(RRF) + MMR 去重 + 实体加成 + 硬门槛。**默认过滤
-    superseded/archived**；看待作废条目走 `list_memories(state="superseded")`。
-    返回 `{count, memories[]}`（键名 `memories` 非 `hits`）；装配式上下文用
-    `get_memory_context`。单条 content 过长被截时该条目自曝 `content_truncated`。
+Returns ``{count, memories[]}`` (not ``hits``). For assembled context, use
+``get_memory_context``. Overly long content is reported via ``content_truncated``.
 
-    Args:
-        query: 查询文本；留空则仅用 LNN 当前时序状态做隐式查询。
-        top_k: 返回条数，默认 5。
-        use_lnn: 融合 LNN 时序状态，默认 True。
-        sample: 距离加权抽样，默认 False 用贪心排序。
-        filter_tags: 结构化标签过滤（JSON 对象字符串），如 `{"章": 43}`，**检索前**收窄候选集。
-        scope: 检索哪个库（U2）：`project`（默认，当前库）/ `user`（用户级库，约定名
-            `user`）/ `all`（项目库结果全前、用户级殿后，`top_k` 是**总数**；两库独立
-            嵌入模型分数不可比，只做硬分段不融合）。`scope=user/all` 时返回体自曝
-            `scope` + `libraries`；跨库内容完全相同的用户级条目带 `duplicate_of` 标注。
-            用户库未建会显式报错（不静默回落）。非法值报错。
-        libraries: 显式多库扇出（B1，拍板②a）：逗号分隔库名（≤4 个），家库/任务库
-            段全前、外围各流 RRF 融合竞争剩余名额（排名融合，跨库比分数没有意义）。
-            每条带 `library` 来源标记；返回体自曝 `mode=multi_library` + 实际打的
-            `libraries`；不在任务目录的值带 `unregistered`（可查，但看得见）。与
-            `library=` / `scope=user|all` **互斥**（组合显式报错）。
-        occurred_after / occurred_before: 时间窗（`YYYY-MM-DD`，UTC 基准，含边界日）。
-            用户说「上周五」「上个月」「三年前」时用它——**把相对时间换算成绝对
-            日期是调用方的事**（模型知道"今天"是哪天，库不知道），库只按时间戳裁
-            候选。默认**没有**按时间淘汰的硬过滤（老记忆照常按相似度参与排序），
-            所以时间窗是"精确圈定范围"而不是"防止旧记忆被丢"的必需品；只有部署
-            方显式开了过时窗口时才需要它来绕开。传空 = 不限；格式错显式报错。
-            返回体带 `time_window` 自曝生效区间——`count=0` 时要分清"窗口内没有"
-            还是"检索没找到"。注意时间窗**不豁免 pin**：钉住是"多给一次机会"，
-            不是"绕过用户的筛选条件"。
+Args:
+    query: Query text. Empty means implicit LNN temporal-state recall only.
+    top_k: Number of results; default 5.
+    use_lnn: Include LNN temporal state; default true.
+    sample: Distance-weighted sampling instead of greedy ranking; default false.
+    filter_tags: JSON object string narrowing candidates before retrieval, e.g.
+        ``{"chapter": 43}``. All keys are AND; multiple values in one key are OR.
+    scope: ``project`` (default), ``user``, or ``all``. For user/all, the response
+        self-reports ``scope`` and ``libraries``; ``top_k`` is the total count.
+    libraries: Explicit multi-library fan-out, comma-separated (up to 4). Each
+        result is marked with its ``library``. Mutually exclusive with
+        ``library=`` and ``scope=user|all``.
+    occurred_after / occurred_before: Inclusive UTC date window in YYYY-MM-DD.
+        Empty means unlimited. A time window narrows candidates; it does not
+        bypass pinned memories.
     """
     await _await_warmup()
     # filter_tags 解析、键名白名单校验、候选收窄与 miss/计数留痕
@@ -481,14 +471,9 @@ async def recall(
 @server.tool(structured_output=False)
 async def get_memory(memory_id: str, library: str = "",
                      include_history: bool = False) -> str:
-    """根据 ID 获取单条记忆的完整信息。
-
-    Args:
-        memory_id: 记忆的唯一标识符。
-        library: 多库时指定目标库（留空走会话粘性/默认库）。
-        include_history: True 时附 ``history`` 键——
-            该记录的改写前值流水（update/merge 的 before，最新在前，
-            cap 20）；默认 False 不加键（返回面零变化）。
+    """Fetch one memory by exact ID.
+Returns the stored record, including state, source ids, entity ids, tags, and
+provenance metadata when present.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -508,21 +493,24 @@ async def update_memory(
     superseded_by: str = "",
     clear_quarantine: bool = False, library: str = "",
 ) -> str:
-    """
-    「那条记错了 / 改成 X」→ 本工具；只更新提供的字段，其余保持不变。
+    """Update selected fields of an existing memory.
+Only supplied fields change; omitted fields remain untouched.
 
-    Args:
-        memory_id: 待更新记忆的 ID。
-        content: 新内容（留空则不更新）；会重新生成嵌入。
-        importance: 新的重要程度（传 -1 或不传则不更新）。
-        memory_type: 新的记忆类型（留空则不更新）。
-        state: 只接受 `active` / `superseded` / `archived`，**其它值显式报错**。
-            `superseded` = 作废旧事实但**保留记录**（退出默认召回）——「新事实取代旧结论」
-            走此通道；不要改 content 覆盖旧事实（会留真假难辨的记录）。
-        superseded_by: 取代本条的新记忆 ID（配合 `state="superseded"`），不存在则报错。
-        clear_quarantine: 受管转正（D2a）：把 user 库待审队列里的一条转正
-            （恢复进召回池与 user_scope 槽）。**只对家库会话开放**——非家
-            会话请求显式报错（提权键不在 agent 手里）；转正动作记 access_log。
+Use ``state="superseded"`` when a newer fact replaces an older one: the old
+record is retained but leaves default recall. Provide ``superseded_by`` with the
+replacement memory ID when available. Avoid overwriting content in place when
+the intent is correction, because that destroys the audit trail.
+
+Args:
+    memory_id: ID of the memory to update.
+    content: New content; omitted means no content change and no re-embedding.
+    importance: New importance; pass -1 or omit to leave unchanged.
+    memory_type: New memory type; omitted means unchanged.
+    state: ``active``, ``superseded``, or ``archived``. Other values error.
+    superseded_by: New memory ID that replaces this one; used with
+        ``state="superseded"``.
+    clear_quarantine: Promote a quarantined user-library write. Allowed only
+        from a home-library session; non-home callers receive an explicit error.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -552,46 +540,21 @@ async def update_tags(
     confirm: bool = False,
     undo: str = "", library: str = "",
 ) -> str:
-    """
-    批量给已有记忆补标签 / 改标签 / 删标签——**存量回填的唯一通路**。
+    """Batch-update tags on existing memories.
+Executes an explicit dry-run plan by default. Because tags are a flat mapping and
+there is no automatic transaction, operations above the configured threshold
+require explicit confirmation. The response includes a full before/after ledger
+and an ``op_id`` for reversible undo.
 
-    `update_memory` 不接受 `tags`，所以入库时没打标签的记录事后就改不动了。
-    「库里 58% 的条目没有任何标签，按域查不到东西」只能靠本工具补。
-
-    **默认只出计划不写入**（`dry_run=True`）。影响超过 100 条还须显式
-    `confirm=True`。幂等：值未变的条目不计入 `to_change`，同一条命令重跑
-    第二次 `to_change=0`。
-
-    **可撤销**：执行即记全量前后影像账本，返回体带 `op_id`；
-    `undo=tagops_N`（或 `"last"`）回滚——**fail-closed**：只改回"当前值
-    仍等于记录的 after"的条目，被改过的进 `conflicts` 自曝，不盖后来的
-    修改；撤销本身也记账，可再撤一次。
-
-    Args:
-        tags: 要写入的标签，JSON 对象字符串，如 `{"域": "F"}`。
-            `mode="merge"`（默认）逐键覆盖，`mode="replace"` 整体替换。
-        clear_keys: 要删掉的键，JSON 数组字符串，如 `["旧键"]`。
-        source: 只改来源**精确等于**该值的条目。
-        source_contains: 只改来源**包含**该子串的条目。
-        contains: 只改**正文包含**该关键词的条目。真库实测 52% 的无标签条目
-            来自同一个文件，靠 source 无法细分，只有这一路能圈出「这一批」。
-        state: 只改指定状态（`active` / `superseded` / `archived`）；留空 = 全部。
-        untagged_only: 只改**完全没有标签**的条目（补缺场景）。
-        missing_keys: JSON 数组，只改**至少缺其中一个键**的条目。
-        memory_ids: JSON 数组，精确点名要改的 id。
-        mode: `merge`（默认）／`replace`。
-        dry_run: 默认 True —— 只出计划，不写。
-        limit: 最多处理多少条（0 = 不限），先小批试用。
-        confirm: 影响 >100 条时的显式确认。
-        undo: 传上次执行的 `op_id`（或 `"last"`）；给了它就忽略
-            tags/clear_keys 转为回滚计划（同样默认 dry_run、超阈值要
-            confirm）。报"没有这个 op"时带 recent_ops 供选。
-
-    Returns:
-        `matched`（过滤命中数）／`to_change`（真会变的条数）／`skipped_unchanged`
-        ／`sample`（前 10 条的改前改后）／`coverage_after`（执行后的标签覆盖率）。
-        执行后另有 `op_id`（撤销凭据）。`matched=0` 时先怀疑过滤条件写错——
-        它和「真没有符合条件的记录」长得一样。
+Args:
+    tags: JSON object of tag key/value updates.
+    clear_keys: JSON array of tag keys to remove.
+    missing_keys: JSON array of keys that must be removed if present.
+    memory_ids: JSON array restricting the operation to specific memories.
+    confirm: Required confirmation when the operation exceeds the safety threshold.
+    dry_run: Preview the plan without writing; default true.
+    undo: Undo a previous operation by ledger ``op_id`` or ``"last"``.
+    untagged_only: Restrict the operation to records with no tags.
     """
     await _await_warmup()
     # 四段 JSON 解析走共用助手（行为逐位不变）：其错误体
@@ -613,15 +576,15 @@ async def update_tags(
 
 @server.tool(structured_output=False)
 async def forget_memory(memory_id: str, reason: str = "", library: str = "") -> str:
-    """    「这条别记了 / 删掉这条」→ 本工具，级联清理全部派生痕迹（也推荐用它纠正错误记忆）。
+    """Delete one memory and clean every derived copy.
+This is the correct entry point for “forget this.” It cascades through entity
+indexes, profiles, topic layers, and other derived state, writes a tombstone to
+prevent resurrection from old snapshots, and restores records that this memory
+had superseded.
 
-    除删 L1 外还清实体倒排引用、摘 L3 画像派生条目（否则错误信息仍进上下文）、
-    剔他条 `entity_ids`、恢复被它取代的记忆为 active、标记 L0 未引用来源、写墓碑。
-
-    Args:
-        memory_id: 待删除记忆的 ID。
-        reason: 删除原因（建议填，如「用户纠正：上线时间记错了」）。
-
+Args:
+    memory_id: ID of the memory to forget.
+    reason: Why it is being deleted; retained in the tombstone/audit trail.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -633,22 +596,16 @@ async def forget_memory(memory_id: str, reason: str = "", library: str = "") -> 
 async def forget_by_query(query: str, top_k: int = 3, dry_run: bool = True,
                           min_similarity: float = -1.0,
                           allow_multiple: bool = False, library: str = "") -> str:
-    """按自然语言定位疑似错误记忆并删除（不知道 ID 时用这个）。
+    """Find and optionally delete memories matching a query.
+Preview is the default: it returns ranked candidates without deleting. Pass
+``dry_run=false`` to delete the selected candidates. This is useful for “that
+whole topic is wrong,” but review the preview before deleting.
 
-    默认只预览（`dry_run=True`）返回候选及内容，确认后再以 `dry_run=False` 执行。
-
-    **真正执行时默认单次只删 1 条**：先剔除没有向量背书的候选（BM25 词面命中、
-    similarity=0.0），再只删排序第一的那条，其余进 `skipped`（带 skip_reason）。
-    「删掉那条记错的」在语义上几乎总是单数，多出来的槽位正是误删来源。
-
-    Args:
-            query: 自然语言描述，如「星轨项目三月上线」。
-            top_k: **预览**多少候选，默认 3。它不等于删除条数（见上）。
-            dry_run: True 只预览候选；False 才真正执行删除。
-            min_similarity: 门槛，负值＝用默认值（0.30，与召回的相似度硬门槛同值）。
-                刻意调高并不能有效防误删——相关性随查询长度整体漂移。
-            allow_multiple: 确认要批量删时才传 True。届时仍会先剔除无向量背书的候选。
-
+Args:
+    query: Query text used to locate candidates.
+    top_k: Maximum candidates to inspect; default 3.
+    dry_run: When true, return candidates only; default true.
+    confirm: Confirmation required for a non-dry-run destructive operation.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -662,14 +619,15 @@ async def forget_by_query(query: str, top_k: int = 3, dry_run: bool = True,
 async def list_memories(
     limit: int = 50, source: str = "", state: str = "", library: str = ""
 ) -> str:
-    """    「我库里都有些什么 / 最近存了啥」→ 本工具（仅元数据，不含嵌入向量）。
+    """List memories with optional filters.
+Use ``state="superseded"`` to inspect replaced records; they are excluded from
+default recall but retained for history and audit.
 
-    按来源审计：先 `list_sources` 看各文件入库多少条，再 `source="卷五.md"` 列该文件条目。
-
-    Args:
-        limit: 返回的最大数量，默认 50。
-        source: 只列出来自该来源（文件名/相对路径）的条目；留空不过滤。
-        state: 只看指定状态 active/superseded/archived；留空不过滤。
+Args:
+    limit: Maximum number of records; default 50.
+    source: Exact source filter, such as a file path.
+    state: ``active``, ``superseded``, ``archived``, or empty for all.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -680,10 +638,9 @@ async def list_memories(
 
 @server.tool(structured_output=False)
 async def list_sources(library: str = "") -> str:
-    """列出记忆库里的来源标签及各自条数（按文件审计用）。
-
-    判断"哪些 md 文件已经导过、各导了多少条"，也是导入幂等的基础。
-    批量导入的记录会显示文件相对路径；手工 ingest 且未传 source 的归入 "(无来源)"。
+    """List known source labels and record counts.
+Useful before bulk import or source-scoped cleanup. The response is metadata
+only; use ``list_memories(source=...)`` to inspect records from one source.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -693,10 +650,9 @@ async def list_sources(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def reset_context(library: str = "") -> str:
-    """重置 LNN 的时序上下文。
-
-    清空 LNN 的隐藏状态和滑动窗口，适用于开始全新的对话或话题切换。
-    已存储的记忆不会被删除，只是 LNN 不再记得之前的时序上下文。
+    """Reset the LNN temporal context for the current library.
+This clears hidden state and recent-context windows. It does not delete
+memories or alter stored records.
     """
     await _await_warmup()
     svc = _organize_service(library)
@@ -706,7 +662,9 @@ async def reset_context(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def get_stats(library: str = "") -> str:
-    """获取记忆系统的当前状态统计。"""
+    """Return basic service/library statistics.
+For richer self-reporting, use ``brain_stats``.
+    """
     await _await_warmup()
     svc = _bootstrap_service(library)
     # 注意：stats 返回体**不带** library 首键（与现行工具逐位一致）。
@@ -715,10 +673,9 @@ async def get_stats(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def save_state(library: str = "") -> str:
-    """将所有状态持久化到磁盘（向量库 + LNN + L0~L3 四层 + 实体索引）。
-
-    与 `save_brain` 等价（两者现在都保存完整状态）。建议在重要操作后
-    或定期调用，防止数据丢失。
+    """Persist the current library state.
+Normally automatic, but useful after large in-memory operations or before
+external inspection. Returns a save receipt/report.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -729,17 +686,9 @@ async def save_state(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def retry_save(library: str = "") -> str:
-    """并发冲突后重试保存：取磁盘最新版本，只补「磁盘上没有的增量」。
-
-    **何时用**：`ingest` / `save_state` 返回 `conflict`，或 ingest 结果里出现
-    `save_warning`——新记忆还在内存里，只是没落盘。
-
-    L1 与 L0 一起存（只存 L1 会让 `source_ids` 指不到原文）；不绕过 `disk_stamp`
-    保护；**不做字段级 merge**（双方都有的保留磁盘版本，本地改动进
-    `dropped_local_edits`）。
-
-    Returns:
-        added / dropped_local_edits / disk_only（磁盘独有：别人新增的，或本进程删过又「复活」的）。
+    """Retry the most recent failed save.
+Use after fixing disk, permission, or concurrent-write issues. The response
+reports whether the retry succeeded and which layers were written.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -748,9 +697,9 @@ async def retry_save(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def load_state(library: str = "") -> str:
-    """从磁盘恢复所有状态（向量库 + LNN + 四层记忆），覆盖当前内存中的数据。
-
-    换嵌入模型后无需重新导入：按当前模型缺失的向量会自动补算。
+    """Reload persisted state from disk.
+Use after another process modified the library or after recovering from a failed
+save. Avoid reloading while another writer is mid-operation.
     """
     await _await_warmup()
     svc = _maintain_service(library)
@@ -827,7 +776,7 @@ def _resolve_workspace_binding(cwd: str) -> tuple[str, dict[str, Any]]:
             return entry["path"], info
         return "", info
     except Exception as exc:  # noqa: BLE001 —— 反查绝不阻断连接
-        logger.warning("工作区绑定反查失败（回落声明库）：%r", exc)
+        logger.warning("workspace binding reverse lookup failed (falling back to the declared library): %r", exc)
         info["status"] = "lookup_error"
         info["reason"] = f"{type(exc).__name__}: {exc}"
         return "", info
@@ -871,7 +820,7 @@ def set_connection_default_library(persist_dir: str = "", cwd: str = "",
         binding["warning"] = _fallback_warning_text(fallback, declared)
     if hit:
         path = hit
-        logger.info("工作区绑定生效：cwd=%s → 家库=%s（任务=%s，覆盖声明库 %s）",
+        logger.info("workspace binding active: cwd=%s -> home library=%s (task=%s, overriding the declared library %s)",
                     binding.get("cwd"), path, binding.get("task"), declared)
     with _conn_lib_lock:
         _conn_default_lib[key] = path
@@ -960,12 +909,12 @@ def _fallback_warning_text(fallback: dict[str, str], declared: str) -> str:
     ——说「进待审」，不说「将错库」。回落库名取路径尾段做展示（user 级
     接入下 env 默认库目录名即 `user`）。
     """
-    raw = fallback.get("declared_raw") or "(空)"
-    tail = os.path.basename((declared or "").rstrip("\\/")) or declared or "(未知)"
-    return (f"工作区声明库「{raw}」未注册/解析失败（{fallback.get('reason')}），"
-            f"已回落默认库「{tail}」：读将落该库，写入将进待审队列（不是全量直写）。"
-            f"请 library_create 注册该库，或核对工作区 .hippocampus.json 的 "
-            f"library 字段。")
+    raw = fallback.get("declared_raw") or "(empty)"
+    tail = os.path.basename((declared or "").rstrip("\\/")) or declared or "(unknown)"
+    return (f"The workspace-declared library {raw!r} is unregistered or failed to resolve ({fallback.get('reason')}); "
+            f"fell back to the default library {tail!r}: reads land there and writes go to the review queue (not direct writes). "
+            f"Register the library via library_create, or check the library field of the "
+            f"workspace .hippocampus.json.")
 
 
 def _inject_session_disclosures(payload: str, client: str | None) -> str:
@@ -1104,7 +1053,7 @@ def _task_directory_register(entry: dict[str, Any]) -> dict[str, Any]:
     try:
         return _task_directory.upsert_entry(info.path, entry)
     except Exception as exc:  # noqa: BLE001 —— 坏文件/写盘失败都要自曝
-        logger.warning("任务目录写失败（%s）：%r", _task_directory.directory_path(
+        logger.warning("task-directory write failed (%s): %r", _task_directory.directory_path(
             info.path), exc)
         return {"registered": False, "reason": "task_directory_write_failed",
                 "detail": str(exc)}
@@ -1158,25 +1107,22 @@ async def ingest(
     auto_tags: bool = False, library: str = "",
     idem_key: str = "",
 ) -> str:
-    """    「把这段存进去 / 帮我整理这段对话笔记」→ 本工具——**推荐写入口**。
+    """Recommended write entry for conversation or document text.
+Stores the original text in L0, deterministically extracts L1 facts, links
+entities, and reports merge/dedup/truncation details. No LLM API call is required
+on the write path.
 
-    原文一字不改进 L0、抽取短句进 L1、维护实体索引；重要性与类型自动判定。批量走 `store_memory`。
-
-    Args:
-        text: 原始文本。
-        speaker: 说话人（user / assistant / 角色名）。
-        importance: 0~1；传 -1 由系统自动判定。
-        cognitive_type: experience / world / opinion；留空自动判定。
-        entities: 逗号分隔的额外实体名（系统也会自动抽取）。
-        source: 来源标签（文件 / 路径 / 会话）；填了则 recall 命中结果带上它。
-        tags: 结构化标签（JSON 对象字符串），如 `{"章": 43}`，供 recall /
-            get_memory_context 的 filter_tags 过滤。
-        auto_tags: 自动抽标签（默认关）。结构由 `<记忆库>/tag_schema.json` 定；生效键名用
-            `brain_stats` 的 tag_schema 核对——**键名不一致 = filter_tags 静默失效**。（显式 tags 优先）
-        idem_key: 幂等键（P0-2）：同键重放**不写 L0、不写 L1**，直接回既有
-            `memory_id`（返回体 `status=duplicate`）。给编排层的重试 / resume
-            用，键按请求唯一。
-
+Args:
+    text: Original conversation/document text.
+    speaker: Speaker label, such as ``user`` or a role name.
+    importance: 0 to 1; -1 lets the system infer importance.
+    cognitive_type: experience / world / opinion; empty lets the system infer.
+    entities: Comma-separated extra entity names; automatic extraction also runs.
+    source: Source label such as a file path or session; returned on recall hits.
+    tags: Structured tags as a JSON object string, e.g. ``{"chapter": 43}``.
+    auto_tags: Enable automatic tag extraction; default false.
+    idem_key: Idempotency key. Retrying the same request does not create a
+        duplicate L0/L1 write and returns the existing memory IDs.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -1195,27 +1141,10 @@ async def ingest_batch(items: str, source: str = "", tags: str = "",
                        granularity: str = "sentence",
                        detect_supersede: bool = False, save: bool = False,
                        auto_tags: bool = False, library: str = "") -> str:
-    """批量写入多段文本（一次调用写完一批，收尾只落盘一次）。
-
-    逐条语义与 `ingest` 完全一致。两个批量特性：**逐项错误隔离**（某项坏只进
-    `errors`，已成功的照常保留）与**整批只在收尾落盘一次**。单批上限 2000 条，超了请分批。
-
-    Args:
-            items: JSON 数组字符串，每项字段同 `ingest`（`text` 必填）。
-                **项级字段覆盖批次级默认值**。
-                例：`[{"text":"甲","importance":0.8},{"text":"乙","source":"x.md"}]`
-            source: 批次默认来源标签（项里写了以项为准）。
-            tags: 批次默认结构化标签（JSON 对象字符串），如 `{"章": 43}`。
-            granularity: `sentence`（按句拆成多条 L1，默认）/ `chunk`（整段一条）。
-            detect_supersede: 是否做事实更新检测；**批量导入建议保持 false**
-                （md 本身已是去重后的当前真相，沿革叙述会被大面积误判）。
-            save: 收尾是否落盘一次（开着自动保存的实例即使传 false 也会收尾存一次）。
-            auto_tags: 逐项从正文自动抽标签（默认关，语义同 `ingest`）。
-
-        返回：`count` / `failed` / `total_input` / `memory_ids` / `entities` /
-        `merged_into`（每项带 index）/ `superseded` / `items` / `errors` /
-        `saved` / `save_warning`。
-
+    """Ingest multiple texts in one call.
+Each item is processed independently; one invalid item does not block the rest.
+The response reports per-item success, new L1 IDs, merges, truncations, and
+errors. Prefer this over repeated single ``ingest`` calls for bulk imports.
     """
     await _await_warmup()
     svc = _write_service(library)
@@ -1234,21 +1163,20 @@ async def ingest_batch(items: str, source: str = "", tags: str = "",
 async def get_memory_context(query: str = "", top_k: int = 5, token_budget: int = 1200,
                              item_max_chars: int = 200, filter_tags: str = "", library: str = "",
                              scope: str = "project") -> str:
-    """
-    「接着上次的 / 现在该想起什么」→ 本工具：5 槽位装配，可直接拼进 system prompt。
+    """Recommended read entry for assembling Agent context.
+Runs state filtering, hybrid retrieval, MMR, entity expansion, conflict
+annotation, and budgeted five-slot assembly. The returned ``text`` is ready to
+prepend to a system prompt; ``blocks`` and ``hits`` remain available for
+programmatic use.
 
-    5 槽位：当前命中 / 待办未决 / 时间线 / 相关实体状态 / 上次未聊完。
-
-    Args:
-        query: 当前任务或问题（用于检索命中与实体定位）。
-        top_k: 命中记忆数量，默认 5。
-        token_budget: 上下文字符预算，默认 1200。
-        item_max_chars: 单条截断长度，默认 200。**传 0 = 不截断**（账目/条文类长句的
-            数字尾巴常被切掉）。只影响 text。
-        filter_tags: 结构化标签过滤（JSON 对象字符串），如 `{"章": 43}`，**检索前**收窄候选集。
-        scope: 装配哪个库（U2）：`project`（默认，当前库）/ `user`（用户级库整体替换
-            查询库，返回体自曝 `scope` + `libraries`）。**不支持 `all`**——5 槽位装配没有
-            「项目排前用户殿后」的落点，要跨库请用 `recall(scope="all")` 或分别调用。
+Args:
+    query: Current task/question. Empty uses pinned-memory briefing.
+    top_k: Hits requested for the current-hits slot; default 5.
+    token_budget: Overall context budget; default 1200.
+    item_max_chars: Per-item clipping in the rendered text; default 200.
+        Pass 0 to disable clipping. ``hits`` always contain full content.
+    filter_tags: JSON object string narrowing retrieval, e.g. ``{"chapter": 43}``.
+    scope / libraries: Library selection semantics shared with ``recall``.
     """
     await _await_warmup()
     # filter_tags 解析（错误体不带信封）与 J2 回显在 RecallService.
@@ -1267,51 +1195,56 @@ async def session_start(task: str = "", recent_limit: int = 10,
                         pin_limit: int = 0, filter_tags: str = "",
                         client: str = "", library: str = "",
                         user_scope: int = 0, task_directory: int = 0) -> str:
-    """
-    **每次会话第一步**（开新任务 / compaction 后）→ 本工具拿预激活包。
+    """Call at session start, after compaction, or when resuming work.
+Returns a pre-activation package: recent memories, task recall, pinned items,
+knowledge map, overview, status, task profile, map index, active sessions, and a
+receipt.
 
-    **compaction 恢复**：只保留返回体 `receipt` 的身份信息（session_id /
-    assembled_at / blocks / memory_active / knowledge_epoch），**不要抄正文**；
-    凭 session_id 再调一次本工具重建，knowledge_epoch 对不上以本次为准。
-    包内槽位各答一类问题：最近记忆 / task 预召回 / 钉住 / 知识地图（这库装了什么）/
-    全貌卡（库整体是什么）/ 状态卡（现在什么状况）/ 任务轮廓（这任务触及什么）/
-    地图索引（有哪几地图、哪张可能旧了）。**槽位开关与条数上限是运维侧 env**
-    （进程启动时读定，调用方改不了；不占工具面参数是因为加参数就是长期 token 成本）。
+For compaction recovery, keep only the receipt identity (``session_id``,
+``assembled_at``, ``blocks``, ``memory_active``, ``knowledge_epoch``), do not copy
+prose, then call this tool again with that ``session_id``. Treat the new response
+as authoritative.
 
-    Args:
-        task: 任务描述，可留空；非空则用于预召回。
-        recent_limit: 带最近多少条记忆，默认 10；传 0 关闭。
-        task_top_k: 按 task 预召回多少条，默认 5；传 0 关闭。
-        working_on: 声明在改什么（文件/模块）。**改文件前先看返回的 `active_sessions`**，
-            避免两会话同改一处；只登记，不阻止写入。
-        pin_limit: 钉住槽条数。0 = 用 env（都没设则 3）；负 = 不带。
-        user_scope: 用户级继承槽条数（U1）：带几条**用户级库**（约定名 `user`）的
-            偏好类记忆——pinned 优先。0 = 用 env（都没设则 3）；负 = 不带该槽（返回体
-            零 user_scope 键、零用户库 I/O）。用户库未建/失联不报错：`user_scope`
-            键自曝 `ready=false` + `reason`。
-        task_directory: 用户级任务目录槽条数（U5）：带几条 `任务 → 库` 映射，最近更新的
-            在前；0 = 用 env（都没设则 8）；负 = 不带该槽（零键零 sidecar I/O）。
-            超出的老任务不在包里：看 `task_directory.total`。未建/失联/文件坏都不报错：
-            `task_directory` 键自曝 `ready=false` + `reason`。
-        filter_tags: 结构化标签过滤（JSON 对象字符串），如 `{"章": 43}`。把 task
-            预召回（`task_hits`）收窄到某个标签域，语义与 `recall` 的 `filter_tags`
-            完全一致（全键 AND、单键多值 OR）。留空 = 不限域；只作用于 task 预召回，
-            recent / pinned / knowledge 槽不受影响。
-        client: 调用方身份。**共享连接下必填**：服务端自造 `sess_xxx` 标识进程不是你。
+Args:
+    task: Current task description; used for pre-recall and write origin.
+    recent_limit: Number of recent memories; default 10, 0 disables.
+    working_on: File/module being changed. Check ``active_sessions`` before editing.
+    task_top_k: Task-recall result count; default 5, 0 disables.
+    pin_limit: Pinned-slot count. 0 uses env (default 3); negative disables.
+    filter_tags: JSON object string narrowing task pre-recall.
+    client: Caller identity. Required on shared connections; otherwise the server
+        creates a synthetic ``sess_*`` identity.
+    library: Optional library override for this call/session.
+    user_scope: User-level inheritance slot count. 0 uses env (default 3);
+        negative disables the slot.
+    task_directory: User-level task-directory slot count. 0 uses env (default 8);
+        negative disables the slot.
     """
     await _await_warmup()
-    # P1：登记本次会话声明的任务，供后续写入的 origin.task 取用。
-    # 空 task 不清（compaction 恢复那次多半不带），清除只由 session_end 做。
+    return await _session_start_payload(
+        task=task, recent_limit=recent_limit, working_on=working_on,
+        task_top_k=task_top_k, pin_limit=pin_limit,
+        filter_tags=filter_tags, client=client, library=library,
+        user_scope=user_scope, task_directory=task_directory)
+
+
+async def _session_start_payload(*, task: str, recent_limit: int,
+                                 working_on: str, task_top_k: int,
+                                 pin_limit: int, filter_tags: str,
+                                 client: str, library: str,
+                                 user_scope: int,
+                                 task_directory: int) -> str:
+    """Assemble the session_start payload after tool-face parsing/gating."""
+    # Register the task declared for this connection; later writes use it for
+    # origin.task. An empty task does not clear it; session_end does.
     bind_task(task)
-    # 保序：库解析先行（现行代码 brain 解析在 filter_tags 解析之前——
-    # 「坏库名 + 坏 JSON」必须先报库错），解析错误体不带 library 首键。
+    # Library resolution stays first: a bad library + bad JSON must report the
+    # library error first, and that error body has no library envelope.
     svc = _bootstrap_service(library)
     parsed_tags, tag_err = _parse_tags_json(filter_tags)
     if tag_err:
-        return json.dumps({"error": f"filter_tags 解析失败：{tag_err}",
+        return json.dumps({"error": f"filter_tags parse failed: {tag_err}",
                            "input": filter_tags[:200]}, ensure_ascii=False)
-    # 键名白名单校验与 degraded 回显、预激活包组装在
-    # BootstrapService.session_start。
     payload = json.dumps(svc.session_start(
         task=task, recent_limit=recent_limit, working_on=working_on,
         task_top_k=task_top_k, pin_limit=pin_limit, filter_tags=parsed_tags,
@@ -1319,26 +1252,22 @@ async def session_start(task: str = "", recent_limit: int = 10,
         task_directory=task_directory,
         user_access=_user_access_tier(svc.library_self, client)),
         ensure_ascii=False)
-    # C1 工作区绑定自曝 + 实测反馈 2026-10-31 的声明库回落顶层 ⚠
-    # （注入逻辑都在 _inject_session_disclosures，工具体薄纪律）。
     return _inject_session_disclosures(payload, client)
 
 
 @server.tool(structured_output=False)
 async def export_memories(since_ts: float = 0.0, source: str = "", state: str = "",
                           limit: int = 0, library: str = "") -> str:
-    """
-    按时间戳 / 来源 / 状态增量导出记忆（不含向量，可直接落盘另存）。
+    """Export memories without vectors for backup or migration.
+Supports incremental export: pass the largest ``timestamp`` from the previous
+export. The boundary is inclusive, so deduplicate by ID after export.
 
-    Args:
-        since_ts: 只导出 timestamp **>=** 该值的记忆（Unix 秒），默认 0 = 全量。
-            **增量导出**：把上次导出结果里最大的 timestamp 原样传进来即可。边界是
-            「含等于」，所以那批最后一条会重复一次——**按 id 去重**即可。**不要**传
-            `max_ts + ε` 去躲这个重复：同一时间戳可能有多条（显式指定 timestamp
-            的批量写入），加 ε 会把它们整批漏掉，那是丢数据。
-        source: 只导出来自该来源的（精确匹配，如 `docs/decisions.md`）。
-        state: 只导出该状态的（active/superseded/archived）；留空不限。
-        limit: 最多导出多少条，默认 0 = 不限。
+Args:
+    since_ts: Only records with timestamp >= this Unix time; 0 means all.
+    source: Exact source filter.
+    state: ``active``, ``superseded``, ``archived``, or empty for all.
+    limit: Maximum records; 0 means unlimited.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _maintain_service(library)
@@ -1354,27 +1283,19 @@ async def session_end(summary: str = "", open_topics: str | list[str] = "",
                       close_topics: str | list[str] = "",
                       session_id: str = "",
                       client: str = "", library: str = "") -> str:
-    """
-    **每次会话收尾**（「今天到这 / 先这样」）→ 本工具：写摘要、登记未完结话题、更新画像、触发巩固。
+    """Call at session end or when the user stops work.
+Writes an L2 summary, records open topics, updates profile, triggers
+consolidation, and closes the session lifecycle.
 
-    Args:
-        summary: 本次会话的一句话摘要。
-        open_topics: 没聊完的话题；JSON 数组或逗号分隔字符串都收。
-            登记前做精确 + 相似度去重（默认开，env 可关）——相似命中会
-            跳过并在 `dedup_hits` 里回显撞上的旧条，供你决定是否
-            `close_topics` 收掉旧条；已达上限时返回 `topics_cap_reached`，
-            优先 close 而不是硬塞。
-        close_topics: 要**关闭**（从全局待办移除）的话题；JSON 数组或逗号
-            分隔字符串都收，匹配同样是去空白精确匹配。话题收口了就关——
-            全局待办纯追加会让收口话题永远残留。
-        session_id: **可选**，精确收尾指定会话。只许收**本 client** 的
-            会话（不许代收，错配报错且零副作用）；留空 = 收本路 current。
-        client: 调用方身份。**共享连接下必填**——服务端自造 `sess_xxx` 标识进程不是你。
-    返回体的 `maintenance_reminders` 是收尾维护清单（可能为空）：启用了文件建档
-    的库会提醒「N 个文件磁盘更新未同步」，带保留标签键的地图超期会提醒同步——
-    没问题时不出现，不占 token。`topics_closed` / `topics_deduped` 分别报
-    本次关闭 / 去重跳过的话题数；`saved_layers` 是本次落盘的层级明细
-    （written/skipped/failed，failed 必伴随 saved=false）。
+Args:
+    summary: One-paragraph session summary.
+    open_topics: Topics intentionally left unfinished; JSON array or comma list.
+    close_topics: Topics now finished; JSON array or comma list. Close topics
+        that have actually been resolved so the global backlog does not grow stale.
+    session_id: Optional explicit session to finalize. Only sessions owned by
+        this client may be finalized.
+    client: Caller identity. Required on shared connections.
+    library: Optional library override.
     """
     await _await_warmup()
     # P1：收尾清掉任务登记，避免下一会话误继承上一次的 origin.task。
@@ -1395,11 +1316,13 @@ async def session_end(summary: str = "", open_topics: str | list[str] = "",
 
 @server.tool(structured_output=False)
 async def remember_intent(text: str, due: str = "", library: str = "") -> str:
-    """登记一条待办/意图（"帮我记住我要做 X"），下次会话会提醒一次，不重复催。
+    """Register a todo/intent for future sessions.
+The intent is returned by later ``session_start`` calls and can trigger proactive
+recall when a related topic appears. Use for user requests that span sessions.
 
-    Args:
-        text: 待办内容，要具体到可检查。
-        due: 截止日期描述，可留空。
+Args:
+    text: What should be done.
+    due: Optional due date/deadline.
     """
     await _await_warmup()
     svc = _bootstrap_service(library)
@@ -1408,10 +1331,9 @@ async def remember_intent(text: str, due: str = "", library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def complete_intent(keyword: str, library: str = "") -> str:
-    """标记一条待办完成。
-
-    Args:
-        keyword: 待办内容中的关键词，用于匹配。
+    """Mark a todo/intent complete by keyword.
+Completion is keyword-based and reports whether a matching open intent was
+found. Completed intents no longer participate in proactive recall.
     """
     await _await_warmup()
     svc = _bootstrap_service(library)
@@ -1420,11 +1342,10 @@ async def complete_intent(keyword: str, library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def report_feedback(memory_id: str, useful: bool = True, library: str = "") -> str:
-    """反馈某条记忆是否真的用上了：有用则提升重要性，无用只降优先级不降权。
-
-    Args:
-        memory_id: 记忆 ID。
-        useful: 是否有用。
+    """Report whether a recalled memory was useful.
+Useful feedback increases future ranking priority; not-useful feedback lowers
+visibility without deleting the memory. Use ``forget_memory`` for genuine
+correction/deletion.
     """
     await _await_warmup()
     svc = _bootstrap_service(library)
@@ -1435,18 +1356,14 @@ async def report_feedback(memory_id: str, useful: bool = True, library: str = ""
 @server.tool(structured_output=False)
 async def consolidate(filter_tags: str = "", max_items: int = 0,
                       dry_run: bool = False, library: str = "") -> str:
-    """执行记忆巩固（睡眠修剪）：标记被取代的事实、归档长期未用的记忆、列出矛盾候选。
+    """Run maintenance/consolidation over the library.
+Can mark superseded facts, archive dormant records, and list contradiction
+candidates. Dry-run is supported and recommended before a real write.
 
-    建议在会话结束或积累较多记忆后调用。矛盾只列出不自动裁决。
-
-    Args:
-        filter_tags: 结构化标签过滤（JSON 对象字符串），如 `{"域": "F"}`。
-            把**沉寂归档与矛盾列举**的候选收窄到某个标签域，语义与 `recall`
-            的 `filter_tags` 完全一致（全键 AND、单键多值 OR）。留空 = 全库，
-            返回体 `scope: null` 自曝"这次没设域"。
-        max_items: 本次沉寂归档最多处理多少条（0 = 不限）。大库分批次归档用。
-        dry_run: 只干跑——列出**将会**归档的候选与矛盾候选，不做任何状态变更
-            （不归档、不刷新画像/主题层、不落盘）。
+Args:
+    filter_tags: JSON object string narrowing the consolidation scope.
+    max_items: Maximum items to process; 0 uses the configured limit.
+    dry_run: Report the plan without writing; default false.
     """
     await _await_warmup()
     # filter_tags 解析（错误体不带信封）、键名校验与 J2 软降级回显都在
@@ -1460,32 +1377,14 @@ async def consolidate(filter_tags: str = "", max_items: int = 0,
 @server.tool(structured_output=False)
 async def contradictions(limit: int = 10, source: str = "",
                          filter_tags: str = "", library: str = "") -> str:
-    """
-    按需列出库里「同一事实、两种口径」的候选对。只读，不改任何记忆。
+    """List candidate pairs where one fact may have two versions.
+This is annotation, not adjudication. Review candidates and resolve through
+``update_memory`` (usually supersession) or ``forget_memory``.
 
-    `consolidate` 只在收尾时顺带列 5 条；这个让你在**写之前**就能查整库有没有
-    并存的口径。
-
-    **只标注不裁决**：确认旧的该作废时由你调 `update_memory` 显式标，本工具
-    绝不自动作废——按「向量相似 + 时间更新」自动裁决会把"两条在讲同一件事"
-    误判成"后者推翻前者"，而作废后的条目会被 `recall` 默认过滤掉、**不报错**。
-
-    Args:
-        limit: 最多返回多少对（默认 10，按相似度降序）。
-        source: 只查某个来源（文件名 / 会话标识）；留空 = 全库。
-        filter_tags: 结构化标签过滤（JSON 对象字符串），如 `{"域": "F"}`。
-            语义与 `recall` 的 `filter_tags` **完全一致**（全键 AND、单键多值
-            OR）。用来把"整库矛盾"收窄成"**某个域内的**矛盾"——六代口径混在
-            一个库里时，全局 top-N 会被无关域占满。
-            ⚠️ 标签键名写错 ⇒ 候选池为 0，看返回体的 `candidate_pool`
-            能当场发现（0 = 过滤没命中，不是"域内没矛盾"）。
-
-    Returns:
-        `candidates` 每对带 `a_id` / `b_id` / 双方正文与来源 / `sim` /
-        `newer`（谁更新）；另有 `candidate_pool`（过滤后进比对的条数，即分母）。
-        确认旧的该作废时，用 `update_memory(a_id, state="superseded",
-        superseded_by=b_id)`——**标作废而不是删除**，删了就没有「曾经改过口径」
-        的痕迹了。
+Args:
+    limit: Maximum candidate pairs; default 10.
+    source: Optional source filter.
+    filter_tags: JSON object string narrowing the candidate pool.
     """
     await _await_warmup()
     # filter_tags 解析（错误体不带信封）与 candidate_pool 回显在
@@ -1499,19 +1398,15 @@ async def contradictions(limit: int = 10, source: str = "",
 @server.tool(structured_output=False)
 async def drift_audit(source: str = "", limit: int = 50,
                       include_ok: bool = False, library: str = "") -> str:
-    """源文件漂移审计："文件改了但记忆没更新"的服务端答案。只读，低频。
+    """Audit memories whose source files may have drifted.
+For file-backed sources, compares recorded signatures (size/mtime/hash) with the
+current files and reports missing, changed, or unbaselined sources. Also reports
+user-library quarantine and access-log summaries when applicable.
 
-    拿 ingest 记的 {mtime, size, sha1} 签名与磁盘现状对比，六类回报：
-    `stale`（文件已变该重导）/ `missing`（文件没了记忆还在）/ `unbaselined`
-    （从没记过签名——**无法判断，不是没漂移**）/ `orphan`（签名无人引用）/
-    `unresolvable`（非文件 source）/ `ok`（一致，默认不列）。每类带分母：
-    `actionable=0` 且 `unbaselined=0` 才是"真没漂移"。`never_ingested`
-    （从没导入过的文件）不在本范围，用 `export_memories(source=...)` 算。
-
-    Args:
-        source: 只审计这一个来源；留空 = 全库。
-        limit: 每类最多回多少行（默认 50；0 = 只给计数）。
-        include_ok: 是否把一致的源也列出来（默认只列有问题的）。
+Args:
+    source: Specific source to audit; empty audits known sources.
+    limit: Maximum detailed rows; default 50.
+    filter_tags: JSON object string narrowing the audited records.
     """
     # 零参数写法：层级按函数名在 STORE_ONLY_TOOLS 查表推断（drift_audit 已入表，
     # 只读库存 + 源签名层，不需要嵌入模型）。派发器那两处显式传参是结构性例外。
@@ -1526,15 +1421,15 @@ async def drift_audit(source: str = "", limit: int = 50,
 @server.tool(structured_output=False)
 async def entity_profile(entity: str, limit: int = 20, order: str = "asc",
                          include_superseded: bool = False, library: str = "") -> str:
-    """
-    取某个实体的完整档案：把它参与过的全部记忆按时间拉一遍。每条带 memory_id /
-    content / timestamp / source / state——能按时间核、能回指原文件、能看出哪条已被作废。
+    """Return the memory profile for one entity.
+Includes linked memories, aliases when known, and mention statistics. Useful for
+“what do we know about X?” before writing or updating project facts.
 
-    Args:
-        entity: 实体名（不区分大小写）。不知道有哪些实体先用 `entity_list`。
-        limit: 最多返回条数，默认 20；传 0 不限。
-        order: `asc`（默认，时间正序，拉时间线用）或 `desc`（最近在前）。
-        include_superseded: 是否带上已作废条目，默认 False。
+Args:
+    entity: Entity name or alias.
+    limit: Maximum linked memories; default 20.
+    order: ``asc`` or ``desc`` chronological order.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -1546,14 +1441,14 @@ async def entity_profile(entity: str, limit: int = 20, order: str = "asc",
 @server.tool(structured_output=False)
 async def entity_list(prefix: str = "", limit: int = 50, min_mentions: int = 1,
                       trusted_only: bool = False, library: str = "") -> str:
-    """列出记忆库里已有哪些实体（按提及条数降序）。
+    """List known entities with optional prefix/count filters.
+Use this to discover project vocabulary and inspect entity coverage.
 
-    Args:
-        prefix: 只看名字以该前缀开头的实体（如 "沈"）。
-        limit: 最多返回条数，默认 50。
-        min_mentions: 至少被多少条记忆提到才列入，默认 1。
-        trusted_only: 只看受信任来源（manual/lexicon/title/spacy）的实体。
-            启发式产出的候选噪声很大，排查时可先勾上这个。
+Args:
+    prefix: Optional case-insensitive prefix.
+    limit: Maximum entities; default 50.
+    min_mentions: Minimum linked-memory count; default 1.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -1574,26 +1469,21 @@ async def entity_list(prefix: str = "", limit: int = 50, min_mentions: int = 1,
 async def map_set(name: str, key: str, status: str = "", fields: str = "{}",
                   desc: str = "", truth_source: str = "", note: str = "",
                   updated_by: str = "", library: str = "") -> str:
-    """改地图上某个条目的当前状态：「把 CN2601 挪到验证集」「chr1 组装完成了」。
+    """Create/update one key in a named information map.
+Information maps store current state (e.g. “where is X deployed?”) separate from
+historical memories. Writing the same key replaces the prior entry; provenance
+and audit fields are retained.
 
-    基因组进度 / 合约分到哪个集合 / 编译开关当前值这类**现在是什么**的信息
-    走本工具，不要写成记忆——记忆的旧状态会在 recall 里和新状态竞争，而
-    精确键查被语义 top-k 挡着（设计文档 §2 的核心判断）。
-
-    **同一键再写整体替换**（一键一条是数据模型保证的，不靠自觉）；首次写入
-    自动建图，`desc` 一句话说明这图管什么（任务相关性匹配靠它）。
-    `truth_source` 声明「这条目的真相在哪个文件」：set 时记录签名，之后
-    `map_verify` 重读比对——文件变了这条目标 drift，不靠人记得核。
-
-    Args:
-        name: 图名，如「合约」「基因组」「代码开关」。
-        key: 条目键，如 CN2601 / chr1 / --use-avx2。
-        status: 状态值，如「验证集」「QC 通过」；留空保留原值。
-        fields: 附加字段 JSON 字符串，如 `{"来源": "10月重划分"}`。
-        desc: 图描述（建图时写；之后传非空可改）。
-        truth_source: 真相源文件路径（相对建档项目根或绝对路径）。
-        note: 备注（短文本）。
-        updated_by: 谁改的（宿主/会话标识，可留空）。
+Args:
+    name: Map name.
+    key: Entry key.
+    status: Current status/value.
+    fields: JSON object of additional structured fields.
+    desc: Human-readable description; used for relevance matching.
+    truth_source: File/path/system that is authoritative for this entry.
+    note: Optional note.
+    updated_by: Who/what made this update.
+    library: Optional library override.
     """
     await _await_warmup()
     # fields 的 JSON 协议解析留在适配层：现行它排在 _brain_for 之前（先报
@@ -1604,9 +1494,9 @@ async def map_set(name: str, key: str, status: str = "", fields: str = "{}",
         try:
             fdict = json.loads(fields)
         except json.JSONDecodeError as exc:
-            return _map_fields_error("fields 不是合法 JSON：%s" % exc, library)
+            return _map_fields_error("fields is not valid JSON: %s" % exc, library)
         if not isinstance(fdict, dict):
-            return _map_fields_error("fields 必须是 JSON 对象", library)
+            return _map_fields_error("fields must be a JSON object", library)
     svc = _organize_service(library)
     # brain.map_set 的 ValueError（非法 name/key）错误体在服务内组装，同样带 library 首键。
     return json.dumps(svc.map_set(
@@ -1617,16 +1507,9 @@ async def map_set(name: str, key: str, status: str = "", fields: str = "{}",
 
 @server.tool(structured_output=False)
 async def map_get(name: str, key: str, library: str = "") -> str:
-    """查地图上某个条目现在是什么：「CN2601 现在在哪个集合」。
-
-    L2 精确查询——**不能省这个入口**：recall 是语义 top-k，用它查状态等于
-    把「精确」换成「猜中」（花大力气堵的「静默返回空」会换个形态回来）。
-    未命中**显式报** ``found=false`` + ``reason``（no_maps / no_map /
-    no_key），不静默返回空。
-
-    Args:
-        name: 图名。
-        key: 条目键。
+    """Fetch one information-map entry by exact map/key.
+Returns ``found=false`` with a reason when the key is absent. Prefer this over
+semantic recall when you need current state, not historical discussion.
     """
     await _await_warmup()
     svc = _organize_service(library)
@@ -1636,10 +1519,9 @@ async def map_get(name: str, key: str, library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def map_list(name: str = "", library: str = "") -> str:
-    """列出本地图有哪些地图（名+条数+新鲜度+漂移数）；点名一张图看它全部条目。
-
-    不知道图有哪些、或某张图都有什么条目时用本工具。`name` 留空 = 列地图，
-    给了图名 = 列该图条目（按最近更新排序，cap 100，超出自曝）。
+    """List information maps or all entries in one map.
+Without ``name``, returns map names, counts, freshness, and drift summaries.
+With ``name``, returns the entries in that map.
     """
     await _await_warmup()
     svc = _organize_service(library)
@@ -1649,16 +1531,10 @@ async def map_list(name: str = "", library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def map_verify(name: str = "", library: str = "") -> str:
-    """核对地图条目与真相源文件还对不对得上（代码开关/合约分配的自动巡检）。
-
-    对声明了 `truth_source` 的条目：重读文件比签名——没变 zero-read；
-    变了读一次内容哈希仲裁（git checkout / touch 重置 mtime 不误报）；
-    真变了标 ``drift``（reason=changed/missing），条目清单随返回体给出。
-    没有声明真相源的条目跳过（纯人工状态退到索引行 ⚠️ / 收尾提醒）。
-    `name` 留空 = 全库核对。
-
-    Args:
-        name: 只核对这一张图；留空 = 全部。
+    """Verify information-map entries against their truth sources.
+For entries with a ``truth_source``, re-reads and compares the recorded source
+signature, reporting stale or unverifiable entries. This is the map-layer
+counterpart to source-drift auditing.
     """
     await _await_warmup()
     svc = _organize_service(library)
@@ -1669,30 +1545,15 @@ async def map_verify(name: str = "", library: str = "") -> str:
 @server.tool(structured_output=False)
 async def knowledge_map(limit: int = 20, include_archived: bool = False,
                         library: str = "") -> str:
-    """整理 / 列出这个记忆库的**知识结构**：有哪些知识点、每个知识点一句话、多大规模。
+    """List derived knowledge topics in the library.
+Topics are clusters of related L1 records with representative excerpts. Use this
+to answer “what does this library know about?” and to locate a topic before
+reading or writing its summary.
 
-    **说「整理hippo库」「梳理知识点」就是调本工具**——返回体里的 `playbook`
-    是一份可直接照着执行的菜谱（取素材 → 你归纳 → 写回），`pending_count`
-    是还剩几个知识点没归纳。
-
-    和 `recall` 的分工：那个回答「我记得什么跟这句话有关」，这个回答
-    **「这个库里到底装了些什么」**——L1 是平铺的事实、L2 只有会话级摘要且
-    写完即沉睡、`entity_list` 只能按实体看，此前没有任何工具能回答它。
-
-    主题是 L1 的**派生层**：由 active 事实聚类而来（受信任实体锚点 + 余弦
-    凝聚），成员失效自动重裁；**不进 `recall` 主路径**（V9f 教训：摘要类内容
-    进检索把 F1 从 .311 打到 .200），出口只有本工具和开场上下文。
-
-    ⚠️ **代表句是抽取式摘录**（离主题质心最近的几条原文），**不是归纳**。
-    真正的上层结论要你（宿主）读完这几条之后总结再写回——本服务的生产
-    路径不内嵌 LLM，这是刻意守的边界。
-
-    Args:
-        limit: 最多返回多少个主题，默认 20；传 0 不限。
-        include_archived: 是否带上成员已被删空而归档的主题，默认 False。
-
-    库里从没梳理过时，首次调用会**自动梳理一次**（全库聚类，万条约秒级），
-    返回体的 `auto_built` 标 True；之后只在 `consolidate` 时增量刷新。
+Args:
+    limit: Maximum topics; default 20.
+    include_archived: Include archived topics; default false.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _recall_service(library)
@@ -1708,52 +1569,18 @@ async def knowledge_topic(topic_id: str = "", action: str = "brief",
                           items: str = "", batch: int = 10,
                           per_topic: int = 5, fras: str = "",
                           library: str = "") -> str:
-    """对一个「知识点」出素材 / 写回归纳 / 撤销归纳（另含批量与重建 action）。
+    """Read material for, or write/undo, one knowledge topic.
+``action=brief`` returns cluster material. ``action=summarize`` writes a
+host-generated summary back. ``action=revert`` undoes a host summary and returns
+to extractive representative sentences. Evidence must be members of the topic.
 
-    `knowledge_map` 回答「这个库有哪些知识点」，本工具是**单个知识点**上的
-    读写通道。三件事刻意合成一个工具而不是三个：工具面每会话随 tools/list
-    注入宿主上下文，加一个工具就是长期 token 成本（本项目 42 个工具已经踩过
-    这条线）。
-
-    **action=brief（默认）** 出归纳素材：按「离主题质心最近」排序取 N 条原文
-    ——不是按时间序，最早那批往往正是后来被推翻的。
-
-    **action=summarize** 把你的归纳写回。三条硬校验，任一不过**整条退回、
-    一个字段都不改**：summary 非空、≤2000 字、evidence 必须是本主题的存活
-    成员 id（凭空引用会被拒）。
-
-    **可选四字段契约**（`fras`）：`{"f":"范畴（直接当标题）","r":["关联
-    实体/主题"],"a":"可引用的结论","s":"推不出来但搞错就出事的约束"}`。
-    四键必须齐全，`s` 没有也要写"无"；只传 fras 不传 summary 时 `a`
-    就是那句话。
-
-    **action=revert** 撤销归纳、退回抽取式代表句。写错了要能撤，否则一条坏
-    归纳会永久占位（自动流程不敢动它，人工又看不见它）。宿主命名过的标题
-    （fras.f）跟着归零。
-
-    **action=rebuild** 重画簇边界（整层世代 +1）。只在**换了聚类参数**（
-    `HIPPOCAMPUS_TOPIC_MAX` / `MAX_MEMBERS`）或旧结构已经长歪时用——平时
-    的增量刷新（`action=refresh`，或 consolidate 自动跑）不会动边界。
-    重建会按成员重叠迁移旧的 host 归纳（搬过去的标 ⚠️ 待复核），迁移不了
-    的条数在返回值 `lost_host` 里自曝——它不会静默消失。
-    ⚠️ 只在**单写者**场景用：多进程同时重建，最后保存的那一代覆盖前一代。
-
-    🔑 **host 归纳是稀缺资产**：写回后 `refresh`（巩固）只填抽取式、绝不覆盖
-    它；多进程层合并时 **host 优先于时间戳**；成员集合变了只标 `stale`、
-    不改写内容——本服务判断不了归纳对不对，只负责把「依据变了」摆出来。
-    要改就再写一次，要退回就 revert。
-
-    Args:
-        topic_id: 主题 id（从 `knowledge_map` 拿）。
-        action: brief / summarize / revert / rebuild / refresh。
-        summary: 归纳文本（summarize 必填；传了 fras 可省，用 fras.a）。
-        evidence: 出处，L1 记忆 id 列表（JSON 数组或逗号分隔）。
-        limit: 素材条数，默认 30（1-200）。
-        fras: 可选四字段结构（JSON 对象字符串），见上；summarize_batch
-            的每条 item 里也可各带一个 fras 键。
-
-    出素材挑的是「最能代表这个主题」的几条，读完总结完写回，这个库才真正
-    有了上层知识——抽取式摘录永远只是摘录。
+Args:
+    topic_id: Topic ID from ``knowledge_map``.
+    action: ``brief`` / ``summarize`` / ``revert``.
+    summary: Host-written summary for ``summarize``.
+    evidence: JSON array of member memory IDs supporting the summary.
+    fras: Optional four-field structured summary as a JSON object.
+    library: Optional library override.
     """
     await _await_warmup()
     # items / fras 的 JSON 解析（失败显式报错、错误体不带信封）与
@@ -1768,22 +1595,15 @@ async def knowledge_topic(topic_id: str = "", action: str = "brief",
 
 @server.tool(structured_output=False)
 async def lexicon_add(terms: str, relink: bool = True, library: str = "") -> str:
-    """向项目专名词库追加专名并**立即生效**（热加载）。
+    """Add trusted entity names/aliases to the library lexicon.
+The lexicon improves extraction, entity linking, and recall for project jargon,
+model hashes, ticket numbers, and other names generic embedders miss. By default
+relinks existing memories afterward.
 
-    登记在册的专名会被稳定抽出、参与检索加成与画像。还能**登记别名**（同一实体的
-    表字 / 简称 / 全称 / 旧称 / 代号）：别名行写 `子安 => 顾言`（`->` / `→` 等价），
-    抽取与查询两侧都会归一。
-
-    Args:
-            terms: JSON 数组 `["同安","顾父"]` 或逗号分隔串；已存在的自动跳过。
-                语法不完整的行**不写盘**，原样出现在返回的 `invalid` 里。
-            relink: 追加后对全库重挂实体，**默认 True 且建议别关**——否则新词只对
-                之后写入的记忆生效，存量记忆仍然查不到。大库重挂约几十秒。写了别名
-                会额外把历史上按别名拆开的档案并回规范名。
-
-        `alias_count` 是当前生效的别名总数（0 表示一条都没生效）；查单个别名是否
-        命中，看 `entity_profile("子安")` 返回的 `resolved_from`。
-
+Args:
+    terms: JSON array or comma-separated list. Use ``alias => canonical`` for aliases.
+    relink: Re-run entity linking after adding terms; default true.
+    library: Optional library override.
     """
     await _await_warmup()
     # terms 的 lenient 解析（JSON 数组/逗号串都收，永不报错）与信封都在
@@ -1796,20 +1616,9 @@ async def lexicon_add(terms: str, relink: bool = True, library: str = "") -> str
 @server.tool(structured_output=False)
 async def lexicon_suggest(top_n: int = 30, min_docs: int = 4, min_files: int = 2,
                           min_len: int = 3, max_len: int = 4, exclude: str = "", library: str = "") -> str:
-    """列出「高频出现但还没登记进词库」的候选专名，供人工过筛后追加。
-    **只做候选展示，不自动写词库**；过筛后用 `lexicon_add` 落盘。
-
-    做法是中文 n-gram 频次统计 + 碎片抑制；按「出现过的记忆条数」降序并给出跨文件数
-    （只在同一文件里反复出现的多半是该文件的术语或标题）。通用行话与序数短语已内置
-    过滤；项目**特有**的结构标签写进 `<词库同目录>/entity_lexicon_stop.txt`。
-
-    Args:
-            top_n: 最多返回多少个候选，默认 30。
-            min_docs: 至少在多少条记忆里出现过才列出，默认 4。
-            min_files: 至少跨几个源文件，默认 2。
-            min_len / max_len: 候选长度，默认 3~4（2 字候选几乎全是通用词）。
-            exclude: 临时排除词，逗号分隔或 JSON 数组。
-
+    """Suggest high-frequency unregistered names for the lexicon.
+Read-only candidate generation. Review suggestions before adding them; do not
+automatically accept every frequent token.
     """
     await _await_warmup()
     # exclude 的 lenient 解析在服务内（现行排在库解析之后，保序）；
@@ -1828,32 +1637,9 @@ async def lexicon_alias_suggest(top_n: int = 30, min_confidence: float = 0.35,
                                 allow_stat_only: bool = False,
                                 exclude: str = "", cue_words: str = "",
                                 with_paren: bool = True, library: str = "") -> str:
-    """挖「同一实体的多种称法」候选。**只出候选 + 证据，不自动写盘**
-    （按 `paste` 复核后用 `lexicon_add` 落盘）。与 `lexicon_suggest` 分工：那个问
-    「这个词要不要登记成专名」，这个问「这两个名字是不是指同一个东西」。
-
-    四条信号：`cue`（称谓提示词）、`paren`（括号同位语）、`cooc`（共现）、
-    `abbrev`（包含关系）。**后两条不能单独成立**（要就得 `allow_stat_only=True`）：
-    实测 `台湾外记 => 台湾` 对包含度 100% 却不是同一事物。
-
-    返回按置信度降序，带 `paste` / `direction_basis` / `evidence`。**不自动归并**——
-    合并即改变实体身份，猜错难拆。
-
-    Args:
-            top_n: 最多返回多少个候选，默认 30。
-            min_confidence: 置信度门槛，默认 0.35。括号信号（0.30）单独过不了，
-                需要多条证据或另一个信号——真实语料里「（作者）」「（一手）」这类
-                注释性括号太多，让它单独成立会拉低整表可用性。
-            min_support: 共现类候选的最少共同出现条数，默认 2。
-            min_lift: 共现的提升度门槛，默认 2.0（独立时约 1）。
-            min_containment: 共现的包含度门槛，默认 0.5（与提升度**满足其一即可**；
-                小语料里提升度天然趋近 1，只设提升度会漏掉真候选）。
-            allow_stat_only: 是否允许只靠统计信号成候选，默认 False。
-            exclude: 本次临时排除词，逗号分隔或 JSON 数组。
-            cue_words: 本次额外补充的称谓提示词（不落盘）。项目专有的写法建议写
-                `<词库同目录>/alias_cue_words.txt`（一行一个，# 注释）长期生效。
-            with_paren: 是否扫括号同位语，默认 True。
-
+    """Suggest possible aliases for the same entity.
+Returns candidate groups with evidence; it does not merge automatically. Review
+evidence, then register confirmed aliases through ``lexicon_add``.
     """
     await _await_warmup()
     # exclude / cue_words 的 lenient 解析在服务内（现行排在库解析之后，
@@ -1869,10 +1655,9 @@ async def lexicon_alias_suggest(top_n: int = 30, min_confidence: float = 0.35,
 
 @server.tool(structured_output=False)
 async def relink_entities(library: str = "") -> str:
-    """对全库已有记忆重跑实体抽取并补挂（词库扩充后的收尾动作）。
-
-    一般不需要手动调用——`lexicon_add` 默认已经做了。只有在你手动编辑了
-    entity_lexicon.txt 之后，才需要跑它让改动对存量记忆生效。
+    """Re-run entity extraction/linking across the library.
+Use after a lexicon changes or when entity linking may be stale. The response
+reports how many memories were relinked and any errors.
     """
     await _await_warmup()
     svc = _organize_service(library)
@@ -1882,16 +1667,15 @@ async def relink_entities(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def miss_log(limit: int = 20, clear: bool = False, library: str = "") -> str:
-    """查看（或清空）「召回不到」的查询留痕。
+    """Inspect recent retrieval misses.
+A miss is a query whose top result did not pass the relevance floor. This is a
+diagnostic signal for vocabulary gaps, retrieval failures, or missing project
+knowledge—not an audit log of all queries.
 
-    显式查询召回不到时自动记一条（带查询、当时的最高相似度、入口、会话 id），平行期
-    不用手记「没命中的 query」，可直接喂归因分析与门槛评测。阈值默认是召回硬门槛 0.30。
-    **不要轻易上调**：实测真命中的最高相似度只有 0.32~0.53，调到 0.50 会把真命中记成未命中。
-
-    Args:
-            limit: 返回最近多少条，默认 20（按时间倒序）。
-            clear: 传 True 清空留痕。
-
+Args:
+    limit: Maximum recent misses; default 20.
+    clear: Clear the miss log after reporting; default false.
+    library: Optional library override.
     """
     await _await_warmup()
     svc = _maintain_service(library)
@@ -1902,17 +1686,10 @@ async def miss_log(limit: int = 20, clear: bool = False, library: str = "") -> s
 
 @server.tool(structured_output=False)
 async def brain_stats(daily_days: int = 0, library: str = "") -> str:
-    """查看四层记忆 + 索引层的规模统计（L0/L1/L2/L3、实体数、待办数等）。
-
-    返回里带 `warmup` 一节——本工具只依赖**库存**层级（几秒应答），所以它同时是
-    「后端准备好没有」的**探针**：`ready=false` 表示正在预热，此时其余带向量的
-    工具会返回「稍后重试」，重试即可，不必重启会话。
-
-    Args:
-            daily_days: `daily_activity.recent` 回显最近多少天。**0 = 用 env
-                `HIPPOCAMPUS_DAILY_ACTIVITY_DAYS`，都没设则 14**。注意这与**存储**上限
-                无关（库里最多留 60 天），只影响这里回显几条。
-
+    """Return detailed library/runtime self-report.
+Includes layer counts, entity stats, model/backend identity, save ledger,
+knowledge coverage, and other health signals. Prefer this over ``get_stats``
+for diagnosis.
     """
     await _await_warmup()
     svc = _maintain_service(library)
@@ -1923,7 +1700,10 @@ async def brain_stats(daily_days: int = 0, library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def save_brain(library: str = "") -> str:
-    """持久化整个记忆底座（向量库 + LNN + 四层数据 + 索引层）。"""
+    """Force a save of the current brain/library.
+Useful before process exit, model swaps, or risky maintenance. Returns a save
+report; failures are not silently swallowed.
+    """
     await _await_warmup()
     svc = _maintain_service(library)
     # 信封（含 ConcurrentWriteError 的 conflict 体）在服务内组装，工具只序列化。
@@ -1935,18 +1715,13 @@ async def save_brain(library: str = "") -> str:
 # ------------------------------------------------------------------
 @server.tool(structured_output=False)
 async def library_list(include_backups: bool = False) -> str:
-    """列出已发现的记忆库。**只读**，不创建也不修改文件——**唯一例外**：一个库都
-    没有时（全新部署首启）会建出默认库目录，并在返回里给 `auto_created`。
+    """List discoverable memory libraries.
+By default backup/snapshot directories are omitted. Use this before
+``library_use`` or ``library_create`` to avoid guessing names or crossing
+projects.
 
-    扫描根：env `HIPPOCAMPUS_LIBRARY_ROOTS`（`os.pathsep` 分隔），默认
-    `~/.hippocampus_mcp` + `<仓库>/data`。
-
-    备份目录（`.bak-*` / `.snap-*` / `corrupt`）默认不列出——它们是只读快照，
-    **不能**作为写入目标；盘点磁盘占用时再开 `include_backups`。
-
-    Args:
-            include_backups: 是否连同备份 / 快照目录一起列出。
-
+Args:
+    include_backups: Include backup/snapshot directories; default false.
     """
     await _await_warmup()
     svc = _library_admin_service()
@@ -1958,13 +1733,9 @@ async def library_list(include_backups: bool = False) -> str:
 
 @server.tool(structured_output=False)
 async def library_info(library: str = "") -> str:
-    """某个记忆库的详情（路径 / id / 名字 / 别名 / 层文件）。
-
-    **刻意不构造 HippoBrain**：本工具只读目录元信息，所以不必等嵌入模型
-    （那要 25–33 秒）。要看条数/统计请用 ``brain_stats``。
-
-    Args:
-        library: 库名 / 别名 / ``lib_`` id / 路径。留空＝本次调用的目标库。
+    """Describe one memory library.
+Returns identity, path, layer files, sizes, model binding, and related metadata.
+Empty library means the default/current library.
     """
     await _await_warmup()
     svc = _library_admin_service()
@@ -1974,14 +1745,9 @@ async def library_info(library: str = "") -> str:
 
 @server.tool(structured_output=False)
 async def library_whoami() -> str:
-    """**本次调用会落到哪个库、能写谁** —— 防串库的第一道自曝。
-
-    `library_use()` 是**纪律不是强制**（已知洞），漏调就静默落到默认库；会话首句
-    问一句即可确认，不必等到写完才发现写错库。
-
-    返回里看三样：`home`（可写家库，写永远钉在这）、`current`（本次寻址落点，读落这）、
-    `permission`（`read-write` 家库 / `managed-write` user 受管通道 / `read-only`
-    会被守卫拦下）。`source` 说明 current 怎么定的：`binding`（会话级粘性）/ `default`。
+    """Report the library this session/call currently targets.
+Call this when the active library is uncertain. Write responses also self-report
+``library`` as their first key, so a wrong destination can be checked there too.
     """
     await _await_warmup()
     svc = _library_admin_service()
@@ -1990,22 +1756,14 @@ async def library_whoami() -> str:
 
 @server.tool(structured_output=False)
 async def library_use(library: str, client: str = "") -> str:
-    """会话级切换：此后本会话**读类**工具自动落到该库（**不必逐个传 library**）；
-    **写永远钉在家库**（家库写边界会拦下跨库写，报错文案里有说明；env 逃生门
-    ``HIPPOCAMPUS_CROSS_LIBRARY_WRITE=1`` 需改宿主配置后重连才生效）。
-    优先级：**显式 `library` 参数 > 会话粘性 > 默认库**。
-    写侧归属用 ``library_whoami`` 确认（``home`` = 可写家库）。
+    """Switch this session's sticky library.
+After a successful switch, subsequent tools use this library without needing
+``library=`` on every call. An unresolvable name fails loudly; it never silently
+falls back to another library.
 
-    **不自动建库**：库不存在就报错并给出候选——自动建库会让拼错的库名变成一个
-    新库，写进去的记忆从此找不到（静默且不可逆）。
-
-    切换后**后台预取**该库（首次调用要加载全库 + 嵌入模型，25–33 秒），避免这段
-    落到第一次工具调用上被判超时。
-
-    Args:
-            library: 库名 / 别名 / `lib_` id / 路径。**必填**。
-            client: 会话署名，多会话共享进程时用它区分绑定。
-
+Args:
+    library: Library name, alias, ``lib_*`` ID, or path.
+    client: Caller identity; required on shared connections.
     """
     await _await_warmup()
     svc = _library_admin_service()
@@ -2018,22 +1776,15 @@ async def library_use(library: str, client: str = "") -> str:
 async def library_create(name: str, path: str = "",
                          aliases: str = "", use: bool = False,
                          client: str = "", workspace_root: str = "") -> str:
-    """
-    新建一个记忆库（写 `library.json` 清单 + 初始化存储）。
+    """Create a new memory library and optionally switch to it.
+Creation is explicit: only this operation writes a manifest/initial storage.
+Duplicate names and ambiguous paths fail rather than guessing.
 
-    建库是**显式动作**：只有这里写清单，日常扫描（`library_list`）绝不写盘。
-    重名直接报错——两个同名库会让 `library_use(名字)` 变歧义，而歧义的代价是
-    写错库。
-
-    Args:
-        name: 库名（必须唯一）。
-        path: 库目录；**留空**则放在默认扫描根下（`<第一个根>/hippo_<name>`）。
-        aliases: 逗号分隔的别名。
-        use: 建完是否立即切到该库。
-        client: 会话署名。
-        workspace_root: C2 受管绑定——把该工作区路径登记为本库的绑定根
-            （HELLO 反查命中即家库）。这是「绑库而非装机」onboarding 的
-            第三步：问一次 → 建库 → 绑定，一步到位。留空 = 不绑定。
+Args:
+    name: Library name.
+    path: Optional explicit path; omitted uses the configured library root.
+    aliases: Optional comma-separated aliases.
+    use: Switch the current session to the new library after creation; default true.
     """
     await _await_warmup()
     svc = _library_admin_service()
@@ -2057,9 +1808,9 @@ if _TOOL_PROFILE != "full":
         _hippo_help,
         name="hippo_help",
         description=(
-            "列出本会话被隐藏、但可通过 hippo_extra 调用的扩展功能及其参数"
-            "（导出/词库/实体图/运维/状态存取等）。"
-            "不确定某个记忆功能是否存在、或找不到要用的工具时，先调本工具查目录。"
+            "List extension actions hidden in this session but callable via hippo_extra, with their arguments "
+            "(export / lexicon / entity graph / ops / state access, etc.). "
+            "When unsure whether a memory capability exists or you cannot find the tool you need, call this first."
         ),
         structured_output=False,
     )
@@ -2067,9 +1818,9 @@ if _TOOL_PROFILE != "full":
         _hippo_extra,
         name="hippo_extra",
         description=(
-            "按 action 名调用本会话未直接暴露的工具（导出 / 词库 / 实体图 / 运维等）。"
-            '先调 hippo_help 看有哪些 action 及参数，再用 hippo_extra(action="...", '
-            'args=\'{"参数名": 值}\') 调用。'
+            "Call a tool not directly exposed in this session by action name (export / lexicon / entity graph / ops, etc.). "
+            'Call hippo_help first for the action list and argument names, then invoke via hippo_extra(action="...", '
+            'args=\'{"argument": value}\')'
         ),
         structured_output=False,
     )

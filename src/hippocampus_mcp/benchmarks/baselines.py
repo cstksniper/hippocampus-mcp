@@ -314,10 +314,10 @@ class LNNBaseline(BaseRetriever):
                 cfc_state[k[4:]] = v  # 去掉 "cfc." 前缀
         if cfc_state:
             self.cfc.load_state_dict(cfc_state)
-            print(f"  [LNNBaseline] 已加载训练权重: {model_path} (val_loss={checkpoint.get('best_val_loss', '?')})")
+            print(f"  [LNNBaseline] training weights loaded: {model_path} (val_loss={checkpoint.get('best_val_loss', '?')})")
         else:
             self.cfc.load_state_dict(checkpoint["model_state"])
-            print(f"  [LNNBaseline] 已加载训练权重 (直接模式): {model_path}")
+            print(f"  [LNNBaseline] training weights loaded (direct mode): {model_path}")
 
 
 class FullMethod(LNNBaseline):

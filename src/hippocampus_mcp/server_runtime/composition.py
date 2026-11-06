@@ -104,7 +104,7 @@ def _sensitive_words() -> tuple[str, ...]:
         with open(path, "r", encoding="utf-8") as fh:
             lines = fh.read().splitlines()
     except OSError as exc:
-        logger.warning("敏感词表 %s 不可读（%s）：本进程只跑模式级内置兜底。",
+        logger.warning("sensitive-word list %s is unreadable (%s): this process runs pattern-level built-in fallback only.",
                        path, exc)
         return ()
     return tuple(ln.strip() for ln in lines
@@ -151,8 +151,8 @@ def _guard_write_boundary(library: str | None = None) -> None:
         return  # 读类工具 / 非工具调用：跨库读开放
     if s.load_config().cross_library_write:
         logger.warning(
-            "逃生门 HIPPOCAMPUS_CROSS_LIBRARY_WRITE=1 生效：%s 的跨库写本进程"
-            "已放开（家库写边界跳过）——迁移操作完成后请摘掉该 env。", tool)
+            "Escape hatch HIPPOCAMPUS_CROSS_LIBRARY_WRITE=1 active: cross-library writes to %s "
+            "are open in this process (home-library write boundary skipped) -- remove this env after the migration is done.", tool)
         return
     info = s._library_self(library)  # {id, name, path}
     home_path = s.default_library_path()
@@ -300,9 +300,10 @@ def _recall_service(library: str | None = None,
         raise s.LibraryResolutionError(spec_err)
     if spec_names and (library or "").strip():
         raise s.LibraryResolutionError(
-            "libraries= 与 library= 互斥：library= 定主检索库，libraries= "
-            "是显式多库扇出，组合没有可预期的语义。多库请只给 libraries="
-            "（家库即当前默认库），单库请只给 library=。")
+            "libraries= and library= are mutually exclusive: library= picks the main retrieval library, "
+            "libraries= is the explicit multi-library fan-out; their combination has no predictable "
+            "semantics. For multi-library pass only libraries= (the home library is the current default), "
+            "for single library pass only library=.")
     if spec_names:
         for name in spec_names:
             path = s.resolve_library_path(name)
@@ -311,7 +312,7 @@ def _recall_service(library: str | None = None,
                 try:
                     s.maybe_warmup_library(path)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("跨库读预取 %s 失败（不阻断本次调用）：%s",
+                    logger.warning("cross-library read prefetch %s failed (this call is not blocked): %s",
                                    path, exc)
             info = s._library_self(name)
             extra.append((info, s._brain_for(name)))
@@ -323,7 +324,7 @@ def _recall_service(library: str | None = None,
             try:
                 s.maybe_warmup_library(path)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("跨库读预取 %s 失败（不阻断本次调用）：%s",
+                logger.warning("cross-library read prefetch %s failed (this call is not blocked): %s",
                                path, exc)
     user_brain = None
     user_self: dict[str, str] | None = None
@@ -424,7 +425,7 @@ def _build_brain(persist_dir: str) -> HippoBrain:
     """
     s = _srv()
     s._prepare_torch()
-    logger.info("初始化 HippoBrain (persist_dir=%s)", persist_dir)
+    logger.info("initializing HippoBrain (persist_dir=%s)", persist_dir)
     brain = s._brain_class()(
         persist_dir=persist_dir,
         lambda_decay=s._LAMBDA_DECAY,
@@ -444,29 +445,29 @@ def _build_brain(persist_dir: str) -> HippoBrain:
     # 生效模型必须可见：导错模型的坑就是「谁都没说自己在用哪个模型」。
     _stats = brain.stats()
     logger.info(
-        "生效嵌入模型: %s（向量 %s，缺失 %d）；supersede=%s；专名词库 %d 条",
+        "effective embedding model: %s (vectors %s, missing %d); supersede=%s; lexicon %d entries",
         _stats["embed_model"], _stats["vectors_by_model"],
         _stats["vectors_missing"], _stats["supersede_enabled"],
         _stats["entity_lexicon_size"],
     )
     if _stats["vectors_missing"]:
         logger.warning(
-            "库内 %d 条记录缺少模型 %s 的向量，检索会漏掉这些记忆；"
-            "请先离线执行 scripts/reembed.py --all --model %s 再启动服务。",
+            "%d records in the library lack vectors for model %s; retrieval will miss those memories. "
+            "Run scripts/reembed.py --all --model %s offline first, then start the service.",
             _stats["vectors_missing"], _stats["embed_model"], _stats["embed_model"],
         )
 
     # 加载 CRL 训练权重（如果配置了）
     if s._CRL_MODEL_PATH and os.path.isfile(s._CRL_MODEL_PATH):
         if brain.manager.load_trained_weights(s._CRL_MODEL_PATH):
-            logger.info("已加载 CRL 训练权重: %s", s._CRL_MODEL_PATH)
+            logger.info("CRL training weights loaded: %s", s._CRL_MODEL_PATH)
         else:
-            logger.warning("CRL 权重加载失败: %s", s._CRL_MODEL_PATH)
+            logger.warning("CRL weight loading failed: %s", s._CRL_MODEL_PATH)
 
     # 存储加载异常必须显式告警：损坏文件已隔离，但人得知道
     issue = brain.manager.store.last_load_issue
     if issue:
         logger.error(
-            "记忆存储加载异常（未静默清空，坏文件已隔离）: %s", issue
+            "memory store failed to load (not silently cleared; corrupt file quarantined): %s", issue
         )
     return brain

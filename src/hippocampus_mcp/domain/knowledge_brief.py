@@ -40,23 +40,23 @@ def knowledge_brief(
     if not knowledge:
         # 有料但从没梳理过 ≠ 没有知识点：把出路讲清楚，别让宿主以为库是空的
         if store_count():
-            return ["（还没梳理过知识点；调 knowledge_map 会梳理一次）"]
+            return ["(no knowledge points sorted yet; calling knowledge_map will sort them once)"]
         return []
     out: list[str] = []
     for t in ordered_topics(knowledge):
         if str(t.get("status") or "") == archived_status:
             continue
-        title = str(t.get("title") or "(未命名)")
+        title = str(t.get("title") or "(untitled)")
         size = len(t.get("member_ids") or [])
         # summary 这一格装的是**当前生效**的那句话：写了 host 归纳就是归纳，
         # 没写就是 refresh 填的抽取式代表句（两者互斥，见 topic.refresh）。
-        line = str(t.get("summary") or "").strip() or "（尚无摘要）"
+        line = str(t.get("summary") or "").strip() or "(no summary yet)"
         mark = ""
         st = summary_state(t, t.get("member_ids"))
         if st.get("is_host"):
             # ⚠️ = 写过归纳但依据成员后来变了（最该拿回宿主重写的一批）
             mark = "" if not st.get("stale") else "⚠️"
-        head = "%s（%d条）%s" % (title, size, mark)
+        head = "%s (%d records) %s" % (title, size, mark)
         # 只截句子、**绝不截标题和规模**：真库实测整行硬截会把两者一起切掉，
         # 剩下半截标题，宿主认不出这是哪个知识点（比少看几个字糟得多）。
         budget = clip - len(head)

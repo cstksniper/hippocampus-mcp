@@ -87,7 +87,7 @@ class BrainRegistry:
                     self._touch(key)
                     return self._brains[key]
             if self._factory is None:
-                raise RuntimeError("BrainRegistry 没有配置 factory")
+                raise RuntimeError("BrainRegistry has no factory configured")
             brain = self._factory(library)
             with self._lock:
                 if key in self._brains:

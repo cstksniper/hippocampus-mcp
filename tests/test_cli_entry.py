@@ -134,7 +134,7 @@ def test_b_dispatch():
         check("B1 doctor 退出码 0", rc == 0, str(rc))
         check("B2 doctor 出体检报告",
               "hippocampus-mcp doctor" in out and "[ OK ]" in out
-              and "各宿主配置里的库" in out, out[:200])
+              and "Libraries configured by host" in out, out[:200])
         check("B3 doctor 不触发启动服务（子命令没被吞）", not calls, str(calls))
 
         ws = tmpdir()
@@ -154,14 +154,14 @@ def test_b_dispatch():
     rc_h, out_h, _err_h = run_cli(["doctor", "--host", "zcode",
                                    "--project", ws2])
     check("B12 doctor --host 经 main 也要出结论段",
-          rc_h == 0 and "宿主×目录判定" in out_h, out_h[:200])
+          rc_h == 0 and "Host/workspace verdict" in out_h, out_h[:200])
     # 只比对目录名：resolve() 可能改写盘符大小写/分隔符，全串比对会假红
     check("B13 结论段带上目标目录", os.path.basename(ws2) in out_h, out_h[:300])
 
     # setup 不带 --host：端到端走自动判定
     rc_a, out_a, _err_a = run_cli(["setup", "--dry-run", "--workspace", ws2])
     check("B14 不带 --host 时自动判定并说出来",
-          rc_a == 0 and "自动判定" in out_a and "zcode" in out_a, out_a[:300])
+          rc_a == 0 and "inferred from workspace markers" in out_a and "zcode" in out_a, out_a[:300])
 
     # 未知子命令：必须报错退出**非 0**（旧入口的病就是静默 exit 0）
     rc3, _out3, err3 = run_cli(["definitely-not-a-subcommand"])
@@ -248,7 +248,7 @@ def test_d_host_project():
         text = out.getvalue()
         check("D1 点名该宿主会读哪份配置",
               ".zcode" in text and "config.json" in text, text[:300])
-        check("D2 缺失必须说「不存在」", "不存在" in text, text[:300])
+        check("D2 missing state is explicit", "Missing (not wired up here)" in text, text[:300])
 
         # 写入一份正确的 ZCode 配置
         cfgdir = ws / ".zcode"
@@ -262,7 +262,7 @@ def test_d_host_project():
         with redirect_stdout(out2):
             cli._doctor_host_project("zcode", ws)
         t2 = out2.getvalue()
-        check("D3 存在且库指向哪", "库=/lib/expected" in t2, t2[:400])
+        check("D3 existing entry reports library", "library=/lib/expected" in t2, t2[:400])
 
         # 事故的**直接检测点**：同目录里有一份宿主不读的配置
         (ws / ".mcp.json").write_text(json.dumps(
@@ -273,7 +273,7 @@ def test_d_host_project():
             cli._doctor_host_project("zcode", ws)
         t3 = out3.getvalue()
         check("D4 点名「存在但 ZCode 不读」",
-              "不读" in t3 and ".mcp.json" in t3, t3[:400])
+              "does not read it" in t3 and ".mcp.json" in t3, t3[:400])
 
         # 配置坏了：不能崩，要给结论
         (cfgdir / "config.json").write_text("{ 这不是 JSON", encoding="utf-8")
@@ -281,7 +281,7 @@ def test_d_host_project():
         try:
             with redirect_stdout(out4):
                 cli._doctor_host_project("zcode", ws)
-            check("D5 坏配置给结论不崩", "不是合法 JSON" in out4.getvalue(),
+            check("D5 bad config gets verdict without crashing", "is not valid JSON" in out4.getvalue(),
                   out4.getvalue()[:400])
         except Exception as exc:  # noqa: BLE001
             check("D5 坏配置给结论不崩", False, f"{type(exc).__name__}: {exc}")
@@ -292,7 +292,7 @@ def test_d_host_project():
         out5 = io.StringIO()
         with redirect_stdout(out5):
             cli._doctor_host_project("zcode", ws)
-        check("D6 无我方条目 → 未接入", "未接入" in out5.getvalue(),
+        check("D6 no our-entry is not wired up", "not wired up" in out5.getvalue(),
               out5.getvalue()[:400])
 
         # 负对照：三种状态必须给出三种**不同**的结论
@@ -335,24 +335,24 @@ def test_e_verify():
     ok, detail = cli._verify_entry(
         _entry(py, ["-c", _FAKE_SRV]), timeout=20.0)
     check("E1 握手成功", ok is True, detail)
-    check("E2 成功明细带工具数", "2 个工具可见" in detail, detail)
+    check("E2 success detail includes tool count", "2 tools visible" in detail, detail)
 
     ok2, d2 = cli._verify_entry(
         _entry(os.path.join(tmpdir(), "no-such-python.exe"), ["-m", "x"]),
         timeout=20.0)
-    check("E3 起不了进程 → 失败带原因", ok2 is False and "起不了进程" in d2, d2)
+    check("E3 process cannot start includes reason", ok2 is False and "Cannot start process" in d2, d2)
 
     ok3, d3 = cli._verify_entry(_entry(py, ["-c", _FAKE_SILENT]), timeout=20.0)
     check("E4 子进程提前退出 → 失败带原因",
-          ok3 is False and "未完成握手" in d3, d3)
+          ok3 is False and "before completing handshake" in d3, d3)
 
     ok4, d4 = cli._verify_entry(_entry(py, ["-c", _FAKE_ERR]), timeout=20.0)
-    check("E5 错误响应 → 失败带原因", ok4 is False and "返回错误" in d4, d4)
+    check("E5 error response includes reason", ok4 is False and "returned error" in d4, d4)
 
     # 负对照：握手通了但 0 个工具 —— 不能算"验证通过"静默过去
     ok5, d5 = cli._verify_entry(
         _entry(py, ["-c", _FAKE_SRV], env={"FAKE_TOOLS": "0"}), timeout=20.0)
-    check("E6 负对照：0 工具要被点名", ok5 is True and "0 个工具" in d5, d5)
+    check("E6 negative control names zero tools", ok5 is True and "0 tools" in d5, d5)
 
     # setup 出口：验证失败必须退非 0（不能"写进去了就当成功"）
     ws = tmpdir()
@@ -363,7 +363,7 @@ def test_e_verify():
         rc, out, _err = run_cli(["setup", "--host", "zcode", "--workspace", ws,
                                  "--file", cfg])
         check("E7 写后即验失败 → setup 退非 0", rc == 1, str(rc))
-        check("E8 失败要在 stdout 说清楚", "握手验证失败" in out, out[-300:])
+        check("E8 failure is reported on stdout", "handshake verification failed" in out, out[-300:])
         check("E9 验证确实被调用了一次", len(calls) == 1, str(calls))
     finally:
         cli._verify_entry = real_verify
@@ -399,7 +399,7 @@ def test_f_preflight():
             rc = L.preflight_persist_dir()
         check("F1 未设库目录 → 放行", rc is None, str(rc))
         check("F2 未设时要自曝（串库从不报错）",
-              "未设置" in err.getvalue() and "doctor" in err.getvalue(),
+              "not set" in err.getvalue() and "doctor" in err.getvalue(),
               err.getvalue()[:200])
 
         ws = tmpdir()
@@ -423,7 +423,7 @@ def test_f_preflight():
         e3 = err3.getvalue()
         check("F5 不可写 → 拒绝启动", rc3 == 2, str(rc3))
         check("F6 拒绝要带原因与修复指引",
-              "拒绝启动" in e3 and L.ENV_PERSIST in e3, e3[:300])
+              "refusing to start" in e3 and L.ENV_PERSIST in e3, e3[:300])
         # 负对照：返回值不能用 falsy 判 —— 0 是"成功启动"，语义相反
         check("F7 负对照：放行是 None 而非 0",
               rc2 is None and rc3 != 0 and bool(rc3) is True,
@@ -450,9 +450,9 @@ def test_g_doctor_selfreport():
         rc, out, _err = run_cli(["doctor"], env={"HIPPOCAMPUS_PERSIST_DIR": None})
         check("G1 doctor 退出码 0", rc == 0, str(rc))
         check("G2 裸跑时自曝「查的是默认库」",
-              "默认库" in out and "不是任何宿主配置里的库" in out, out[:600])
-        check("G3 未设模型时自曝默认模型",
-              "本次检查的是默认模型" in out, out[:600])
+              "default library" in out and "not a library from any host config" in out, out[:600])
+        check("G3 default model is self-reported",
+              "this checks the default model" in out, out[:600])
 
         rc2, out2, _e2 = run_cli(
             ["doctor"], env={"HIPPOCAMPUS_PERSIST_DIR": "/lib/explicit"})
@@ -460,12 +460,12 @@ def test_g_doctor_selfreport():
               "不是任何宿主配置里的库" not in out2, out2[:600])
         # 负对照：自曝只跟 env 有关，跟配置内容无关
         check("G5 负对照：自曝由 env 触发（G2/G4 结论相反）",
-              ("不是任何宿主配置里的库" in out)
-              != ("不是任何宿主配置里的库" in out2), "自曝没随 env 变化")
+              ("not a library from any host config" in out)
+              != ("not a library from any host config" in out2), "self-report did not follow env")
 
         # 库矩阵每行必须带配置文件路径 —— 看出问题后下一步永远是"改哪个文件"
         check("G6 库矩阵每行带配置来源路径",
-              f"<{upath}>" in out2 and "库=/lib/from-user" in out2, out2[-600:])
+              f"<{upath}>" in out2 and "library=/lib/from-user" in out2, out2[-600:])
     finally:
         cli.user_config_path = real_user_path
 
@@ -492,11 +492,11 @@ def test_i_disk_hint():
         check("I2 系统盘 + 小体积 → 一行「暂不必迁」",
               (h := cli._system_disk_migration_hint(Path("C:/libs/user"),
                                                     0.3 * _GB, "C:\\")) is not None
-              and "暂不必迁" in h and "迁移三步" not in h, str(h)[:200])
+              and "no move needed yet" in h and "Migration steps" not in h, str(h)[:200])
         big = cli._system_disk_migration_hint(Path("C:/libs/user"), 2.4 * _GB,
                                               "C:\\")
         check("I3 系统盘 + 大体积 → 迁移三步 + 指路 env 与验证命令",
-              big is not None and "⚠" in big and "迁移三步" in big
+              big is not None and "⚠" in big and "Migration steps" in big
               and "HIPPOCAMPUS_PERSIST_DIR" in big
               and "library_whoami" in big, str(big)[:200])
         check("I4 盘符大小写不敏感",

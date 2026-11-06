@@ -63,7 +63,7 @@ from ..common.sidecar_lock import SidecarBusy, SidecarUnreadable
 MAX_KEY_LEN = 100        # 条目键（CN2601 / chr1 / --use-avx2）
 MAX_STATUS_LEN = 200     # 状态值
 MAX_DESC_LEN = 200       # 图描述（相关性匹配靠它，一句话）
-MAX_NOTE_LEN = 500       # 备注
+MAX_NOTE_LEN = 500       # note
 MAX_FIELDS = 20          # 附加字段个数
 MAX_FIELD_LEN = 200      # 单个附加字段值长度
 MAX_MAPS = 200           # 一个库的地图数上限（防误用成记忆库）
@@ -184,8 +184,8 @@ def empty() -> dict:
 def _clip(s: object, n: int, what: str) -> str:
     s = "" if s is None else str(s)
     if len(s) > n:
-        raise ValueError("%s 超长（%d > %d 字符）：地图条目不是文章，"
-                         "长内容请进记忆" % (what, len(s), n))
+        raise ValueError("%s too long (%d > %d chars): map entries are not articles; "
+                         "put long content into memories instead" % (what, len(s), n))
     return s
 
 
@@ -243,23 +243,23 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
     - notes 是非致命警告（如 truth_source 不在磁盘上）——返回给宿主，
       不打断写入。
     """
-    name = _clip(name, MAX_DESC_LEN, "地图名")
-    key = _clip(key, MAX_KEY_LEN, "条目键")
+    name = _clip(name, MAX_DESC_LEN, "map name")
+    key = _clip(key, MAX_KEY_LEN, "entry key")
     if not name or not key:
-        raise ValueError("地图名和条目键不能为空")
+        raise ValueError("map name and entry key must not be empty")
     maps = data.setdefault("maps", {})
     if name not in maps and len(maps) >= MAX_MAPS:
-        raise ValueError("地图数达上限 %d——maps 不是记忆库，请先清理"
+        raise ValueError("map count reached the limit %d -- maps are not a memory store; clean up first"
                          % MAX_MAPS)
     now = time.time()
     m = maps.setdefault(name, {"desc": name, "created_at": now,
                                "updated_at": now, "entries": {}})
     if desc is not None:
-        m["desc"] = _clip(desc, MAX_DESC_LEN, "地图描述")
+        m["desc"] = _clip(desc, MAX_DESC_LEN, "map description")
     ent = m["entries"].get(key) or {}
     new_ent: dict = {
         "status": _clip(status if status is not None else ent.get("status", ""),
-                        MAX_STATUS_LEN, "状态值"),
+                        MAX_STATUS_LEN, "status value"),
         "fields": ent.get("fields") or {},
         "updated_at": now,
         "updated_by": _clip(updated_by, 50, "updated_by"),
@@ -267,14 +267,14 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
         "source_sig": None,
         "drift": None,
         "note": _clip(note if note is not None else ent.get("note", ""),
-                      MAX_NOTE_LEN, "备注"),
+                      MAX_NOTE_LEN, "note"),
     }
     if fields:
         if not isinstance(fields, dict):
-            raise ValueError("fields 必须是 dict")
+            raise ValueError("fields must be a dict")
         if len(fields) > MAX_FIELDS:
-            raise ValueError("附加字段超 %d 个" % MAX_FIELDS)
-        new_ent["fields"] = {str(k): _clip(v, MAX_FIELD_LEN, "字段值")
+            raise ValueError("more than %d extra fields" % MAX_FIELDS)
+        new_ent["fields"] = {str(k): _clip(v, MAX_FIELD_LEN, "field value")
                              for k, v in fields.items()}
     notes: list[str] = []
     old_ts = str(ent.get("truth_source") or "")
@@ -288,7 +288,7 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
         full = resolve_source(new_ent["truth_source"], root)
         sig = _record_source_sig(full)
         if sig is None:
-            notes.append("truth_source 不在磁盘上或太大（未记录签名）：%s"
+            notes.append("truth_source missing from disk or too large (no recorded signature): %s"
                          % new_ent["truth_source"])
         new_ent["source_sig"] = sig
     # truth_source == ""（显式空串）⇒ 清除：source_sig 保持 None
@@ -324,10 +324,10 @@ def ack_entry(data: dict, name: str, key: str,
     now = time.time() if now is None else now
     m = (data.get("maps") or {}).get(str(name))
     if not m:
-        raise ValueError("没有这张图：%s" % name)
+        raise ValueError("no such map: %s" % name)
     ents = m.get("entries") or {}
     if str(key) not in ents:
-        raise ValueError("图「%s」里没有条目：%s" % (name, key))
+        raise ValueError("map %r has no entry %r" % (name, key))
     ent = ents[str(key)]
     ent["updated_at"] = now
     ent["acked_at"] = now

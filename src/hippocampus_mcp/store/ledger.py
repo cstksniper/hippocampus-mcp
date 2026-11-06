@@ -177,7 +177,7 @@ def reconcile_on_boot(
         end_fps = last.get("layer_fps")
         if not isinstance(end_fps, dict):
             rec["layer_fps_absent"] = True
-            rec["note"] = "账本末条无层指纹（旧格式或指纹已关），不做内容对账。"
+            rec["note"] = "The last ledger entry has no layer fingerprints (old format or fingerprinting off); content reconciliation skipped."
         else:
             for name in layer_names:
                 fp = end_fps.get(name)
@@ -185,9 +185,9 @@ def reconcile_on_boot(
                     mismatch.append(name)
             rec["disk_mismatch"] = mismatch
             rec["note"] = (
-                f"磁盘内容与账本末条(end seq={seq})不符的层：{'、'.join(mismatch)}"
-                "——外部工具改动或写坏，账本没有对应的 end。" if mismatch else
-                "磁盘内容与账本末条一致，没有未说明的改动。")
+                f"Layers whose disk content mismatches the last ledger entry (end seq={seq}): {', '.join(mismatch)} "
+                "-- changed by an external tool or corrupted; the ledger has no matching end." if mismatch else
+                "Disk content matches the last ledger entry; no unexplained changes.")
     elif phase in ("begin", "fail"):
         begin = last if phase == "begin" else None
         if phase == "fail":
@@ -198,8 +198,8 @@ def reconcile_on_boot(
         begin_fps = begin.get("layer_fps") if isinstance(begin, dict) else None
         if not isinstance(begin_fps, dict):
             rec["layer_fps_absent"] = True
-            rec["note"] = (f"账本末条是 {phase}（上次保存没走完），"
-                           "但行里没有层指纹，判不出具体哪层丢了。")
+            rec["note"] = (f"The last ledger entry is {phase} (the previous save did not finish), "
+                           "and the row carries no layer fingerprints, so the lost layers cannot be identified.")
         else:
             lost = {}
             counts = begin.get("layers") if isinstance(begin, dict) else {}
@@ -209,13 +209,13 @@ def reconcile_on_boot(
                     lost[name] = (counts or {}).get(name)
             rec["lost_since_last_save"] = lost
             if lost:
-                detail = "、".join(f"{k}({v}条)" for k, v in lost.items())
-                rec["note"] = (f"上次保存(seq={seq})没走完，以下层声明要写、"
-                               f"磁盘上却不是那份内容：{detail}。")
+                detail = ", ".join(f"{k}({v} records)" for k, v in lost.items())
+                rec["note"] = (f"The previous save (seq={seq}) did not finish; the following layers declared writes "
+                               f"but the disk no longer holds that content: {detail}.")
             else:
-                rec["note"] = (f"上次保存(seq={seq})没走完，但各层磁盘内容与 "
-                               "begin 声明一致——可能已写完、只是 end 没落。")
+                rec["note"] = (f"The previous save (seq={seq}) did not finish, but every layer's disk content matches "
+                               "the begin declaration -- the write likely completed and only the end row was lost.")
     else:
-        rec["note"] = f"账本末条 phase={phase} 未知，不对账。"
+        rec["note"] = f"The last ledger entry has unknown phase={phase}; reconciliation skipped."
 
     return rec

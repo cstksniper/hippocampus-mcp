@@ -55,7 +55,7 @@ def recall_feedback_stats(
             "recall_count_positive": 0,
             "coverage": None,
             "coverage_level": "unknown",
-            "note": "库内没有 active 记忆，覆盖率无意义",
+            "note": "no active memories in the library; coverage is meaningless",
         }
     with_last = sum(1 for r in active if (r.last_recalled_at or 0.0) > 0.0)
     counted = sum(1 for r in active if (r.recall_count or 0) > 0)
@@ -104,13 +104,13 @@ def pin_stats(
     if error is not None:
         return {"active_total": 0, "pinned_total": 0, "pinned_ratio": None,
                 "suspected_auto_pinned": 0, "level": "unknown",
-                "note": f"统计失败（不影响其它自曝项）: {error}"}
+                "note": f"stats failed (other self-report fields unaffected): {error}"}
     active = [r for r in records if r.state == active_state]
     total = len(active)
     if not total:
         return {"active_total": 0, "pinned_total": 0, "pinned_ratio": None,
                 "suspected_auto_pinned": 0, "level": "unknown",
-                "note": "库内没有 active 记忆，pin 占比无意义"}
+                "note": "no active memories in the library; pin ratio is meaningless"}
     pinned = [r for r in active if getattr(r, "pin", False)]
     auto = [r for r in pinned
             if pin_threshold <= (getattr(r, "importance", 0) or 0) <= 0.75]
@@ -220,19 +220,19 @@ def lexical_self_report(
                 fts_ready = False
             break
     if name == "sqlite" and fts_ready and indexed == 0:
-        level, note = "ok", "字面通道走 FTS5，内存 BM25 未建（34.5MB 已省下）"
+        level, note = "ok", "the literal channel uses FTS5; in-memory BM25 not built (34.5MB saved)"
     elif name == "sqlite" and fts_ready and path == "memory":
         level = "degraded"
-        note = (f"FTS5 可用但本次查询仍回退了内存 BM25（已建 {indexed} 条）；"
+        note = (f"FTS5 is available but this query still fell back to in-memory BM25 (built {indexed} records)；"
                 "中文 2 字词触发回退是预期行为，频繁出现才需要查")
     elif name == "sqlite" and not fts_ready:
         level = "degraded"
-        note = (f"sqlite 后端但 FTS5 不可用 ⇒ 字面通道回退内存 BM25"
-                f"（已建 {indexed} 条，34.5MB 省不到）")
+        note = (f"sqlite backend without FTS5 => the literal channel falls back to in-memory BM25 "
+                f"(built {indexed} records; the 34.5MB saving is unavailable)")
     elif name == "json":
-        level, note = "json", f"json 后端：字面通道只能走内存 BM25（已建 {indexed} 条）"
+        level, note = "json", f"json backend: the literal channel can only use in-memory BM25 (built {indexed} records)"
     else:
-        level, note = "unknown", f"后端={name}，无法判定字面通道形态"
+        level, note = "unknown", f"backend={name}, the literal channel's form cannot be determined"
     return {
         "store_backend": name,
         "fts5_ready": fts_ready,

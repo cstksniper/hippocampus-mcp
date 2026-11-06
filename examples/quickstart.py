@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
-"""HippoMCP 最小可运行示例 —— 不需要下载模型，不需要任何 API Key。
+"""HippoMCP minimal runnable example -- no model downloads, no API key.
 
-演示记忆底座的四个核心动作：
+Demonstrates the four core actions of the memory layer:
 
-    1. ingest()           写入：原始文本进 L0，萃取出的句子进 L1，并挂上实体
-    2. recall()           召回：融合检索（向量 + BM25 + 时序）并标注口径冲突
-    3. get_memory_context()  用层：按 5 个固定槽位装配，可直接拼进 system prompt
-    4. forget()           删除：级联清掉 L2/L3/索引层，不留孤儿
+    1. ingest()              write: raw text goes to L0, extracted facts to L1, entities attached
+    2. recall()              retrieve: hybrid search (vector + BM25 + temporal) with conflict flags
+    3. get_memory_context()  consume: assemble 5 fixed slots, ready to paste into a system prompt
+    4. forget()              delete: cascade-clean L2/L3/index layers, no orphans left
 
-运行::
+Run::
 
     PYTHONPATH=src python examples/quickstart.py
 
-说明：本示例刻意使用 ``embedder_backend="hash"``，好处是**不下载模型、秒级启动**，
-便于快速确认整套流程能跑通。哈希嵌入不具备语义泛化能力，检索只按词面相似——
-要看真实效果请换成句向量模型::
+Note: this example deliberately uses ``embedder_backend="hash"`` so it
+**downloads no models and starts in seconds** -- good for verifying the whole
+pipeline end to end. Hash embeddings have no semantic generalization; retrieval
+matches surface tokens only. For real quality, switch to a sentence-embedding
+model::
 
     PYTHONPATH=src python examples/quickstart.py --model sentence-transformers/all-MiniLM-L6-v2
 """
@@ -35,24 +37,25 @@ def banner(title: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="HippoMCP 最小可运行示例")
+    ap = argparse.ArgumentParser(description="HippoMCP minimal runnable example")
     ap.add_argument(
         "--model", default="",
-        help="句向量模型名；留空则用 hash 后端（零下载）",
+        help="sentence-embedding model name; empty uses the hash backend (zero download)",
     )
     args = ap.parse_args()
 
     workdir = tempfile.mkdtemp(prefix="hippocampus_quickstart_")
     backend = "sentence_transformer" if args.model else "hash"
-    print(f"临时记忆库目录: {workdir}")
-    print(f"嵌入后端      : {backend}" + (f" ({args.model})" if args.model else ""))
+    print(f"Temp memory library : {workdir}")
+    print(f"Embedding backend   : {backend}" + (f" ({args.model})" if args.model else ""))
 
-    # 示例语料：一个虚构项目组的三次对话。全部为通用内容，不含任何私人数据。
+    # Sample corpus: three fictional conversations from one project team.
+    # Fully generic content, no private data.
     corpus = [
-        ("设计评审定下来用 PostgreSQL，不用 MongoDB，理由是事务和报表。", "会议纪要.md"),
-        ("张工的邮箱是 zhang@example.com，负责后端。", "团队花名册.md"),
-        ("部署窗口改到每周三凌晨，运维说周二有例行维护。", "会议纪要.md"),
-        ("之前定的部署窗口是周一，后来改成周三了。", "会议纪要.md"),
+        ("The design review settled on PostgreSQL, not MongoDB, because of transactions and reporting.", "meeting-notes.md"),
+        ("Engineer Zhang's email is zhang@example.com; they own the backend.", "team-roster.md"),
+        ("The deploy window moved to every Wednesday early morning; ops said Tuesday has routine maintenance.", "meeting-notes.md"),
+        ("The deploy window used to be Monday; it was later changed to Wednesday.", "meeting-notes.md"),
     ]
 
     brain = HippoBrain(
@@ -63,24 +66,24 @@ def main() -> int:
     )
 
     try:
-        # ---------------- 1. 写入 ----------------
-        banner("1. ingest —— 写入并萃取")
+        # ---------------- 1. Write ----------------
+        banner("1. ingest -- write and extract")
         for text, source in corpus:
             r = brain.ingest(text, source=source)
             n = len(r.get("memory_ids") or r.get("memories") or [])
-            print(f"  + [{source}] {text[:34]}…  → 新增 {n} 条 L1")
+            print(f"  + [{source}] {text[:34]}…  -> {n} new L1 facts")
 
         st = brain.stats()
-        print(f"\n  L0 原文: {st.get('L0_raw')} 条   L1 记忆: {st.get('L1_memories')} 条   "
-              f"实体: {st.get('entities')}   嵌入模型: {st.get('embed_model')}")
+        print(f"\n  L0 raw: {st.get('L0_raw')}   L1 facts: {st.get('L1_memories')}   "
+              f"entities: {st.get('entities')}   embed model: {st.get('embed_model')}")
 
-        # ---------------- 2. 召回 ----------------
-        banner("2. recall —— 融合检索")
-        for q in ("部署窗口是什么时候", "谁负责后端"):
+        # ---------------- 2. Recall ----------------
+        banner("2. recall -- hybrid retrieval")
+        for q in ("when is the deploy window", "who owns the backend"):
             hits = brain.recall(q, top_k=3)
-            print(f"\n  查询: {q}")
+            print(f"\n  query: {q}")
             if not hits:
-                print("    （无命中）")
+                print("    (no hits)")
             for h in hits:
                 score = h.get("score", h.get("similarity", 0.0))
                 flags = " ".join(
@@ -88,34 +91,34 @@ def main() -> int:
                 )
                 print(f"    {score:.3f}  {str(h.get('content', ''))[:44]}  {flags}")
 
-        # ---------------- 3. 用层装配 ----------------
-        banner("3. get_memory_context —— 5 槽位装配")
-        ctx = brain.get_memory_context("准备写部署文档", top_k=5)
+        # ---------------- 3. Context assembly ----------------
+        banner("3. get_memory_context -- 5-slot assembly")
+        ctx = brain.get_memory_context("preparing to write deployment docs", top_k=5)
         blocks = ctx.get("blocks", {})
-        print("  槽位装载情况:")
+        print("  slot fill:")
         for key, val in blocks.items():
-            print(f"    {key:24s} {len(val)} 项")
+            print(f"    {key:24s} {len(val)} items")
             for item in list(val)[:2]:
                 print(f"        - {str(item)[:58]}")
-        print(f"\n  估算 token: {ctx.get('token_estimate')}")
-        print("  ---- 可直接拼进 system prompt 的文本 ----")
-        for line in (ctx.get("text") or "（空）").splitlines()[:12]:
+        print(f"\n  estimated tokens: {ctx.get('token_estimate')}")
+        print("  ---- text ready to paste into a system prompt ----")
+        for line in (ctx.get("text") or "(empty)").splitlines()[:12]:
             print(f"    {line}")
 
-        # ---------------- 4. 级联删除 ----------------
-        banner("4. forget —— 级联删除")
-        victim = brain.recall("张工的邮箱", top_k=1)
+        # ---------------- 4. Cascade delete ----------------
+        banner("4. forget -- cascade delete")
+        victim = brain.recall("zhang@example.com", top_k=1)
         if victim:
             mid = victim[0].get("id") or victim[0].get("memory_id")
-            rep = brain.forget(mid, reason="quickstart 演示：级联删除")
-            print(f"  删除 {mid}")
-            print(f"  级联报告: {rep}")
-            left = brain.recall("张工的邮箱", top_k=1)
-            print(f"  删除后同查询命中: {len(left)} 条")
+            rep = brain.forget(mid, reason="quickstart demo: cascade delete")
+            print(f"  deleted {mid}")
+            print(f"  cascade report: {rep}")
+            left = brain.recall("zhang@example.com", top_k=1)
+            print(f"  hits for the same query after deletion: {len(left)}")
 
-        banner("完成")
-        print("  全部流程跑通。真实使用时把 persist_dir 指向你的记忆库目录即可。")
-        print("  详见 docs/ARCHITECTURE.md")
+        banner("Done")
+        print("  All steps completed. For real use, point persist_dir at your memory library directory.")
+        print("  See docs/ARCHITECTURE.md")
         return 0
 
     finally:

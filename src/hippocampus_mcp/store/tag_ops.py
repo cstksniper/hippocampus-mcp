@@ -108,7 +108,7 @@ def append_ops(persist_dir: str | None,
     except OSError as exc:
         # 账本写失败不能吞：撤销依据丢了必须让宿主知道（内存里的标签
         # 已经改了，但"改之前是什么"从此无处可查）。
-        logger.warning("[tag_ops] 账本追加失败：%s", exc)
+        logger.warning("[tag_ops] ledger append failed: %s", exc)
         return None, last_seq, lines
     return entry["op_id"], last_seq, lines
 
@@ -135,5 +135,5 @@ def trim_ops(persist_dir: str | None, ring: int, lines: int) -> int:
         os.replace(tmp, path)
         return len(keep)
     except OSError as exc:
-        logger.warning("[tag_ops] 账本裁剪失败：%s", exc)
+        logger.warning("[tag_ops] ledger trim failed: %s", exc)
         return lines

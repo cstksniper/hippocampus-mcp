@@ -1,12 +1,15 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "HippoMCP: 面向 LLM 宿主的 MCP 记忆底座"
+title: "HippoMCP: A Long-Term Memory Layer for LLM Hosts via MCP"
 abstract: >-
-  一个通过 MCP（Model Context Protocol）为 LLM 宿主提供长期记忆的服务。
-  与"给应用加一层向量库"不同，它覆盖写入、检索、整理到"按槽位递给宿主"的完整链路：
-  四层记忆模型（原始流水 / 记忆 / 摘要 / 画像）、级联删除与墓碑机制、
-  superseded 状态机（不删旧事实而是标注被取代）、基于液态神经网络 CfC 的时序编码，
-  以及带独立 token 预算的 5 槽位上下文装配。
+  A service that provides long-term memory to LLM hosts through MCP
+  (Model Context Protocol). Unlike "adding a vector store to an app",
+  it covers the full path from writing, retrieval, and curation to
+  hand-assembled context slots: a four-layer memory model (raw stream /
+  facts / summaries / profile), cascade deletion with tombstones,
+  a superseded state machine (old facts are marked superseded, not erased),
+  CfC-based temporal encoding inspired by liquid neural networks,
+  and 5-slot context assembly with an independent token budget.
 authors:
   - name: "cstksniper"
     email: "cstksniper@qq.com"

@@ -22,7 +22,7 @@ domain 但只准依赖 common；沿用 knowledge_batch 先例）。
    stale（宁可漏标也不误标，改写权在宿主）。
 3. ``entities`` / ``tags`` 各截前 3；``span`` 拷贝一份（不与主题层同对象）；
    ``size`` / ``recall_hits`` 走 ``int(x or 0)``；``title`` 空则
-   ``(未命名)``。
+   ``(untitled)``。
 4. ``pending_counts`` 的 excluded 口径是同一函数 ``exclude_low_info=False``
    （假簇自曝差集）；``excluded_n = max(0, 差)``——正常 excluded ≥ pending，
    max(0) 是防御性的（文案钉）。
@@ -71,7 +71,7 @@ def project_rows(
             continue
         rows.append({
             "id": t.get("id"),
-            "title": t.get("title") or "(未命名)",
+            "title": t.get("title") or "(untitled)",
             "status": t.get("status"),
             "size": int(t.get("size") or 0),
             "summary": t.get("summary") or "",

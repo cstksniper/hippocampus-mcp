@@ -242,7 +242,7 @@ def plan_prune(
                 model_id=m.model_id,
                 path=int8_dirs[0] if int8_dirs else os.path.join(m.path, "onnx_int8"),
                 bytes_=m.int8_bytes,
-                reason="运行时不读 onnx_int8/（ONNX_SUBDIR 只有 onnx，量化产物是导出中间件）",
+                reason="onnx_int8/ is not read at runtime (ONNX_SUBDIR only accepts onnx; the quantized artifact is an export intermediate)",
             ))
 
         # 注意：这里用标志位而不是在分支里 continue —— 被引用的模型仍然
@@ -251,10 +251,10 @@ def plan_prune(
         keep_model = bool(refs) or is_protected
         if refs:
             plan.notes.append(
-                f"{m.model_id}：被库 {', '.join(sorted(refs))} 引用，整体保留")
+                f"{m.model_id}: referenced by libraries {', '.join(sorted(refs))}; kept whole")
         elif is_protected:
             plan.notes.append(
-                f"{m.model_id}：当前默认 / 显式指定模型，整体保留")
+                f"{m.model_id}: current default / explicitly specified model; kept whole")
 
         if keep_model:
             # 保留的模型才谈得上「onnx 是否冗余」
@@ -265,7 +265,7 @@ def plan_prune(
                     model_id=m.model_id,
                     path=onnx_dirs[0] if onnx_dirs else os.path.join(m.path, "onnx"),
                     bytes_=m.onnx_bytes,
-                    reason="显式 torch 后端：ONNX 快路径不会被用到（可 export_onnx.py 重生成）",
+                    reason="explicit torch backend: the ONNX fast path is unused (can be regenerated via export_onnx.py)",
                 ))
             continue
 
@@ -275,7 +275,7 @@ def plan_prune(
             model_id=m.model_id,
             path=m.path,
             bytes_=m.total_bytes,
-            reason="无库引用，且不是当前默认模型",
+            reason="no library references it, and it is not the current default model",
         ))
 
     plan.actions.sort(key=lambda a: -a.bytes_)
@@ -330,7 +330,7 @@ def apply_prune(actions: list[PruneAction], cache_roots: list[str]) -> tuple[int
     errors: list[str] = []
     for act in actions:
         if not _is_safe_target(act.path, cache_roots):
-            errors.append(f"{act.kind} {act.model_id}：路径不在缓存根内，已跳过 {act.path}")
+            errors.append(f"{act.kind} {act.model_id}: path outside the cache roots, skipped {act.path}")
             continue
         try:
             before = _dir_size(act.path)
@@ -388,51 +388,51 @@ def format_report(
     in_use = in_use or {}
     protected = protected or set()
     lines: list[str] = []
-    lines.append("本地嵌入模型缓存")
+    lines.append("Local embedding-model cache")
     for root in (cache_roots or []):
-        lines.append(f"  根目录: {root}")
+        lines.append(f"  roots: {root}")
     if not models:
-        lines.append("  （没有扫描到任何 models--* 目录）")
+        lines.append("  (no models--* directories found in the scan)")
         return "\n".join(lines)
 
     lines.append("-" * 74)
     for m in models:
         lines.append(f"{m.model_id}   {human_size(m.total_bytes)}")
-        detail = (f"权重 {human_size(m.weight_bytes)}"
+        detail = (f"weights {human_size(m.weight_bytes)}"
                   f" + ONNX {human_size(m.onnx_bytes)}"
                   f" + int8 {human_size(m.int8_bytes)}"
-                  f" + 其他 {human_size(m.other_bytes)}")
+                  f" + other {human_size(m.other_bytes)}")
         lines.append(f"    {detail}")
         refs = in_use.get(m.model_id) or []
         flags = []
-        flags.append("在用: " + (", ".join(sorted(refs)) if refs else "（无库引用）"))
+        flags.append("in use: " + (", ".join(sorted(refs)) if refs else "(no library references)"))
         if m.model_id in protected:
-            flags.append("当前默认")
+            flags.append("current default")
         lines.append("    " + "   ".join(flags))
-        lines.append(f"    路径: {m.path}")
+        lines.append(f"    path: {m.path}")
     lines.append("-" * 74)
-    lines.append(f"合计 {human_size(sum(m.total_bytes for m in models))}"
-                 f"（其中必须保留的引擎部分 "
-                 f"{human_size(sum(m.engine_bytes for m in models))}）")
+    lines.append(f"total {human_size(sum(m.total_bytes for m in models))} "
+                 f"(the engine portions that must be kept "
+                 f"{human_size(sum(m.engine_bytes for m in models))})")
     return "\n".join(lines)
 
 
 def format_plan(plan: PrunePlan) -> str:
     """渲染回收计划（``--yes`` 之前的最后一道确认）。"""
     if not plan.actions and not plan.notes:
-        return "没有可回收项。"
+        return "Nothing reclaimable."
     lines: list[str] = []
     if plan.actions:
-        lines.append(f"可回收 {human_size(plan.total_bytes)}：")
+        lines.append(f"Reclaimable {human_size(plan.total_bytes)}:")
         for a in plan.actions:
-            label = {"model": "[整模型]", "onnx_int8": "[int8]  ", "onnx": "[ONNX]  "}.get(a.kind, a.kind)
+            label = {"model": "[whole model]", "onnx_int8": "[int8]     ", "onnx": "[ONNX]     "}.get(a.kind, a.kind)
             lines.append(f"  {label} {a.model_id}  {human_size(a.bytes_)}")
             lines.append(f"           {a.reason}")
             lines.append(f"           {a.path}")
     if plan.notes:
         if lines:
             lines.append("")
-        lines.append("保留说明：")
+        lines.append("Keep notes:")
         for n in plan.notes:
             lines.append(f"  - {n}")
     return "\n".join(lines)

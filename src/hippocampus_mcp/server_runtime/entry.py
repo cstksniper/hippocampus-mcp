@@ -75,13 +75,13 @@ def run_main() -> None:
             brain._get_nlp()
             brain.manager.embedder.embed("warmup")
             s.logger.info(
-                "预热完成: L1=%d 实体=%d",
+                "warmup done: L1=%d entities=%d",
                 brain.manager.store.count(), len(brain.entities),
             )
         except Exception as e:  # 预热失败不阻断服务（首次调用会重试）
-            s.logger.warning("预热失败（将在首次调用时重试）: %s", e)
+            s.logger.warning("warmup failed (will retry on first call): %s", e)
     elif s._WARMUP_MODE == "off":
-        s.logger.info("HIPPOCAMPUS_WARMUP=off：跳过预热，首次工具调用将自行初始化")
+        s.logger.info("HIPPOCAMPUS_WARMUP=off: skipping warmup; the first tool call will initialize")
     else:
         s.start_background_warmup()
 
@@ -90,11 +90,11 @@ def run_main() -> None:
     _boot_s = time.time() - s._PROCESS_T0
     if _boot_s > s._HANDSHAKE_WINDOW:
         s.logger.warning(
-            "启动耗时 %.1fs，已超宿主工具注册窗口（约 %.0fs）——"
-            "本服务工具可能被整个漏注册；根治靠 launcher + daemon 常驻进程。",
+            "startup took %.1fs, over the host tool-registration window (about %.0fs) -- "
+            "this service's tools may have been missed at registration entirely; the durable fix is launcher + resident daemon.",
             _boot_s, s._HANDSHAKE_WINDOW)
     else:
-        s.logger.info("启动耗时 %.1fs（在 %.0fs 窗口内）",
+        s.logger.info("startup took %.1fs (within the %.0fs window)",
                       _boot_s, s._HANDSHAKE_WINDOW)
 
     s.server.run()

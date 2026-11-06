@@ -60,13 +60,13 @@ def load_json_config(path: Path) -> tuple[dict | None, str]:
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        return None, f"读不出来（{type(exc).__name__}: {exc}）"
+        return None, f"unreadable ({type(exc).__name__}: {exc})"
     try:
         cfg = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, f"不是合法 JSON（{exc}）"
+        return None, f"not valid JSON ({exc})"
     if not isinstance(cfg, dict):
-        return None, "顶层不是 JSON 对象"
+        return None, "top level is not a JSON object"
     return cfg, ""
 
 
@@ -172,14 +172,14 @@ def classify(path: Path, origin: str,
     if key_path is not None:
         if any(_looks_like_server_entry(v) for v in container.values()):
             return Candidate(path, origin, "new", key_path,
-                             reason="有其他 server 条目")
+                             reason="other server entries exist")
         return Candidate(path, origin, "suspect", key_path,
-                         reason="容器为空")
+                         reason="container is empty")
     if _convention_name(path):
         return Candidate(path, origin, "suspect", None,
-                         reason="尚无 mcp 容器（按文件名约定识别）")
+                         reason="no MCP container yet (identified by filename convention)")
     return Candidate(path, origin, "skip", key_path,
-                     reason="未识别出 MCP 配置形态")
+                     reason="unrecognized MCP config shape")
 
 
 def _walk_names(root: Path, globs: tuple[str, ...], max_depth: int):

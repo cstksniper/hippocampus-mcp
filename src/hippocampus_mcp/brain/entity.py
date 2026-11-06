@@ -442,12 +442,12 @@ class _EntityLexiconMixin:
             # 如实说清查过哪三条路——旧文案只说「persist_dir 未设」，而真因
             # 通常是「默认路径下的文件不存在」，把人往完全错误的地方引。
             raise ValueError(
-                "无法追加专名词库：没有可写的词库路径。已依次查找 —— "
-                f"① 显式 entity_lexicon_path="
-                f"{self._explicit_lexicon_path or '未设'}；"
-                f"② env HIPPOCAMPUS_ENTITY_LEXICON={_env or '未设'}；"
-                f"③ 默认 <记忆库>/entity_lexicon.txt：persist_dir="
-                f"{_dir or '未设'}（创建失败或无权限）。"
+                "cannot append to the lexicon: no writable lexicon path. Searched, in order -- "
+                f"1) explicit entity_lexicon_path="
+                f"{self._explicit_lexicon_path or 'unset'}; "
+                f"2) env HIPPOCAMPUS_ENTITY_LEXICON={_env or 'unset'}; "
+                f"3) default <memory library>/entity_lexicon.txt: persist_dir="
+                f"{_dir or 'unset'} (creation failed or no permission)."
             )
         existing_terms, existing_aliases = self._read_lexicon(path)
         before = len(existing_terms)
@@ -586,24 +586,24 @@ class _EntityLexiconMixin:
         a_is_alias = ca.lower() != a.lower()
         b_is_alias = cb.lower() != b.lower()
         if a_is_alias and not b_is_alias:
-            return b, ca, f"{a} 已在词库登记为 {ca} 的别名"
+            return b, ca, f"{a} is already registered in the lexicon as an alias of {ca}"
         if b_is_alias and not a_is_alias:
-            return a, cb, f"{b} 已在词库登记为 {cb} 的别名"
+            return a, cb, f"{b} is already registered in the lexicon as an alias of {cb}"
         a_lex, b_lex = a in in_lexicon, b in in_lexicon
         if a_lex != b_lex:
-            return (b, a, "词库已登记") if a_lex else (a, b, "词库已登记")
+            return (b, a, "registered in lexicon") if a_lex else (a, b, "registered in lexicon")
         na = max(docs.get(a, 0), self.entities.get(a, {}).get("mention_count", 0))
         nb = max(docs.get(b, 0), self.entities.get(b, {}).get("mention_count", 0))
         if na != nb:
-            return ((b, a, f"提及更多（{na} > {nb}）") if na > nb
-                    else (a, b, f"提及更多（{nb} > {na}）"))
+            return ((b, a, f"mentioned more often ({na} > {nb})") if na > nb
+                    else (a, b, f"mentioned more often ({nb} > {na})"))
         if len(a) != len(b):
-            return ((b, a, f"更长优先（全称优于简称，{len(a)}/{len(b)} 字）")
+            return ((b, a, f"longer form wins (full name over abbreviation, {len(a)}/{len(b)} chars)")
                     if len(a) > len(b)
-                    else (a, b, f"更长优先（全称优于简称，{len(b)}/{len(a)} 字）"))
+                    else (a, b, f"longer form wins (full name over abbreviation, {len(b)}/{len(a)} chars)"))
         if a <= b:
-            return b, a, "无法判断，按字典序给出——请人工确认方向"
-        return a, b, "无法判断，按字典序给出——请人工确认方向"
+            return b, a, "cannot decide; ordered lexicographically -- confirm the direction manually"
+        return a, b, "cannot decide; ordered lexicographically -- confirm the direction manually"
 
 
 
@@ -848,7 +848,7 @@ class _EntityLexiconMixin:
             if len(ent["evidence"]) < max_evidence:
                 ent["evidence"].append({
                     "memory_id": "", "signal": "cooc", "cue": "",
-                    "text": f"共同出现 {cnt} 条（提升度 {lf:.1f}x／包含度 {contain:.0%}）",
+                    "text": f"co-occur {cnt} times (lift {lf:.1f}x / containment {contain:.0%}）",
                 })
 
         # ---- 门控 → 定方向 → 打分 → 排序 ---------------------------------
@@ -934,7 +934,7 @@ class _EntityLexiconMixin:
             "cue_words": cue_stat,
             "stop_words": stop_stat,
             "skipped": skipped,
-            "note": "只做候选，不自动写盘；确认方向后用 lexicon_add(paste) 落盘",
+            "note": "candidates only, nothing written automatically; after confirming the direction, persist via lexicon_add(paste)",
         }
 
 
@@ -993,7 +993,7 @@ class _EntityLexiconMixin:
         #   ③ 本次调用的 `exclude` 参数（临时排除，不落盘）
         stop, stop_grams, stop_stat = self._stop_grams(exclude)
         logger.info(
-            "[lexicon_suggest] 停用词 %d 条（内置 %d / 项目文件 %d / 本次 exclude %d）",
+            "[lexicon_suggest] %d stopwords (built-in %d / project file %d / excluded this run %d)",
             len(stop), stop_stat["builtin"], stop_stat["file"], stop_stat["extra"],
         )
         noise = tuple(self._NOISE_CHARS)

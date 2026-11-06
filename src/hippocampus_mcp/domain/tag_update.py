@@ -68,14 +68,14 @@ def normalize_request(
     mode = (mode or "merge").strip().lower()
     if mode not in ("merge", "replace"):
         return mode, {}, [], {
-            "ok": False, "error": f"非法 mode: {mode!r}",
+            "ok": False, "error": f"invalid mode: {mode!r}",
             "allowed_modes": ["merge", "replace"]}
     new_tags = dict(tags or {})
     ckeys = [str(k) for k in (clear_keys or []) if str(k)]
     if not new_tags and not ckeys:
         return mode, new_tags, ckeys, {
             "ok": False,
-            "error": "tags 与 clear_keys 不能同时为空（没有要改的东西）"}
+            "error": "tags and clear_keys cannot both be empty (nothing to change)"}
     return mode, new_tags, ckeys, None
 
 
@@ -185,16 +185,16 @@ def build_payload(
                                  sample_max=sample_max),
     }
     payload["reverse_hint"] = (
-        "可撤销：服务端记了全量前后影像账本，执行后带 op_id；"
-        "update_tags(undo=op_id 或 \"last\", dry_run=false) 即 fail-closed "
-        "回滚（当前值仍等于 after 才改回 before，被改过的条目会跳过并自曝）"
+        "Reversible: the server keeps a full before/after ledger; the result carries op_id. "
+        "update_tags(undo=op_id or \"last\", dry_run=false) performs a fail-closed "
+        "rollback (restores before only if the current value still equals after; changed entries are skipped and self-reported)"
     )
 
     if dry_run:
         payload["hint"] = (
-            "这是计划，没有写入。确认无误后用 dry_run=false 执行"
-            + (f"；影响 {to_change} 条 > {confirm_above}，"
-               f"还需同时 confirm=true" if to_change > confirm_above else "")
+            "This is a plan; nothing was written. Execute with dry_run=false once confirmed"
+            + (f"; it would affect {to_change} entries > {confirm_above}, "
+               f"confirm=true is also required" if to_change > confirm_above else "")
         )
         return payload, False
 
@@ -202,8 +202,8 @@ def build_payload(
         payload.update({
             "ok": False,
             "applied": False,
-            "error": (f"影响 {to_change} 条 > {confirm_above}，"
-                      f"拒绝执行：请先 dry_run=true 看 sample，确认后加 confirm=true"),
+            "error": (f"would affect {to_change} entries > {confirm_above}; "
+                      f"refusing to execute: run dry_run=true first to inspect the sample, then add confirm=true"),
         })
         return payload, False
     return payload, True

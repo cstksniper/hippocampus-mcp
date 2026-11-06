@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""提升候选判据：稳定期限 + 去个案化 + 敏感标注。
+"""提升候选判据：稳定期限 + 去个案化 + sensitive标注。
 
 提升流决策语义的纯函数落点（domain 只准依赖 common；本模块
-**连 sensitive 都不 import**——同层禁互引，敏感匹配经 ``sensitive_fn``
+**连 sensitive 都不 import**——同层禁互引，sensitive匹配经 ``sensitive_fn``
 回调由服务层注入，词表内容与模式都在服务层装配）：
 
 * 稳定期限：记录在 ≥ ``min_sessions`` 个**不同会话**中出现。
@@ -12,8 +12,8 @@
   ``session_id`` 为准（空 id 的摘要不计——没有会话归属就没法数"不同"）。
 * 去个案化：**只标注不硬拦**——候选带 ``project_entities``
   （该记录命中的本项目实体名），改写由人。
-* 敏感：``sensitive_fn(content)`` 命中 → ``blocked=True`` +
-  ``sensitive_hits`` 详情（可改写后重提）；带 ``敏感=true`` 标签的记录
+* sensitive：``sensitive_fn(content)`` 命中 → ``blocked=True`` +
+  ``sensitive_hits`` 详情（可改写后重提）；带 ``sensitive=true`` 标签的记录
   **永不进候选**（服务层与判据层双重尊重）。
 * 写入绝不自动：本函数只产候选清单；写入走
   ``store_memory(library="user")`` 的人工两步（改写 + 显式调用），
@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterable
 __all__ = ["collect_promote_candidates"]
 
 #: "打了这个结构化标签的记录永不进提升候选"（约定键）。
-SENSITIVE_TAG_KEY = "敏感"
+SENSITIVE_TAG_KEY = "sensitive"
 
 
 def collect_promote_candidates(
@@ -83,7 +83,7 @@ def collect_promote_candidates(
             continue
         tags = r.tags or {}
         if isinstance(tags, dict) and tags.get(SENSITIVE_TAG_KEY):
-            continue  # 打了敏感标记的永不进候选
+            continue  # 打了sensitive标记的永不进候选
         sessions = set(ids_sessions.get(r.id, ()))
         ents = [name for name, ids in members.items() if r.id in ids]
         if ents:

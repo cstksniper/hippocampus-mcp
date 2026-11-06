@@ -258,10 +258,10 @@ def test_b2_chroma_backend_rejected() -> None:
         except ValueError as ex:
             msg = str(ex)
             check("B2 chroma 后端抛 ValueError", True)
-            check("B2 信息说明未接通", "未接通" in msg, msg[:120])
+            check("B2 信息说明not wired up", "not wired up" in msg, msg[:120])
             check("B2 信息点明最严重的缺陷（换模型静默污染）",
                   "静默污染" in msg or "missing_ids" in msg, msg[:200])
-            check("B2 信息给出补齐后可放开的口径", "补齐" in msg, msg[:200])
+            check("B2 信息给出补齐后可放开的口径", "Once all five" in msg, msg[:200])
         except Exception as ex:       # noqa: BLE001
             check("B2 chroma 后端抛 ValueError", False,
                   f"抛的是 {type(ex).__name__}: {ex}")
@@ -353,7 +353,7 @@ def test_b5_chroma_removed_but_reason_kept() -> None:
     except ValueError as ex:
         msg = str(ex)
         check("B5 backend='chroma' 仍被拒绝", True)
-        check("B5 错误信息说明了会静默损坏数据的原因", "静默" in msg, msg[:120])
+        check("B5 错误信息说明了会静默损坏数据的原因", "silently" in msg, msg[:120])
     except Exception as ex:           # noqa: BLE001
         check("B5 backend='chroma' 仍被拒绝", False, f"{type(ex).__name__}: {ex}")
 

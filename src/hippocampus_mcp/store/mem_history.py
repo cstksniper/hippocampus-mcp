@@ -105,7 +105,7 @@ def append_history(persist_dir: str | None,
         if lines > trim_at:
             lines = trim_history(persist_dir, ring, lines)
     except OSError as exc:
-        logger.warning("[mem_history] 账本追加失败：%s", exc)
+        logger.warning("[mem_history] ledger append failed: %s", exc)
         return None, last_seq, lines
     return entry["op_id"], last_seq, lines
 
@@ -131,5 +131,5 @@ def trim_history(persist_dir: str | None, ring: int, lines: int) -> int:
         os.replace(tmp, path)
         return len(keep)
     except OSError as exc:
-        logger.warning("[mem_history] 账本裁剪失败：%s", exc)
+        logger.warning("[mem_history] ledger trim failed: %s", exc)
         return lines

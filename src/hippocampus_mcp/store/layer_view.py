@@ -138,8 +138,8 @@ def ledger_view(
             "boot_reconcile": None,
             "external_touched": [],
             "level": "unknown",
-            "note": "尚无保存记录（新库或本进程还没落盘过）。"
-                    "不报 0 —— 0 会被读成刚保存过。",
+            "note": "No save records yet (new library, or this process has never persisted). "
+                    "Reported as unknown rather than 0 -- 0 would read as having just saved.",
         }
     at_wall = last.get("at_wall")
     at_mono = float(last.get("at_mono") or now())
@@ -150,8 +150,8 @@ def ledger_view(
     stamp = stamp_of(at_wall) if at_wall else "unknown"
     if phase != "end":
         level = "warn"
-        note = (f"账本末条是 {phase} 而不是 end：上次保存**没走完**就断了"
-                f"（崩溃 / 宿主回收进程）。这是事后唯一能看见它的地方。")
+        note = (f"The last ledger entry is {phase}, not end: the previous save was **interrupted** "
+                f"(crash / the host reclaimed the process). This is the only place it is visible after the fact.")
     else:
         hh = int(interval // 3600)
         mm = int((interval % 3600) // 60)
@@ -161,18 +161,18 @@ def ledger_view(
             level = "warn"
         else:
             level = "stale"
-        note = (f"上次保存 {stamp}，距今 {hh}h{mm}m；期间 0 次落盘。"
-                f"这段时间里的内存改动，进程一旦被宿主回收就没了。")
+        note = (f"Last save {stamp}, {hh}h{mm}m ago; 0 saves since. "
+                f"In-memory changes made during this window are lost if the host reclaims the process.")
     # F14-5：启动对账结果非空 lost ⇒ 这是最重的一级（数据确实没写下去）；
     # 磁盘与账本不符次之。
     if isinstance(boot, dict):
         if boot.get("lost_since_last_save"):
             level = "critical"
-            note = f"启动对账：{boot['note']}"
+            note = f"Boot reconcile: {boot['note']}"
         elif boot.get("disk_mismatch"):
             if level == "ok":
                 level = "warn"
-            note = f"启动对账：{boot['note']}"
+            note = f"Boot reconcile: {boot['note']}"
     if any(q in ("unsaved", "conflict") for q in quadrant.values()) and level == "ok":
         level = "warn"
     return {
@@ -187,10 +187,10 @@ def ledger_view(
         # 当前内存指纹 vs 上次落盘指纹，不一致即"改了还没写下去"。
         "pending_layers": list(pending) if pending else [],
         "pending_note": (
-            (f"{len(pending)} 个层有改动还没落盘：{'、'.join(pending)}。"
-             "进程此刻被宿主回收，这些改动就没了。")
+            (f"{len(pending)} layers have unsaved changes: {', '.join(pending)}. "
+             "If the host reclaims the process now, these changes are gone.")
             if pending else
-            "当前没有「改了却没写下去」的层（内存与上次落盘内容一致）。"
+            "No layer currently holds unwritten changes (memory matches the last persisted content)."
         ),
         # G0：上次 save 实际跳过了几个层（派生层脏集的效果，恒为空说明没生效）
         "last_layers_skipped": last.get("layers_skipped") or [],

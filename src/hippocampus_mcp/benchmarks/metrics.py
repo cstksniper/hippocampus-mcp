@@ -333,15 +333,15 @@ class EvalReport:
     def summary(self) -> str:
         lines = [f"=== {self.method_name} ==="]
         if self.retrieval_metrics:
-            lines.append("  检索指标:")
+            lines.append("  Retrieval metrics:")
             for k, v in sorted(self.retrieval_metrics.items()):
                 lines.append(f"    {k}: {v:.4f}")
         if self.qa_metrics:
-            lines.append("  QA 指标:")
+            lines.append("  QA metrics:")
             for k, v in sorted(self.qa_metrics.items()):
                 lines.append(f"    {k}: {v:.4f}")
         if self.per_category:
-            lines.append("  分类别:")
+            lines.append("  Per category:")
             for cat, metrics in sorted(self.per_category.items()):
                 lines.append(f"    {cat}: {metrics}")
         return "\n".join(lines)

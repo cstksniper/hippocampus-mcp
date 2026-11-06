@@ -137,7 +137,7 @@ def serve_connection(conn: Connection, handler, on_exit=None) -> None:
     try:
         handler(conn)
     except Exception as exc:  # noqa: BLE001
-        print(f"[daemon] 连接 {conn.conn_id} 处理异常: {type(exc).__name__}: {exc}",
+        print(f"[daemon] connection {conn.conn_id} handling failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
     finally:
         conn.closed = True
@@ -238,8 +238,8 @@ class Daemon:
             if idle < self.idle_exit_seconds:
                 continue
             print(
-                f"[daemon] 孤儿回收：无活跃连接已 {idle:.0f}s"
-                f"（阈值 {self.idle_exit_seconds:.0f}s），save 后退出",
+                f"[daemon] orphan cleanup: no active connections for {idle:.0f}s"
+                f" (threshold {self.idle_exit_seconds:.0f}s); saving and exiting",
                 file=sys.stderr,
             )
             self.stop()
@@ -311,17 +311,17 @@ class Daemon:
                 # 或者出了意外时留痕，避免日志被"每次都说忙"刷满。
                 if res.get("ok"):
                     print(
-                        f"[daemon] 空闲卸载模型 pid={os.getpid()} "
-                        f"idle={idle:.0f}s 释放={res.get('reclaimed_mb')}MB "
+                        f"[daemon] idle model unload pid={os.getpid()} "
+                        f"idle={idle:.0f}s freed={res.get('reclaimed_mb')}MB "
                         f"({res.get('before_mb')}→{res.get('after_mb')}MB) "
                         f"pools={res.get('pools')} conns={self._active_conns}",
                         file=sys.stderr, flush=True,
                     )
                 elif res.get("reason") != "busy":
-                    print(f"[daemon] 卸载模型失败: {res}",
+                    print(f"[daemon] model unload failed: {res}",
                           file=sys.stderr, flush=True)
             except Exception as exc:  # noqa: BLE001 —— 哨兵绝不能带崩 daemon
-                print(f"[daemon] 卸载哨兵异常: {type(exc).__name__}: {exc}",
+                print(f"[daemon] unload sentinel failed: {type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
 
     # -- O2 睡眠窗口 ----------------------------------------------------
@@ -360,7 +360,7 @@ class Daemon:
             try:
                 self._run_sleep_once(idle)
             except Exception as exc:  # noqa: BLE001 —— 哨兵绝不能带崩 daemon
-                print(f"[daemon] 睡眠批异常: {type(exc).__name__}: {exc}",
+                print(f"[daemon] sleep batch failed: {type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
             finally:
                 self._sleep_running = False
@@ -391,12 +391,12 @@ class Daemon:
                 report = brain.sleep_batch(
                     cancel=self._sleep_cancel, budget_s=self.sleep_budget_s)
             except Exception as exc:  # noqa: BLE001 —— 单库失败不挡其它库睡
-                print(f"[daemon] 睡眠批失败 lib={key}: "
+                print(f"[daemon] sleep batch failed for library={key}: "
                       f"{type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
                 continue
             print(
-                f"[daemon] 睡眠批 pid={os.getpid()} lib={key} "
+                f"[daemon] sleep batch pid={os.getpid()} library={key} "
                 f"idle={idle:.0f}s took={time.time() - t0:.1f}s "
                 f"clusters={report.get('replay_clusters')} "
                 f"records={report.get('replay_records')} "
@@ -409,7 +409,7 @@ class Daemon:
 
     def serve_forever(self) -> None:
         if self.sock is None:
-            raise RuntimeError("先 bind()")
+            raise RuntimeError("bind() must run first")
         if self.model_unload_seconds > 0:
             # daemon=True：这条线程不持有任何需要收尾的东西
             if self._model_unload_thread is None:
@@ -518,7 +518,7 @@ class Daemon:
         # 收尾落盘：**不能因为保存失败就不退出**，但要把失败吼出来
         errors = self.registry.save_all()
         if errors:
-            print(f"[daemon] 退出前保存失败: {json.dumps(errors, ensure_ascii=False)}",
+            print(f"[daemon] save before exit failed: {json.dumps(errors, ensure_ascii=False)}",
                   file=sys.stderr)
         # 清注册表：本 daemon 已退出，别让 launcher 撞上死条目多等一轮探测
         # （launcher 本就有 pid+port 存活校验，这里只是把现场擦干净）
@@ -526,11 +526,11 @@ class Daemon:
             path = registry_path(self.key)
             try:
                 os.remove(path)
-                print(f"[daemon] 已擦注册表: {path}", file=sys.stderr)
+                print(f"[daemon] registry removed: {path}", file=sys.stderr)
             except OSError as e:
                 # 擦不掉要吼出来：残留条目会让下一个 launcher 多等一轮存活探测，
                 # 而它看起来和"daemon 还活着"一模一样。
-                print(f"[daemon] 擦注册表失败: {path} -> {type(e).__name__}: {e}",
+                print(f"[daemon] failed to remove registry: {path} -> {type(e).__name__}: {e}",
                       file=sys.stderr)
         self._finished.set()
 
@@ -575,17 +575,17 @@ def _make_handler():
     只有显式 ``HIPPOCAMPUS_DAEMON_ECHO=1`` 才允许退化成 echo（本地排障用）。
     """
     if os.environ.get("HIPPOCAMPUS_DAEMON_ECHO", "").strip() == "1":
-        print("[daemon] HIPPOCAMPUS_DAEMON_ECHO=1 -> echo 泵（仅供本地排障）",
+        print("[daemon] HIPPOCAMPUS_DAEMON_ECHO=1 -> echo pump (local diagnostics only)",
               file=sys.stderr)
         return _default_handler
     try:
         from .bridge import bridge_available, make_mcp_handler  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            f"MCP 会话桥不可用（缺 anyio / mcp）: {type(exc).__name__}: {exc}"
+            f"MCP session bridge unavailable (missing anyio / mcp): {type(exc).__name__}: {exc}"
         ) from exc
     if not bridge_available():
-        raise RuntimeError("MCP 会话桥自检失败：anyio / mcp 不可用")
+        raise RuntimeError("MCP session bridge self-check failed: anyio / mcp unavailable")
     return make_mcp_handler()
 
 
@@ -656,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
     diag = _install_crash_diagnostics()
     d.bind()
     if not d.announce(key, library=library, model=model):
-        print(f"[daemon] 写注册表失败: {registry_path(key)}", file=sys.stderr)
+        print(f"[daemon] failed to write registry: {registry_path(key)}", file=sys.stderr)
         return 1
     print(f"[daemon] key={key} port={d.port} pid={os.getpid()} "
           f"idle_exit={idle_exit:.0f}s "

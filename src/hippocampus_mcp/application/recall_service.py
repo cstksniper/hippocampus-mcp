@@ -41,6 +41,7 @@ from ..common.params import (filter_applied, parse_str_list_lenient,
                              parse_tags_json)
 from ..common.recency import iso_date, parse_date_bound
 from ..domain import metacog as _metacog
+from ..domain.context_slots import BLOCK_PLACEHOLDERS
 from ..domain import prospective as _prospective
 from ..domain.scope_recall import (SCOPE_ALL, SCOPE_PROJECT, SCOPE_USER,
                                    merge_multi_library, merge_scope_hits,
@@ -56,9 +57,9 @@ logger = logging.getLogger("hippocampus_mcp")
 
 #: D2b：none 档对 user 库的读拒绝文案（单一真相，多工具共用）。
 USER_READ_DENIED = (
-    "当前工作区对用户级库的读取权为 none（未登记/未绑定工作区，fail-closed）。"
-    "请先在本工作区会话里登记任务目录（library_create 带 workspace_root），"
-    "或在家工作区（日常助手宿主）会话里操作。")
+    "This workspace has none-level read access to the user library (not registered/bound; fail-closed)."
+    "Register the task directory from a session in this workspace first (library_create with workspace_root), "
+    "or operate from a home workspace (daily assistant host) session.")
 
 
 class RecallService(BaseService):
@@ -102,20 +103,22 @@ class RecallService(BaseService):
         if (libraries or "").strip():
             if scope != SCOPE_PROJECT:
                 return {"error": (
-                    f"libraries= 与 scope={scope} 互斥：scope=user/all 是"
-                    "「项目库+用户库」的双库语法糖，libraries= 是显式多库"
-                    "通道，组合没有可预期的语义。多库请只给 libraries=，"
-                    "双库请只给 scope。"), "input": libraries}
+                    f"libraries= and scope={scope} are mutually exclusive: "
+                    "scope=user/all is sugar for the project+user pair, while "
+                    "libraries= is the explicit multi-library channel. Their "
+                    "combination has no predictable semantics. Use only "
+                    "libraries= for multi-library, or only scope for the paired "
+                    "scopes."), "input": libraries}
             spec_names, spec_err = parse_library_spec(libraries)
             if spec_err:
                 return {"error": spec_err, "input": libraries}
             if not spec_names:
-                return {"error": f"libraries= 全是空白：{libraries!r}",
+                return {"error": f"libraries= contains only whitespace: {libraries!r}",
                         "input": libraries}
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
             # 注意：此错误体**不带** library 首键（与现行工具逐位一致）。
-            return {"error": f"filter_tags 解析失败：{tag_err}",
+            return {"error": f"filter_tags parse failed: {tag_err}",
                     "input": filter_tags[:200]}
         # 时间窗解析（2026-11-05）：日期格式错**显式报错**，不静默当"不限"。
         # 静默丢参数的后果是「结果看起来像库里真没有」，而实际是条件没生效。
@@ -123,11 +126,11 @@ class RecallService(BaseService):
             win_after = parse_date_bound(occurred_after)
             win_before = parse_date_bound(occurred_before, end_of_day=True)
         except ValueError as e:
-            return {"error": f"时间窗参数错误：{e}",
+            return {"error": f"Invalid time-window argument: {e}",
                     "input": f"{occurred_after!r} / {occurred_before!r}"}
         if win_after > 0 and win_before > 0 and win_after > win_before:
-            return {"error": (f"时间窗上下界颠倒：occurred_after={occurred_after} "
-                              f"晚于 occurred_before={occurred_before}"),
+            return {"error": (f"Inverted time-window bounds: occurred_after={occurred_after} "
+                              f"is later than occurred_before={occurred_before}"),
                     "input": f"{occurred_after!r} / {occurred_before!r}"}
         tw = (win_after, win_before)
         if scope == SCOPE_PROJECT:
@@ -155,8 +158,9 @@ class RecallService(BaseService):
         if user_brain is None:
             # 正常到不了这里：库缺失时工厂解析已抛 LibraryResolutionError
             # （显式检索找不到库必须报错）。防御性自曝，不静默回落 project。
-            return {"error": "scope=user/all 需要用户级库（约定名 user），"
-                             "本次调用未注入。", "input": scope}
+            return {"error": "scope=user/all requires the user-level library "
+                             "(conventional name user); it was not injected for "
+                             "this call.", "input": scope}
         # D2b：用户库流的档位门（scope=user/all 打的就是用户库）。
         tier = self._ua(client)
         if scope == SCOPE_USER:
@@ -476,8 +480,8 @@ class RecallService(BaseService):
                     getattr(rec, "sensitivity", "") or ""
             ).startswith("sensitive:"):
                 return {"error": (
-                            "该记忆为 sensitive 类，当前工作区读取权为 "
-                            "masked（敏感档不可读）。"),
+                            "This memory is sensitive and this workspace has "
+                            "masked read access (sensitive records are unreadable)."),
                         "memory_id": memory_id}
         record = self.manager.get_memory(memory_id)
         if record is None:
@@ -523,7 +527,7 @@ class RecallService(BaseService):
         if self._ua(client) in ("masked", "none"):
             return {"error": USER_READ_DENIED}
         raw = self.manager.sources()
-        labeled = {"(无来源)" if k == "" else k: v for k, v in raw.items() if k != ""}
+        labeled = {("(no source)" if k == "" else k): v for k, v in raw.items() if k != ""}
         return {
             "count": len(labeled),
             "sources": dict(sorted(labeled.items(), key=lambda kv: -kv[1])),
@@ -553,13 +557,14 @@ class RecallService(BaseService):
             return {"error": err, "input": scope}
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
-            return {"error": f"filter_tags 解析失败：{tag_err}",
+            return {"error": f"filter_tags parse failed: {tag_err}",
                     "input": filter_tags[:200]}
         brain = self.brain
         if scope == SCOPE_USER:
             if self.user_brain is None:
-                return {"error": "scope=user 需要用户级库（约定名 user），"
-                                 "本次调用未注入。", "input": scope}
+                return {"error": "scope=user requires the user-level library "
+                                 "(conventional name user); it was not injected "
+                                 "for this call.", "input": scope}
             # D2b：装配面的跨库通道只在 full 档开放——5 槽位装配里没有
             # 「滤一半」的自然落点（同 scope=all 只配 recall 的收窄理由）。
             tier = self._ua(client)
@@ -567,10 +572,12 @@ class RecallService(BaseService):
                 return {"error": USER_READ_DENIED, "input": scope}
             if tier == "masked":
                 return {"error": (
-                            "当前工作区对用户级库的读取权为 masked，装配式"
-                            "上下文（get_memory_context）不支持敏感档过滤——"
-                            "请用 recall(scope=\"user\")（带 filtered_sensitive "
-                            "自曝）或在家工作区会话里装配。"), "input": scope}
+                            "This workspace has masked read access to the user "
+                            "library; assembled context (get_memory_context) does "
+                            "not support sensitive-level filtering. Use "
+                            "recall(scope=\"user\") (which self-reports "
+                            "filtered_sensitive) or assemble from a "
+                            "home-workspace session."), "input": scope}
             brain = self.user_brain
         parsed_tags, key_info = check_tag_keys(brain, parsed_tags)
         if key_info and key_info.get("error"):
@@ -663,7 +670,7 @@ class RecallService(BaseService):
             basis 与 value 联动：None 时报 empty_*，不给"满档"的假标签。
             """
             lines = lines or []
-            if not lines or (len(lines) == 1 and str(lines[0]).startswith("（")):
+            if not lines or (len(lines) == 1 and str(lines[0]) in BLOCK_PLACEHOLDERS):
                 return {"value": None, "basis": "empty_" + basis}
             return {"value": _metacog.FIRST_PARTY_SCORE, "basis": basis}
 
@@ -693,7 +700,7 @@ class RecallService(BaseService):
         brain = self.brain
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
-            return {"error": f"filter_tags 解析失败：{tag_err}",
+            return {"error": f"filter_tags parse failed: {tag_err}",
                     "input": filter_tags[:200]}
         parsed_tags, key_info = check_tag_keys(brain, parsed_tags)
         if key_info and key_info.get("error"):
@@ -725,9 +732,11 @@ class RecallService(BaseService):
         _tier = self._ua(client)
         if _tier in ("masked", "none"):
             return {"error": (
-                f"用户级库的审计（drift_audit）仅家工作区可调（当前档位 "
-                f"{_tier}）：审计会展示 L2/L3 聚合内容，masked/none 档一律"
-                "拒绝。待审复审请在 home 工作区（日常助手宿主）会话里做。")}
+                "User-library audit (drift_audit) is callable only from a home "
+                f"workspace (current access level: {_tier}); audits expose L2/L3 "
+                "aggregate content, so masked/none levels are always refused. "
+                "Review quarantined items from a home workspace (daily assistant "
+                "host) session.")}
         out = self.brain.source_drift(source=source, limit=limit,
                                       include_ok=include_ok)
         try:
@@ -745,9 +754,9 @@ class RecallService(BaseService):
             out["quarantine"] = {
                 "count": len(quarantined),
                 "items": quarantined[:limit],
-                "hint": ("转正：update_memory(memory_id=…, "
-                         "clear_quarantine=True)（仅家库会话）；"
-                         "删除：forget_memory(memory_id=…)。"),
+                "hint": ("Promote: update_memory(memory_id=..., "
+                         "clear_quarantine=True) (home-library session only); "
+                         "delete: forget_memory(memory_id=...)."),
             }
             # B2 目录健康：库路径/绑定根失联与僵尸条目（描述审计挂点，
             # 设计稿 §2.2/§3.2——目录 note 会腐化，路径会漂移，要看得见）。
@@ -821,10 +830,10 @@ class RecallService(BaseService):
                 parsed_items = json.loads(raw_items)
             except json.JSONDecodeError as exc:
                 return {"ok": False, "action": action,
-                        "error": "items 不是合法 JSON：" + str(exc)}
+                        "error": f"items is not valid JSON: {exc}"}
             if not isinstance(parsed_items, list):
                 return {"ok": False, "action": action,
-                        "error": "items 必须是数组（每项含 topic_id/summary/evidence）"}
+                        "error": "items must be an array (each item contains topic_id/summary/evidence)"}
         # fras 同上：解析失败显式报错（静默当"没传"会让宿主以为结构写进去了）。
         parsed_fras: Any = None
         raw_fras = (fras or "").strip()
@@ -833,10 +842,10 @@ class RecallService(BaseService):
                 parsed_fras = json.loads(raw_fras)
             except json.JSONDecodeError as exc:
                 return {"ok": False, "action": action,
-                        "error": "fras 不是合法 JSON：" + str(exc)}
+                        "error": f"fras is not valid JSON: {exc}"}
             if not isinstance(parsed_fras, dict):
                 return {"ok": False, "action": action,
-                        "error": "fras 必须是 JSON 对象（f/r/a/s 四个键）"}
+                        "error": "fras must be a JSON object (f/r/a/s keys)"}
         return self._envelope(self.brain.knowledge_topic(
             topic_id=topic_id, action=action, summary=summary,
             evidence=parse_str_list_lenient(evidence), limit=limit,

@@ -53,7 +53,7 @@ INTENT_BLOCK_CAP = 5
 
 #: 触发待办在 block_2 行尾的标记。放在行内让文本槽直接可读；结构化详情
 #: 走 ``prospective_intents`` 键，两者同源。
-TRIGGER_SUFFIX = "（⚡与当前话题相关）"
+TRIGGER_SUFFIX = " (⚡ related to the current topic)"
 
 _ZH_RUN = re.compile(r"[\u4e00-\u9fa5]{2,}")
 
@@ -158,7 +158,7 @@ def prospective_block2(
                  + (TRIGGER_SUFFIX if idx in marked else "")
                  for idx, i in enumerate(items)]
         cut = lines[:max(int(cap), 0)]
-        return cut or ["（无待办）"]
+        return cut or ["(No todos)"]
 
     if not (query or "").strip():
         return ProspectivePlan(lines=_render(open_intents, set()), triggered=[])

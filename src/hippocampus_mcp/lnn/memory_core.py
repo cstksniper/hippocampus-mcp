@@ -172,7 +172,7 @@ class MemoryCore:
             elif x.dim() != 3:
                 raise ValueError(
                     f"step 输入维度应为 2 (1, input_dim) 或 "
-                    f"3 (batch, seq, input_dim), 但得到 {x.dim()} 维张量"
+                    f"3 (batch, seq, input_dim), 但得到 {x.dim()}D tensor"
                 )
             return x.float()
         x = np.asarray(x, dtype=np.float32)
@@ -181,7 +181,7 @@ class MemoryCore:
         elif x.ndim != 3:
             raise ValueError(
                 f"step 输入维度应为 2 (1, input_dim) 或 "
-                f"3 (batch, seq, input_dim), 但得到 {x.ndim} 维张量"
+                f"3 (batch, seq, input_dim), 但得到 {x.ndim}D tensor"
             )
         return x
 
@@ -356,8 +356,8 @@ class MemoryCore:
         saved_dim = state.get("output_dim")
         if saved_dim is not None and int(saved_dim) != int(self.output_dim):
             _stderr_print(
-                f"[MemoryCore] 忽略不兼容的 LNN 状态: 维度 {saved_dim} "
-                f"!= 当前 {self.output_dim}（嵌入模型已切换，状态重新积累）"
+                f"[MemoryCore] ignoring incompatible LNN state: dimension {saved_dim} "
+                f"!= 当前 {self.output_dim}(the embedding model changed; state will re-accumulate)"
             )
             self.reset_state()
             return
@@ -372,7 +372,7 @@ class MemoryCore:
         if last is None or tuple(np.asarray(last).shape) != (self.output_dim,):
             if last is not None:
                 _stderr_print(
-                    f"[MemoryCore] 忽略不兼容的 last_output: "
+                    f"[MemoryCore] ignoring incompatible last_output: "
                     f"{tuple(np.asarray(last).shape)} != ({self.output_dim},)"
                 )
             self.last_output = self._zeros(self.output_dim)

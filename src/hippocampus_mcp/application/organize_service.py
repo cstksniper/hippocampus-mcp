@@ -70,7 +70,7 @@ class OrganizeService(BaseService):
         brain = self.brain
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
-            return {"error": f"filter_tags 解析失败：{tag_err}",
+            return {"error": f"filter_tags parse failed: {tag_err}",
                     "input": filter_tags[:200]}
         parsed_tags, key_info = check_tag_keys(brain, parsed_tags)
         if key_info and key_info.get("error"):
@@ -177,4 +177,4 @@ class OrganizeService(BaseService):
     def reset_context(self) -> dict[str, Any]:
         """重置 LNN 时序上下文（清隐藏状态与滑窗，不删记忆）。**不带**信封。"""
         self.manager.reset_context()
-        return {"status": "context_reset", "message": "LNN 时序上下文已清空"}
+        return {"status": "context_reset", "message": "LNN temporal context cleared"}

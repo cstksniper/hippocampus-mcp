@@ -224,12 +224,12 @@ def extract_cmake(text: str, args: dict) -> tuple[dict, str | None, None]:
             parts[1] if len(parts) > 1 else "")
         reason = None
         if depth > 0:
-            reason = "处于 if/foreach 条件块内（被动态块遮蔽）"
+            reason = "inside an if/foreach conditional block (shadowed by a dynamic block)"
         elif not value:
-            reason = "缺值"
+            reason = "missing value"
         elif ("$" in value or "(" in value or "," in value
               or value.upper() not in _CMAKE_LITERALS):
-            reason = "动态值 %s" % value
+            reason = "dynamic value %s" % value
         _record(vals, name, value, reason)
     return vals, None, None
 
@@ -254,27 +254,27 @@ def extract_c_define(text: str, args: dict) -> tuple[dict, str | None, None]:
             value = rest or "1"
             reason = None
             if depth > 0:
-                reason = "处于 #if/#ifdef 条件块内（平台分支不猜）"
+                reason = "inside an #if/#ifdef conditional block (platform branches are not guessed)"
             elif value not in _C_LITERALS:
-                reason = "非字面量值 %s" % value
+                reason = "non-literal value %s" % value
             _record(vals, name, value, reason)
             continue
         mt = re.match(r"#\s*undef\s+([A-Za-z_]\w*)", line)
         if mt:
-            _record(vals, mt.group(1), None, "#undef 之后的状态不确定")
+            _record(vals, mt.group(1), None, "state is indeterminate after #undef")
     return vals, None, None
 
 
 def extract_regex(text: str, args: dict) -> tuple[dict, str | None, None]:
     pattern = str((args or {}).get("pattern") or "")
     if not pattern:
-        return {}, "regex 提取器缺 extract_args.pattern", None
+        return {}, "regex extractor is missing extract_args.pattern", None
     try:
         rx = re.compile(pattern, re.M)
     except re.error as exc:
-        return {}, "正则不合法：%s" % exc, None
+        return {}, "invalid regex: %s" % exc, None
     if "key" not in rx.groupindex:
-        return {}, "正则缺命名组 (?P<key>...)", None
+        return {}, "regex is missing the named group (?P<key>...)", None
     vals: dict = {}
     for mt in rx.finditer(text):
         key = mt.group("key")
@@ -283,9 +283,9 @@ def extract_regex(text: str, args: dict) -> tuple[dict, str | None, None]:
         value = mt.groupdict().get("value")
         reason = None
         if value is None:
-            reason = "正则没给 (?P<value>...) 组"
+            reason = "regex provides no (?P<value>...) group"
         elif "$" in str(value):
-            reason = "动态值 %s" % value
+            reason = "dynamic value %s" % value
         _record(vals, str(key), None if value is None else str(value), reason)
     return vals, None, None
 
@@ -299,18 +299,18 @@ def _load_struct(text: str) -> tuple[object, str | None]:
     try:
         import yaml  # type: ignore
     except ImportError:
-        return None, ("yaml 解析器不可用（本仓不新增依赖）——把配置文件转 JSON，"
-                      "或改用 regex 提取器")
+        return None, ("yaml parser unavailable (no new dependencies in this repo) -- convert the config to JSON, "
+                      "or switch to the regex extractor")
     try:
         return yaml.safe_load(text), None
     except Exception as exc:  # noqa: BLE001 —— 第三方解析器异常类型不定
-        return None, "yaml 解析失败：%s" % exc
+        return None, "yaml parse failed: %s" % exc
 
 
 def extract_yaml_path(text: str, args: dict):
     path = str((args or {}).get("path") or "")
     if not path:
-        return {}, "yaml_path 提取器缺 extract_args.path", None
+        return {}, "yaml_path extractor is missing extract_args.path", None
     doc, err = _load_struct(text)
     if err:
         return {}, err, None
@@ -323,11 +323,11 @@ def extract_yaml_path(text: str, args: dict):
             else:
                 return None, None          # 路径不存在 ⇒ 该键「没出现」
         if isinstance(cur, (dict, list)):
-            return None, "路径 %s 是容器不是开关值" % path
+            return None, "path %s is a container, not a flag value" % path
         if cur is None:
-            return None, "路径 %s 是空值" % path
+            return None, "path %s is empty" % path
         if "$" in str(cur):
-            return None, "动态值 %s" % cur
+            return None, "dynamic value %s" % cur
         return str(cur), None
 
     return {}, None, lookup
@@ -359,30 +359,30 @@ def _validate_reconcile(out: dict) -> dict:
     """C2 配方校验（用法错误抛 ValueError——配错了就是假的 clean）。"""
     for dead in ("source", "extract", "extract_args", "normalize"):
         if out.get(dead):
-            raise ValueError("dir_reconcile 不需要 %s（对账消费 file_registry"
-                             " 建档产物，不读真相文件）——要么去掉它，要么"
-                             "把 kind 改回 code_flag" % dead)
+            raise ValueError("dir_reconcile does not need %s (reconciliation consumes file_registry "
+                             "output, not truth files) -- remove it, or "
+                             "switch kind back to code_flag" % dead)
         out.pop(dead, None)
     pat = str(out.get("key_pattern") or "").strip()
     if not pat:
-        raise ValueError("dir_reconcile 必须给 key_pattern（从目录名/文件名"
-                         "抽条目键）；要整串相等写 ^CN[0-9]+$，要抽取写 "
+        raise ValueError("dir_reconcile requires key_pattern (extracts the entry key from directory/file "
+                         "names); for full-string equality use ^CN[0-9]+$, to extract use "
                          "^(?P<key>CN[0-9]+)\\.fastq$")
     try:
         re.compile(pat)
     except re.error as exc:
-        raise ValueError("key_pattern 不是合法正则：%s" % exc)
+        raise ValueError("key_pattern is not a valid regex: %s" % exc)
     out["key_pattern"] = pat
     root = str(out.get("root") or "").strip()
     out["root"] = root if os.path.isabs(root) else _norm_rel(root)
     sm = out.get("status_map")
     if sm is not None:
         if not isinstance(sm, dict):
-            raise ValueError("status_map 必须是 JSON 对象（status → 目录名）")
+            raise ValueError("status_map must be a JSON object (status -> directory name)")
         for k, v in sm.items():
             if isinstance(v, (dict, list)) or v is None:
-                raise ValueError("status_map 的「%s」不是目录名（要对账子目录，"
-                                 "不是对象）" % k)
+                raise ValueError("status_map entry %r is not a directory name (subdirectories are "
+                                 "reconciled, not objects)" % k)
         out["status_map"] = {str(k): str(v) for k, v in sm.items()}
     ext = str(out.get("file_ext") or "").strip()
     if ext:
@@ -395,35 +395,35 @@ def _validate_reconcile(out: dict) -> dict:
 def validate_rule(rule: dict) -> dict:
     """校验并按默认值补全一条 auto 配方；用法错误抛 ValueError。"""
     if not isinstance(rule, dict):
-        raise ValueError("auto 配方必须是 JSON 对象")
+        raise ValueError("the auto recipe must be a JSON object")
     out = dict(rule)
     kind = _kind(out)
     if kind not in KINDS:
-        raise ValueError("不支持的 auto.kind「%s」——可用：%s"
+        raise ValueError("unsupported auto.kind %r -- available: %s"
                          % (kind, "、".join(KINDS)))
     out["kind"] = kind
     if kind == "dir_reconcile":
         return _validate_reconcile(out)
     source = str(out.get("source") or "").strip()
     if not source:
-        raise ValueError("auto.source 不能为空（相对 file_registry root 的"
-                         "真相文件路径）")
+        raise ValueError("auto.source must not be empty (truth-file path relative to the "
+                         "file_registry root)")
     out["source"] = source
     extract = str(out.get("extract") or "").strip()
     if extract not in EXTRACTORS:
-        raise ValueError("未知 auto.extract「%s」——可用：%s"
+        raise ValueError("unknown auto.extract %r -- available: %s"
                          % (extract, "、".join(EXTRACTORS)))
     out["extract"] = extract
     out.setdefault("extract_args", {})
     if not isinstance(out["extract_args"], dict):
-        raise ValueError("auto.extract_args 必须是 JSON 对象")
+        raise ValueError("auto.extract_args must be a JSON object")
     if extract == "regex" and not out["extract_args"].get("pattern"):
-        raise ValueError("regex 提取器必须给 extract_args.pattern")
+        raise ValueError("the regex extractor requires extract_args.pattern")
     if extract == "yaml_path" and not out["extract_args"].get("path"):
-        raise ValueError("yaml_path 提取器必须给 extract_args.path")
+        raise ValueError("the yaml_path extractor requires extract_args.path")
     norm = out.get("normalize")
     if norm is not None and not isinstance(norm, dict):
-        raise ValueError("auto.normalize 必须是 JSON 对象（配置值 → 地图用词）")
+        raise ValueError("auto.normalize must be a JSON object (config value -> map wording)")
     return out
 
 
@@ -461,12 +461,12 @@ def _stat_sig(full: str) -> dict | None:
 def _read_text(full: str) -> tuple[str | None, str | None]:
     try:
         if os.path.getsize(full) > MAP_AUTO_MAX_SOURCE_BYTES:
-            return None, ("源文件超过 %d 字节上限（构建脚本不该这么大）"
+            return None, ("source file exceeds the %d-byte limit (a build script should not be this large)"
                           % MAP_AUTO_MAX_SOURCE_BYTES)
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             return f.read(), None
     except OSError as exc:
-        return None, "读不了源文件：%s" % exc
+        return None, "cannot read the source file: %s" % exc
 
 
 def _mark_failed(ent: dict, now: float, reason: str, **extra) -> None:
@@ -483,8 +483,8 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
     for rule in rules:
         base = _base_root(rule, registry_root)
         if base is None:
-            state["error"] = ("无根可依，不 verify（未建档 root 且 "
-                              "auto.root 非绝对路径）")
+            state["error"] = ("no root to anchor on; not verifying (no registered root and "
+                              "auto.root is not absolute)")
             state["at"] = now
             res["no_root"].append(mname)
             return
@@ -497,7 +497,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
         sig = _stat_sig(os.path.join(bases[src], src))
         sigs[src] = sig
         if sig is None:
-            src_err[src] = "源文件不存在"
+            src_err[src] = "source file does not exist"
 
     # 哈希仲裁快路径：源签名没变 ⇒ 零读取，用上次结论（同纪律）
     prev = state.get("source_sigs")
@@ -535,8 +535,8 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
         expect = norm_flag(ent.get("status"))
         if expect is None:
             failed += 1
-            reason = ("status「%s」不在 {开,on,true,1,关,off,false,0} 内"
-                      "——不猜" % (ent.get("status") or "空"))
+            reason = ("status %r is not in {on,true,1,off,false,0} "
+                      "-- not guessing" % (ent.get("status") or "empty"))
             _mark_failed(ent, now, reason)
             res["failed"].append({"map": mname, "key": key, "reason": reason})
             continue
@@ -559,7 +559,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
             src_used = str(rule.get("source") or "")
             got_norm = norm_flag(apply_normalize(value, rule.get("normalize")))
             if got_norm is None:
-                fail_reason = ("配置值「%s」无法归一到开/关（%s）"
+                fail_reason = ("config value %r cannot be normalized to on/off (%s)"
                                % (value, src_used))
             break
 
@@ -576,10 +576,10 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
                 # 所有源都读不了：报源错误本身，比「没找到」有用
                 reason = "；".join(dict.fromkeys(errs))
             else:
-                reason = ("源里没找到该开关（%s）"
+                reason = ("the flag was not found in the source (%s)"
                           % ("、".join(str(r.get("source") or "")
                                       for r, _, _, _ in extracted)
-                             or "无可用源"))
+                             or "no available source"))
             _mark_failed(ent, now, reason)
             res["failed"].append({"map": mname, "key": key, "reason": reason})
             continue
@@ -697,8 +697,8 @@ def _scan_keys(files: dict, prefix: str, rx: re.Pattern,
 
 
 def _fmt_locs(locs: set[str]) -> str:
-    items = sorted("(根目录)" if not x else x for x in locs)
-    tail = " 等 %d 处" % len(items) if len(items) > 3 else ""
+    items = sorted("(repo root)" if not x else x for x in locs)
+    tail = " and %d more location(s)" % len(items) if len(items) > 3 else ""
     return "、".join(items[:3]) + tail
 
 
@@ -710,8 +710,8 @@ def _reconcile_root(rule: dict, base: str) -> tuple[str, str | None]:
     if os.path.isabs(raw):
         rel = os.path.relpath(raw, base).replace("\\", "/")
         if rel == ".." or rel.startswith("../"):
-            return "", ("auto.root 不在建档 root 内（%s）——目录对账只认"
-                        "建档 root 下的子树（要扫别处先给 file_registry 换根）"
+            return "", ("auto.root is outside the registered root (%s) -- directory reconciliation only "
+                        "trusts the subtree under the registered root (re-root file_registry first to scan elsewhere)"
                         % raw)
         return _norm_rel(rel), None
     return _norm_rel(raw), None
@@ -731,15 +731,15 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
     # 等于没有对账数据源）。缺了就拒绝执行，不降级现扫、不回落 cwd。
     if not isinstance(registry, dict) \
             or not isinstance(registry.get("files"), dict):
-        _add_error(state, "未建档（无 file_registry 侧车），不 verify——"
-                          "目录对账只消费建档产物，不降级现扫")
+        _add_error(state, "not registered (no file_registry sidecar), not verifying -- "
+                          "directory reconciliation only consumes registry output, no live-scan fallback")
         state["at"] = now
         res["no_registry"].append(mname)
         return
     base = str(registry.get("root") or registry_root or "")
     if not base or not os.path.isdir(base):
-        _add_error(state, "建档 root 不存在或未记录（%s），不 verify"
-                   % (base or "空"))
+        _add_error(state, "registered root does not exist or was never recorded (%s); not verifying"
+                   % (base or "empty"))
         state["at"] = now
         res["no_registry"].append(mname)
         return
@@ -755,12 +755,12 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
         if not err:
             pat = str(rule.get("key_pattern") or "").strip()
             if not pat:
-                err = "dir_reconcile 缺 key_pattern（不猜，拒绝执行）"
+                err = "dir_reconcile is missing key_pattern (no guessing; refusing to execute)"
             else:
                 try:
                     rx = re.compile(pat)
                 except re.error as exc:
-                    err = "key_pattern 不是合法正则：%s" % exc
+                    err = "key_pattern is not a valid regex: %s" % exc
         if err:
             _add_error(state, err)
             res["bad_root"].append({"map": mname, "error": err})
@@ -769,12 +769,12 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
         if not os.path.isdir(target):
             # 目录整枝不在：报「对账目录不存在」而不是让每个条目都 missing
             # ——后者会把一次改名说成 N 条数据丢失（假告警比漏报更伤信任）
-            err = "对账目录不存在：%s（相对建档 root %s）" % (prefix or ".", base)
+            err = "reconciliation directory does not exist: %s (relative to registered root %s)" % (prefix or ".", base)
             _add_error(state, err)
             res["bad_root"].append({"map": mname, "error": err})
             continue
         ok_rules += 1
-        roots.append(prefix or "(项目根)")
+        roots.append(prefix or "(project root)")
         for k, locs in _scan_keys(files, prefix, rx,
                                   rule.get("file_ext") or None).items():
             merged.setdefault(k, set()).update(locs)
@@ -800,8 +800,8 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
             if not complete:
                 # 截断区域里的键本来就没被看到：判 missing 是纯误报
                 failed += 1
-                reason = ("建档扫描不完整（scan_complete=false）——没扫到"
-                          "不等于不存在，不判缺失")
+                reason = ("registered scan incomplete (scan_complete=false) -- not scanned "
+                          "does not mean absent; missing-entries are not judged")
                 _mark_failed(ent, now, reason)
                 res["failed"].append({"map": mname, "key": key,
                                       "reason": reason})
@@ -811,17 +811,17 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
             since = ((prev.get("since") or now)
                      if prev.get("reason") == "dir_missing" else now)
             ent["drift"] = {"reason": "dir_missing", "since": since,
-                            "observed": "在 %s 下找不到" % where,
+                            "observed": "not found under %s" % where,
                             "expect": ent.get("status") or "",
                             "source": "file_registry"}
             ent["auto_state"] = {"state": "drifted",
-                                 "observed": "不在 %s 下" % where,
+                                 "observed": "not under %s" % where,
                                  "expect": ent.get("status") or "",
                                  "source": "file_registry", "at": now}
             res["drifted"].append({"map": mname, "key": key,
                                    "reason": "dir_missing",
                                    "expect": ent.get("status") or "",
-                                   "observed": "不在 %s 下" % where,
+                                   "observed": "not under %s" % where,
                                    "source": "file_registry"})
             continue
 
@@ -834,9 +834,9 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
                 expect_dir = low.get(status.lower())
             if expect_dir is None:
                 failed += 1
-                reason = ("status「%s」不在 status_map 内（%s）——不猜它"
-                          "该住哪个子目录" % (status or "空",
-                                              "、".join(status_map)))
+                reason = ("status %r is not in status_map (%s) -- not guessing "
+                          "which subdirectory it belongs to" % (status or "empty",
+                                              ", ".join(status_map)))
                 _mark_failed(ent, now, reason)
                 res["failed"].append({"map": mname, "key": key,
                                       "reason": reason})
@@ -861,15 +861,15 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
                  if prev.get("reason") == "dir_conflict" else now)
         ent["drift"] = {"reason": "dir_conflict", "since": since,
                         "observed": _fmt_locs(locs),
-                        "expect": expect_dir or "(根目录)",
+                        "expect": expect_dir or "(repo root)",
                         "source": "file_registry"}
         ent["auto_state"] = {"state": "drifted",
                              "observed": _fmt_locs(locs),
-                             "expect": expect_dir or "(根目录)",
+                             "expect": expect_dir or "(repo root)",
                              "source": "file_registry", "at": now}
         res["drifted"].append({"map": mname, "key": key,
                                "reason": "dir_conflict",
-                               "expect": expect_dir or "(根目录)",
+                               "expect": expect_dir or "(repo root)",
                                "observed": _fmt_locs(locs),
                                "source": "file_registry"})
 
@@ -903,8 +903,8 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
         res["incomplete"] = True
         state["incomplete"] = True
         if not complete:
-            _add_error(state, "建档扫描不完整（scan_complete=false）——"
-                              "本轮不判缺失/漏登，只核对已扫到的部分")
+            _add_error(state, "registered scan incomplete (scan_complete=false) -- "
+                              "this round skips missing/absent judgments and only checks what was scanned")
 
 
 def _verify_map(mname: str, m: dict, rules: list[dict],

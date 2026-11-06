@@ -82,6 +82,9 @@ def resolve_default_lib_ex(
     ``persist_dir`` / ``start`` 是**连接级**入口：daemon 一个
     进程服务 N 条连接，每条连接可能属于不同工作区，不能共用进程启动时算出的
     那一份。不传就走模块级 env / cwd，行为与改造前**逐位一致**。
+    🔴 例外：``persist_dir`` 显式传了而 ``start`` 为空 ⇒ **不查引导文件**，
+    直接用声明值——进程 cwd 不属于这条连接（跨工作区串库洞，见下方
+    代码注释）；进程级默认（两者皆 None）仍是「引导文件 > env」。
 
     🔴 引导文件**只接受能明确解析成库的**值。解析不了就打一条 warning 并
     回退 env 默认——这是"便利项"该有的行为（它不该有能力让服务起不来），
@@ -98,6 +101,16 @@ def resolve_default_lib_ex(
     s = _srv()
     base = _library.normpath(os.path.expanduser(
         persist_dir if persist_dir is not None else s._PERSIST_DIR))
+    # 🔴 引导文件只属于「cwd 口径」。连接级**显式声明**（persist_dir 传入）
+    # 且连接没带 cwd 时，绝不能拿进程 cwd 去找引导文件：daemon 服务 N 个
+    # 工作区，进程 cwd 是**第一个**工作区的，用它精化别人的连接声明 =
+    # 跨工作区串库（f9_4e C 组在本仓根有 .hippocampus.json 时暴露的正是
+    # 这个洞）；没有握手行的客户端（测试/手工直连，f9_4e 红线）也必须
+    # 完全不受宿主进程所在工作区影响。带了 cwd 就照旧精化（launcher 发
+    # cwd 就是干这个用的，见 t_b5d）；进程级默认（两者都 None）照旧
+    # 「引导文件 > env」。
+    if (persist_dir or "").strip() and not (start or "").strip():
+        return base, None
     guide = _find_workspace_guide(start)
     if not guide:
         return base, None
@@ -111,19 +124,19 @@ def resolve_default_lib_ex(
         info = _library.resolve_library(want, default_path=base)
         if info is None:
             logger.warning(
-                "工作区引导文件 %s 的 library「%s」解析为空，回退 env 默认库",
+                "Workspace guide file %s library %r resolved to empty; falling back to env default library",
                 guide, want)
             return base, {"declared_raw": want, "reason": "unresolvable",
-                          "detail": "resolve_library 返回 None"}
-        logger.info("工作区引导文件 %s 指定默认库：%s（%s）", guide, info.name, info.path)
+                          "detail": "resolve_library returned None"}
+        logger.info("Workspace guide file %s set default library: %s (%s)", guide, info.name, info.path)
         return info.path, None
     except _library.LibraryResolutionError as e:
         # 指定了但解析不明：出声，且**不**拿它当默认库（串库比回退危险得多）
-        logger.warning("工作区引导文件 %s 的 library 解析不明，回退 env 默认库：%s", guide, e)
+        logger.warning("Workspace guide file %s library was unresolvable; falling back to env default library: %s", guide, e)
         return base, {"declared_raw": want, "reason": "unresolvable",
                       "detail": str(e)}
     except Exception as e:      # 文件坏了 / 不是 JSON：同样出声回退
-        logger.warning("工作区引导文件 %s 读取失败，回退 env 默认库：%s", guide, e)
+        logger.warning("Workspace guide file %s read failed; falling back to env default library: %s", guide, e)
         return base, {"declared_raw": want, "reason": "read_error",
                       "detail": str(e)}
 
@@ -179,7 +192,7 @@ def libraries(force: bool = False) -> list[Any]:
     try:
         found = _library.scan_libraries()
     except Exception as exc:  # noqa: BLE001 —— 扫描失败不该让工具挂掉
-        logger.warning("库扫描失败: %s", exc)
+        logger.warning("Library scan failed: %s", exc)
         found = []
     s._library_cache = found
     s._library_cache_at = now
@@ -206,11 +219,11 @@ def resolve_library_path(library: str | None = None,
         info = _library.resolve_library(
             q, libs=s.libraries(), default_path=s.default_library_path(client))
         if info is None:  # 理论上不会（q 非空时要么命中要么抛）
-            raise LibraryResolutionError(f"库 {q} 解析失败")
+            raise LibraryResolutionError(f"Library {q} could not be resolved")
         if info.backup:
             raise LibraryResolutionError(
-                f"{info.name} 是备份/快照目录，只读，不能作为写入目标。"
-                f"请用真库名或 library_id 指定。")
+                f"{info.name} is a backup/snapshot directory; it is read-only and cannot be a write target."
+                f"Use a real library name or library_id.")
         return info.path
     with _library_binding_lock:
         bound = _library_binding.get(session_key(client))
@@ -297,7 +310,7 @@ def _ensure_default_dir(path: str) -> bool:
         os.makedirs(path, exist_ok=True)
         return True
     except OSError as e:
-        logger.warning("零库首启自动建 default 失败（不影响使用）: %s", e)
+        logger.warning("Zero-library first-start failed to create default (use unaffected): %s", e)
         return False
 
 
@@ -330,7 +343,7 @@ def _prefetch_library(path: str) -> None:
         try:
             _srv()._registry_get().get(path)
         except Exception as e:  # noqa: BLE001
-            logger.warning("库预取失败（不影响后续惰性加载）: %s", e)
+            logger.warning("Library prefetch failed (later lazy loading unaffected): %s", e)
 
     threading.Thread(target=_prefetch, name="hippo-lib-prefetch",
                      daemon=True).start()

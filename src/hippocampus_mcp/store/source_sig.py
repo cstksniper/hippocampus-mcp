@@ -286,7 +286,7 @@ def drift_audit(records: Iterable[Any],
     actionable = counts["stale"] + counts["missing"] + counts["unbaselined"]
     return {
         "ok": True,
-        "scope": source.strip() or "(全库)",
+        "scope": source.strip() or "(whole library)",
         "counts": counts,
         # 可行动的（要宿主看一眼的）三类合计——"0"才是"没漂移"，
         # 但 unbaselined>0 时它说的是"无法判断"，必须分开读。

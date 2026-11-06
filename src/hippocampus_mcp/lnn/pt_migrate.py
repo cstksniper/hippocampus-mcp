@@ -22,7 +22,7 @@ faulthandler.dump_traceback_later(30, exit=False)
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
-        print("用法: python -m hippocampus_mcp.lnn.pt_migrate <src.pt> <dst.npz>",
+        print("usage: python -m hippocampus_mcp.lnn.pt_migrate <src.pt> <dst.npz>",
               file=sys.stderr)
         return 2
     src, dst = argv
@@ -31,7 +31,7 @@ def main(argv: list[str]) -> int:
 
         data = torch.load(src, map_location="cpu", weights_only=False)
     except Exception as exc:
-        print(f"pt_migrate: 读取失败 ({src}): {exc}", file=sys.stderr)
+        print(f"pt_migrate: read failed ({src}): {exc}", file=sys.stderr)
         return 1
 
     from .checkpoint import payload_from_state
@@ -45,7 +45,7 @@ def main(argv: list[str]) -> int:
 
         np.savez(dst, **payload)
     except Exception as exc:
-        print(f"pt_migrate: 写入失败 ({dst}): {exc}", file=sys.stderr)
+        print(f"pt_migrate: write failed ({dst}): {exc}", file=sys.stderr)
         return 1
     print(f"pt_migrate: {src} → {dst} OK")
     return 0

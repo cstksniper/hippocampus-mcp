@@ -98,10 +98,10 @@ def check_capacity(items: Any, *, max_items: int) -> None:
             具体数值——宿主看到就能自己算要分几批。
     """
     if not isinstance(items, list):
-        raise ValueError(f"items 必须是数组，收到 {type(items).__name__}")
+        raise ValueError(f"items must be an array, got {type(items).__name__}")
     if len(items) > max_items:
         raise ValueError(
-            f"单批上限 {max_items} 条，收到 {len(items)} 条，请分批调用"
+            f"batch limit is {max_items} items, got {len(items)}; split into multiple calls"
         )
 
 
@@ -142,11 +142,11 @@ def normalize_item(
         ValueError: ``tags`` 是字符串但 JSON 解析失败（``json.loads`` 抛出）。
     """
     if not isinstance(it, dict):
-        return ItemError(index=index, error="项不是对象(dict)",
+        return ItemError(index=index, error="item is not an object (dict)",
                          preview=str(it)[:80])
     text = it.get("text")
     if not isinstance(text, str) or not text.strip():
-        return ItemError(index=index, error="text 缺失或为空",
+        return ItemError(index=index, error="text is missing or empty",
                          preview=str(text)[:80])
 
     imp = it.get("importance")

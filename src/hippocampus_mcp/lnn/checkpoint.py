@@ -121,7 +121,7 @@ class StateCheckpoint:
             state: 待保存的状态字典 (通常来自 MemoryCore.get_state()).
         """
         if not self.save_with_backup(state):
-            _stderr_print("[StateCheckpoint] save 失败, 状态未持久化（详见上方错误输出）")
+            _stderr_print("[StateCheckpoint] save failed; state was not persisted (see the error output above)")
 
     def save_atomic(self, state: dict) -> bool:
         """原子写入: 先写 ``.tmp``, 成功后 ``os.replace`` 替换目标文件.
@@ -144,14 +144,14 @@ class StateCheckpoint:
             if target_eff != tmp:
                 os.replace(target_eff, tmp)
         except Exception as exc:
-            _stderr_print(f"[StateCheckpoint] save_atomic 写入失败: {exc}")
+            _stderr_print(f"[StateCheckpoint] save_atomic write failed: {exc}")
             self._safe_remove(tmp)
             return False
         try:
             os.replace(tmp, self.path)
             return True
         except Exception as exc:
-            _stderr_print(f"[StateCheckpoint] save_atomic 替换失败: {exc}")
+            _stderr_print(f"[StateCheckpoint] save_atomic replace failed: {exc}")
             self._safe_remove(tmp)
             return False
 
@@ -184,7 +184,7 @@ class StateCheckpoint:
             os.replace(tmp, self.path)
             return True
         except Exception as exc:
-            _stderr_print(f"[StateCheckpoint] save_with_backup 写入失败: {exc}")
+            _stderr_print(f"[StateCheckpoint] save_with_backup write failed: {exc}")
             self._safe_remove(tmp)
             return False
 
@@ -211,20 +211,20 @@ class StateCheckpoint:
                 return self._read_npz(self.path)
             except Exception as exc:
                 main_err = exc
-                _stderr_print(f"[StateCheckpoint] 主文件加载失败 ({self.path}): {exc}")
+                _stderr_print(f"[StateCheckpoint] main file load failed ({self.path}): {exc}")
         # 2. 回退到备份文件（主文件缺失或损坏都走这里）
         data: dict | None = None
         if os.path.isfile(self.bak_path):
             try:
-                _stderr_print(f"[StateCheckpoint] 尝试从备份恢复 ({self.bak_path})")
+                _stderr_print(f"[StateCheckpoint] attempting restore from backup ({self.bak_path})")
                 data = self._read_npz(self.bak_path)
             except Exception as exc:
-                _stderr_print(f"[StateCheckpoint] 备份文件加载失败 ({self.bak_path}): {exc}")
+                _stderr_print(f"[StateCheckpoint] backup file load failed ({self.bak_path}): {exc}")
         if data is not None:
             if main_err is not None:
                 q = self._quarantine(self.path)
                 if q:
-                    _stderr_print(f"[StateCheckpoint] 已隔离损坏的主文件 → {q}")
+                    _stderr_print(f"[StateCheckpoint] quarantined corrupt main file -> {q}")
             return data
         # 3. legacy .pt（历史格式的库；惰性 torch——环境里没有就安全放弃）
         legacy = self._load_legacy_pt()
@@ -232,24 +232,24 @@ class StateCheckpoint:
             if main_err is not None:
                 q = self._quarantine(self.path)
                 if q:
-                    _stderr_print(f"[StateCheckpoint] 已隔离损坏的主文件 → {q}")
+                    _stderr_print(f"[StateCheckpoint] quarantined corrupt main file -> {q}")
             return legacy
         # 4. 全部失败: 隔离现场（保留证据，避免反复失败）
         if main_err is not None:
             q = self._quarantine(self.path)
             if q:
-                _stderr_print(f"[StateCheckpoint] 已隔离损坏的主文件 → {q}")
+                _stderr_print(f"[StateCheckpoint] quarantined corrupt main file -> {q}")
         if os.path.isfile(self.bak_path):
             q = self._quarantine(self.bak_path)
             if q:
-                _stderr_print(f"[StateCheckpoint] 已隔离损坏的备份文件 → {q}")
+                _stderr_print(f"[StateCheckpoint] quarantined corrupt backup file -> {q}")
         return {}
 
     def _read_npz(self, path: str) -> dict:
         with np.load(path, allow_pickle=False) as z:
             version = int(z[_KEY_VERSION])
             if version > _NPZ_VERSION:
-                raise ValueError(f"npz 格式版本过新: {version} > {_NPZ_VERSION}")
+                raise ValueError(f"npz format version is too new: {version} > {_NPZ_VERSION}")
             has_hx = bool(z[_KEY_HAS_HX])
             hx = np.asarray(z[_KEY_HX], dtype=np.float32) if has_hx else None
             last = np.asarray(z[_KEY_LAST], dtype=np.float32)
@@ -291,13 +291,13 @@ class StateCheckpoint:
                 try:
                     return self._read_npz(self.path)
                 except Exception as exc:
-                    _stderr_print(f"[StateCheckpoint] npz 读取失败 ({self.path}): {exc}")
+                    _stderr_print(f"[StateCheckpoint] npz read failed ({self.path}): {exc}")
                     return None
             if "torch" not in sys.modules:
                 _stderr_print(
-                    f"[StateCheckpoint] 发现 legacy LNN 状态 {cand}。主进程零 torch 不读取——"
-                    "hx/window 将重新积累（reference_time 由 meta JSON 兜底）。"
-                    "想保留旧时序状态请离线跑: python scripts/migrate_lnn_state.py"
+                    f"[StateCheckpoint] found legacy LNN state {cand}. The torch-free main process does not read it -- "
+                    "hx/window will re-accumulate (reference_time falls back to the meta JSON). "
+                    "To keep the old temporal state, run offline: python scripts/migrate_lnn_state.py"
                 )
                 return None
             try:
@@ -305,7 +305,7 @@ class StateCheckpoint:
 
                 data = torch.load(cand, map_location="cpu", weights_only=False)
             except Exception as exc:
-                _stderr_print(f"[StateCheckpoint] legacy 状态读取失败 ({cand}): {exc}")
+                _stderr_print(f"[StateCheckpoint] legacy state read failed ({cand}): {exc}")
                 continue
             out: dict[str, Any] = {}
             for k, v in (data or {}).items():
@@ -357,7 +357,7 @@ class StateCheckpoint:
             os.replace(path, target)
             return target
         except OSError as exc:
-            _stderr_print(f"[StateCheckpoint] 隔离损坏文件 {path} 失败: {exc}")
+            _stderr_print(f"[StateCheckpoint] failed to quarantine corrupt file {path} : {exc}")
             return None
 
     # ------------------------------------------------------------------ #

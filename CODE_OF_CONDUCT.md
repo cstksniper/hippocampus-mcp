@@ -1,51 +1,57 @@
-# 行为准则
+# Code of Conduct
 
-## 我们的承诺
+## Our pledge
 
-为了营造开放和友好的环境，我们作为贡献者和维护者承诺：
-无论年龄、体型、身体健全与否、民族、性别认同和表达、经验水平、教育程度、
-社会经济地位、国籍、外貌、种族、宗教信仰或性取向如何，
-参与本项目社区都不会受到骚扰。
+In the interest of fostering an open and welcoming environment, we as
+contributors and maintainers pledge to make participation in our community a
+harassment-free experience for everyone, regardless of age, body size, visible
+or invisible disability, ethnicity, gender identity and expression, level of
+experience, education, socio-economic status, nationality, personal appearance,
+race, religion, or sexual identity and orientation.
 
-## 我们的标准
+## Our standards
 
-有助于创造积极环境的行为包括：
+Behavior that contributes to a positive environment includes:
 
-- 使用友好和包容的语言
-- 尊重不同的观点和经验
-- 优雅地接受建设性批评
-- 关注对社区最有利的事情
-- 对其他社区成员表示同理心
+- Using welcoming and inclusive language
+- Being respectful of differing viewpoints and experiences
+- Gracefully accepting constructive criticism
+- Focusing on what is best for the community
+- Showing empathy towards other community members
 
-不可接受的行为包括：
+Unacceptable behavior includes:
 
-- 使用与性有关的言语或图像，以及不受欢迎的性关注或性骚扰
-- 挑衅、侮辱或贬损的评论，人身攻击或政治攻击
-- 公开或私下的骚扰
-- 未经明确许可发布他人的私人信息（如住址、邮箱）
-- 其他在专业场合下可被合理认定为不适当的行为
+- The use of sexualized language or imagery, and unwelcome sexual attention or advances
+- Trolling, insulting or derogatory comments, and personal or political attacks
+- Public or private harassment
+- Publishing others' private information (such as an address or email) without explicit permission
+- Other conduct which could reasonably be considered inappropriate in a professional setting
 
-## 我们的责任
+## Our responsibilities
 
-项目维护者有责任解释可接受行为的标准，
-并对任何不可接受的行为采取适当和公平的纠正措施，
-包括删除、编辑或拒绝不符合本准则的评论、提交、代码、Issue 和其他贡献。
+Maintainers are responsible for clarifying the standards of acceptable behavior
+and are expected to take appropriate and fair corrective action in response to
+any instances of unacceptable behavior, including removal, editing, or rejection
+of comments, commits, code, issues, and other contributions that do not align
+with this Code of Conduct.
 
-## 适用范围
+## Scope
 
-本准则适用于所有项目空间（仓库、Issue、PR、讨论区），
-也适用于个人在公开场合代表本项目或其社区的情形。
+This Code of Conduct applies within all project spaces (repository, issues,
+pull requests, discussions), and also applies when an individual officially
+represents the project or its community in public spaces.
 
-## 执行
+## Enforcement
 
-遇到辱骂、骚扰或其他不可接受的行为，
-请通过 Issue 报告；若涉及隐私、不便公开，可直接发邮件到
-[cstksniper@qq.com](mailto:cstksniper@qq.com)。
-所有投诉都会被审阅和调查，并作出必要且适当的回应。
-维护团队有义务对事件报告者的信息保密。
+Instances of abusive, harassing, or otherwise unacceptable behavior may be
+reported through an issue; for anything private or unsuitable for public
+discussion, email [cstksniper@qq.com](mailto:cstksniper@qq.com) directly.
+All complaints will be reviewed and investigated and will result in a response
+that is deemed necessary and appropriate to the circumstances. The project team
+is obligated to maintain confidentiality with regard to the reporter of an incident.
 
-## 归属
+## Attribution
 
-本准则改编自 [Contributor Covenant](https://www.contributor-covenant.org)
-版本 2.1，原文见
-<https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>。
+This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org),
+version 2.1, available at
+<https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>.

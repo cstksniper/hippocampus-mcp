@@ -49,11 +49,11 @@ def guard(items: Any) -> tuple[Any, dict[str, Any] | None]:
     """
     if not items:
         return None, {"ok": False, "enabled": True, "action": ACTION,
-                      "error": "items 是空的（需要 [{topic_id, summary, "
-                               "evidence}]）"}
+                      "error": "items is empty (expects [{topic_id, summary, "
+                               "evidence}])"}
     if not isinstance(items, list):
         return None, {"ok": False, "enabled": True, "action": ACTION,
-                      "error": "items 必须是数组"}
+                      "error": "items must be an array"}
     return items, None
 
 
@@ -76,12 +76,12 @@ def apply_items(
     failed: list[dict[str, Any]] = []
     for raw in items:
         if not isinstance(raw, dict):
-            failed.append({"topic_id": "", "error": "条目不是对象"})
+            failed.append({"topic_id": "", "error": "item is not an object"})
             continue
         tid = str(raw.get("topic_id") or "").strip()
         t = knowledge.get(tid)
         if t is None:
-            failed.append({"topic_id": tid, "error": "没有这个主题：" + tid})
+            failed.append({"topic_id": tid, "error": "no such topic: " + tid})
             continue
         info = {str(it["id"]): it for it in items_of(require_vec=False)}
         alive = [m for m in (t.get("member_ids") or []) if m in info]
@@ -91,7 +91,7 @@ def apply_items(
             failed.append({"topic_id": tid, "error": err})
             continue
         written.append({"topic_id": tid,
-                        "title": t.get("title") or "(未命名)",
+                        "title": t.get("title") or "(untitled)",
                         "size": len(alive),
                         "has_fras": bool(t.get("summary_fras"))})
     return written, failed
@@ -121,9 +121,9 @@ def assemble_report(
         "results": written,
         "saved": bool(written),
         "pending_count": pending,
-        "note": ("已写回 %d 条%s；写回即落盘。剩余待归纳 %d 个。"
+        "note": ("Wrote back %d item(s)%s; write-back persists to disk. %d topic(s) still pending."
                  % (len(written),
-                    "" if not failed else "，%d 条被退回（见 failed）"
+                    "" if not failed else "; %d item(s) rejected (see failed)"
                     % len(failed),
                     len(pending_summary_ids(knowledge, defaults=defaults)))),
     }

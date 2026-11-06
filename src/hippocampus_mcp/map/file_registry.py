@@ -170,12 +170,12 @@ def init(persist_dir: str, root: str, force: bool = False) -> dict:
     """
     root = os.path.abspath(root)
     if not os.path.isdir(root):
-        raise FileNotFoundError("项目根不存在：%s" % root)
+        raise FileNotFoundError("the project root does not exist: %s" % root)
 
     def _do(reg):
         if (reg.get("root") or reg.get("files")) and not force:
             raise FileExistsError(
-                "已建档（root=%s，%d 个文件）；重init 会丢历史，确认请传 force"
+                "already registered (root=%s, %d files); re-init would lose history -- pass force to confirm"
                 % (reg.get("root"), len(reg.get("files") or {})))
         reg.clear()
         reg.update({

@@ -311,12 +311,12 @@ def _spawn_without_breakaway(cmd, env, log_fh, base_flags: int,
     """
     if not breakaway_flag:
         return None
-    msg = (f"[launcher] ⚠ daemon spawn 带 CREATE_BREAKAWAY_FROM_JOB 失败"
-           f"（{type(exc).__name__}: {exc}）—— daemon **仍留在宿主的进程树里**，"
-           f"宿主回收会话时会被一起终止（实测：15 个 daemon 无退出日志、"
-           f"无崩溃痕迹地消失）。退回不加该 flag 重试（可用，但不免疫宿主回收）。"
-           f"要真正脱离，用 :mod:`hippocampus_mcp.prewarm` 把创建者换成"
-           f"登录启动/计划任务 —— 那才是治本解。")
+    msg = (f"[launcher] ⚠ daemon spawn with CREATE_BREAKAWAY_FROM_JOB failed"
+           f" ({type(exc).__name__}: {exc}) -- daemon remains in the host process tree; "
+           f"it will be terminated with the host session. Retrying without this flag works, "
+           f"but does not protect against host cleanup."
+           f"To fully detach, use :mod:`hippocampus_mcp.prewarm` to change the creator to "
+           f"a login-startup or scheduled task.")
     print(msg, file=sys.stderr, flush=True)
     try:
         return subprocess.Popen(
@@ -496,12 +496,12 @@ def _open_daemon_log(log_path: str):
         else f"{log_path}.{os.getpid()}"
     try:
         fh = open(alt, "ab")
-        print(f"[launcher] daemon 主日志被占用（{type(last_err).__name__}）"
-              f"→ 本次输出改落 {alt}", file=sys.stderr)
+        print(f"[launcher] daemon main log is busy ({type(last_err).__name__}); "
+              f"falling back to {alt}", file=sys.stderr)
         return fh, alt
     except OSError:
-        print(f"[launcher] daemon 日志打不开（{type(last_err).__name__}）："
-              f"这一份输出无法落盘，崩溃将无痕", file=sys.stderr)
+        print(f"[launcher] cannot open daemon log ({type(last_err).__name__}); "
+              f"crash output will be lost", file=sys.stderr)
         return None, ""
 
 
@@ -519,7 +519,7 @@ def release_spawn_lock(key: str) -> None:
         except OSError:
             pass
         return
-    print(f"[launcher] ⚠ spawn 锁已不属于本进程（内容={info}），不删除 {path}",
+    print(f"[launcher] ⚠ spawn lock is no longer owned by this process (content={info}); not removing {path}",
           file=sys.stderr, flush=True)
 
 
@@ -698,9 +698,9 @@ HANDSHAKE_REPLAY_TIMEOUT = 60.0
 #: 未决请求的交代文案。**必须说清"结果未知"**——不许暗示成功或失败，
 #: 调用方（尤其是写类操作的调用方）全靠这句话决定要不要重试。
 ERR_DAEMON_LOST = (
-    "hippocampus daemon 连接中断且未能即时自愈：本条请求的执行结果**未知**"
-    "（可能已执行，也可能从未到达 daemon）。幂等操作可安全重试；"
-    "非幂等操作（ingest / update_memory / forget 等写操作）请先读回确认。"
+    "HippoMCP daemon connection was interrupted and could not recover immediately: the result of this request is UNKNOWN"
+    " (it may have executed, or may never have reached the daemon). Idempotent operations may be safely retried; "
+    "for non-idempotent writes (ingest / update_memory / forget), read back before retrying."
 )
 
 #: main() 在开跑前填好 —— _Relay 靠它知道"该重连到哪个 key"。
@@ -846,8 +846,8 @@ class _Relay:
         if self._reseat(pending=line):
             return
         n = self._fail_inflight(ERR_DAEMON_LOST)
-        _diag(f"自愈失败，已向 {n} 条未决请求返回 error，终止本次 stdio")
-        raise _RelayLost("daemon 连接不可恢复")
+        _diag(f"Recovery failed; returned error for {n} pending requests and terminated this stdio session")
+        raise _RelayLost("daemon connection is unrecoverable")
 
     def _send(self, line: bytes) -> bool:
         with self._sock_lock:
@@ -892,7 +892,7 @@ class _Relay:
             if buf.strip():
                 # 断在半帧上：这一帧永远不完整，只能丢。要吼一句 —— 静默丢帧
                 # 在以后的事故里会被当成"daemon 没回"。
-                _diag(f"丢弃半帧 {len(buf)}B（连接在非帧边界断开）")
+                _diag(f"Discarded partial frame {len(buf)}B (connection broke at a non-frame boundary)")
             with self._sock_lock:
                 current = self._gen == gen and self._sock is sock
             if current and not self._stopped.is_set():
@@ -927,14 +927,14 @@ class _Relay:
                 attempt += 1
                 if attempt > RECONNECT_MAX_ATTEMPTS:
                     break
-                _diag(f"daemon 连接断开，第 {attempt} 次重连")
+                _diag(f"daemon connection dropped; reconnect attempt {attempt}")
                 s = self._connect_fresh()
                 if s is None:
                     time.sleep(RECONNECT_BACKOFF * attempt)
                     continue
                 if not self._install(s, replay_handshake=True):
                     continue
-                _diag("重连成功，会话已在新 daemon 上重建")
+                _diag("Reconnected; MCP session rebuilt on new daemon")
                 return self._replay_pending(pending)
             return False
         finally:
@@ -975,7 +975,7 @@ class _Relay:
     def _install(self, sock: socket.socket, replay_handshake: bool = False) -> bool:
         """接管一条新连接（并起它的回程线程）。"""
         if replay_handshake and not self._replay_handshake(sock):
-            _diag("重连后重建 MCP 会话失败，换一条重试")
+            _diag("Failed to rebuild MCP session after reconnect; trying another connection")
             try:
                 sock.close()
             except OSError:
@@ -1011,7 +1011,7 @@ class _Relay:
             return True
         for raw in self._handshake:
             if _RELAY_DEBUG:
-                print(f"[relay] 重放握手帧 {raw[:70]!r}",
+                print(f"[relay] replaying handshake frame {raw[:70]!r}",
                       file=sys.stderr, flush=True)
             try:
                 sock.sendall(raw + b"\n")
@@ -1024,7 +1024,7 @@ class _Relay:
             if obj.get("method") == "initialize" and "id" in obj:
                 if not self._drink(sock):
                     if _RELAY_DEBUG:
-                        print("[relay] 重放握手的响应没等到",
+                        print("[relay] no response to replayed handshake",
                               file=sys.stderr, flush=True)
                     return False
         return True
@@ -1086,7 +1086,7 @@ class _Relay:
         with self._inflight_lock:
             self._inflight[k] = line.decode("utf-8", "replace")
             if _RELAY_DEBUG:
-                print(f"[relay] -> 记入未决 id={k} 在途={len(self._inflight)}",
+                print(f"[relay] -> registered pending id={k} in-flight={len(self._inflight)}",
                       file=sys.stderr, flush=True)
         return k
 
@@ -1098,7 +1098,7 @@ class _Relay:
         with self._inflight_lock:
             existed = self._inflight.pop(k, None)
         if _RELAY_DEBUG and existed is not None:
-            print(f"[relay] xx 撤销未决 id={k}", file=sys.stderr, flush=True)
+            print(f"[relay] xx canceled pending id={k}", file=sys.stderr, flush=True)
 
     def _settle_inflight(self, line: bytes) -> None:
         """应答到达，勾销未决。"""
@@ -1115,7 +1115,7 @@ class _Relay:
         with self._inflight_lock:
             removed = self._inflight.pop(_id_key(obj["id"]), None)
         if _RELAY_DEBUG and removed is not None:
-            print(f"[relay] <- 勾销 id={_id_key(obj['id'])}",
+            print(f"[relay] <- completed id={_id_key(obj['id'])}",
                   file=sys.stderr, flush=True)
 
     def _fail_inflight(self, reason: str) -> int:
@@ -1209,9 +1209,9 @@ def preflight_persist_dir() -> int | None:
     if not lib:
         # 未设不算错（人工裸跑 launcher 调试是合法场景），但要自曝：
         # 此刻的默认库很可能不是用户以为的那个库 —— 串库从不报错。
-        print(f"[launcher] ⚠ 未设置 {ENV_PERSIST}：本次将落在默认库。"
-              f"若本次由宿主拉起，多半是宿主没读到配置 —— 跑 "
-              f"`python -m hippocampus_mcp.cli doctor --host <宿主> ` 看结论",
+        print(f"[launcher] ⚠ {ENV_PERSIST} is not set; this run will use the default library. "
+              f"If launched by a host, the host probably did not read its config. "
+              f"Run `python -m hippocampus_mcp.cli doctor --host <host>` for a verdict.",
               file=sys.stderr, flush=True)
         return None
     try:
@@ -1221,12 +1221,12 @@ def preflight_persist_dir() -> int | None:
             f.write("ok")
         os.remove(probe)
     except OSError as exc:
-        print(f"[launcher] ✗ 库目录不可写，拒绝启动：{lib}\n"
-              f"  原因：{type(exc).__name__}: {exc}\n"
-              f"  拒绝的理由：与其让宿主挂到超时、之后每次写入都静默失败，"
-              f"不如现在明确断开。\n"
-              f"  修复：把宿主配置 env 里的 {ENV_PERSIST} 改到可写目录，"
-              f"或检查磁盘/权限后重启会话。",
+        print(f"[launcher] ✗ Library directory is not writable; refusing to start: {lib}\n"
+              f"  Reason: {type(exc).__name__}: {exc}\n"
+              f"  Why: rather than let the host time out and silently fail every later write, "
+              f"disconnect now.\n"
+              f"  Fix: change {ENV_PERSIST} in the host config env to a writable directory, "
+              f"or check disk/permissions and restart the session.",
               file=sys.stderr, flush=True)
         return 2
     return None
@@ -1252,16 +1252,16 @@ def main(argv: list[str] | None = None) -> int:
         # 180s，首次要加载嵌入模型），期间 stderr 一个字都没有的话，宿主与
         # 用户都只能判定为"挂了"，然后按"坏了"处理（杀进程 / 改配置）。
         # 先 flush 一行状态，让等待可被识别为等待。
-        _diag(f"正在连接共享 daemon（首次需加载嵌入模型，数十秒属正常；"
-              f"超过 {DAEMON_READY_TIMEOUT:.0f}s 未就绪则退回直连 server）")
+        _diag(f"Connecting to shared daemon (first start loads the embedding model; tens of seconds is normal; "
+              f"after {DAEMON_READY_TIMEOUT:.0f}s without readiness, falls back to direct server)")
         info = ensure_daemon(key, library=library, model=model)
         if info is None:
-            _diag("daemon 起不来，退回直连 server（本次会话独占一份模型，"
-                  f"日志见 {runtime_dir()} 下的 daemon-*.log）")
+            _diag("Daemon failed to start; falling back to direct server (this session gets its own model; "
+                  f"logs under {runtime_dir()}/daemon-*.log)")
             return run_server_inline(argv)
         sock = try_connect(int(info["port"]), timeout=5.0)
         if sock is None:
-            _diag("daemon 注册表已就绪但连不上端口，退回直连 server")
+            _diag("Daemon registry is ready but its port is unreachable; falling back to direct server")
             return run_server_inline(argv)
         # _Relay 靠它知道"断了该往哪个 key 重连"
         _SESSION_PARAMS["key"] = key
@@ -1269,7 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
         _SESSION_PARAMS["model"] = model
         rc = relay(sock)
         if rc == 4:
-            _diag("stdio 已主动断开：让宿主看到一次明确失败，而不是僵尸连接")
+            _diag("stdio disconnected deliberately; surface an explicit failure to the host instead of leaving a zombie connection")
         return rc
     except Exception:  # noqa: BLE001 —— 启动器不能因为任何原因让宿主连不上
         return run_server_inline(argv)

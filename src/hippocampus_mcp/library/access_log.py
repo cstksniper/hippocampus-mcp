@@ -41,7 +41,7 @@ def append_access_event(lib_path: str, event: dict[str, Any]) -> bool:
             f.write(line + "\n")
         return True
     except OSError as e:
-        logger.warning("access_log 追加失败（不阻断写入）：%s: %s",
+        logger.warning("access_log append failed (writes are not blocked): %s: %s",
                        path, e)
         return False
 
@@ -62,7 +62,7 @@ def read_access_events(lib_path: str, limit: int = 50) -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except OSError as e:
-        logger.warning("access_log 读取失败：%s: %s", path, e)
+        logger.warning("access_log read failed: %s: %s", path, e)
         out["skipped"] = -1  # -1 = 整文件读不出来（与坏行的逐行跳过区分）
         return out
     events: list[dict[str, Any]] = []

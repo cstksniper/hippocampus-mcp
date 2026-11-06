@@ -68,7 +68,7 @@ def forget_by_query(
         for h in hits
     ]
     if not candidates:
-        return {"ok": False, "error": f"没有匹配的记忆: {query}",
+        return {"ok": False, "error": f"no memories matched: {query}",
                 "query": query, "candidates": []}
 
     if dry_run:
@@ -76,8 +76,8 @@ def forget_by_query(
             "ok": True, "dry_run": True, "query": query,
             "candidates": candidates,
             "min_similarity": floor,
-            "note": (f"执行时：只处理 similarity >= {floor} 的候选；"
-                     f"未显式传 allow_multiple=True 时最多删 1 条。"),
+            "note": (f"When executed: only candidates with similarity >= {floor} are processed; "
+                     f"at most 1 deletion unless allow_multiple=True is passed explicitly."),
         }
 
     eligible: list[dict[str, Any]] = []
@@ -87,15 +87,15 @@ def forget_by_query(
             eligible.append(c)
         else:
             skipped.append({**c, "skip_reason":
-                            f"similarity {c['similarity']} 低于门槛 {floor}"})
+                            f"similarity {c['similarity']} below the threshold {floor}"})
 
     if not eligible:
         return {
             "ok": False,
-            "error": (f"{len(skipped)} 条候选里没有任何一条达到删除门槛 {floor}，"
-                      f"未删除任何记忆。它们多半只是 BM25 词面命中。"
-                      f"请换更贴近目标原文的措辞，或用 dry_run 结果里的 "
-                      f"memory_id 调 forget_memory 精确删除。"),
+            "error": (f"None of the {len(skipped)} candidates reached the deletion threshold {floor}; "
+                      f"nothing was deleted. They are most likely BM25 surface-form hits. "
+                      f"Rephrase closer to the target's exact wording, or call forget_memory with the "
+                      f"memory_id from the dry_run result for a precise delete."),
             "query": query, "dry_run": False,
             "min_similarity": floor, "skipped": skipped, "removed_count": 0,
         }
@@ -104,7 +104,7 @@ def forget_by_query(
         for c in eligible[1:]:
             skipped.append({
                 **c, "skip_reason":
-                "单条模式：只删最匹配的一条（需批量删请传 allow_multiple=True）",
+                "single mode: only the best-matching one is deleted (pass allow_multiple=True for bulk deletion)",
             })
         eligible = eligible[:1]
 
@@ -125,6 +125,6 @@ def forget_by_query(
     if skipped:
         out["skipped"] = skipped
         out["skipped_count"] = len(skipped)
-        out["note"] = (f"{len(skipped)} 条候选未删除（见 skipped 的 skip_reason）；"
-                       f"确需删除时请用其 memory_id 调 forget_memory。")
+        out["note"] = (f"{len(skipped)} candidates were not deleted (see skip_reason in skipped); "
+                       f"to delete them anyway, call forget_memory with their memory_id.")
     return out

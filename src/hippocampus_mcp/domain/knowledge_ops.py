@@ -87,7 +87,7 @@ def knowledge_stats(
     """brain_stats 自曝：主题层现在什么状态（含覆盖率与上次刷新时点）。"""
     if not port.defaults_fn().layer_enabled:
         return {"enabled": False,
-                "note": "主题层已关闭（HIPPOCAMPUS_TOPIC_LAYER=0）"}
+                "note": "the topic layer is disabled (HIPPOCAMPUS_TOPIC_LAYER=0)"}
     active_total = sum(1 for r in records
                        if r.state == active_state)
     out = port.coverage_of(knowledge, active_total)
@@ -102,6 +102,6 @@ def knowledge_stats(
                                 if last_took is not None else None),
         "members_dropped_last": last_dropped,
         "note": (out.get("note") or
-                 "主题层是 L1 的派生层；代表句是抽取式摘录（离质心最近的几条原文），不是归纳"),
+                 "the topic layer is derived from L1; representative sentences are extractive quotes (originals closest to the centroid), not summaries"),
     })
     return out
