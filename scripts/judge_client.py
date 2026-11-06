@@ -80,11 +80,14 @@ class JudgeClient:
         retry_backoff: float = 2.0,
     ) -> None:
         if not base_url:
-            raise JudgeConfigError(f"{ENV_BASE_URL} 为空——评测需要 judge 端点")
+            raise JudgeConfigError(
+                f"{ENV_BASE_URL} is empty — a judge endpoint is required for evaluation")
         if not api_key:
-            raise JudgeConfigError(f"{ENV_API_KEY} 为空——评测需要 judge 凭据")
+            raise JudgeConfigError(
+                f"{ENV_API_KEY} is empty — judge credentials are required for evaluation")
         if not model:
-            raise JudgeConfigError(f"{ENV_MODEL} 为空——评测需要指定 judge 模型")
+            raise JudgeConfigError(
+                f"{ENV_MODEL} is empty — a judge model must be specified")
 
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -165,20 +168,22 @@ class JudgeClient:
                 except Exception:
                     pass
                 last_err = JudgeRequestError(
-                    f"judge HTTP {e.code}（第 {attempt + 1} 次）：{detail}"
+                    f"judge HTTP {e.code} (attempt {attempt + 1}): {detail}"
                 )
                 # 4xx 是请求本身的问题，重试无意义
                 if 400 <= e.code < 500:
                     raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_err = JudgeRequestError(f"judge 网络失败（第 {attempt + 1} 次）：{e}")
+                last_err = JudgeRequestError(
+                    f"judge network failure (attempt {attempt + 1}): {e}")
             except ValueError as e:  # 返回体不是预期结构
-                raise JudgeRequestError(f"judge 返回体解析失败：{e}") from e
+                raise JudgeRequestError(
+                    f"failed to parse judge response body: {e}") from e
 
             if attempt < self.max_retries:
                 time.sleep(self.retry_backoff * (attempt + 1))
 
-        raise last_err or JudgeRequestError("judge 调用失败：原因未知")
+        raise last_err or JudgeRequestError("judge call failed: unknown reason")
 
     # ---------------------------------------------------------------- 内部
 
@@ -192,13 +197,14 @@ class JudgeClient:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise JudgeRequestError(f"judge 返回的不是 JSON：{raw[:200]}") from e
+            raise JudgeRequestError(
+                f"judge response is not JSON: {raw[:200]}") from e
 
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise JudgeRequestError(
-                f"judge 返回体缺少 choices[0].message.content：{raw[:200]}"
+                f"judge response missing choices[0].message.content: {raw[:200]}"
             ) from e
 
 
@@ -212,11 +218,13 @@ if __name__ == "__main__":
             if not os.environ.get(n)
         ]
         raise SystemExit(
-            "judge 未配置，缺：" + ", ".join(missing) + "\n"
-            "设置这三个环境变量即可（见 .env.example）。\n"
-            "注意：核心记忆服务不需要 judge，只有评测脚本需要。"
+            "judge not configured, missing: " + ", ".join(missing) + "\n"
+            "Set these three environment variables (see .env.example).\n"
+            "Note: the core memory service does not need a judge; "
+            "only evaluation scripts do."
         )
 
     client = JudgeClient.from_env()
-    print(f"judge 已配置：model={client.model} endpoint={client.base_url}")
-    print("连通性测试 ->", client.chat([{"role": "user", "content": "回复两个字：正常"}]))
+    print(f"judge configured: model={client.model} endpoint={client.base_url}")
+    print("connectivity test ->",
+          client.chat([{"role": "user", "content": "Reply with one word: OK"}]))

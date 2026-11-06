@@ -113,9 +113,9 @@ def save_full_log(log_dir: str, name: str, passed: int, total: int,
     """
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, os.path.basename(name).replace(".py", "") + ".log")
-    head = (f"# 套件: {name}\n"
-            f"# 断言: {passed}/{total}  耗时: {elapsed:.1f}s\n"
-            f"# 失败项: {fails}\n" + "=" * 62 + "\n")
+    head = (f"# suite: {name}\n"
+            f"# assertions: {passed}/{total}  elapsed: {elapsed:.1f}s\n"
+            f"# failures: {fails}\n" + "=" * 62 + "\n")
     with open(path, "w", encoding="utf-8", errors="replace") as f:
         f.write(head + out)
     return path
@@ -155,7 +155,7 @@ def run_one(path: str, timeout: float):
         out = (proc.stdout or "") + (proc.stderr or "")
         rc = proc.returncode
     except subprocess.TimeoutExpired:
-        return 0, 0, time.time() - t0, [("<超时>", f"超过 {timeout:.0f}s")], ""
+        return 0, 0, time.time() - t0, [("<timeout>", f"exceeded {timeout:.0f}s")], ""
     elapsed = time.time() - t0
 
     # 优先用套件自报的「结果：N/M 通过」
@@ -173,30 +173,36 @@ def run_one(path: str, timeout: float):
 
     fails = [tuple(g) for g in FAIL_HINT_RE.findall(out)]
     if rc != 0 and not fails:
-        fails = [("<退出码>", f"返回 {rc}")]
+        fails = [("<exit-code>", f"returned {rc}")]
     return passed, total, elapsed, fails, out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="零依赖回归 runner")
-    ap.add_argument("-k", "--keyword", default="", help="只跑文件名含该关键词的套件")
-    ap.add_argument("--list", action="store_true", help="只列出会跑哪些套件")
-    ap.add_argument("--timeout", type=float, default=600.0, help="单套件超时秒数（默认 600）")
+    ap = argparse.ArgumentParser(description="Zero-dependency regression runner")
+    ap.add_argument("-k", "--keyword", default="",
+                    help="only run suites whose filename contains this keyword")
+    ap.add_argument("--list", action="store_true",
+                    help="only list which suites would run")
+    ap.add_argument("--timeout", type=float, default=600.0,
+                    help="per-suite timeout in seconds (default 600)")
     ap.add_argument("--include-scripts", action="store_true",
-                    help="连同 scripts/ 下未进公开层的私有套件一起跑")
+                    help="also run the private test_* suites under scripts/ "
+                         "that are not part of the public layer")
     # perf_write 这类**耗时阈值**用例在负载高的机器上会偶发红
     # （连跑 12/13、单跑 13/13），红的是机器忙、不是代码退化。
     # 默认仍按失败处理（否则永远发现不了真退化）；CI 里显式声明哪些套件
     # 允许红，红也要打印出来，只是不影响退出码。
     ap.add_argument("--allow-fail", default="",
-                    help="逗号分隔的套件名（可只写片段）；这些套件失败只警告、"
-                         "不影响退出码")
+                    help="comma-separated suite-name fragments; failures in these "
+                         "suites only warn and do not affect the exit code")
     ap.add_argument("-v", "--verbose", action="store_true",
-                    help="失败时打印原始输出尾部（8K 字符 / 40 行）")
+                    help="on failure, print the tail of raw output (8K chars / 40 lines)")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB_DEFAULT,
-                    help="开跑前要求各盘剩余空间（GB），不足即中止；0 = 不检查")
+                    help="required free disk space (GB) before starting; abort if "
+                         "lower; 0 = skip the check")
     ap.add_argument("--log-dir", default="",
-                    help="非 PASS 套件的完整 stdout+stderr 落到此目录（CI artifact）")
+                    help="write full stdout+stderr of non-PASS suites to this "
+                         "directory (CI artifact)")
     args = ap.parse_args()
 
     if args.log_dir:
@@ -204,19 +210,20 @@ def main() -> int:
 
     suites = discover(args.include_scripts, args.keyword)
     if not suites:
-        print("没有发现任何 test_*.py 套件", file=sys.stderr)
+        print("no test_*.py suites found", file=sys.stderr)
         return 2
 
     if args.min_free_gb > 0:
         low = check_free_space(args.min_free_gb)
         if low:
-            print("磁盘空间不足，拒绝开跑（低剩余会让套件成片假红，"
-                  "实测曾白耗两轮排查）：", file=sys.stderr)
-            for drive, free_gb in low:
-                print(f"  {drive} 剩 {free_gb:.1f} GB < "
-                      f"{args.min_free_gb:.1f} GB", file=sys.stderr)
-            print("清理后重跑，或显式 --min-free-gb 0 跳过本检查。",
+            print("not enough free disk space, refusing to start (low space makes "
+                  "suites fail in batches; this wasted two real debugging rounds):",
                   file=sys.stderr)
+            for drive, free_gb in low:
+                print(f"  {drive} has {free_gb:.1f} GB free < "
+                      f"{args.min_free_gb:.1f} GB", file=sys.stderr)
+            print("Free up space and rerun, or pass --min-free-gb 0 to skip this "
+                  "check.", file=sys.stderr)
             return 2
 
     # ------------------------------------------------------------------
@@ -232,26 +239,29 @@ def main() -> int:
         try:
             shown = open(guide, encoding="utf-8").read().strip().replace("\n", " ")[:80]
         except Exception:  # noqa: BLE001
-            shown = "<读不出来>"
+            shown = "<unreadable>"
         print("!" * 62)
-        print("⚠ 当前目录存在引导文件 .hippocampus.json："
+        print("⚠ A guide file .hippocampus.json exists in the current directory: "
               f"{shown}\n"
-              "  它会**盖过** HIPPOCAMPUS_PERSIST_DIR ⇒ 依赖「自行指定库目录」的用例\n"
-              "  会被静默重定向。**若出现 connect-level / 多库类失败，先怀疑它**：\n"
+              "  It **overrides** HIPPOCAMPUS_PERSIST_DIR ⇒ cases that rely on\n"
+              "  \"specifying the library directory themselves\" get silently\n"
+              "  redirected. **If connect-level / multi-library failures appear,\n"
+              "  suspect this file first**:\n"
               "    mv .hippocampus.json /tmp/ && python scripts/run_all_tests.py\n"
-              "  （跑完记得 mv 回来）")
+              "  (move it back when the run finishes)")
         print("!" * 62 + "\n")
 
-    print(f"发现 {len(suites)} 个套件，开始运行\n" + "=" * 62)
+    print(f"discovered {len(suites)} suites, starting\n" + "=" * 62)
     if args.list:
         for name, _ in suites:
             print(" ", name)
-        print(f"共 {len(suites)} 个套件")
+        print(f"{len(suites)} suites total")
         return 0
 
     allow = [s.strip() for s in args.allow_fail.split(",") if s.strip()]
     if allow:
-        print(f"（非阻断名单：{', '.join(allow)} —— 这些套件失败只警告）")
+        print(f"(non-blocking list: {', '.join(allow)} — failures in these suites "
+              f"only warn)")
     total_pass = total_all = 0
     failed_suites = []
     allowed_failures = []
@@ -276,25 +286,26 @@ def main() -> int:
         if mark != "PASS" and args.log_dir:
             log_path = save_full_log(args.log_dir, name, passed, total,
                                      elapsed, fails, out)
-            print(f"      完整输出 → {log_path}")
+            print(f"      full log → {log_path}")
         if mark != "PASS" and args.verbose and tail:
-            print("      ── 输出尾部 ──")
+            print("      ── output tail ──")
             for line in tail.strip().splitlines()[-40:]:
                 print("      " + line)
 
     print("=" * 62)
-    print(f"套件 {len(suites) - len(failed_suites) - len(allowed_failures)}"
-          f"/{len(suites)} 全通过 ｜ "
-          f"断言 {total_pass}/{total_all} ｜ 总耗时 {time.time() - t_start:.1f}s")
+    print(f"suites {len(suites) - len(failed_suites) - len(allowed_failures)}"
+          f"/{len(suites)} all passed | "
+          f"assertions {total_pass}/{total_all} | total {time.time() - t_start:.1f}s")
     if allowed_failures:
-        print(f"\n非阻断失败 {len(allowed_failures)} 个（已计入警告，不影响退出码）：")
+        print(f"\nnon-blocking failures: {len(allowed_failures)} "
+              "(warned only, exit code unaffected):")
         for name, fails in allowed_failures:
             print(f"  {name}")
             for item, detail in fails[:6]:
                 print(f"    - {item} → {detail}"[:150])
 
     if failed_suites:
-        print("\n失败明细：")
+        print("\nfailure details:")
         for name, fails in failed_suites:
             print(f"  {name}")
             for item, detail in fails[:6]:

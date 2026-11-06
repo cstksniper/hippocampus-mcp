@@ -45,16 +45,17 @@ def line(title: str) -> None:
 
 def main() -> None:
     # 不做任何删除：DEMO_DIR 每次都是新建的临时目录（见文件头说明）。
-    print(f"演示库目录：{DEMO_DIR}")
-    print("初始化 HippoBrain（首次会加载嵌入模型，稍等）...")
+    print(f"demo library dir: {DEMO_DIR}")
+    print("Initializing HippoBrain (first run loads the embedding model, "
+          "please wait)...")
     brain = HippoBrain(persist_dir=DEMO_DIR)
     day = 86400.0
     t0 = time.time() - 30 * day  # 30 天前开始
 
     # ── 会话 1：认识用户 ────────────────────────────────
-    line("会话 1（30 天前）：认识用户")
+    line("Session 1 (30 days ago): meeting the user")
     s1 = brain.session_start(task="了解用户")
-    print("预激活包（首次为空/极少）:")
+    print("pre-activation package (empty/near-empty on first run):")
     for k, v in s1.items():
         print(f"  {k}: {v}")
 
@@ -65,7 +66,7 @@ def main() -> None:
     brain.ingest("记住：我对花生过敏，任何方案里都不要出现花生相关的产品。", speaker="user", timestamp=t0 + 120)
     brain.ingest("帮我记住下个月要给供应商付尾款。", speaker="user", timestamp=t0 + 180)
     brain.track_intent("给供应商付尾款", due="下个月")
-    print(f"\n写入后: {brain.stats()}")
+    print(f"\nafter writes: {brain.stats()}")
 
     brain.session_end(
         summary="认识用户：陈默，深圳跨境电商（家居），养柯基豆豆，花生过敏，有供应商尾款待办",
@@ -73,31 +74,32 @@ def main() -> None:
     )
 
     # ── 会话 2：跨会话想起 ──────────────────────────────
-    line("会话 2（15 天后）：跨会话还能想起来吗？")
+    line("Session 2 (15 days later): does cross-session recall still work?")
     t2 = t0 + 15 * day
     s2 = brain.session_start(task="继续讨论家居选品")
-    print("预激活包:")
-    print(f"  画像: {s2['block_profile']}")
-    print(f"  最近摘要: {s2['block_recent_summaries']}")
-    print(f"  未完结: {s2['block_open_topics']}")
-    print(f"  待办: {s2['block_pending_intents']}")
+    print("pre-activation package:")
+    print(f"  profile: {s2['block_profile']}")
+    print(f"  recent summaries: {s2['block_recent_summaries']}")
+    print(f"  open topics: {s2['block_open_topics']}")
+    print(f"  pending intents: {s2['block_pending_intents']}")
 
-    print("\n问：用户是做什么的？有什么禁忌？")
+    print("\nQ: what does the user do? Any taboos?")
     ctx = brain.get_memory_context("用户做什么工作，有什么过敏或禁忌", top_k=3)
     print(ctx["text"])
 
     # ── 会话 3：知识更新（事实被取代）────────────────────
-    line("会话 3（今天）：知识更新 — 事实被取代时怎么处理")
+    line("Session 3 (today): knowledge update — how superseded facts are handled")
     t3 = time.time()
     brain.ingest("我以前养的是柯基豆豆，现在养的是一只叫年糕的布偶猫。",
                  speaker="user", timestamp=t3, entities=["豆豆", "年糕"])
     brain.ingest("我们不再做家居品类了，现在主要做宠物用品。",
                  speaker="user", timestamp=t3 + 60, entities=["家居品类", "宠物用品"])
 
-    print("\n问：用户现在养什么宠物？")
+    print("\nQ: what pet does the user keep now?")
     ctx3 = brain.get_memory_context("用户现在养什么宠物", top_k=4)
     print(ctx3["text"])
-    print("\n命中记忆的状态（注意 superseded 的旧事实仍在库里但被标注）:")
+    print("\nstates of the recalled memories "
+          "(note: superseded old facts stay in the library, flagged):")
     for h in ctx3["hits"]:
         print(f"  [{h['state']:<10s}] sim={h['similarity']:.3f} imp={h['importance']:.2f} "
               f"pin={h['pin']} | {h['content'][:50]}")
@@ -105,25 +107,26 @@ def main() -> None:
     brain.session_end(summary="用户转做宠物用品，宠物换成布偶猫年糕")
 
     # ── 巩固 ─────────────────────────────────────────
-    line("巩固任务（睡眠修剪）")
+    line("Consolidation (sleep pruning)")
     print(brain.consolidate())
 
     # ── 最终状态 ──────────────────────────────────────
-    line("最终状态")
+    line("Final state")
     st = brain.stats()
     for k, v in st.items():
         print(f"  {k}: {v}")
 
     # ── 持久化 & 重载验证 ──────────────────────────────
-    line("持久化 / 重载验证")
+    line("Persistence / reload check")
     brain.save()
     brain2 = HippoBrain(persist_dir=DEMO_DIR)
-    print(f"重载后: L0={len(brain2.raw_log)} 条, L1={brain2.manager.store.count()} 条, "
-          f"L2={len(brain2.summaries)} 条, 实体={len(brain2.entities)} 个")
+    print(f"after reload: L0={len(brain2.raw_log)} raw, "
+          f"L1={brain2.manager.store.count()} facts, "
+          f"L2={len(brain2.summaries)} summaries, entities={len(brain2.entities)}")
     r = brain2.recall("用户现在做什么品类", top_k=2)
-    print("重载后召回测试 →", [x["content"][:40] for x in r])
+    print("recall test after reload →", [x["content"][:40] for x in r])
 
-    print("\n✅ demo 完成。数据目录:", DEMO_DIR)
+    print("\n✅ demo done. data dir:", DEMO_DIR)
 
 
 if __name__ == "__main__":

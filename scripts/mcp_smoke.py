@@ -61,14 +61,15 @@ async def main() -> None:
                 # 兜住不同 mcp SDK 版本的命名差异（实测 2.3.0
                 # 只有 is_error，直接写 r.isError 会 AttributeError 崩在第一次调用）。
                 if getattr(r, "is_error", False) or getattr(r, "isError", False):
-                    raise RuntimeError(f"{name} 失败: {r.content[0].text[:300]}")
+                    raise RuntimeError(f"{name} failed: {r.content[0].text[:300]}")
                 return json.loads(r.content[0].text) if r.content else {}
 
             tools = await session.list_tools()
-            print(f"[smoke] 已注册 {len(tools.tools)} 个工具", flush=True)
+            print(f"[smoke] {len(tools.tools)} tools registered", flush=True)
             if len(tools.tools) < 40:
                 raise RuntimeError(
-                    f"工具面只有 {len(tools.tools)} 条，full 剖面应为 46 条"
+                    f"tool surface has only {len(tools.tools)} tools; "
+                    "the full profile should expose 46"
                 )
 
             # 0. 轻量调用探测（不触发嵌入/NER）
@@ -96,8 +97,8 @@ async def main() -> None:
             _want = os.path.normcase(os.path.abspath(env["HIPPOCAMPUS_PERSIST_DIR"]))
             _got = os.path.normcase(os.path.abspath(_lib.get("path") or ""))
             if _got and _got != _want:
-                print(f"[smoke] ⚠️ 实际写入 {_lib.get('name')} @ {_got}，"
-                      f"与 HIPPOCAMPUS_PERSIST_DIR={_want} 不一致")
+                print(f"[smoke] ⚠️ actually wrote to {_lib.get('name')} @ {_got}, "
+                      f"mismatch with HIPPOCAMPUS_PERSIST_DIR={_want}")
             await call("session_end", {
                 "summary": "了解用户：林晚，杭州独立游戏开发者",
                 "open_topics": "解谜游戏的美术风格",
@@ -110,7 +111,7 @@ async def main() -> None:
             stats = await call("brain_stats", {})
             print("[stats]", json.dumps(stats, ensure_ascii=False)[:200])
 
-    print("\n✅ MCP stdio 链路端到端 OK")
+    print("\n✅ MCP stdio end-to-end OK")
 
 
 if __name__ == "__main__":
@@ -120,5 +121,5 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-        print(f"[smoke] 失败: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"[smoke] failed: {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)

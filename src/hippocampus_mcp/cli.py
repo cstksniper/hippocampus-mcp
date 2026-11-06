@@ -1113,6 +1113,122 @@ def _clear_stop_marker(key: str) -> None:
         pass
 
 
+def _library_for_workspace(cwd: str, user_lib: str | None = None) -> str | None:
+    """Reverse-lookup the library bound to a workspace (read-only, daemon-free).
+
+    Reads the same mapping the host session uses — the user task directory
+    (``<user library>/directory.json``) maps ``workspace_root`` to a library
+    ``path`` — and returns the library directory of the **deepest** bound
+    workspace root that contains *cwd*. Returns ``None`` when nothing matches
+    or the sidecar is unreadable; the caller decides on the fallback.
+    """
+    from .library.task_directory import load_directory
+
+    lib = user_lib or os.path.join(os.path.expanduser("~"), ".hippocampus_mcp",
+                                   "user")
+    try:
+        data, _issue = load_directory(lib)
+    except Exception:  # noqa: BLE001 — a lookup failure must not break the command
+        return None
+    key = os.path.normcase(os.path.abspath(cwd))
+    best: tuple[str, str] | None = None
+    for entry in data.get("entries") or []:
+        wr = str(entry.get("workspace_root") or "").strip()
+        path = str(entry.get("path") or "").strip()
+        if not wr or not path:
+            continue
+        wrn = os.path.normcase(os.path.abspath(os.path.expanduser(wr)))
+        if key == wrn or key.startswith(wrn + os.sep):
+            if best is None or len(wrn) > len(best[0]):
+                best = (wrn, path)
+    return best[1] if best else None
+
+
+# --------------------------------------------------------------------------
+# 子命令：tree（V3, read-only library tree + static HTML viewer）
+# --------------------------------------------------------------------------
+def cmd_tree(args: argparse.Namespace) -> int:
+    """Render a read-only tree of a library (markdown, or single-file HTML).
+
+    Read-only guarantees and privacy red lines live in ``tree_view``:
+    the library is opened ``mode=ro`` (sqlite) / plain-read (json); the user
+    library is rendered with zero content and ``--full`` is refused there;
+    L0 raw text never enters the output.
+    """
+    import os
+
+    from .tree_view import (
+        LibraryNotFoundError,
+        TreePrivacyError,
+        aggregate,
+        is_user_library,
+        library_kind,
+        render_html,
+        render_markdown,
+        snapshot_library,
+    )
+
+    if args.persist_dir:
+        persist = str(Path(args.persist_dir).expanduser())
+    else:
+        workspace = os.path.abspath(args.project or os.getcwd())
+        bound = _library_for_workspace(workspace)
+        if bound:
+            persist = bound
+            print(f"note: library resolved from workspace binding: {persist}",
+                  file=sys.stderr)
+        else:
+            persist = str(Path(LIBRARY_DEFAULT).expanduser())
+            print(f"note: no workspace binding for {workspace}; using default "
+                  f"library {persist}", file=sys.stderr)
+    if library_kind(persist) is None:
+        print(f"error: not a hippocampus library (no hippocampus.db / "
+              f"memories.json): {persist}")
+        return 2
+    if args.full and is_user_library(persist):
+        print("error: --full is refused on the user library "
+              "(privacy: zero content in every channel)")
+        return 2
+    if args.html and not args.out:
+        print("error: --html writes a file containing library content, "
+              "so an explicit --out path is required")
+        return 2
+
+    try:
+        snapshot = snapshot_library(persist)
+        states = ("active",) if args.state == "active" else (
+            "active", "superseded", "archived")
+        agg = aggregate(
+            snapshot,
+            include_states=states,
+            full=bool(args.full),
+            limit=args.limit,
+        )
+        if args.html:
+            html = render_html(agg, title=f"Library tree — {os.path.basename(persist)}")
+            out = str(Path(args.out).expanduser())
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            size_kb = os.path.getsize(out) / 1024.0
+            print(f"written {out} ({size_kb:.1f} KB) — this file contains "
+                  f"library content, store it accordingly")
+            print(f"entries included: {agg['health']['included_total']} "
+                  f"(states: {', '.join(agg['health']['include_states'])})")
+            return 0
+        markdown = render_markdown(agg)
+        if args.out:
+            out = str(Path(args.out).expanduser())
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(markdown + "\n")
+            print(f"written {out} (contains library content)")
+        else:
+            print(markdown)
+        return 0
+    except (LibraryNotFoundError, TreePrivacyError) as exc:
+        print(f"error: {exc}")
+        return 2
+
+
 def cmd_stop(args) -> int:
     """Cooperative stop: write a marker and wait for a graceful, saved exit.
 
@@ -1287,6 +1403,35 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Embedding model component of the daemon key (defaults to env "
                          "HIPPOCAMPUS_EMB_MODEL or the built-in default)")
     cx.set_defaults(func=cmd_context)
+
+    tr = sub.add_parser(
+        "tree",
+        help="Read-only library tree (markdown, or single-file HTML viewer "
+             "for the browser)")
+    tr.add_argument("--persist-dir", default=None,
+                    help="Library directory. Omit to resolve the bound library "
+                         "from the workspace (see --project); falls back to "
+                         + LIBRARY_DEFAULT)
+    tr.add_argument("--project", default=None,
+                    help="Workspace root for library reverse lookup via the "
+                         "user task directory (default: current directory)")
+    tr.add_argument("--state", choices=("active", "all"), default="active",
+                    help="Include only active entries, or all states "
+                         "(default: active)")
+    tr.add_argument("--full", action="store_true",
+                    help="Include whole content instead of the 60-char "
+                         "preview (refused on the user library)")
+    tr.add_argument("--html", action="store_true",
+                    help="Emit a self-contained single-file HTML viewer "
+                         "instead of markdown (requires --out)")
+    tr.add_argument("--out", default=None,
+                    help="Write the output to this file instead of stdout "
+                         "(required for --html)")
+    tr.add_argument("--limit", type=int, default=200,
+                    help="Max entries rendered in the markdown tree "
+                         "(default 200; counts stay complete)")
+    tr.set_defaults(func=cmd_tree)
+
     sp_stop = sub.add_parser(
         "stop", help="Gracefully stop the shared daemon (saves state before exit)")
     sp_stop.add_argument("--timeout", type=float, default=30.0,

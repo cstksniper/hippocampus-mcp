@@ -42,6 +42,15 @@ project and user permissions still apply.
 - It does not guarantee better recall or lower token use for every workload. Small, curated Markdown files can be simpler and cheaper.
 - Installing the MCP server alone does not force every host to write or recall memories; the host needs the lifecycle integration below.
 
+### Native Chinese support
+
+HippoMCP is built Chinese-first, not translated afterwards:
+
+- **Embedding models**: on a Chinese-language system the service auto-selects a Chinese embedding model (BGE, 768-dim); other systems get MiniLM (384-dim). Switching models is a documented three-step procedure.
+- **Chinese text processing**: Chinese sentence segmentation for `ingest`, per-library Chinese entity lexicons, and a lexical (BM25/FTS5) channel that handles Chinese bigrams.
+- **Structured tags**: chapter/volume/year-style hard constraints turn "what did section 43 say" from guessing into filtering.
+- **Docs and evaluation**: bilingual documentation, Chinese test fixtures, and Chinese query decomposition in the evaluation tooling.
+
 ---
 
 ## Complements `AGENTS.md` and `MEMORY.md` — does not replace them
@@ -273,6 +282,7 @@ The default profile exposes only 12 high-frequency tools; hidden tools remain av
 | Command | Purpose |
 |---|---|
 | `hippocampus-mcp doctor` | Health check for the installation and libraries |
+| `hippocampus-mcp tree` | Read-only library tree: markdown overview, or a single-file HTML viewer with `--html --out`; run inside a bound workspace it locates the library automatically |
 | `hippocampus-mcp models` / `--fetch` / `--prune` | Inspect, download, and reclaim embedding-model caches |
 | `python scripts/reembed.py --all` | Backfill vectors after switching the embedding model |
 | `python scripts/import_md.py --dir <md dir> --project <name>` | Bulk-import Markdown documentation into a library |

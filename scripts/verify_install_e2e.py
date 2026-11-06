@@ -65,29 +65,29 @@ def main() -> int:
     repo = Path(ap.parse_args().repo).resolve()
     py = sys.executable
 
-    print("== 0. 解释器 / 仓库 ==")
+    print("== 0. Interpreter / repo ==")
     print("python :", py)
     print("repo   :", repo)
 
     import hippocampus_mcp
     pkg = Path(hippocampus_mcp.__file__).resolve()
 
-    print("\n== 1. 包来源 ==")
+    print("\n== 1. Package origin ==")
     print("package:", pkg)
-    check("wheel 安装形态（包不在仓库 src/ 布局里）",
+    check("wheel install layout (package not inside the repo src/ layout)",
           pkg.parent.name != "src" and repo not in pkg.parents, str(pkg))
 
-    print("\n== 2. 顶层导入 ==")
+    print("\n== 2. Top-level imports ==")
     for mod in ("hippocampus_mcp.server", "hippocampus_mcp.cli",
                 "hippocampus_mcp.launcher"):
         rc, out = run([py, "-c", f"import {mod}"], timeout=180)
         check(f"import {mod}", rc == 0, out[-600:])
 
-    print("\n== 3. quickstart 全流程 ==")
+    print("\n== 3. quickstart full pipeline ==")
     quickstart = repo / "examples" / "quickstart.py"
     rc, out = run([py, str(quickstart)], cwd=str(repo), timeout=300)
-    check("quickstart 退出码 0", rc == 0, out[-800:])
-    check("quickstart 走完全流程", "全部流程跑通" in out, out[-400:])
+    check("quickstart exit code 0", rc == 0, out[-800:])
+    check("quickstart full pipeline", "All steps completed" in out, out[-400:])
 
     cli = [py, "-m", "hippocampus_mcp.cli"]
     # setup 的写后握手会顺手拉起 daemon 并留存保温；Windows 上它仍握着
@@ -102,35 +102,37 @@ def main() -> int:
         rc, out = run(cli + ["setup", "--host", "workbuddy", "--dry-run"],
                       env=env, cwd=str(repo), timeout=180)
         print(out[-900:])
-        check("dry-run 退出码 0", rc == 0, out[-800:])
-        check("wheel 布局不写 PYTHONPATH", "PYTHONPATH: 未设置" in out, out[-500:])
+        check("dry-run exit code 0", rc == 0, out[-800:])
+        check("wheel layout writes no PYTHONPATH", "PYTHONPATH: not set" in out,
+              out[-500:])
 
-        print("\n== 5. setup 真跑 + 写后真实握手 ==")
+        print("\n== 5. real setup + post-write handshake ==")
         rc, out = run(cli + ["setup", "--host", "workbuddy"],
                       env=env, cwd=str(repo), timeout=300)
         print(out[-1400:])
-        check("setup 退出码 0", rc == 0, out[-1000:])
-        check("initialize + tools/list 握手成功", "配置已验证可用" in out, out[-800:])
+        check("setup exit code 0", rc == 0, out[-1000:])
+        check("initialize + tools/list handshake OK", "✓ config verified" in out,
+              out[-800:])
 
         cfg = home / ".workbuddy" / "mcp.json"
-        check("配置文件已生成", cfg.is_file(), str(cfg))
+        check("config file generated", cfg.is_file(), str(cfg))
         if cfg.is_file():
             try:
                 entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["hippocampus"]
-                check("entry 使用当前解释器", entry.get("command") == py,
+                check("entry uses the current interpreter", entry.get("command") == py,
                       repr(entry.get("command")))
-                check("entry 不含 PYTHONPATH", "PYTHONPATH" not in entry.get("env", {}),
+                check("entry has no PYTHONPATH", "PYTHONPATH" not in entry.get("env", {}),
                       repr(entry.get("env")))
                 lib = entry.get("env", {}).get("HIPPOCAMPUS_PERSIST_DIR", "")
-                check("库目录落在临时 HOME 内", str(home) in lib, repr(lib))
+                check("library dir inside the temp HOME", str(home) in lib, repr(lib))
             except Exception as exc:  # noqa: BLE001
-                check("配置 JSON 可解析", False, repr(exc))
+                check("config JSON parseable", False, repr(exc))
 
-        print("\n== 6. doctor 只读体检 ==")
+        print("\n== 6. doctor read-only check ==")
         rc, out = run(cli + ["doctor", "--host", "workbuddy", "--project", "."],
                       env=env, cwd=str(repo), timeout=180)
         print(out[-1200:])
-        check("doctor 退出码 0", rc == 0, f"rc={rc}\n{out[-800:]}")
+        check("doctor exit code 0", rc == 0, f"rc={rc}\n{out[-800:]}")
 
     print("\n" + "=" * 64)
     print(f"PASS={_PASS}  FAIL={_FAIL}")

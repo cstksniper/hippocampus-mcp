@@ -72,11 +72,11 @@ def main() -> int:
         model_name = "BAAI/bge-base-zh-v1.5"
 
     if not os.path.isdir(model_dir):
-        print(f"[FAIL] 模型目录不存在: {model_dir}", file=sys.stderr)
+        print(f"[FAIL] model directory not found: {model_dir}", file=sys.stderr)
         return 1
 
-    print(f"模型目录: {model_dir}")
-    print("[1/3] 加载 torch(sentence-transformers) 版 …")
+    print(f"model directory: {model_dir}")
+    print("[1/3] loading the torch (sentence-transformers) version ...")
     # 🔴 反假绿（实测踩中）：``SentenceTransformerEmbedder`` 在
     # ``auto`` 后端下会自动挂上 ONNX ⇒ 所谓"torch 版"其实是 ONNX 版，
     # 门槛退化成 **ONNX vs ONNX**，cos 恒等于 1.000000 而**什么都没验到**
@@ -87,30 +87,32 @@ def main() -> int:
     t0 = time.time()
     try:
         torch_emb = SentenceTransformerEmbedder(model_name=model_name)
-        torch_emb.embed("预热")
+        torch_emb.embed("warmup")
     finally:
         if _prev_backend is None:
             os.environ.pop("HIPPOCAMPUS_EMB_BACKEND", None)
         else:
             os.environ["HIPPOCAMPUS_EMB_BACKEND"] = _prev_backend
     if getattr(torch_emb, "_onnx", None) is not None:
-        print("[FAIL] torch 侧被解析成了 ONNX 后端：本门槛将退化为 ONNX vs ONNX，"
-              "cos 恒为 1.0 而毫无验证意义。请检查 HIPPOCAMPUS_EMB_BACKEND 是否被覆盖。",
+        print("[FAIL] the torch side resolved to the ONNX backend: this gate would "
+              "degenerate into ONNX vs ONNX with cos pinned at 1.0, verifying "
+              "nothing. Check whether HIPPOCAMPUS_EMB_BACKEND was overridden.",
               file=sys.stderr)
         return 1
-    print(f"      耗时 {time.time() - t0:.1f}s  dim={torch_emb.dim}")
+    print(f"      elapsed {time.time() - t0:.1f}s  dim={torch_emb.dim}")
 
-    print("[2/3] 加载 ONNX 版 …")
+    print("[2/3] loading the ONNX version ...")
     t0 = time.time()
     onnx_emb = OnnxEmbedder(model_dir=model_dir, model_name=model_name)
-    onnx_emb.embed("预热")
-    print(f"      耗时 {time.time() - t0:.1f}s  dim={onnx_emb.dim}")
+    onnx_emb.embed("warmup")
+    print(f"      elapsed {time.time() - t0:.1f}s  dim={onnx_emb.dim}")
 
     if torch_emb.dim != onnx_emb.dim:
-        print(f"[FAIL] 维度不一致: torch={torch_emb.dim} onnx={onnx_emb.dim}", file=sys.stderr)
+        print(f"[FAIL] dim mismatch: torch={torch_emb.dim} onnx={onnx_emb.dim}",
+              file=sys.stderr)
         return 1
 
-    print("[3/3] 逐句比对余弦相似度")
+    print("[3/3] comparing cosine similarity sentence by sentence")
     worst = 1.0
     worst_text = ""
     fails = []
@@ -118,7 +120,7 @@ def main() -> int:
         a = torch_emb.embed(s)
         b = onnx_emb.embed(s)
         c = cos(a, b)
-        label = (s[:24] + "…") if len(s) > 24 else (s or "<空串>")
+        label = (s[:24] + "...") if len(s) > 24 else (s or "<empty>")
         flag = "OK " if c >= COS_THRESHOLD else "LOW"
         print(f"  [{flag}] cos={c:.6f}  {label}")
         if c < COS_THRESHOLD:
@@ -129,9 +131,10 @@ def main() -> int:
     # 查询侧（带 BGE 前缀）也要比
     q = "记忆系统如何做多跳检索"
     cq = cos(torch_emb.embed_query(q), onnx_emb.embed_query(q))
-    print(f"  [{'OK ' if cq >= COS_THRESHOLD else 'LOW'}] cos={cq:.6f}  查询侧(带前缀) {q!r}")
+    print(f"  [{'OK ' if cq >= COS_THRESHOLD else 'LOW'}] cos={cq:.6f}  "
+          f"query side (with prefix) {q!r}")
     if cq < COS_THRESHOLD:
-        fails.append(("查询侧", cq))
+        fails.append(("query side", cq))
     worst = min(worst, cq)
 
     # 批量路径
@@ -141,18 +144,20 @@ def main() -> int:
         ((cos(tb[i], ob[i]), i) for i in range(len(SAMPLES[:6]))),
         key=lambda x: x[0],
     )
-    cb_text = (SAMPLES[cb_i][:24] or "<空串>")
-    print(f"  [{'OK ' if cb >= COS_THRESHOLD else 'LOW'}] cos={cb:.6f}  批量 embed_batch 最差值: {cb_text}")
+    cb_text = (SAMPLES[cb_i][:24] or "<empty>")
+    print(f"  [{'OK ' if cb >= COS_THRESHOLD else 'LOW'}] cos={cb:.6f}  "
+          f"batch embed_batch worst: {cb_text}")
     if cb < COS_THRESHOLD:
-        fails.append((f"批量:{cb_text}", cb))
+        fails.append((f"batch:{cb_text}", cb))
     if cb < worst:
         worst, worst_text = cb, cb_text
 
     print()
     if fails:
-        print(f"[FAIL] {len(fails)} 项低于 {COS_THRESHOLD}，最低={worst:.6f} ({worst_text})")
+        print(f"[FAIL] {len(fails)} item(s) below {COS_THRESHOLD}, "
+              f"worst={worst:.6f} ({worst_text})")
         return 1
-    print(f"[PASS] 全部 >= {COS_THRESHOLD}，最低={worst:.6f}")
+    print(f"[PASS] all >= {COS_THRESHOLD}, worst={worst:.6f}")
     return 0
 
 
