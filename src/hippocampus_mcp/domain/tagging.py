@@ -1,34 +1,42 @@
 # -*- coding: utf-8 -*-
-"""结构化标签：**可配置**的结构标记抽取器。
+"""Structured tags: a **configurable** structural-marker extractor.
 
-为什么要有这个模块
-==================
+Why this module exists
+======================
 
-标签的**过滤侧**（``recall(filter_tags=...)``）从一开始就是通用的——任意键、
-AND/OR、``str()`` 归一，代码里没有任何"章/卷/年"的影子。
+The **filter side** of tags (``recall(filter_tags=...)``) has been generic
+from the start -- any keys, AND/OR, ``str()`` normalization; the code never
+had any shadow of "章/卷/年" in it.
 
-但**抽取侧**不是：三条正则（``第N章回`` / ``第N卷部`` / ``干支``）写死在导入
-脚本里，且只存在于导入脚本中。于是出现两个普遍性缺口：
+The **extraction side** was not: three regexes (``第N章回`` / ``第N卷部`` /
+``干支``) were hard-coded in the import script and existed only there. That
+left two generic gaps:
 
-1. **换语料就要改代码**。合同按「第N条」、病历按「第N次化疗」、日志按
-   「2026-09」，全都是同一类需求（"文档自带的结构标记 → 可过滤的标签"），
-   却只能改 Python 源码。
-2. **服务端写入根本没有抽取能力**。``ingest``/``ingest_batch`` 只接受宿主
-   自己抽好的 ``tags``；宿主没抽，库里的条目就永远是"按标签查不到"的那部分。
+1. **New corpus means code changes**. Contracts use 「第N条」, medical
+   records use 「第N次化疗」, logs use 「2026-09」 -- all the same need
+   ("structural markers carried by the document → filterable tags"), yet
+   the only way was editing Python source.
+2. **Server-side writes had no extraction ability at all**.
+   ``ingest``/``ingest_batch`` only accept ``tags`` the host extracted
+   itself; if the host did not extract, those entries stayed forever in the
+   "not findable by tag" bucket.
 
-本模块把"结构标记 → 标签"做成 **抽取器 + 配置**：
+This module turns "structural marker → tag" into an **extractor + config**:
 
-* 内置的只是**与领域无关的中文文档结构词**——编号族（章/回/卷/部）与时间族
-  （干支纪年、公元年、月份）。**不针对任何具体语料**；
-* 键名（``keys``）与被识别的后缀（``suffixes``）都能被配置改名/扩充；
-* 任何项目特有的结构标记一律走 ``patterns`` 配置，**不进代码**。
+* The built-ins are only **domain-agnostic Chinese document structure
+  words** -- the numbering family (章/回/卷/部) and the time family (ganzhi
+  years, Gregorian years, months). **Targeted at no specific corpus**;
+* Key names (``keys``) and recognized suffixes (``suffixes``) can both be
+  renamed/extended via config;
+* Any project-specific structural marker goes through ``patterns`` config,
+  **never into code**.
 
-配置来源（优先级从高到低）::
+Config source (priority, high to low)::
 
-    显式 schema 参数 → HIPPOCAMPUS_TAG_SCHEMA（文件路径）
-    → <persist_dir>/tag_schema.json → 内置默认
+    explicit schema param → HIPPOCAMPUS_TAG_SCHEMA (file path)
+    → <persist_dir>/tag_schema.json → built-in defaults
 
-配置格式（JSON，字段全部可选，只写要覆盖的）::
+Config format (JSON; all fields optional; write only what you override)::
 
     {
       "keys":     {"章": "chapter", "月": "month"},
@@ -42,16 +50,23 @@ AND/OR、``str()`` 归一，代码里没有任何"章/卷/年"的影子。
       "cap": 6
     }
 
-硬约束（改动前务必读）
-======================
+Hard constraints (read before changing)
+=======================================
 
-* **键名是调用方契约**。宿主按 ``filter_tags={"月": "闰四月"}`` 查，这里就得产
-  ``月``。改名必须双端同步——**键名不一致 = 过滤静默失效**，不报错。
-* **宁缺勿滥**。只认明确的结构性标记，不做任何猜测。错误的标签比没有标签
-  更糟：它会让过滤给出**错误答案**（而不是查不到）。
-* 值统一 ``int`` / ``str``；多值记列表（过滤侧按 OR 展开），单值降为标量。
-* 抽取顺序无关紧要，但**同一条记忆涉及多个同键值时必须全部保留**——
-  ``{"章": [5, 12]}`` 的语义是"这条涉及这两章"，只留一个会让它在另一章下消失。
+* **Key names are the caller's contract**. If the host queries with
+  ``filter_tags={"月": "闰四月"}``, this side must produce ``月``. Renaming
+  must be synchronized on both ends -- **key mismatch = silent filter
+  failure**, no error.
+* **Prefer missing over wrong**. Only recognize unambiguous structural
+  markers; never guess. A wrong tag is worse than no tag: it makes
+  filtering give the **wrong answer** (rather than no answer).
+* Values are uniformly ``int`` / ``str``; multiple values are stored as a
+  list (the filter side expands it as OR), a single value degrades to a
+  scalar.
+* Extraction order does not matter, but **when one memory involves multiple
+  values under the same key, all must be kept** -- ``{"章": [5, 12]}``
+  means "this entry involves both chapters"; keeping only one makes it
+  disappear under the other chapter.
 """
 
 from __future__ import annotations
@@ -66,13 +81,15 @@ logger = logging.getLogger(__name__)
 
 ENV_TAG_SCHEMA = "HIPPOCAMPUS_TAG_SCHEMA"
 
-# 构造注入缝：旋钮登记在 config（tag_schema），生产路径由 engine
-# import 时灌入；解析序（env 先、注入值回退）见 common/config_bridge。
+# Construction-time injection seam: the knobs are registered in config
+# (tag_schema) and filled in by engine at import on the production path;
+# for the resolution order (env first, injected value as fallback) see
+# common/config_bridge.
 from ..common.config_bridge import apply_config, resolve as _resolve
 SCHEMA_FILENAME = "tag_schema.json"
 
 # ----------------------------------------------------------------------
-# 中文数字
+# Chinese numerals
 # ----------------------------------------------------------------------
 CN_NUM_CHARS = "零〇一二三四五六七八九十百千两"
 _CN_DIGITS = {
@@ -83,10 +100,11 @@ _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 
 
 def cn_num_to_int(text: str) -> int | None:
-    """中文数字转 int（"四十三" → 43，"十" → 10，"43" → 43）。失败返回 None。
+    """Chinese numeral to int ("四十三" → 43, "十" → 10, "43" → 43). Returns None on failure.
 
-    标签值统一用 int：过滤时 ``{"章": 43}`` 与 ``{"章": "43"}`` 都能对上
-    （比较前 ``str()`` 归一），但存 int 更便于人读与排序。
+    Tag values are uniformly int: at filter time both ``{"章": 43}`` and
+    ``{"章": "43"}`` match (``str()`` normalization before comparison), but
+    storing int is friendlier for humans and for sorting.
     """
     text = (text or "").strip()
     if not text:
@@ -107,23 +125,28 @@ def cn_num_to_int(text: str) -> int | None:
 
 
 # ----------------------------------------------------------------------
-# 内置模式
+# Built-in patterns
 # ----------------------------------------------------------------------
-# 干支纪年：60 组合法组合 = 天干(10) × 地支(12) 按位配对，最小公倍数 60
+# Ganzhi year naming: 60 legal combinations = heavenly stems (10) × earthly
+# branches (12) paired positionally, least common multiple 60
 _TIANGAN = "甲乙丙丁戊己庚辛壬癸"
 _DIZHI = "子丑寅卯辰巳午未申酉戌亥"
 _GANZHI_60 = [_TIANGAN[i % 10] + _DIZHI[i % 12] for i in range(60)]
 _GANZHI_ALT = "|".join(_GANZHI_60)
 
-# 键名默认值。**这四个是通用中文文档结构词**，不是某个项目的私有约定。
+# Default key names. **These four are generic Chinese document structure
+# words**, not any single project's private convention.
 DEFAULT_KEYS: dict[str, str] = {"章": "章", "卷": "卷", "年": "年", "月": "月"}
 
-# 结构后缀 → 键名。默认只含与历史行为一致的两族；
-# 想认「第N条 / 第N节 / 第N幕」等项目特有结构，用配置加，**不要改这里**。
+# Structural suffix → key name. Defaults contain only the two families that
+# match historical behavior; to recognize project-specific structures like
+# 「第N条 / 第N节 / 第N幕」, add them via config, **do not change this**.
 DEFAULT_SUFFIXES: dict[str, str] = {"章": "章", "回": "章", "卷": "卷", "部": "卷"}
 
-# 特称月（农历常见写法）。只收最通用的三个，不枚举"菊月/荷月"这类别称——
-# 枚举式词表正是"对着一个语料定方案"的老毛病。
+# Special-call months (common lunar-calendar spellings). Only the three most
+# generic are collected; no enumerating aliases like "菊月/荷月" -- an
+# enumerated wordlist is exactly the old disease of "designing against one
+# corpus".
 LUNAR_MONTH_NAMES = ("正月", "冬月", "腊月")
 
 _FEATURE = re.compile(r"[\u4e00-\u9fa5]")
@@ -131,10 +154,11 @@ _BAD_SUFFIX_CHARS = set("的了是在和与我你他她它")
 
 
 class TagPattern:
-    """一条自定义抽取规则（配置里 ``patterns`` 的项）。
+    """One custom extraction rule (an item of ``patterns`` in the config).
 
-    ``regex`` 必须**有一个捕获组**，其内容作为标签值；``type="int"`` 时经
-    :func:`cn_num_to_int` 转换，失败即丢弃（不做二次猜测）。
+    ``regex`` must **have one capture group**, whose content becomes the tag
+    value; with ``type="int"`` it is converted via :func:`cn_num_to_int`,
+    and on failure the match is dropped (no second-guessing).
     """
 
     __slots__ = ("key", "regex", "type", "min", "max", "multi")
@@ -180,12 +204,13 @@ class TagPattern:
 
 
 def _tag_value_sort_key(v: Any) -> tuple:
-    """标签值排序键：数字按数值排、字符串按字典序，数字在前。
+    """Sort key for tag values: numbers by value, strings lexicographically, numbers first.
 
-    不能用 ``str(v)`` 直接排——那样 12 会排在 5 前面（``"12" < "5"``），
-    章号列表就变成乱的（实际踩过：合并后 ``[12, 5]``）。
+    You cannot sort via ``str(v)`` directly -- 12 would sort before 5
+    (``"12" < "5"``), and the chapter list comes out scrambled (actually
+    hit: ``[12, 5]`` after a merge).
     """
-    if isinstance(v, bool):  # bool 是 int 子类，单独归到数字前
+    if isinstance(v, bool):  # bool is an int subclass; given its own branch into the number group
         return (0, float(v), "")
     if isinstance(v, (int, float)):
         return (0, float(v), "")
@@ -193,7 +218,7 @@ def _tag_value_sort_key(v: Any) -> tuple:
 
 
 def merge_tag_values(a: Any, b: Any) -> Any:
-    """把两个标签值合并（标量/列表混用安全），去重后单值降为标量。"""
+    """Merge two tag values (safe for scalar/list mixes); after dedup a single value degrades to a scalar."""
     vals: list[Any] = []
     for v in (a, b):
         if v is None:
@@ -204,21 +229,27 @@ def merge_tag_values(a: Any, b: Any) -> Any:
 
 
 class TagExtractor:
-    """按配置抽取结构化标签。
+    """Extract structured tags according to the configuration.
 
     Args:
-        keys: 内置族 → 键名的覆盖映射（如 ``{"章": "chapter"}``）。
-        suffixes: 结构后缀 → 键名（如 ``{"条": "条"}``）。**扩充即新增可识别结构**。
-        patterns: 额外的自定义规则（:class:`TagPattern` 或配置 dict）。
-        month: 是否抽月份（干支月 / 数字月 / 特称月）。默认 True。
-        gregorian_year: 是否抽公元年（``2026年``）。默认 True。
-        cap: 同键多值上限。
-        num_max: 编号上限（防"第 9999 章"这类明显误抽）。
-        filter_keys: **过滤侧白名单**。声明了才校验 `filter_tags` 的键，
-            未声明 = 不校验（保持"任意键"现状）。见 :func:`validate_filter_keys`。
-        filter_degrade: 非法键是否**软降级**为"忽略该键继续跑"。默认 False
-            ＝显式报错。见 :func:`validate_filter_keys` 的取舍说明。
-        source: 配置来源标签，仅用于日志/自述。
+        keys: override mapping built-in family → key name (e.g. ``{"章": "chapter"}``).
+        suffixes: structural suffix → key name (e.g. ``{"条": "条"}``).
+            **Extending it adds newly recognizable structures**.
+        patterns: extra custom rules (:class:`TagPattern` or config dicts).
+        month: whether to extract months (ganzhi month / numeric month /
+            special-call month). Default True.
+        gregorian_year: whether to extract Gregorian years (``2026年``).
+            Default True.
+        cap: per-key multi-value cap.
+        num_max: numbering cap (guards against obvious mis-extractions like
+            "第 9999 章").
+        filter_keys: **filter-side whitelist**. Only when declared are
+            `filter_tags` keys validated; undeclared = no validation (keeps
+            the "any key" status quo). See :func:`validate_filter_keys`.
+        filter_degrade: whether invalid keys **soft-degrade** to "ignore
+            that key and continue". Default False = explicit error. See the
+            trade-off notes in :func:`validate_filter_keys`.
+        source: config source label, for logging/self-description only.
     """
 
     def __init__(
@@ -240,7 +271,7 @@ class TagExtractor:
         self.gregorian_year = bool(gregorian_year)
         self.cap = max(int(cap or 1), 1)
         self.num_max = int(num_max)
-        # 空列表视同"未声明"（写了 `[]` 等于把所有键都判非法，几乎必然是误配）
+        # An empty list counts as "undeclared" (writing `[]` would mark every key invalid, almost certainly a misconfiguration)
         fk = [str(k) for k in (filter_keys or []) if str(k)]
         self.filter_keys: tuple[str, ...] | None = tuple(fk) if fk else None
         self.filter_degrade = bool(filter_degrade)
@@ -250,7 +281,7 @@ class TagExtractor:
             for p in (patterns or [])
         ]
 
-        # 后缀按长度降序，保证「单元」优先于「元」这类前缀（目前无重叠，仍按惯例排）
+        # Suffixes sorted by length descending so 「单元」 wins over prefixes like 「元」 (no overlap today, sorted by convention anyway)
         sufs = sorted(self.suffixes, key=len, reverse=True)
         suf_alt = "|".join(re.escape(s) for s in sufs)
         self._re_suffix = (
@@ -267,19 +298,22 @@ class TagExtractor:
         self._re_ganzhi_month = re.compile(rf"(?:{_GANZHI_ALT})\s*月")
         self._re_gyear = re.compile(r"(?<!\d)(1[0-9]{3}|20[0-9]{2})\s*年")
         self._re_month_num = re.compile(r"(?<!\d)(\d{1,2})\s*月份?")
-        # ISO 日期：``2026-09-01`` / ``2026/9/1`` / ``2026.09``。
-        # 为什么必须单独一条：``_re_gyear`` 要求「年」字后缀，而工程类语料通篇写
-        # ISO 日期（真实库的无标签条目里大部分含 ``YYYY-MM-DD``，内置抽取器
-        # 却一条都匹配不上）。日部分可选：只给到年月（``2026.09``）也要认。
-        # 前视 ``(?!\d)`` 拦住 ``2026-09-011`` 这类长数字串的前缀误命中；
-        # 月份限 1–12、日限 1–31，避免把版本号 / 模型编号当日期。
+        # ISO dates: ``2026-09-01`` / ``2026/9/1`` / ``2026.09``.
+        # Why a separate pattern is required: ``_re_gyear`` demands a 「年」
+        # suffix, while engineering corpora write ISO dates throughout (most
+        # unlabeled entries in the real library contain ``YYYY-MM-DD``, yet
+        # the built-in extractor matched none of them). The day part is
+        # optional: year-month only (``2026.09``) must also be recognized.
+        # The lookahead ``(?!\d)`` blocks prefix false hits on long digit
+        # strings like ``2026-09-011``; months limited to 1–12, days to
+        # 1–31, so version numbers / model numbers are not taken for dates.
         self._re_iso_date = re.compile(
             r"(?<!\d)(1[0-9]{3}|20[0-9]{2})[-/.]"
             r"(0?[1-9]|1[0-2])"
             r"(?:[-/.](0?[1-9]|[12]\d|3[01]))?(?!\d)"
         )
-        # 特称月（正月/冬月/腊月）与中文数字月分开写：
-        # 「正/冬/腊」不在中文数字字符集里，两者不重叠，各自的捕获组也更简洁。
+        # Special-call months (正月/冬月/腊月) and Chinese-numeral months are written separately:
+        # 「正/冬/腊」 are not in the Chinese numeral charset, the two do not overlap, and each capture group stays simpler.
         lunar_alt = "|".join(LUNAR_MONTH_NAMES)
         self._re_month_lunar = re.compile(rf"(闰?(?:{lunar_alt}))")
         self._re_month_cn = re.compile(r"(闰?[一二三四五六七八九十]{1,3}月)")
@@ -302,7 +336,7 @@ class TagExtractor:
         return self.keys.get("月", "月")
 
     def describe(self) -> dict[str, Any]:
-        """自述当前生效的抽取规则（写进工具返回值，便于宿主核对键名）。"""
+        """Describe the extraction rules currently in effect (written into tool return values so the host can check key names)."""
         return {
             "source": self.source,
             "keys": dict(self.keys),
@@ -311,26 +345,28 @@ class TagExtractor:
             "gregorian_year": self.gregorian_year,
             "cap": self.cap,
             "custom_patterns": [p.to_dict() for p in self.patterns],
-            # 过滤侧白名单。None = 未声明 = 不校验（宿主可用任意键）
+            # Filter-side whitelist. None = undeclared = no validation (the host may use any key)
             "filter_keys": list(self.filter_keys) if self.filter_keys else None,
             "filter_degrade": self.filter_degrade,
         }
 
     # ------------------------------------------------------------------
     def _family_key(self, family: str | None) -> str | None:
-        """族名 → 输出键名。
+        """Family name → output key name.
 
-        **两步映射，不能省**：``suffixes`` 把「后缀」映到**族**（条 → 条族），
-        ``keys`` 再把「族」映到**输出键名**。早先只有一步（后缀直接给键名）时，
-        配置改 ``keys`` 会被默认 ``suffixes`` 覆盖掉——表现为"键名改了没生效"，
-        且不报错。
+        **The two-step mapping cannot be skipped**: ``suffixes`` maps a
+        「suffix」 to a **family** (条 → the 条 family), then ``keys`` maps
+        the **family** to the **output key name**. When there was only one
+        step (suffix directly to key name), a config change to ``keys`` got
+        overridden by the default ``suffixes`` -- manifesting as "the key
+        rename did not take effect", with no error.
         """
         if not family:
             return None
         return self.keys.get(family, family)
 
     def _numbered(self, text: str) -> list[tuple[str, Any]]:
-        """编号族：``第N<后缀>`` / ``chN``（后者只作"章"的英文写法）。"""
+        """Numbering family: ``第N<suffix>`` / ``chN`` (the latter only as the English spelling of "章")."""
         out: list[tuple[str, Any]] = []
         if self._re_suffix is not None:
             for m in self._re_suffix.finditer(text):
@@ -346,10 +382,11 @@ class TagExtractor:
         return out
 
     def _bare_volume(self, text: str, scan_all: bool = False) -> list[tuple[str, Any]]:
-        """裸「卷三」写法（无「第」）。
+        """Bare 「卷三」 spelling (no 「第」).
 
-        只在**标题开头**认：正文里"卷三"可能只是叙述（"卷三之后"），
-        无「第」时唯一可靠的锚点就是行首。
+        Recognized only at the **start of a heading**: in body text "卷三"
+        may be mere narration ("卷三之后"); without 「第」 the only reliable
+        anchor is the line start.
         """
         out: list[tuple[str, Any]] = []
         if self._re_bare_volume is None:
@@ -363,21 +400,22 @@ class TagExtractor:
         return out
 
     def _years(self, text: str) -> list[tuple[str, Any]]:
-        """时间族·年：干支 + 公元。干支在前，保持历史优先序。"""
+        """Time family, years: ganzhi + Gregorian. Ganzhi first, keeping the historical priority order."""
         out: list[tuple[str, Any]] = []
         for m in self._re_ganzhi.finditer(text):
             out.append((self.year_key, m.group(0)))
         if self.gregorian_year:
             for m in self._re_gyear.finditer(text):
                 out.append((self.year_key, int(m.group(1))))
-            # ISO 日期里的年（``2026-09-01`` → 2026）。干支在前、公元在后
-            # 的历史优先序不变；ISO 与「2026年」重复时由 ``_assemble`` 去重。
+            # The year inside ISO dates (``2026-09-01`` → 2026). The historical
+            # priority order -- ganzhi first, Gregorian after -- is unchanged;
+            # duplicates between ISO and 「2026年」 are deduped by ``_assemble``.
             for m in self._re_iso_date.finditer(text):
                 out.append((self.year_key, int(m.group(1))))
         return out
 
     def _months(self, text: str) -> list[tuple[str, Any]]:
-        """时间族·月：干支月（戊子月）/ 特称月（正月·闰四月）/ 数字月（3月·3月份）。"""
+        """Time family, months: ganzhi months (戊子月) / special-call months (正月·闰四月) / numeric months (3月·3月份)."""
         out: list[tuple[str, Any]] = []
         if not self.month:
             return out
@@ -391,11 +429,13 @@ class TagExtractor:
             n = int(m.group(1))
             if 1 <= n <= 12:
                 out.append((self.month_key, n))
-        # ISO 日期里的月。放在最后——中文月（正月/闰四月/10月）优先级更高，
-        # 标题模式「按第一个命中取值」的既有行为不受影响。
-        # 月份已在正则里限 1–12，但 ``09`` 要归一成 int 9，否则过滤侧
-        # ``filter_tags={"月": 9}`` 会与 ``"09"`` 对不上（不过标签侧统一走
-        # ``str()`` 归一，所以这里 int 化只为与「2026年9月」那条路同口径）。
+        # Months inside ISO dates. Placed last -- Chinese months (正月/闰四月/10月)
+        # have higher priority, and the heading mode's existing "take the
+        # first hit" behavior is unaffected. The regex already limits months
+        # to 1–12, but ``09`` must be normalized to int 9, otherwise the
+        # filter side's ``filter_tags={"月": 9}`` would not match ``"09"``
+        # (the tag side normalizes via ``str()`` anyway, so the int-ification
+        # here only aligns with the 「2026年9月」 path).
         for m in self._re_iso_date.finditer(text):
             out.append((self.month_key, int(m.group(2))))
         return out
@@ -409,13 +449,15 @@ class TagExtractor:
 
     # ------------------------------------------------------------------
     def extract(self, text: str, heading: bool = False) -> dict[str, Any]:
-        """抽标签。
+        """Extract tags.
 
         Args:
-            heading: 标题模式。标题一行只有一个结构值（``### 第43章``），
-                所以每个键**只取第一个**命中，且裸「卷三」写法也在此时才认。
-                正文模式（默认）**全部收集**：一条记忆可能涉及多章
-                （"参见第 12 章…本章对应第 5 章"），只留一个会让它在另一章下消失。
+            heading: heading mode. A heading line holds only one structural
+                value (``### 第43章``), so each key takes **only the first**
+                hit, and the bare 「卷三」 spelling is recognized only here.
+                Body mode (default) **collects all**: one memory may involve
+                several chapters ("参见第 12 章…本章对应第 5 章"); keeping
+                only one makes it disappear under the other chapter.
         """
         if not text:
             return {}
@@ -439,27 +481,31 @@ class TagExtractor:
         out: dict[str, Any] = {}
         for key, vals in grouped.items():
             if heading:
-                # 标题模式：**按出现顺序取第一个**，不排序。标题里的第一个结构值
-                # 才是它的主题（"卷三 己丑年" → 卷=3，年=己丑）；排序会把 int
-                # 提前，干支年就被公元年挤掉了。
+                # Heading mode: **take the first by order of appearance**, no
+                # sorting. The first structural value in a heading is its
+                # subject ("卷三 己丑年" → 卷=3, 年=己丑); sorting would float
+                # the int up and the ganzhi year would be crowded out by the
+                # Gregorian year.
                 out[key] = vals[0]
                 continue
-            # 正文模式：数值按数值序、字符串按字典序——不能用 str() 排
-            # （12 会跑到 5 前面）。
+            # Body mode: numbers by numeric order, strings lexicographically -- cannot sort via str()
+            # (12 would jump ahead of 5).
             vals = sorted(vals, key=_tag_value_sort_key)[: self.cap]
             out[key] = vals[0] if len(vals) == 1 else vals
         return out
 
 
 # ----------------------------------------------------------------------
-# 配置加载
+# Config loading
 # ----------------------------------------------------------------------
 def resolve_schema_path(explicit: str | None = None,
                         persist_dir: str | None = None) -> str | None:
-    """解析标签 schema 文件路径：显式 > env > ``<persist_dir>/tag_schema.json``。
+    """Resolve the tag schema file path: explicit > env > ``<persist_dir>/tag_schema.json``.
 
-    与专名词库同款约定（``_resolve_lexicon_path``）：**每次现算不缓存**——
-    服务启动后才放进 schema 文件是常见操作顺序，缓存 None 会让它永远读不到。
+    Same convention as the proper-noun lexicon (``_resolve_lexicon_path``):
+    **computed fresh each time, never cached** -- placing the schema file in
+    place only after service startup is a common order of operations, and a
+    cached None would make it unreadable forever.
     """
     if explicit:
         return explicit if os.path.isfile(explicit) else None
@@ -474,16 +520,19 @@ def resolve_schema_path(explicit: str | None = None,
 
 
 def extractor_from_config(cfg: dict[str, Any], source: str = "config") -> TagExtractor:
-    """从配置 dict 造抽取器。字段非法即抛错——**不静默降级成默认规则**。
+    """Build an extractor from a config dict. Invalid fields raise immediately -- **no silent degradation to default rules**.
 
-    静默降级会让"我明明配了"变成"其实没生效"，这是最难查的一类故障。
+    Silent degradation turns "I definitely configured it" into "it actually
+    never took effect", the hardest class of fault to debug.
     """
     if not isinstance(cfg, dict):
         raise ValueError(f"标签 schema 必须是 JSON 对象，得到 {type(cfg).__name__}")
     known = {"keys", "suffixes", "patterns", "month", "gregorian_year",
              "cap", "num_max", "filter_keys", "filter_degrade", "observed"}
-    # 下划线开头的是**给看文件的人**留的元数据（如 build_tag_schema.py 写的
-    # `_generated`），抽取器本就不读——不该每加载一次就 warning 一遍。
+    # underscore-prefixed entries are metadata left **for humans reading the
+    # file** (e.g. the `_generated` written by build_tag_schema.py); the
+    # extractor never reads them -- they should not trigger a warning on
+    # every load.
     unknown = {k for k in cfg if not str(k).startswith("_")} - known
     if unknown:
         logger.warning("标签 schema 含未知字段（已忽略）: %s", sorted(unknown))
@@ -504,35 +553,46 @@ def extractor_from_config(cfg: dict[str, Any], source: str = "config") -> TagExt
 def validate_filter_keys(tags: dict[str, Any] | None,
                          extractor: TagExtractor,
                          ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """校验 ``filter_tags`` 的**键**是否在白名单里。
+    """Validate that the **keys** of ``filter_tags`` are within the whitelist.
 
-    返回 ``(effective_tags, err)``，两者必有其一为 ``None``（**不同时非空**）：
+    Returns ``(effective_tags, err)``, exactly one of which is ``None``
+    (**never both non-empty**):
 
-    * ``(tags, None)`` —— 放行。含两种情况：白名单未声明、或键全部合法。
-    * ``(None, err)``  —— 拦截（``degrade=False``）或全被剥光（``degrade=True``）。
+    * ``(tags, None)`` -- pass-through. Two cases: the whitelist is
+      undeclared, or all keys are valid.
+    * ``(None, err)``  -- blocked (``degrade=False``) or fully stripped
+      (``degrade=True``).
 
-    为什么只在**声明了白名单**时才校验
-    --------------------------------
-    ``filter_tags`` 从一开始就是通用的（任意键 / AND-OR / ``str()`` 归一）。
-    在库里**还没有** ``tag_schema.json`` 时开校验，等于把库内现有键全部判成
-    非法 ⇒ 从"键名写错静默返回空"变成"每次调用都报错"，是纯粹的倒退。
-    故顺序必须是**先建档，再开校验**——次序不能反。
+    Why validation only happens when a **whitelist is declared**
+    -----------------------------------------------------------
+    ``filter_tags`` has been generic from the start (any keys / AND-OR /
+    ``str()`` normalization). Turning validation on while the library does
+    not yet have a ``tag_schema.json`` would mark every existing key in the
+    library invalid ⇒ "a typo silently returns empty" becomes "every call
+    errors out" -- pure regression. So the order must be **build the schema
+    first, then turn on validation** -- never the reverse.
 
-    为什么默认**不软降级**
-    ----------------------
-    降级（把非法键扔掉继续跑）会把"键名写错"重新变回静默：去掉非法键后检索
-    照样返回结果，调用方读到的仍是"库里就这些"，与不校验时一模一样。键校验
-    要堵的正是这个洞，所以缺省 ``degrade=False`` 显式报错；确实需要降级时必须
-    在 schema 里**显式**写 ``"filter_degrade": true``，且返回体必带
-    ``degraded: true`` 与 ``degraded_from``，让调用方看得见被改过。
+    Why **no soft degradation** by default
+    --------------------------------------
+    Degrading (throwing away invalid keys and continuing) makes "a typo in
+    the key name" silent again: with the invalid keys removed, retrieval
+    still returns results, and the caller reads "this is all the library
+    has" -- identical to not validating at all. Key validation exists to
+    plug exactly this hole, so the default ``degrade=False`` errors out
+    explicitly; when degradation is genuinely needed, ``"filter_degrade":
+    true`` must be written **explicitly** in the schema, and the return
+    body must carry ``degraded: true`` and ``degraded_from`` so the caller
+    can see the change.
 
-    只校验键，不校验值：值的取值域由语料决定（``章`` 可以是 43 也可以是"闰四月"），
-    拦值会误伤合法查询；且值写错已经被 ``matched=0`` 回显覆盖了。
+    Only keys are validated, not values: a value's domain is decided by the
+    corpus (``章`` can be 43 or "闰四月"); blocking values would hurt
+    legitimate queries; and a wrong value is already surfaced by the
+    ``matched=0`` echo.
     """
     if not tags:
         return tags, None
     allowed = extractor.filter_keys
-    if not allowed:                      # 未声明白名单 ⇒ 不校验（逐位不变）
+    if not allowed:                      # No whitelist declared ⇒ no validation (bit-for-bit unchanged)
         return tags, None
     unknown = [str(k) for k in tags if str(k) not in allowed]
     if not unknown:
@@ -548,7 +608,7 @@ def validate_filter_keys(tags: dict[str, Any] | None,
                          f"tag_schema.json 的 filter_keys）")
         info["degraded"] = False
         return None, info
-    # 软降级：剥掉非法键，剩下的继续跑；剩下的为空则等同于"不过滤"，仍要回显
+    # Soft degradation: strip invalid keys and keep running with the rest; if nothing remains it equals "no filtering", still echoed
     kept = {k: v for k, v in tags.items() if str(k) not in unknown}
     info["degraded"] = True
     info["degraded_from"] = dict(tags)
@@ -562,11 +622,11 @@ def validate_filter_keys(tags: dict[str, Any] | None,
 
 def load_extractor(schema: str | None = None,
                    persist_dir: str | None = None) -> TagExtractor:
-    """按优先级加载抽取器；找不到配置就用内置默认规则。
+    """Load the extractor by priority; fall back to built-in default rules when no config is found.
 
     Args:
-        schema: 显式 schema 文件路径。
-        persist_dir: 记忆库目录（找 ``tag_schema.json``）。
+        schema: explicit schema file path.
+        persist_dir: memory library directory (to find ``tag_schema.json``).
     """
     path = resolve_schema_path(schema, persist_dir)
     if not path:
@@ -575,7 +635,7 @@ def load_extractor(schema: str | None = None,
         with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        # 文件坏了必须吼一声：静默用内置规则会让人以为配置生效了
+        # A broken file must be shouted about: silently using built-in rules makes people believe the config took effect
         logger.error("标签 schema 读取失败，回退内置规则: %s (%s)", path, e)
         return TagExtractor(source=f"builtin(读取失败:{path})")
     ext = extractor_from_config(cfg, source=path)
@@ -584,16 +644,17 @@ def load_extractor(schema: str | None = None,
 
 
 # ----------------------------------------------------------------------
-# 兼容入口（历史函数名，签名不变）
+# Compatibility entry points (historical function names, signatures unchanged)
 # ----------------------------------------------------------------------
 _DEFAULT: TagExtractor | None = None
 
 
 def default_extractor() -> TagExtractor:
-    """进程级默认抽取器（惰性构造，读 env）。
+    """Process-level default extractor (lazily built, reads env).
 
-    与 ``_resolve_lexicon_path`` 同理：**不缓存外部文件的内容**，只缓存
-    "没有显式配置"这一个判断——需要热更新时调用 :func:`reset_default`。
+    Same reasoning as ``_resolve_lexicon_path``: **never cache the external
+    file's contents**, only cache the one judgment "no explicit config" --
+    call :func:`reset_default` when a hot update is needed.
     """
     global _DEFAULT
     if _DEFAULT is None:
@@ -602,28 +663,32 @@ def default_extractor() -> TagExtractor:
 
 
 def reset_default(schema: str | None = None, persist_dir: str | None = None) -> TagExtractor:
-    """重建默认抽取器（配置改了不用重启进程）。"""
+    """Rebuild the default extractor (config changes need no process restart)."""
     global _DEFAULT
     _DEFAULT = load_extractor(schema, persist_dir)
     return _DEFAULT
 
 
 def extract_heading_tags(heading: str) -> dict[str, Any]:
-    """从标题抽结构化标签：``第43章`` → ``{"章": 43}``。
+    """Extract structured tags from a heading: ``第43章`` → ``{"章": 43}``.
 
-    键名默认 ``章`` / ``卷`` / ``年`` / ``月``（可经 schema 配置改名，
-    **改名必须与调用方的 ``filter_tags`` 同步**，否则过滤静默失效）。
-    只抽明确的结构性标记，抽不到就返回空字典。
+    Key names default to ``章`` / ``卷`` / ``年`` / ``月`` (renamable via
+    schema config; **renames must stay in sync with the caller's
+    ``filter_tags``, otherwise filtering silently fails**).
+    Only unambiguous structural markers are extracted; returns an empty
+    dict when nothing matches.
     """
     return default_extractor().extract(heading, heading=True)
 
 
 def extract_text_tags(text: str, cap: int = 6) -> dict[str, Any]:
-    """扫**正文**抽结构化标签（存量回填用，不需要源文件）。
+    """Scan **body text** for structured tags (for backfilling existing entries; no source file needed).
 
-    与 :func:`extract_heading_tags` 的区别：标题只有一个结构值，正文里一条
-    记忆可能同时提到多个（"参见第 12 章…本章对应第 5 章"）。这里**全部收集**，
-    多值记列表——过滤侧对列表走 OR，语义正是"这条记忆涉及这几章"。
+    Difference from :func:`extract_heading_tags`: a heading has one
+    structural value, while the body text of one memory may mention several
+    ("参见第 12 章…本章对应第 5 章"). Here **all are collected**, multiple
+    values stored as a list -- the filter side expands lists as OR, whose
+    semantics are exactly "this memory involves these chapters".
     """
     ext = default_extractor()
     if cap != ext.cap:

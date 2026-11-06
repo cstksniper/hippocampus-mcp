@@ -1,28 +1,39 @@
-"""地图工具后端：map_set / map_list / map_verify 的判定核。
+"""Map tool backend: the decision core of map_set / map_list / map_verify.
 
-从 ``brain.core`` 整搬三件。``map_index`` 在基线上已是薄壳
-（``domain/map_view.py`` 的 ``_map_index_fn``），本批未动。
+Three pieces moved wholesale from ``brain.core``. ``map_index`` was already a
+thin shell on the baseline (``domain/map_view.py``'s ``_map_index_fn``) and
+was not touched in this batch.
 
-**G1 约束的注入形态**：``store`` 与 ``domain`` 都不许 import ``map`` 包，
-所以 map 包能力全部由壳**调用时现取**注入——``load`` 在壳上调好把
-``data`` 传进来，``set_entry`` / ``update`` / ``verify`` / ``list_maps`` /
-``map_names`` 是回调，``busy_exc`` / ``unreadable_exc`` 是异常类按值传
-（``except <表达式>:`` 在 Python 里合法，运行时求值），``wait`` /
-``max_maps`` 按值传。``root_fn`` 惰性（truth_source 解析根，锁内才调）。
+**Injection shape under the G1 constraint**: neither ``store`` nor ``domain``
+may import the ``map`` package, so all map-package capabilities are injected
+by the shell **fetched at call time** — ``load`` is called in the shell and its
+``data`` passed in; ``set_entry`` / ``update`` / ``verify`` / ``list_maps`` /
+``map_names`` are callbacks; ``busy_exc`` / ``unreadable_exc`` are exception
+classes passed as values (``except <expression>:`` is legal in Python,
+evaluated at runtime); ``wait`` / ``max_maps`` are passed as values.
+``root_fn`` is lazy (parses the truth_source root; called only inside the
+lock).
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (changing any one is a behavior change; parity
+will catch it):
 
-  * map_set：锁内读-改-写（``create=True``）；抢不到锁如实回 ``busy``
-    带文案（不假装成功）；坏侧车回 ``error`` 且坏文件保留原处；回显带
-    ``maps_total``（update 前的图数）与 ``map_entries``（本图条目数）；
-    ``desc`` / ``truth_source`` / ``note`` 空串归一成 None 才进 set_entry；
-  * map_list：data 为 None（未启用）→ ``enabled=False``；name 空 → 图
-    列表截 ``max_maps`` 带 ``hidden`` 自曝；单图条目按 ``updated_at``
-    降序（缺省 0.0），行截 **字面量 100**（不是常量——刻意与图数上限
-    分开），``hidden`` 自曝；图 desc 缺省回落图名；
-  * map_verify：锁内 verify（写 drift）+ 回填 maps 列表；busy/unreadable
-    的回显形状与 map_set **刻意不同**（``checked:0`` + ``drifted:[]``）；
-    data 为 None → ``enabled=False``；命中时补 ``enabled=True``。
+  * map_set: read-modify-write inside the lock (``create=True``); failing to
+    get the lock honestly returns ``busy`` with a message (never fakes
+    success); a corrupt sidecar returns ``error`` with the bad file left in
+    place; the echo carries ``maps_total`` (map count before the update) and
+    ``map_entries`` (this map's entry count);
+    ``desc`` / ``truth_source`` / ``note`` empty strings are normalized to None
+    before entering set_entry;
+  * map_list: data None (not enabled) → ``enabled=False``; empty name → the
+    map list truncated to ``max_maps`` with a ``hidden`` self-report; a single
+    map's entries sorted by ``updated_at`` descending (default 0.0), rows
+    truncated at the **literal 100** (not a constant — deliberately separate
+    from the map-count cap), with a ``hidden`` self-report; a map desc missing
+    falls back to the map name;
+  * map_verify: verify inside the lock (writes drift) + backfills the maps
+    list; busy/unreadable echoes are shaped **deliberately differently** from
+    map_set (``checked:0`` + ``drifted:[]``); data None → ``enabled=False``;
+    on a hit, ``enabled=True`` is added.
 """
 from __future__ import annotations
 
@@ -37,11 +48,13 @@ def map_set(
     root_fn: Callable[[], str | None], busy_exc: type,
     unreadable_exc: type, wait: float,
 ) -> dict[str, Any]:
-    """闸一写入口：按键 upsert（同键再写整体替换，旧状态不竞争）。
+    """Gate one's write entry: upsert by key (rewriting the same key replaces wholesale; old states do not compete).
 
-    锁内读-改-写：``set_entry`` 必须作用在**最新的**侧车上——否则两个
-    会话同时 map_set 不同键，后写的会把前一个的条目整个抹掉（静默丢
-    更新）。抢不到锁如实报 ``busy``，不假装成功。
+    Read-modify-write inside the lock: ``set_entry`` must act on the **latest**
+    sidecar — otherwise two sessions calling map_set on different keys
+    concurrently means the later write wipes the earlier one's entry wholesale
+    (a silently lost update). Failing to get the lock honestly reports
+    ``busy``; it never fakes success.
     """
 
     def _do(data):
@@ -71,7 +84,7 @@ def map_list(
     data: dict | None, name: str = "", *, list_maps_fn: Callable[..., Any],
     map_names_fn: Callable[[dict], list], max_maps: int,
 ) -> dict[str, Any]:
-    """列地图（name 空）或列一张图的条目（带 cap + 自曝）。"""
+    """List maps (empty name) or list one map's entries (with cap + self-report)."""
     if data is None:
         return {"maps": [], "maps_total": 0, "enabled": False}
     if not name:
@@ -108,10 +121,11 @@ def map_verify(
     root_fn: Callable[[], str | None], busy_exc: type,
     unreadable_exc: type, wait: float,
 ) -> dict[str, Any]:
-    """闸二：重读 truth_source 比对签名（哈希仲裁，touch 不误报）。
+    """Gate two: re-read the truth_source and compare signatures (hash arbitration; a touch causes no false alarm).
 
-    锁内读-改-写：verify 会写 ``drift``，若在锁外读快照再整量写回，
-    会把这期间别人的 ``map_set`` 一起抹掉。
+    Read-modify-write inside the lock: verify writes ``drift``; if it read a
+    snapshot outside the lock and wrote the whole thing back, it would wipe out
+    everyone else's ``map_set`` made in the meantime.
     """
 
     def _do(data):

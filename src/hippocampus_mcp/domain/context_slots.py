@@ -1,32 +1,36 @@
 # -*- coding: utf-8 -*-
-"""5 槽位上下文装配（借鉴 bigeye AttentionFocus）——编排层。
+"""5-slot context assembly (modeled on bigeye AttentionFocus) — the orchestration layer.
 
-产物是一块可以直接拼进 system prompt 的文本（``text``）+ 结构化槽位
-（``blocks``）+ 命中明细（``hits``）：
+The product is a text block that can be spliced directly into a system prompt (``text``)
+plus structured slots (``blocks``) plus hit details (``hits``):
 
-    block_1 当前查询直接命中  block_2 未决问题/待办
-    block_3 时间线位置（最近会话摘要）  block_4 相关实体状态
-    block_5 上次结论 / 未完结话题
+    block_1 direct hits for the current query  block_2 pending questions/open intents
+    block_3 timeline position (recent session summaries)  block_4 related entity state
+    block_5 last conclusions / open topics
 
-block_4 有**自己的预算**（``block4_*`` 四个注入值：最多
-``block4_max_entities`` 个实体、每个至多 ``block4_max_facts_per_entity``
-条事实、全块 ≤ ``block4_max_chars`` 字符），且候选以**查询词实体**优先、
-命中实体的前若干条作兜底——**不随 ``top_k`` 膨胀**（zcode D2 主体）。
-预算不与全局 ``token_budget`` 抢额度。
+block_4 has **its own budget** (four injected ``block4_*`` values: at most
+``block4_max_entities`` entities, at most ``block4_max_facts_per_entity``
+facts each, and the whole block ≤ ``block4_max_chars`` chars), and candidates prioritize
+**query-word entities** with the first few hit entities as fallback — **it does not
+inflate with ``top_k``** (the main body of zcode D2).
+Its budget does not compete with the global ``token_budget``.
 
-``item_max_chars`` 传 0 表示不截断（账目/条文类长句的数字尾巴常被 200
-切掉，用户反馈）；它只影响拼进 prompt 的 text，返回的
-``hits`` 始终是完整内容。``filter_tags`` 给定时 block_4 **不做查询词
-实体扩展**，只在命中集内发生（命中为空则无实体可扩）——按章写作时不
-希望别章的实体状态混进上下文。
+``item_max_chars`` = 0 means no truncation (numeric tails of ledger/clause-style long
+sentences were often cut off by 200, per user feedback); it only affects the text spliced
+into the prompt; the returned ``hits`` are always the full content. When ``filter_tags``
+is given, block_4 **skips query-word entity expansion** and only expands within the hit
+set (no hits means no entities to expand) — when writing per-chapter, entity state from
+other chapters must not leak into the context.
 
-落点说明：本体是纯编排（分流 + 候选收集 + 预算装填），六个
-brain 入口（recall / pinned_brief / trusted_entity_ids / extract_entities /
-entity_facts / render_blocks）以**可调用对象**注入，``BLOCK4_*`` 四个上限
-由调用方现取传入（住在 common/constants，patch 调用方命名空间即生效）。
-四个数据面（entities / intents / summaries / open_topics）是零成本属性
-读，原样传值——原实现里它们也都是在一次调用内顺序读，调用期间无写入方
-（recall / entity_facts 对它们均只读）。
+Placement note: the body is pure orchestration (branching + candidate collection + budget
+loading); the six brain entry points (recall / pinned_brief / trusted_entity_ids /
+extract_entities / entity_facts / render_blocks) are injected as **callables**, and the
+four ``BLOCK4_*`` caps are fetched fresh by the caller and passed in (they live in
+common/constants; patching the caller's namespace takes effect immediately).
+The four data faces (entities / intents / summaries / open_topics) are zero-cost attribute
+reads, passed through as-is — in the original implementation they too were read sequentially
+within a single call, with no writer during the call
+(recall / entity_facts only read them).
 """
 from __future__ import annotations
 
@@ -62,45 +66,54 @@ def memory_context(
     block4_max_chars: int,
     block4_hit_entity_topn: int,
 ) -> dict[str, Any]:
-    """装配 5 槽位上下文，可直接拼进 system prompt。
+    """Assemble the 5-slot context, ready to be spliced into a system prompt.
 
     Args:
-        query: 查询语；为空时 block_1 走钉住简报（``pinned_brief``）。
-        top_k: 召回条数，透传给 recall（pinned_brief 路径同值）。
-        token_budget: 全块 token 预算（粗粒度：中文约 2 字符/token）。
-        item_max_chars: 单条文本在上下文里的截断长度，默认 200；
-            **传 0 表示不截断**。只影响 ``text``，``hits`` 始终完整。
-        filter_tags: 结构化标签过滤，透传给 block_1 的命中检索；
-            给定时 block_4 不做查询词实体扩展。
-        recall: 召回入口，按 ``recall(query, top_k=..., filter_tags=...)``
-            形态调用。
-        pinned_brief: 钉住简报入口，按 ``pinned_brief(top_k)`` 形态调用。
-        trusted_entity_ids: 受信任实体 id 集合，调用时现取。
-        entities: 实体表 ``{小写名: 实体 dict}``（原样传值，调用期内只读）。
-        extract_entities: 实体名抽取，按 ``extract_entities(query)`` 调用。
-        entity_facts: 实体事实，按
-            ``entity_facts(ent["key"], limit=...)`` 形态调用。
-        intents / summaries / open_topics: 待办 / 会话摘要 / 未完结话题
-            三个时间序列（原样传值，调用期内只读）。
-        render_blocks: 块渲染 + 预算装填，按
-            ``render_blocks(blocks, token_budget, item_max_chars)`` 调用。
+        query: the query text; when empty, block_1 falls back to the pin brief
+            (``pinned_brief``).
+        top_k: number of recall entries, passed through to recall (same value on the
+            pinned_brief path).
+        token_budget: token budget for the whole block (coarse-grained: Chinese is roughly
+            2 chars/token).
+        item_max_chars: per-item truncation length inside the context, default 200;
+            **0 means no truncation**. Only affects ``text``; ``hits`` is always complete.
+        filter_tags: structured tag filtering, passed through to block_1's hit retrieval;
+            when given, block_4 skips query-word entity expansion.
+        recall: recall entry point, called as
+            ``recall(query, top_k=..., filter_tags=...)``.
+        pinned_brief: pin brief entry point, called as ``pinned_brief(top_k)``.
+        trusted_entity_ids: the set of trusted entity ids, fetched fresh at call time.
+        entities: the entity table ``{lowercase name: entity dict}`` (passed through
+            as-is, read-only during the call).
+        extract_entities: entity-name extraction, called as ``extract_entities(query)``.
+        entity_facts: entity facts, called as
+            ``entity_facts(ent["key"], limit=...)``.
+        intents / summaries / open_topics: the open intents / session summaries /
+            open topics time series (passed through as-is, read-only during the call).
+        render_blocks: block rendering + budget loading, called as
+            ``render_blocks(blocks, token_budget, item_max_chars)``.
         block4_max_entities / block4_max_facts_per_entity /
-            block4_max_chars / block4_hit_entity_topn: block_4 的四道
-            独立预算（调用方现取注入）。
+            block4_max_chars / block4_hit_entity_topn: block_4's four
+            independent budgets (fetched fresh and injected by the caller).
     """
     hits = (
         recall(query, top_k=top_k, filter_tags=filter_tags)
         if query else pinned_brief(top_k)
     )
 
-    # block_4：相关实体状态。**已收窄**——
-    # 老实现是"从**命中记忆**的实体出发"，于是 top_k 越大牵出的实体越多，
-    # 该块退化成噪声墙。现在候选顺序为：
-    #   ① 查询词里的实体（最贴题）；
-    #   ② 命中记忆的实体，且只取前 block4_hit_entity_topn 条命中（查询没提实体时兜底）。
-    # 再受 block4_* 独立预算约束——不与全局 token_budget 抢额度。
-    # **只认受信任实体**：这块钱直接拼进 system prompt，短语噪声进来就是纯干扰。
-    # 两条路径都过这道门（查询词实体亦然），否则等于把 origin 门控悄悄放开一个口子。
+    # block_4: related entity state. **Already narrowed** —
+    # the old implementation started "from the entities of the **hit memories**", so the
+    # larger top_k was, the more entities it dragged in, and this block degenerated into
+    # a noise wall. The candidate order is now:
+    #   ① entities from the query words (most on-topic);
+    #   ② entities of the hit memories, taking only the first block4_hit_entity_topn hits
+    #      (fallback for when the query mentions no entity).
+    # Then constrained by the independent block4_* budgets — no competing with the global
+    # token_budget for quota.
+    # **Trusted entities only**: this block is spliced straight into the system prompt;
+    # short-phrase noise getting in is pure interference.
+    # Both paths pass this gate (query-word entities too); otherwise the origin gating
+    # is silently left open a crack.
     trusted_ids = trusted_entity_ids()
     by_id = {e["id"]: e for e in entities.values()}
     cand_ids: list[str] = []
@@ -109,14 +122,15 @@ def memory_context(
         if eid and eid in trusted_ids and eid not in cand_ids:
             cand_ids.append(eid)
 
-    # ① 查询词实体。**按标签收窄时不启用**——那时整块上下文只该在命中集内
-    #    扩展（把别章的实体状态拖进"按章写作"的 prompt 会破坏隔离）。
+    # ① Query-word entities. **Not enabled when narrowing by tags** — in that case the whole
+    #    context block should only expand within the hit set (dragging entity state from other
+    #    chapters into a "writing per chapter" prompt would break isolation).
     if query and filter_tags is None:
         for name in extract_entities(query):
             ent = entities.get(name.lower())
             if ent:
                 _push(ent["id"])
-    # ② 命中记忆的实体（只取前若干条命中）
+    # ② Entities of the hit memories (taking only the first few hits)
     for h in hits[:block4_hit_entity_topn]:
         for eid in (h.get("entity_ids") or []):
             _push(eid)
@@ -133,22 +147,29 @@ def memory_context(
         if not facts:
             continue
         line = f"{ent['name']}: " + " / ".join(facts)
-        # 独立预算：超了就**丢弃后续实体整条**（绝不切在行中间——块内事实已按
-        # 时间倒序，前几条就是最近的）。第一条无条件保留，否则整块可能全空。
+        # Independent budget: once exceeded, **drop the whole line of each subsequent entity**
+        # (never cut in the middle of a line — facts within the block are already in reverse
+        # chronological order, so the first few are the most recent). The first line is kept
+        # unconditionally, otherwise the whole block could end up empty.
         if ent_facts and used_chars + len(line) > block4_max_chars:
             break
         seen_facts.update(facts)
         ent_facts.append(line)
         used_chars += len(line)
 
-    # 并存口径警示：命中里若出现"疑似同一事实的不同口径"，在块尾点明。
-    # 不折叠、不删条目——只让读这块钱的人（或模型）知道"下面这两条是一件事
-    # 的两版，别混着用"。旧口径可能是被引用的历史事实，也可能才是对的。
-    # 每条命中带日期前缀（2026-11-05）：装配式上下文是宿主最常用的入口，
-    # 若这里不带时间，库侧派生的 `occurred_at` 就等于白给——Agent 拿到的
-    # 仍是一堆无时间片段，"几周前 / 上个月"这类问题照旧答不了。
-    # 只在派生字段存在时加（时间未知的条目不编一个假日期）。
-    # 成本约 17 字符/条，块预算由 render_blocks 统一裁剪，不会击穿上限。
+    # Coexisting-accounts warning: if the hits contain "suspected different accounts of the
+    # same fact", call it out at the end of the block.
+    # No collapsing, no deleting entries — just let the reader of this block (human or model)
+    # know "the next two lines are two versions of the same thing; do not mix them".
+    # The old account may be a historical fact being cited, or it may be the correct one.
+    # Each hit carries a date prefix (2026-11-05): assembled context is the host's most-used
+    # entry point; without time here, the library-side derived `occurred_at` would be given
+    # away for nothing — the Agent would still receive a pile of time-less fragments, and
+    # questions like "a few weeks ago / last month" would remain unanswerable.
+    # Added only when the derived fields exist (entries with unknown time do not get a
+    # made-up date).
+    # Costs about 17 chars per entry; the block budget is trimmed uniformly by render_blocks,
+    # so the cap will not be breached.
     hit_lines = [
         (f"[{h['occurred_at']} {h['weekday']}] {h['content']}"
          if h.get("occurred_at") and h.get("weekday") else h["content"])

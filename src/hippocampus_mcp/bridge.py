@@ -1,31 +1,36 @@
-"""daemon 的 TCP 连接 ↔ MCP 会话桥。
+"""Bridge between the daemon's TCP connections and MCP sessions.
 
-**这段代码补的是 daemon 缺的那一环。** daemon 之前只有 ``_default_handler``
-（一个 echo 泵：收到什么原样发回去），而 ``server.py`` 里 grep
-``HIPPOCAMPUS_DAEMON`` 零命中——「真正的 MCP 会话由 server 侧接手」只是一句
-注释。本模块把这两头接上。
+**This code fills the missing piece of the daemon.** The daemon previously only
+had ``_default_handler`` (an echo pump: whatever it receives is sent back
+verbatim), and grepping ``HIPPOCAMPUS_DAEMON`` in ``server.py`` hit nothing --
+"a real MCP session is handled by the server side" was only a comment. This
+module wires the two ends together.
 
-**这段要补的，正是 daemon 早期注释里写明的那句话**：
+**What this fills in is exactly the sentence written in the daemon's early
+comment**:
 
-> daemon 接手的是字节泵，还没把 FastMCP ``Server.run`` 挂到 socket 流上
-> （需一层 anyio 内存流适配器）
+> The daemon takes over the byte pump and has not yet attached FastMCP
+> ``Server.run`` to the socket stream (an anyio memory stream adapter is needed)
 
-所以做法就是：把每条 TCP 连接当成一个 MCP 会话，用 anyio 内存对象流当适配层，
-一头泵 socket 字节流，一头喂给低层 ``Server.run``。
+So the approach: treat each TCP connection as one MCP session, use anyio memory
+object streams as the adapter layer, pumping the socket byte stream on one end
+and feeding the low-level ``Server.run`` on the other.
 
-**线协议**：MCP over stdio 是「换行分隔的 JSON-RPC 消息」，直接搬到 TCP 上，
-一行一条。所以本侧只需对字节流做**行帧**，不必实现长度前缀。
+**Wire protocol**: MCP over stdio is "newline-delimited JSON-RPC messages",
+moved directly onto TCP, one per line. So this side only needs to **frame by
+lines** on the byte stream; no length prefix is needed.
 
-**为什么不直接 FastMCP.run()**：它的 ``transport`` 只有
-``stdio`` / ``sse`` / ``streamable-http``，没有「给我一对流」。要用它的 stream
-就得下到 ``self._mcp_server``（低层 Server），那正是 ``run_stdio_async``
-自己用的写法。
+**Why not FastMCP.run() directly**: its ``transport`` only accepts
+``stdio`` / ``sse`` / ``streamable-http``; there is no "give me a pair of
+streams". To use its stream you must drop down to ``self._mcp_server`` (the
+low-level Server), which is exactly what ``run_stdio_async`` itself does.
 
-**一个进程共享一份模型**就落在这里：``server_obj`` 是模块级单例，
-多少个连接进来都是同一个对象、同一个 brain、同一份 torch 权重。
+**One process shares one model** lands here: ``server_obj`` is a module-level
+singleton; no matter how many connections come in, it is the same object, the
+same brain, the same torch weights.
 """
 
-# 豁免登记：模块快照调试面，封闭清单见 config.py「根层豁免清单」。
+# Exemption registry: module snapshot debug surface; see the closed list in config.py's "root-level exemption list".
 
 from __future__ import annotations
 
@@ -36,25 +41,29 @@ import socket
 import sys
 from typing import Any
 
-from .common.session_ctx import HELLO_PREFIX   # 纯标准库：不破坏本模块的惰性加载
+from .common.session_ctx import HELLO_PREFIX   # pure stdlib: does not break this module's lazy loading
 
 __all__ = ["make_mcp_handler", "mcp_connection_handler"]
 
-#: 单次 recv 的字节上限。JSON-RPC 帧通常 <64KB，取 64KB 足够且不会卡住软 wait。
+#: Byte cap for a single recv. JSON-RPC frames are usually <64KB, so 64KB is
+#: enough and does not stall the soft wait.
 INPUT_CHUNK = 65536
-#: 桥的调试开关（``HIPPOCAMPUS_BRIDGE_DEBUG=1``）：把每一帧的进出方向打在
-#: stderr 上。排查「请求进来了、响应永远不回来」这类**无异常挂起**时，
-#: 这是唯一能分清"卡在读 / 卡在写 / 卡在工具里"的手段。
+#: The bridge's debug switch (``HIPPOCAMPUS_BRIDGE_DEBUG=1``): prints each
+#: frame's in/out direction to stderr. When diagnosing **hangs without
+#: exceptions** like "the request came in, the response never comes back",
+#: this is the only way to tell "stuck on read / stuck on write / stuck in a
+#: tool" apart.
 BRIDGE_DEBUG = os.environ.get("HIPPOCAMPUS_BRIDGE_DEBUG", "") == "1"
 
 _server_obj: Any = None
 
 
 def _get_server() -> Any:
-    """惰性取 server 单例。
+    """Get the server singleton lazily.
 
-    **必须惰性**：daemon 要为「可用性 > 省内存」保持启动极快，而 import
-    ``server`` 会拉起<｜hy_place▁holder▁no▁813｜> torch。顶层 import 会毁掉这一条。
+    **Must be lazy**: the daemon needs a very fast startup for "availability >
+    memory savings", while importing ``server`` pulls in torch. A top-level
+    import would ruin that.
     """
     global _server_obj
     if _server_obj is None:
@@ -64,16 +73,18 @@ def _get_server() -> Any:
 
 
 def _low_level(obj: Any) -> Any:
-    """从高层 server 实例取低层 Server（本来就传低层 Server 时原样返回）。
+    """Get the low-level Server from a high-level server instance (returned
+    unchanged when a low-level Server was passed in the first place).
 
-    🔴 属性名在 mcp 2.x 换了：
+    🔴 The attribute name changed in mcp 2.x:
 
-    * 1.x ``FastMCP`` → ``_mcp_server``；
-    * 2.x ``MCPServer`` → ``_lowlevel_server``。
+    * 1.x ``FastMCP`` -> ``_mcp_server``;
+    * 2.x ``MCPServer`` -> ``_lowlevel_server``.
 
-    2.x 的高层类只有 ``run(transport=...)``，既没有
-    ``create_initialization_options`` 也不接受一对流；不停到低层就会抛
-    ``AttributeError`` 让整条连接断掉。按顺序探测两个名字，两个版本都能用。
+    The 2.x high-level class only has ``run(transport=...)``; it has neither
+    ``create_initialization_options`` nor does it accept a pair of streams; not
+    stopping at the low level raises ``AttributeError`` and takes down the whole
+    connection. Probe both names in order so both versions work.
     """
     for attr in ("_mcp_server", "_lowlevel_server"):
         inner = getattr(obj, attr, None)
@@ -84,7 +95,7 @@ def _low_level(obj: Any) -> Any:
 
 async def _serve_socket_session(server_obj: Any, sock: socket.socket,
                                 key: str) -> None:
-    """在一对 anyio 内存流上架起一次完整 MCP 会话。"""
+    """Set up one complete MCP session over a pair of anyio memory streams."""
     import anyio  # noqa: PLC0415
     from anyio import BrokenResourceError, ClosedResourceError, EndOfStream  # noqa: PLC0415
     from mcp.shared.message import SessionMessage  # noqa: PLC0415
@@ -93,21 +104,22 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
 
     from .common import session_ctx  # noqa: PLC0415
 
-    # 🔴 mcp 1.x 的 ``JSONRPCMessage`` 是 pydantic RootModel（有
-    # ``model_validate_json``）；mcp 2.x 把它改成了 PEP 604 union
-    # （``types.UnionType``），**没有**这个方法。旧写法在 2.x 下抛
-    # AttributeError，被下面的「坏帧」分支当成非法 JSON 静默丢掉 ⇒
-    # 客户端一帧响应都收不到，TaskGroup 随即崩掉关连接（CI 上
-    # ``f9_4b`` 的 ``EOFError: daemon 关闭了连接`` 就是它）。
-    # ``TypeAdapter`` 对 RootModel 与 union 都能解析，且两种结果都能被
-    # ``SessionMessage`` 接受（1.29 / 2.3 实测）。
+    # 🔴 mcp 1.x's ``JSONRPCMessage`` is a pydantic RootModel (it has
+    # ``model_validate_json``); mcp 2.x turned it into a PEP 604 union
+    # (``types.UnionType``), which **does not** have that method. The old way
+    # raises AttributeError under 2.x, and the "bad frame" branch below then
+    # silently drops it as illegal JSON => the client receives not a single
+    # response frame and the TaskGroup crashes and closes the connection (CI's
+    # ``f9_4b`` ``EOFError: the daemon closed the connection`` was exactly this).
+    # ``TypeAdapter`` parses both RootModel and union, and both results are
+    # accepted by ``SessionMessage`` (verified on 1.29 / 2.3).
     jsonrpc_type = types.JSONRPCMessage
     parse_jsonrpc = (jsonrpc_type.model_validate_json
                      if hasattr(jsonrpc_type, "model_validate_json")
                      else TypeAdapter(jsonrpc_type).validate_json)
 
-    # 这一条连接就是一个会话：上下文 key 一旦绑定，
-    # 本线程本 task 内的所有工具调用都自动落在这个 key 上。
+    # This one connection is one session: once the context key is bound,
+    # every tool call in this thread and task automatically lands on that key.
     session_ctx.bind_session(key)
 
     low = _low_level(server_obj)
@@ -118,7 +130,7 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
     write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
 
     async def sock_reader() -> None:
-        """socket 字节流 → 行帧 → SessionMessage → 读流。"""
+        """Socket byte stream -> line framing -> SessionMessage -> read stream."""
         buf = b""
         try:
             while True:
@@ -140,8 +152,10 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
                     try:
                         msg = parse_jsonrpc(line)
                     except Exception as exc:  # noqa: BLE001
-                        # 坏帧不能带走整条连接：跳过这一条，等下一帧。
-                        # 但要吼出来——静默丢包和静默串库是一类事故。
+                        # A bad frame must not take down the whole connection: skip
+                        # this one and wait for the next. But shout it out -- silent
+                        # frame drops and silent cross-library use are the same class
+                        # of incident.
                         print(
                             f"[bridge] discarded invalid JSON-RPC frame: {type(exc).__name__}: {exc}",
                             file=sys.stderr)
@@ -157,7 +171,7 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
                 pass
 
     async def sock_writer() -> None:
-        """写流 → SessionMessage → JSON → socket。"""
+        """Write stream -> SessionMessage -> JSON -> socket."""
         try:
             async with write_stream_reader:
                 async for session_message in write_stream_reader:
@@ -182,19 +196,24 @@ async def _serve_socket_session(server_obj: Any, sock: socket.socket,
 
 
 def _read_hello(sock: Any, timeout: float = 1.5) -> dict | None:
-    """吃掉 launcher 的带外握手行（返回解析结果；没有就 None）。
+    """Consume the launcher's out-of-band handshake line (returns the parsed
+    result; None if absent).
 
-    🔴 三条不能破的纪律：
+    🔴 Three disciplines that must not be broken:
 
-    1. **先 ``MSG_PEEK`` 再决定读不读**。这条通道必须兼容「直接连 daemon 的
-       客户端」（测试、手工排障）：它们不发握手行，硬读就会把 MCP 的第一帧
-       吃掉，表现为协议错误。
-    2. **逐字节读到 ``\\n`` 为止**。loopback 上 launcher 的握手行与随后的
-       ``initialize`` 完全可能被合并进同一个 TCP 段；一次 ``recv(4096)`` 会
-       连客户端的第一帧一起吃掉，而这里没有"把多读的还回去"的机制。
-    3. **用完必须还原 timeout**。``settimeout(t)`` 之后不还原，残留的超时会
-       让后续 ``recv`` 抛 ``socket.timeout``，而它被 ``except Exception: pass``
-       吞掉 ⇒ 回程泵静默死亡（实测踩过一次，别踩第二次）。
+    1. **``MSG_PEEK`` first, then decide whether to read**. This channel must
+       stay compatible with "clients connecting straight to the daemon" (tests,
+       manual debugging): they send no handshake line, and a hard read would eat
+       MCP's first frame, showing up as a protocol error.
+    2. **Read byte by byte up to ``\\n``**. On loopback, the launcher's handshake
+       line and the following ``initialize`` may well be coalesced into one TCP
+       segment; a single ``recv(4096)`` would swallow the client's first frame
+       too, and there is no mechanism here to "give back the over-read bytes".
+    3. **Restore the timeout when done**. Not restoring after ``settimeout(t)``
+       leaves a residual timeout that makes later ``recv`` calls raise
+       ``socket.timeout``, which then gets swallowed by
+       ``except Exception: pass`` => the return pump dies silently (stepped on
+       once in real testing; do not step on it a second time).
     """
     prefix = HELLO_PREFIX.encode("utf-8")
     try:
@@ -205,7 +224,7 @@ def _read_hello(sock: Any, timeout: float = 1.5) -> dict | None:
         try:
             sock.settimeout(timeout)
             head = sock.recv(len(prefix), socket.MSG_PEEK)
-        except Exception:  # noqa: BLE001 —— 超时/对端已关都算"没有握手行"
+        except Exception:  # noqa: BLE001 -- timeout/peer closed both count as "no handshake line"
             return None
         if not head or not head.startswith(prefix):
             return None
@@ -220,28 +239,32 @@ def _read_hello(sock: Any, timeout: float = 1.5) -> dict | None:
             buf += ch
     finally:
         try:
-            sock.settimeout(old)   # 还原成原来的阻塞模式
+            sock.settimeout(old)   # restore the original blocking mode
         except Exception:  # noqa: BLE001
             pass
     try:
         obj = json.loads(buf.decode("utf-8", "replace")[len(prefix):].strip())
-    except Exception:  # noqa: BLE001 —— 握手行坏了不该让连接起不来
+    except Exception:  # noqa: BLE001 -- a broken handshake line must not keep the connection from starting
         return None
     return obj if isinstance(obj, dict) else None
 
 
 def mcp_connection_handler(conn: Any) -> None:
-    """daemon 的 handler 形态：同步函数，进去跑完一条连接的整个生命周期。
+    """The daemon's handler shape: a synchronous function that runs the whole
+    lifecycle of one connection.
 
-    每个 conn 一个 ``asyncio.run``（独立 event loop）+ daemon 每连接一个线程，
-    于是 N 个会话彼此隔离；而 ``_get_server()`` 是进程级单例，
-    模型与 brain 始终只有一份。
+    One ``asyncio.run`` (independent event loop) per conn + one thread per
+    connection inside the daemon, so N sessions are isolated from each other;
+    and ``_get_server()`` is a process-level singleton, so there is always
+    exactly one model and one brain.
     """
     key = getattr(conn, "session_key", None)
     key = key() if callable(key) else (key or "")
     sock = conn.sock
-    # 带外握手：这条连接属于哪个库，由 launcher 声明。
-    # 拿不到就走进程级默认库 —— 与改造前逐位一致，绝不让连接起不来。
+    # Out-of-band handshake: which library this connection belongs to, declared
+    # by the launcher. If unavailable, use the process-level default library --
+    # bit-for-bit identical to before the rework; never block the connection
+    # from starting.
     hello = _read_hello(sock)
     if hello:
         try:
@@ -253,28 +276,31 @@ def mcp_connection_handler(conn: Any) -> None:
             )
             print(f"[bridge] session {key} default library={path} (from launcher HELLO)",
                   file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001 —— 握手失败不能让会话起不来
+        except Exception as exc:  # noqa: BLE001 -- a failed handshake must not keep the session from starting
             print(f"[bridge] session {key} HELLO handling failed (falling back to process default library): "
                   f"{type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         asyncio.run(_serve_socket_session(_get_server(), sock, key))
     except RuntimeError as exc:
-        # 典型：宿主把 socket 断了，而会话还在收尾
+        # Typical: the host tore down the socket while the session was still winding down
         print(f"[bridge] session {key} ended: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
 
 def make_mcp_handler() -> Any:
-    """给 ``Daemon(registry, handler=...)`` 用的 factory。
+    """Factory for ``Daemon(registry, handler=...)``.
 
-    保持函数形态是为了让 daemon 侧不必在本模块之前加载 heavy import。
+    Staying a plain function means the daemon side does not have to load this
+    module's heavy imports ahead of time.
     """
     return mcp_connection_handler
 
 
 def _self_check_imports() -> bool:
-    """桥能不能用，取决于 anyio / mcp 在不在。缺失时**必须**明确报错，
-    不能让 daemon 静默退化成 echo 泵——那会让宿主连上却永远收不到响应。
+    """Whether the bridge is usable depends on anyio / mcp being present. When
+    missing, **must** report the error explicitly -- never let the daemon
+    silently degrade into an echo pump, which would leave the host connected yet
+    forever without a response.
     """
     try:
         import anyio  # noqa: F401
@@ -285,9 +311,10 @@ def _self_check_imports() -> bool:
 
 
 def bridge_available() -> bool:
-    """桥验证可用 -> True。daemon 据此决定「起真 MCP」还是「明确报错退出」。"""
+    """True if the bridge verifies as usable. The daemon decides on this basis
+    between "start real MCP" and "exit with an explicit error"."""
     return _self_check_imports()
 
 
-#: socket 仅用于类型标注，保留引用以免 lint 判为未使用
+#: socket is only used for type annotations; keep the reference so lint does not flag it as unused
 _ = socket

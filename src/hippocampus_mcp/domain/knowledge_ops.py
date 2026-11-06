@@ -1,26 +1,34 @@
-"""知识主题层操作族：成员打包 / 统计自曝。
+"""Knowledge topic-layer operations: member packing / stats self-report.
 
-从 ``brain.core`` 整搬两件。架构约束：``domain/topic`` 是同层（同层互引都
-不行）⇒ topic 层能力全部经 :class:`TopicPort` **由壳调用时现取注入**
-（``_topic_defaults`` / ``ordered`` / ``pending_summary_ids`` /
+Two pieces moved wholesale from ``brain.core``. Architectural constraint:
+``domain/topic`` is a sibling layer (siblings may not import each other)
+⇒ all topic-layer capabilities are injected through :class:`TopicPort`,
+fetched live when the shell calls
+(``_topic_defaults`` / ``ordered`` / ``pending_summary_ids`` /
 ``representative_ids`` / ``summary_state`` / ``apply_host_summary`` /
-``coverage_of`` / ``by_status`` / ``host_summary_stats`` 是回调，
-``TOPIC_EVIDENCE_CLIP`` 是值）。
+``coverage_of`` / ``by_status`` / ``host_summary_stats`` are callbacks;
+``TOPIC_EVIDENCE_CLIP`` is a value).
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (changing any one is a behavior change; parity
+will catch it):
 
-  * knowledge_items：只收 **active**；``require_vec=False`` 连无向量记录
-    一起收（``vec`` 为 None）——「存活」与「有向量」是两件事，混用会让
-    active-无向量成员反复抖动；实体名只取**受信任实体**且在实体表里的
-    （``e in trusted and e in id_to_name``）；timestamp/importance 走
-    ``float(x or 0.0)``；tags 浅拷贝；
-  * knowledge_stats：层关闭只回 note；空库 coverage 由 topic 层给；
-    ``last_refresh_took_s`` None 不 round；note 有 topic 层文案时
-    **不覆盖**（``out.get("note") or 默认文案``）；
-> 注：``brief_batch`` / ``summarize_batch`` 两件不在本模块——曾经并存过
-> 两套行为等价的同名实现，为避免双轨漂移只保留单一线，落在
-> ``domain/knowledge_batch.py`` 与 ``domain/summarize_batch_flow.py``；
-> 验证由那两个模块的目标测试与兼容套件承担。
+  * knowledge_items: takes only **active**; ``require_vec=False`` also takes
+    records with no vector (``vec`` is None) -- "alive" and "has a vector"
+    are two different things, and mixing them makes active-without-vector
+    members flap; entity names only take **trusted entities** that are in
+    the entity table (``e in trusted and e in id_to_name``);
+    timestamp/importance go through ``float(x or 0.0)``; tags are
+    shallow-copied;
+  * knowledge_stats: layer disabled returns only a note; empty-library
+    coverage is given by the topic layer; ``last_refresh_took_s`` None is
+    not rounded; when the note already carries topic-layer text, do **not**
+    overwrite it (``out.get("note") or default text``);
+> Note: ``brief_batch`` / ``summarize_batch`` are not in this module -- two
+> behaviorally equivalent same-named implementations once coexisted; to
+> avoid dual-track drift only a single line was kept, landing in
+> ``domain/knowledge_batch.py`` and ``domain/summarize_batch_flow.py``;
+> verification is carried by those two modules' targeted tests and the
+> compatibility suite.
 """
 from __future__ import annotations
 
@@ -30,7 +38,9 @@ from typing import Any, Callable
 
 @dataclass(frozen=True)
 class TopicPort:
-    """topic 层能力端口（壳构造，调用时现取——架构约束：同层不互引）。"""
+    """Topic-layer capability port (built by the shell, fetched live at call
+    time -- architectural constraint: sibling layers do not import each
+    other)."""
     defaults_fn: Callable[[], Any]
     ordered: Callable[..., Any]
     pending_summary_ids: Callable[..., Any]
@@ -48,14 +58,16 @@ def knowledge_items(
     vector_of: Callable[..., Any], active_state: str,
     require_vec: bool = True,
 ) -> list[dict[str, Any]]:
-    """把 active 的 L1 记录打包成 topic 模块的输入。
+    """Pack active L1 records into the topic module's input format.
 
-    只收 **active**：superseded / archived 是已经不算数的口径。
-    ``require_vec=False`` 时连**还没算向量**的记录一起收（``vec`` 为
-    None）——「存活」和「有向量」是两件事：聚类比不了没有向量的记录
-    （宁缺勿滥，进 ``unassigned`` 自曝），但判「哪些成员已经失效」只能
-    看 active。混用会让 active-无向量 的记录反复抖动 ⇒ 签名对不上 ⇒
-    满屏假 stale。
+    Takes only **active**: superseded / archived are positions that no longer
+    count. With ``require_vec=False``, records that **have no vector yet**
+    are taken too (``vec`` is None) -- "alive" and "has a vector" are two
+    different things: clustering cannot compare records without vectors
+    (better missing than wrong; they self-report into ``unassigned``), but
+    deciding "which members have gone invalid" can only look at active.
+    Mixing them makes active-without-vector records flap ⇒ signatures stop
+    matching ⇒ false stale everywhere.
     """
     trusted = trusted_ids
     id_to_name = {e.get("id"): k for k, e in entities.items()}
@@ -84,7 +96,8 @@ def knowledge_stats(
     port: TopicPort, *, knowledge: dict, records: Any,
     active_state: str, last_at: Any, last_took: Any, last_dropped: Any,
 ) -> dict[str, Any]:
-    """brain_stats 自曝：主题层现在什么状态（含覆盖率与上次刷新时点）。"""
+    """brain_stats self-report: the topic layer's current state (coverage
+    and last refresh time included)."""
     if not port.defaults_fn().layer_enabled:
         return {"enabled": False,
                 "note": "the topic layer is disabled (HIPPOCAMPUS_TOPIC_LAYER=0)"}
@@ -94,8 +107,10 @@ def knowledge_stats(
     out.update({
         "enabled": True,
         "by_status": port.by_status(knowledge),
-        # 归纳进度：host = 宿主已写回的；host_stale = 写了但成员已变。
-        # 有这两格，「梳理到什么程度」就不用靠感觉。
+        # Summarization progress: host = already written back by the host;
+        # host_stale = written but members have since changed.
+        # With these two cells, "how far along is the curation" needs no
+        # guesswork.
         "summary_kinds": port.host_summary_stats(knowledge),
         "last_refresh_at": last_at,
         "last_refresh_took_s": (round(last_took, 3)

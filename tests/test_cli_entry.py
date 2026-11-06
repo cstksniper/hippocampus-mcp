@@ -1,29 +1,29 @@
 # -*- coding: utf-8 -*-
-"""CLI 入口与接入自检：console-script 绑定 / 子命令分发 / doctor 结论。
+"""CLI entry and wiring self-check: console-script binding / subcommand dispatch / doctor verdicts.
 
-背景是一次真实接入事故：旧安装的 ``hippocampus-mcp.exe`` 入口把子命令
-**静默吞掉**（``doctor`` / ``setup`` 变成"启动服务并 exit 0"），于是
-"配置其实没写对"这件事没有任何人报错 —— 用户只能在宿主里看到
-``mcp__hippocampus__*`` 工具不存在，而 MCP server 没被加载时物理上无法
-自己发声。本套件守的就是这条链路的**可发现性**。
+The background is a real onboarding incident: the old installed ``hippocampus-mcp.exe``
+entry point **silently swallowed** subcommands (``doctor`` / ``setup`` became "start the
+server and exit 0"), so nobody ever got an error about "the config was actually wrong" —
+the user only saw ``mcp__hippocampus__*`` tools missing in the host, and an unloaded MCP
+server is physically unable to speak for itself. This suite guards that chain's **discoverability**.
 
-覆盖：
-    A console-script 入口绑定 cli:main（源码口径 + 变异负对照）
-    B 子命令分发：doctor 出体检报告 / 未知子命令非 0 / 子命令不被吞成启动服务
-    C setup 不带 --host 时的工作区特征探测（含"不瞎选"）
-    D doctor --host × --project 的结论式判定（宿主会读什么、缺了谁）
-    E setup 写后即验：真子进程握手，失败必须带原因且 setup 退非 0
-    F launcher 启动前自检（库目录可写性 fail-fast）
-    G doctor 自曝：本次检查的是默认库 / 每行配置来自哪个文件
+Coverage:
+    A console-script entry binds cli:main (source check + mutation negative control)
+    B subcommand dispatch: doctor reports / unknown subcommand non-zero / not swallowed into startup
+    C workspace-marker detection when setup runs without --host (incl. "no guessing")
+    D verdict-style doctor --host × --project (what the host reads, what is missing)
+    E setup verify-after-write: real subprocess handshake, failure must carry a reason and exit non-zero
+    F launcher preflight (library-dir writability fail-fast)
+    G doctor self-report: which library this run checks / which file each config line comes from
 
-纪律：
-  · 断言可证伪 —— 替身有效性用反面对照钉（B6 / A4 / D6），
-    否则"没被调用"可能是替身自己失效；
-  · 行为级优先：E 组起真子进程，不 mock 掉握手；
-  · ``preflight_persist_dir`` 的返回值用 ``is None`` 判定，不用 falsy ——
-    ``0`` 也是 falsy，而 0 意味着"成功启动"，语义正好相反。
+Discipline:
+  · Falsifiable assertions — stub validity is pinned by negative controls
+    (B6 / A4 / D6), else "not called" may just be a dead stub;
+  · Behavior-level first: group E spawns a real subprocess, no mocked handshake;
+  · ``preflight_persist_dir``'s return value is judged with ``is None``, not
+    falsiness — ``0`` is falsy too and 0 means "started successfully", the opposite.
 
-用法：
+Usage:
     python tests/test_cli_entry.py
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import tomllib  # requires-python >= 3.11，标准库必有
+import tomllib  # requires-python >= 3.11, guaranteed in the stdlib
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -65,7 +65,7 @@ def check(name, cond, detail=""):
 
 
 def run_cli(argv, env=None):
-    """跑 ``cli.main(argv)``，返回 (返回码, stdout, stderr)。"""
+    """Run ``cli.main(argv)``; return (return code, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
     old = dict(os.environ)
     try:
@@ -77,7 +77,7 @@ def run_cli(argv, env=None):
                     os.environ[k] = v
         with redirect_stdout(out), redirect_stderr(err):
             rc = cli.main(argv)
-    except SystemExit as exc:          # argparse 的 error() 走这条路
+    except SystemExit as exc:          # argparse's error() takes this path
         rc = exc.code
     finally:
         os.environ.clear()
@@ -90,14 +90,14 @@ def tmpdir():
 
 
 # ======================================================================
-# A 组：console-script 入口绑定（防退回 server:main）
+# A group: console-script entry binding (guards against reverting to server:main)
 # ======================================================================
 def _scripts_of(text: str) -> dict:
     return tomllib.loads(text).get("project", {}).get("scripts", {})
 
 
 def _binds_cli(text: str) -> bool:
-    """入口是否绑定 CLI 分发器（同时返回绑定值的可读性由调用方断言）。"""
+    """Whether the entry binds the CLI dispatcher (asserting the bound value itself is the caller's job)."""
     return _scripts_of(text).get("hippocampus-mcp") == "hippocampus_mcp.cli:main"
 
 
@@ -105,152 +105,152 @@ def test_a_entry_binding():
     with open(PYPROJECT, "r", encoding="utf-8") as f:
         text = f.read()
     scripts = _scripts_of(text)
-    check("A1 console-script 绑 cli:main",
+    check("A1 console-script binds cli:main",
           scripts.get("hippocampus-mcp") == "hippocampus_mcp.cli:main",
           str(scripts))
-    check("A2 没有任何入口指向 server 模块",
+    check("A2 no entry points at the server module",
           not any("hippocampus_mcp.server" in str(v) for v in scripts.values()),
           str(scripts))
-    check("A3 绑定目标可解析且可调用",
+    check("A3 binding target resolvable and callable",
           callable(getattr(cli, "main", None)), str(getattr(cli, "main", None)))
-    # 负对照：把绑定改回 server:main，A1 的判据必须翻红 —— 否则 A1 恒真。
+    # Negative control: revert the binding to server:main; A1's check must fail — otherwise A1 is vacuously true.
     mutated = text.replace("hippocampus_mcp.cli:main",
                            "hippocampus_mcp.server:main")
-    check("A4 负对照：改回 server:main 必须判失败",
+    check("A4 negative control: reverted server:main must fail",
           (not _binds_cli(mutated)) and mutated != text,
           "变异没生效或判据恒真")
 
 
 # ======================================================================
-# B 组：子命令分发（核心回归：子命令被静默吞掉）
+# B group: subcommand dispatch (core regression: subcommands silently swallowed)
 # ======================================================================
 def test_b_dispatch():
-    # doctor：必须出体检报告，且**不能**去启动服务
+    # doctor: must print its report and must **not** start the server
     real_serve = cli.cmd_serve
     calls: list[object] = []
     cli.cmd_serve = lambda args: (calls.append(args), 0)[1]
     try:
         rc, out, _err = run_cli(["doctor"])
-        check("B1 doctor 退出码 0", rc == 0, str(rc))
-        check("B2 doctor 出体检报告",
+        check("B1 doctor exit code 0", rc == 0, str(rc))
+        check("B2 doctor prints its report",
               "hippocampus-mcp doctor" in out and "[ OK ]" in out
               and "Libraries configured by host" in out, out[:200])
-        check("B3 doctor 不触发启动服务（子命令没被吞）", not calls, str(calls))
+        check("B3 doctor does not start the server (subcommand not swallowed)", not calls, str(calls))
 
         ws = tmpdir()
         rc2, out2, _err2 = run_cli(
             ["setup", "--host", "zcode", "--dry-run", "--workspace", ws])
-        check("B4 setup --dry-run 退出码 0", rc2 == 0, str(rc2))
-        check("B5 setup 不触发启动服务", not calls, str(calls))
-        check("B6 setup 预览内容落地", "dry-run" in out2 and "zcode" in out2,
+        check("B4 setup --dry-run exit code 0", rc2 == 0, str(rc2))
+        check("B5 setup does not start the server", not calls, str(calls))
+        check("B6 setup preview content lands", "dry-run" in out2 and "zcode" in out2,
               out2[:200])
     finally:
         cli.cmd_serve = real_serve
 
-    # 结论式判定也必须经 ``main()`` 分发后可见 —— 只测 _doctor_host_project
-    # 会被"分发没接上"漏过去（旧入口吞子命令正是那一层坏）。
+    # The verdict must also be visible after dispatch through ``main()`` — testing only
+    # _doctor_host_project would miss "dispatch not wired" (the old entry broke at that layer).
     ws2 = tmpdir()
     os.makedirs(os.path.join(ws2, ".zcode"))
     rc_h, out_h, _err_h = run_cli(["doctor", "--host", "zcode",
                                    "--project", ws2])
-    check("B12 doctor --host 经 main 也要出结论段",
+    check("B12 doctor --host prints the verdict via main too",
           rc_h == 0 and "Host/workspace verdict" in out_h, out_h[:200])
-    # 只比对目录名：resolve() 可能改写盘符大小写/分隔符，全串比对会假红
-    check("B13 结论段带上目标目录", os.path.basename(ws2) in out_h, out_h[:300])
+    # Compare directory names only: resolve() may rewrite drive case/separators; full-string compare would false-fail
+    check("B13 verdict names the target directory", os.path.basename(ws2) in out_h, out_h[:300])
 
-    # setup 不带 --host：端到端走自动判定
+    # setup without --host: end-to-end auto-detection
     rc_a, out_a, _err_a = run_cli(["setup", "--dry-run", "--workspace", ws2])
-    check("B14 不带 --host 时自动判定并说出来",
+    check("B14 without --host auto-detects and says so",
           rc_a == 0 and "inferred from workspace markers" in out_a and "zcode" in out_a, out_a[:300])
 
-    # 未知子命令：必须报错退出**非 0**（旧入口的病就是静默 exit 0）
+    # Unknown subcommand: must error out with a **non-zero** exit (the old entry's disease was a silent exit 0)
     rc3, _out3, err3 = run_cli(["definitely-not-a-subcommand"])
-    check("B7 未知子命令退出非 0", isinstance(rc3, int) and rc3 != 0, str(rc3))
-    check("B8 未知子命令有报错输出", "invalid choice" in err3, err3[:200])
+    check("B7 unknown subcommand exits non-zero", isinstance(rc3, int) and rc3 != 0, str(rc3))
+    check("B8 unknown subcommand prints an error", "invalid choice" in err3, err3[:200])
 
-    # 无子命令 = 启动服务（旧 entry point 行为必须保留）
+    # No subcommand = start the server (old entry point behavior must be kept)
     calls2: list[object] = []
     real_serve2 = cli.cmd_serve
     cli.cmd_serve = lambda args: (calls2.append(args), 0)[1]
     try:
         rc4, _o4, _e4 = run_cli([])
-        check("B9 无子命令仍走启动服务", len(calls2) == 1 and rc4 == 0,
+        check("B9 no subcommand still starts the server", len(calls2) == 1 and rc4 == 0,
               f"calls={calls2} rc={rc4}")
-        check("B10 默认经 launcher（direct=False）",
+        check("B10 default goes through the launcher (direct=False)",
               len(calls2) == 1 and getattr(calls2[0], "direct", None) is False,
               str(calls2))
-        # 负对照：同一个替身在"该被调用"的场景确实记到了 —— 否则 B3/B5 的
-        # "没被调用"只是替身失效的假象。
-        check("B11 负对照：替身自身有效（B9 场景记到调用）", len(calls2) == 1,
+        # Negative control: the same stub does record calls in a scenario where it
+        # SHOULD be called — otherwise B3/B5's "not called" is just a dead stub's illusion.
+        check("B11 negative control: stub itself works (B9 scenario recorded the call)", len(calls2) == 1,
               str(calls2))
     finally:
         cli.cmd_serve = real_serve2
 
 
 # ======================================================================
-# C 组：setup 不带 --host 时的工作区特征探测
+# C group: workspace-marker detection when setup runs without --host
 # ======================================================================
 def test_c_detect_host():
     ws = tmpdir()
     try:
         cli._detect_host(Path(ws))
-        check("C1 无从判断时必须报错（不瞎选）", False, "没有抛 SystemExit")
+        check("C1 must error when undecidable (no guessing)", False, "没有抛 SystemExit")
     except SystemExit:
-        check("C1 无从判断时必须报错（不瞎选）", True)
+        check("C1 must error when undecidable (no guessing)", True)
     except Exception as exc:  # noqa: BLE001
-        check("C1 无从判断时必须报错（不瞎选）", False,
+        check("C1 must error when undecidable (no guessing)", False,
               f"{type(exc).__name__}: {exc}")
 
     ws2 = tmpdir()
     os.makedirs(os.path.join(ws2, ".zcode"))
-    check("C2 有 .zcode/ → zcode", cli._detect_host(Path(ws2)) == "zcode",
+    check("C2 .zcode/ present -> zcode", cli._detect_host(Path(ws2)) == "zcode",
           cli._detect_host(Path(ws2)))
 
     ws3 = tmpdir()
     Path(ws3, ".mcp.json").write_text("{}", encoding="utf-8")
-    check("C3 有 .mcp.json → workbuddy",
+    check("C3 .mcp.json present -> workbuddy",
           cli._detect_host(Path(ws3)) == "workbuddy",
           cli._detect_host(Path(ws3)))
 
-    # 两者都有：判据顺序必须钉死，否则换机器就换结果
+    # Both present: the precedence order must be pinned, otherwise results flip across machines
     ws4 = tmpdir()
     os.makedirs(os.path.join(ws4, ".zcode"))
     Path(ws4, ".mcp.json").write_text("{}", encoding="utf-8")
-    check("C4 两者都有 → zcode 优先",
+    check("C4 both present -> zcode wins",
           cli._detect_host(Path(ws4)) == "zcode", cli._detect_host(Path(ws4)))
 
-    # 负对照：同名的**文件**不算宿主痕迹（is_dir 语义）
+    # Negative control: a same-named **file** does not count as a host marker (is_dir semantics)
     ws5 = tmpdir()
     Path(ws5, ".zcode").write_text("{}", encoding="utf-8")
     try:
         cli._detect_host(Path(ws5))
-        check("C5 负对照：.zcode 是文件不算数", False, "被当成目录了")
+        check("C5 negative control: .zcode as a file does not count", False, "被当成目录了")
     except SystemExit:
-        check("C5 负对照：.zcode 是文件不算数", True)
+        check("C5 negative control: .zcode as a file does not count", True)
     except Exception as exc:  # noqa: BLE001
-        check("C5 负对照：.zcode 是文件不算数", False,
+        check("C5 negative control: .zcode as a file does not count", False,
               f"{type(exc).__name__}: {exc}")
 
 
 # ======================================================================
-# D 组：doctor --host × --project 的结论式判定
+# D group: verdict-style doctor --host × --project
 # ======================================================================
 def test_d_host_project():
     ws = Path(tmpdir())
     real_user_path = cli.user_config_path
-    # 宿主 user 级路径隔离到 tmp：测试机上 ~/.workbuddy/mcp.json 是真的，
-    # 不隔离的话结论会掺进本机状态，套件换个机器就翻红。
+    # Isolate the host user-level path into tmp: on dev machines ~/.workbuddy/mcp.json is
+    # real; unisolated, the verdict mixes in local state and the suite fails elsewhere.
     cli.user_config_path = lambda host: Path(tmpdir()) / f"{host}-user.json"
     try:
         out = io.StringIO()
         with redirect_stdout(out):
             cli._doctor_host_project("zcode", ws)
         text = out.getvalue()
-        check("D1 点名该宿主会读哪份配置",
+        check("D1 names which config this host reads",
               ".zcode" in text and "config.json" in text, text[:300])
         check("D2 missing state is explicit", "Missing (not wired up here)" in text, text[:300])
 
-        # 写入一份正确的 ZCode 配置
+        # Write a correct ZCode config
         cfgdir = ws / ".zcode"
         cfgdir.mkdir(parents=True, exist_ok=True)
         (cfgdir / "config.json").write_text(json.dumps({
@@ -264,7 +264,7 @@ def test_d_host_project():
         t2 = out2.getvalue()
         check("D3 existing entry reports library", "library=/lib/expected" in t2, t2[:400])
 
-        # 事故的**直接检测点**：同目录里有一份宿主不读的配置
+        # The incident's **direct detection point**: a config in the same directory that the host does not read
         (ws / ".mcp.json").write_text(json.dumps(
             {"mcpServers": {"hippocampus": {"command": "python"}}}),
             encoding="utf-8")
@@ -272,10 +272,10 @@ def test_d_host_project():
         with redirect_stdout(out3):
             cli._doctor_host_project("zcode", ws)
         t3 = out3.getvalue()
-        check("D4 点名「存在但 ZCode 不读」",
+        check("D4 names the 'exists but ZCode does not read it' state",
               "does not read it" in t3 and ".mcp.json" in t3, t3[:400])
 
-        # 配置坏了：不能崩，要给结论
+        # Broken config: must not crash, must still give a verdict
         (cfgdir / "config.json").write_text("{ 这不是 JSON", encoding="utf-8")
         out4 = io.StringIO()
         try:
@@ -284,9 +284,9 @@ def test_d_host_project():
             check("D5 bad config gets verdict without crashing", "is not valid JSON" in out4.getvalue(),
                   out4.getvalue()[:400])
         except Exception as exc:  # noqa: BLE001
-            check("D5 坏配置给结论不崩", False, f"{type(exc).__name__}: {exc}")
+            check("D5 broken config gives a verdict without crashing", False, f"{type(exc).__name__}: {exc}")
 
-        # 有条目但不是我们这条
+        # An entry exists but it is not ours
         (cfgdir / "config.json").write_text(json.dumps(
             {"mcp": {"servers": {"other": {}}}}), encoding="utf-8")
         out5 = io.StringIO()
@@ -295,20 +295,20 @@ def test_d_host_project():
         check("D6 no our-entry is not wired up", "not wired up" in out5.getvalue(),
               out5.getvalue()[:400])
 
-        # 负对照：三种状态必须给出三种**不同**的结论
+        # Negative control: the states must produce **distinct** verdicts
         v_missing = cli._entry_verdict(ws / "nope.json", cli._HOSTS["zcode"])
         v_broken = cli._entry_verdict(cfgdir / "config.json",
                                       cli._HOSTS["zcode"])
-        check("D7 负对照：缺失/无条目/坏配置结论互不相同",
+        check("D7 negative control: missing/no-entry/broken verdicts all differ",
               len({v_missing, v_broken}) == 2, f"{v_missing} | {v_broken}")
     finally:
         cli.user_config_path = real_user_path
 
 
 # ======================================================================
-# E 组：setup 写后即验（真子进程握手）
+# E group: setup verify-after-write (real subprocess handshake)
 # ======================================================================
-#: 假 MCP server：读一行 → 回一行（只验握手链路，不加载任何模型）
+#: Fake MCP server: read one line -> reply one line (verifies only the handshake, loads no models)
 _FAKE_SRV = r"""
 import json, sys
 sys.stdin.readline()
@@ -334,7 +334,7 @@ def test_e_verify():
     py = sys.executable
     ok, detail = cli._verify_entry(
         _entry(py, ["-c", _FAKE_SRV]), timeout=20.0)
-    check("E1 握手成功", ok is True, detail)
+    check("E1 handshake succeeds", ok is True, detail)
     check("E2 success detail includes tool count", "2 tools visible" in detail, detail)
 
     ok2, d2 = cli._verify_entry(
@@ -343,18 +343,18 @@ def test_e_verify():
     check("E3 process cannot start includes reason", ok2 is False and "Cannot start process" in d2, d2)
 
     ok3, d3 = cli._verify_entry(_entry(py, ["-c", _FAKE_SILENT]), timeout=20.0)
-    check("E4 子进程提前退出 → 失败带原因",
+    check("E4 subprocess exits early -> failure carries the reason",
           ok3 is False and "before completing handshake" in d3, d3)
 
     ok4, d4 = cli._verify_entry(_entry(py, ["-c", _FAKE_ERR]), timeout=20.0)
     check("E5 error response includes reason", ok4 is False and "returned error" in d4, d4)
 
-    # 负对照：握手通了但 0 个工具 —— 不能算"验证通过"静默过去
+    # Negative control: handshake OK but 0 tools — must not silently pass as "verified"
     ok5, d5 = cli._verify_entry(
         _entry(py, ["-c", _FAKE_SRV], env={"FAKE_TOOLS": "0"}), timeout=20.0)
     check("E6 negative control names zero tools", ok5 is True and "0 tools" in d5, d5)
 
-    # setup 出口：验证失败必须退非 0（不能"写进去了就当成功"）
+    # setup exit: verification failure must exit non-zero (no "written so it worked")
     ws = tmpdir()
     cfg = os.path.join(ws, "cfg.json")
     real_verify, calls = cli._verify_entry, []
@@ -362,33 +362,33 @@ def test_e_verify():
     try:
         rc, out, _err = run_cli(["setup", "--host", "zcode", "--workspace", ws,
                                  "--file", cfg])
-        check("E7 写后即验失败 → setup 退非 0", rc == 1, str(rc))
+        check("E7 verify-after-write fails -> setup exits non-zero", rc == 1, str(rc))
         check("E8 failure is reported on stdout", "handshake verification failed" in out, out[-300:])
-        check("E9 验证确实被调用了一次", len(calls) == 1, str(calls))
+        check("E9 verification was actually called once", len(calls) == 1, str(calls))
     finally:
         cli._verify_entry = real_verify
 
-    # --no-verify 必须真的跳过（关得掉是纪律）
+    # --no-verify must really skip (being switchable is the discipline)
     calls2: list[object] = []
     cli._verify_entry = lambda *a, **k: (calls2.append(a), (True, "ok"))[1]
     try:
         rc2, _o2, _e2 = run_cli(["setup", "--host", "zcode", "--workspace", ws,
                                  "--file", cfg, "--no-verify"])
-        check("E10 --no-verify 跳过验证且仍成功", rc2 == 0 and not calls2,
+        check("E10 --no-verify skips verification and still succeeds", rc2 == 0 and not calls2,
               f"rc={rc2} calls={calls2}")
     finally:
         cli._verify_entry = real_verify
 
-    # 负对照：真跑一次（E1 用的假脚本确实是子进程、不是 mock 兜底）
+    # Negative control: run it for real (E1's fake script is a genuine subprocess, not a mock fallback)
     p = subprocess.run([py, "-c", _FAKE_SRV], input='{"id":1}\n{"x"}\n{"id":2}\n',
                        capture_output=True, text=True, timeout=30)
-    check("E11 负对照：假 server 本身可用（真进程）",
+    check("E11 negative control: fake server works on its own (real process)",
           p.returncode == 0 and '"id": 2' in (p.stdout or ""),
           f"rc={p.returncode} out={p.stdout[:120]}")
 
 
 # ======================================================================
-# F 组：launcher 启动前自检（库目录可写性 fail-fast）
+# F group: launcher preflight (library-dir writability fail-fast)
 # ======================================================================
 def test_f_preflight():
     old = os.environ.get(L.ENV_PERSIST)
@@ -397,8 +397,8 @@ def test_f_preflight():
         err = io.StringIO()
         with redirect_stderr(err):
             rc = L.preflight_persist_dir()
-        check("F1 未设库目录 → 放行", rc is None, str(rc))
-        check("F2 未设时要自曝（串库从不报错）",
+        check("F1 library dir unset -> pass through", rc is None, str(rc))
+        check("F2 self-reports when unset (a cross-library leak never errors)",
               "not set" in err.getvalue() and "doctor" in err.getvalue(),
               err.getvalue()[:200])
 
@@ -407,13 +407,13 @@ def test_f_preflight():
         err2 = io.StringIO()
         with redirect_stderr(err2):
             rc2 = L.preflight_persist_dir()
-        check("F3 可写目录 → 放行", rc2 is None, str(rc2))
-        check("F4 探测件不残留",
+        check("F3 writable dir -> pass through", rc2 is None, str(rc2))
+        check("F4 probe file leaves no residue",
               not os.path.exists(os.path.join(ws, ".hippo-write-probe")),
               str(os.listdir(ws)))
 
-        # 不可写：拿一个已存在的**文件**当目录名（比权限手法更确定，
-        # 管理员模式下"只读目录"未必真的写不进）
+        # Unwritable: use an existing **file** as the directory name (more reliable than
+        # permission tricks — under admin, "read-only directories" may still be writable)
         blocker = os.path.join(tmpdir(), "i-am-a-file")
         Path(blocker).write_text("x", encoding="utf-8")
         os.environ[L.ENV_PERSIST] = blocker
@@ -421,11 +421,11 @@ def test_f_preflight():
         with redirect_stderr(err3):
             rc3 = L.preflight_persist_dir()
         e3 = err3.getvalue()
-        check("F5 不可写 → 拒绝启动", rc3 == 2, str(rc3))
-        check("F6 拒绝要带原因与修复指引",
+        check("F5 unwritable -> refuse to start", rc3 == 2, str(rc3))
+        check("F6 refusal carries a reason and fix guidance",
               "refusing to start" in e3 and L.ENV_PERSIST in e3, e3[:300])
-        # 负对照：返回值不能用 falsy 判 —— 0 是"成功启动"，语义相反
-        check("F7 负对照：放行是 None 而非 0",
+        # Negative control: the return value must not be judged by falsiness — 0 means "started successfully", the opposite
+        check("F7 negative control: pass-through is None, not 0",
               rc2 is None and rc3 != 0 and bool(rc3) is True,
               f"ok={rc2!r} fail={rc3!r}")
     finally:
@@ -436,7 +436,7 @@ def test_f_preflight():
 
 
 # ======================================================================
-# G 组：doctor 自曝（本次查的是哪个库 / 配置来自哪个文件）
+# G group: doctor self-report (which library this run checks / which file each config comes from)
 # ======================================================================
 def test_g_doctor_selfreport():
     real_user_path = cli.user_config_path
@@ -448,85 +448,85 @@ def test_g_doctor_selfreport():
     cli.user_config_path = lambda host: upath if host == "workbuddy" else None
     try:
         rc, out, _err = run_cli(["doctor"], env={"HIPPOCAMPUS_PERSIST_DIR": None})
-        check("G1 doctor 退出码 0", rc == 0, str(rc))
-        check("G2 裸跑时自曝「查的是默认库」",
+        check("G1 doctor exit code 0", rc == 0, str(rc))
+        check("G2 bare run self-reports 'this checks the default library'",
               "default library" in out and "not a library from any host config" in out, out[:600])
         check("G3 default model is self-reported",
               "this checks the default model" in out, out[:600])
 
         rc2, out2, _e2 = run_cli(
             ["doctor"], env={"HIPPOCAMPUS_PERSIST_DIR": "/lib/explicit"})
-        check("G4 设了库就不再自曝默认库",
+        check("G4 with a library set, no default-library self-report",
               "不是任何宿主配置里的库" not in out2, out2[:600])
-        # 负对照：自曝只跟 env 有关，跟配置内容无关
-        check("G5 负对照：自曝由 env 触发（G2/G4 结论相反）",
+        # Negative control: the self-report follows env only, not config content
+        check("G5 negative control: self-report driven by env (G2/G4 outcomes opposite)",
               ("not a library from any host config" in out)
               != ("not a library from any host config" in out2), "self-report did not follow env")
 
-        # 库矩阵每行必须带配置文件路径 —— 看出问题后下一步永远是"改哪个文件"
-        check("G6 库矩阵每行带配置来源路径",
+        # Every library-matrix row must carry its config file path — after spotting a problem the next step is always "which file to fix"
+        check("G6 library-matrix rows carry the config source path",
               f"<{upath}>" in out2 and "library=/lib/from-user" in out2, out2[-600:])
     finally:
         cli.user_config_path = real_user_path
 
 
 # ======================================================================
-# I 组：doctor 盘符 / 体积体检（实测反馈 2026-10-31，relocate 场景在
-# 体检输出里说清楚——刻意没有 relocate 命令）
+# I group: doctor drive-letter / size check (field feedback 2026-10-31; the
+# relocate scenario is spelled out in the check output — deliberately no relocate command)
 # ======================================================================
 _GB = 1024 ** 3
 
 
 def test_i_disk_hint():
-    # 本组测的是 Windows 盘符语义（C:\ ↔ c:）。Linux 的 os.path.splitdrive
-    # 恒返回空盘符，纯函数拿不到 drive 就一律返回 None —— 不是代码退化，
-    # 是平台没有这个概念（CI 上 I2/I3/I4 假红即由此而来）。
-    # 非 Windows 时临时把 splitdrive 换成 ntpath 语义，让这 5 条断言在
-    # Linux runner 上仍保有完整判别力；生产代码一行不动。
+    # This group tests Windows drive-letter semantics (C:\ vs c:). Linux's
+    # os.path.splitdrive always returns an empty drive, so the pure function returns
+    # None without a drive — not a code regression, the platform lacks the concept
+    # (the source of CI's false failures on I2/I3/I4). Non-Windows: temporarily swap
+    # splitdrive to ntpath semantics so the 5 assertions stay sharp on Linux; production code untouched.
     _drive_ctx = (mock.patch.object(os.path, "splitdrive", ntpath.splitdrive)
                   if os.name != "nt" else nullcontext())
     with _drive_ctx:
-        check("I1 非系统盘 → 不叨叨",
+        check("I1 non-system drive -> no nagging",
               cli._system_disk_migration_hint(Path("D:/libs/user"), 5 * _GB,
                                               "C:\\") is None)
-        check("I2 系统盘 + 小体积 → 一行「暂不必迁」",
+        check("I2 system drive + small size -> one-line 'no move needed yet'",
               (h := cli._system_disk_migration_hint(Path("C:/libs/user"),
                                                     0.3 * _GB, "C:\\")) is not None
               and "no move needed yet" in h and "Migration steps" not in h, str(h)[:200])
         big = cli._system_disk_migration_hint(Path("C:/libs/user"), 2.4 * _GB,
                                               "C:\\")
-        check("I3 系统盘 + 大体积 → 迁移三步 + 指路 env 与验证命令",
+        check("I3 system drive + large size -> three migration steps + env and verify command pointers",
               big is not None and "⚠" in big and "Migration steps" in big
               and "HIPPOCAMPUS_PERSIST_DIR" in big
               and "library_whoami" in big, str(big)[:200])
-        check("I4 盘符大小写不敏感",
+        check("I4 drive-letter case-insensitive",
               cli._system_disk_migration_hint(Path("c:/libs/user"), 2 * _GB,
                                               "C:\\") is not None)
-        check("I5 system_drive 空 → 判不了不告警",
+        check("I5 empty system_drive -> undecidable, no warning",
               cli._system_disk_migration_hint(Path("C:/libs/user"), 2 * _GB,
                                               "") is None)
 
 
 # ======================================================================
-# H 组：ZCode 用户级配置路径（2026-10-30 盲区事故的回归钉）
+# H group: ZCode user-level config path (regression pin for the 2026-10-30 blind-spot incident)
 # ======================================================================
 def test_h_zcode_user_config_path():
-    """user_config_path("zcode") 必须指向 ~/.zcode/cli/config.json。
+    """user_config_path("zcode") must point at ~/.zcode/cli/config.json.
 
-    背景是一次真实事故：ZCode 升级把用户级配置从 ~/.zcode/config.json 迁到
-    cli/ 子目录，而本函数当时对 zcode 返回 None——doctor/sync 看不见用户级
-    配置，9-28 补在旧位置的条目升级后丢失也无人能体检出来（接入迁移设计
-    文档 §一）。本组钉住：路径映射存在、且 doctor 的宿主库对账真能读到它。
+    Background: a real incident where a ZCode upgrade moved the user-level config from
+    ~/.zcode/config.json into cli/ while this function returned None for zcode — doctor/sync
+    went blind to it and 9-28 entries re-added at the old spot were lost undetected (migration
+    design doc §1). Pinned: the mapping exists and doctor's host-library reconciliation reads it.
     """
     got = cli.user_config_path("zcode")
-    check("H1 zcode 用户级路径 = ~/.zcode/cli/config.json",
+    check("H1 zcode user-level path = ~/.zcode/cli/config.json",
           got is not None
           and got.parts[-3:] == (".zcode", "cli", "config.json"),
           str(got))
-    # 负对照：未知宿主仍返回 None（没有的路径不许瞎编）
-    check("H2 未知宿主返回 None", cli.user_config_path("nonexistent") is None,
+    # Negative control: unknown host still returns None (no inventing paths that do not exist)
+    check("H2 unknown host returns None", cli.user_config_path("nonexistent") is None,
           str(cli.user_config_path("nonexistent")))
-    # 端到端：临时家目录里放一份用户级配置，doctor 的宿主库对账必须看到
+    # End-to-end: put a user-level config in a temp home; doctor's host-library reconciliation must see it
     real_home = Path.home
     fake_home = Path(tmpdir())
     (fake_home / ".zcode" / "cli").mkdir(parents=True)
@@ -537,14 +537,14 @@ def test_h_zcode_user_config_path():
         encoding="utf-8")
     Path.home = lambda: fake_home
     try:
-        # 键形一致性：_HOSTS["zcode"] 的 key_path 必须能从用户级文件里
-        # 真的挖出我们的条目（路径对 + 键形对，才是完整可发现）
+        # Key-shape consistency: _HOSTS["zcode"]'s key_path must really dig our entry
+        # out of the user-level file (right path + right key shape = fully discoverable)
         upath = cli.user_config_path("zcode")
-        check("H3 用户级文件存在", upath.is_file(), str(upath))
+        check("H3 user-level file exists", upath.is_file(), str(upath))
         cfg, err = cli.hc.load_json_config(upath)
         container = cli._dig(cfg or {}, cli._HOSTS["zcode"]["key_path"])
         entry = (container or {}).get("hippocampus")
-        check("H4 键形 (mcp,servers) 可解析出我方条目",
+        check("H4 key shape (mcp,servers) resolves our entry",
               not err and isinstance(entry, dict)
               and entry.get("env", {}).get("HIPPOCAMPUS_PERSIST_DIR") == "/lib/user-level",
               f"err={err} entry={str(entry)[:200]}")

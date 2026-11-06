@@ -1,27 +1,40 @@
-"""地图自动巡检族：auto verify + mention drift。
+"""Map auto-patrol family: auto verify + mention drift.
 
-从 ``brain.core`` 整搬两件（与 :meth:`map_verify` 的签名级比对分工：
-C1/C2 读真相源，mention 读记忆正文——弱信号写独立的 ``ent["mention"]``
-不覆盖 ``ent["drift"]``）。G1：map 包能力全部由壳**调用时现取**注入
-（``auto_run`` / ``auto_needs_registry`` / ``needs_run_fn`` / ``run_fn``
-/ ``registry_load`` / ``update_fn`` 回调，``busy_exc`` 异常类按值传，
-config 三旋钮在壳上调用时现取按值传）；``records_fn`` 是惰性回调——
-mention 的记录快照只在锁内、过了间隔门控之后才物化（快照一份防
-并发 ingest 的 "list changed during iteration"）。
+Moved wholesale from ``brain.core`` (division of labor with
+:meth:`map_verify`'s signature-level comparison: C1/C2 read the source
+of truth, mention reads memory text -- weak signals write a separate
+``ent["mention"]`` without overwriting ``ent["drift"]``). G1: all map
+capabilities are injected by the shell, **fetched live at call time**
+(the ``auto_run`` / ``auto_needs_registry`` / ``needs_run_fn`` /
+``run_fn`` / ``registry_load`` / ``update_fn`` callbacks, the
+``busy_exc`` exception class passed by value, the three config knobs
+fetched live on the shell and passed by value); ``records_fn`` is a lazy
+callback -- mention's record snapshot is materialized only inside the
+lock and after the interval gate (one snapshot guards against
+concurrent ingest's "list changed during iteration").
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (changing any one is a behavior change;
+parity will catch it):
 
-  * 三条运行时纪律两件共有：间隔门控（默认 6h，**锁内重判**——门控与
-    run 同临界区重读最新时钟，防两会话各跑一遍互相覆盖；``force`` 或
-    interval<=0 跳过门控）、best-effort 落盘（SidecarBusy→skipped:busy、
-    OSError→save_failed、其余异常→error 自曝，巡检可再生不炸开场）、
-    侧车不存在（update 返回 None）→ enabled=False 未启用；
-  * auto：一次读盘两用（建档 root 是 C1 解析根、files 是 C2 对账源）；
-    ``needs_registry`` 为假不传 registry（零重复 IO）；**只有真有 auto
-    配方的库才推进 ``auto_checked_at``**（返回 ``bool(res.get("maps"))``
-    作为是否保存的判据——没配方的库零写盘）；
-  * mention：``needs_run`` 为假直接 skipped:no_maps（不门控不推进时钟）；
-    推进 ``mention_checked_at`` 无条件（与 auto 的条件推进刻意不同）。
+  * three runtime disciplines shared by both: interval gate (default 6h,
+    **re-judged inside the lock** -- the gate re-reads the latest clock
+    in the same critical section as run, preventing two sessions from
+    each running once and overwriting each other; ``force`` or
+    interval<=0 skips the gate), best-effort persist to disk
+    (SidecarBusy→skipped:busy, OSError→save_failed, other exceptions→
+    error self-report; patrol can regenerate and never blows up the
+    opening), sidecar absent (update returns None) → enabled=False not
+    enabled;
+  * auto: one disk read serves two purposes (registry root is C1's
+    resolved root, files is C2's reconciliation source); a false
+    ``needs_registry`` passes no registry (zero duplicate IO); **only
+    libraries that really have an auto recipe advance
+    ``auto_checked_at``** (``bool(res.get("maps"))`` returned as the
+    save criterion -- recipe-less libraries write zero bytes);
+  * mention: a false ``needs_run`` returns skipped:no_maps directly (no
+    gating, no clock advance); advancing ``mention_checked_at`` is
+    unconditional (deliberately different from auto's conditional
+    advance).
 """
 from __future__ import annotations
 
@@ -35,7 +48,7 @@ def auto_verify(
     auto_needs_registry: Callable[[dict], bool],
     update_fn: Callable[..., Any], busy_exc: type,
 ) -> dict[str, Any]:
-    """C 期：按信号自动 verify——C1 值级 / C2 目录对账（图级 ``auto`` 配方）。"""
+    """Phase C: signal-driven auto verify -- C1 value-level / C2 directory reconciliation (map-level ``auto`` recipe)."""
     if not enabled:
         return {"enabled": False, "reason": "env 关闭"}
 
@@ -48,9 +61,11 @@ def auto_verify(
                 return False, {"skipped": "interval", "last_run": last,
                                "next_in_s": int(interval_h * 3600 -
                                                 elapsed)}
-        # 一次读盘两用：建档 root 是 C1 的解析根，建档 files 是 C2 的
-        # 对账数据源（C2 零重复 IO 全靠它）。没有 dir_reconcile 配方时
-        # 不读 files 之外的东西——也没有第二次读。
+        # One disk read serves two purposes: the registry root is C1's
+        # resolved root; the registry files are C2's reconciliation data
+        # source (C2's zero duplicate IO depends entirely on it). Without
+        # a dir_reconcile recipe, nothing beyond files is read -- and
+        # there is no second read either.
         reg = registry_load(persist_dir)
         res = auto_run(
             data, registry_root=(reg or {}).get("root") or None,
@@ -58,7 +73,7 @@ def auto_verify(
             force=force, now=now,
             registry=(reg if (reg and auto_needs_registry(data))
                       else None))
-        # 只有真有 auto 配方的库才推进巡检时钟（没配方的库零写盘）
+        # Only libraries that really have an auto recipe advance the patrol clock (recipe-less libraries write zero bytes)
         data["auto_checked_at"] = now
         return bool(res.get("maps")), res
 
@@ -68,7 +83,7 @@ def auto_verify(
         return {"enabled": True, "skipped": "busy"}
     except OSError:
         return {"enabled": True, "save_failed": True}
-    except Exception as exc:  # noqa: BLE001 —— 自动 verify 不炸开场
+    except Exception as exc:  # noqa: BLE001 -- auto verify must not blow up the opening
         return {"enabled": True,
                 "error": "%s: %s" % (type(exc).__name__, exc)}
     if res is None:
@@ -84,7 +99,7 @@ def mention_drift(
     run_fn: Callable[..., Any], records_fn: Callable[[], list],
     update_fn: Callable[..., Any], busy_exc: type,
 ) -> dict[str, Any]:
-    """闸三：更新后被提到「另一个状态」⇒ 条可疑过期（写 ``ent["mention"]``）。"""
+    """Gate three: mentioned as 「another state」 after an update ⇒ the entry is possibly stale (writes ``ent["mention"]``)."""
     if not enabled:
         return {"enabled": False, "reason": "env 关闭"}
 
@@ -100,9 +115,10 @@ def mention_drift(
                                "next_in_s": int(interval_h * 3600 -
                                                 elapsed)}
         res = run_fn(
-            # 快照一份：同进程若另一线程正在 ingest，直接迭代活列表会
-            # 撞 "list changed size during iteration"（references 拷贝，
-            # 不复制记录本体，代价可忽略）
+            # Snapshot once: if another thread in the same process is
+            # mid-ingest, iterating the live list directly hits "list
+            # changed size during iteration" (references copied; the
+            # record bodies are not duplicated, negligible cost)
             data, records_fn(), now=now,
             budget_s=budget_s,
             max_records=max_records)
@@ -115,7 +131,7 @@ def mention_drift(
         return {"enabled": True, "skipped": "busy"}
     except OSError:
         return {"enabled": True, "save_failed": True}
-    except Exception as exc:  # noqa: BLE001 —— 巡检不炸开场
+    except Exception as exc:  # noqa: BLE001 -- patrol must not blow up the opening
         return {"enabled": True,
                 "error": "%s: %s" % (type(exc).__name__, exc)}
     if res is None:

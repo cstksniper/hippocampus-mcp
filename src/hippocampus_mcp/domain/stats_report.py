@@ -1,31 +1,37 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.stats`` 的回显体组装（从 core 抽取）。
+"""Assembly of the ``brain.core.stats`` echo body (extracted from core).
 
-**为什么值得搬**：``stats`` 是宿主必调的自查入口，除两个副作用
-调用（词库热感知 / 写者心跳）与已抽出的六个投影外，剩余的 return
-大字典约 120 行、45 键、每键带设计 rationale 注释——纯「键序敏感回显体
-组装」，与 knowledge_map_view 的 assemble_report 完全同型。
+**Why this is worth moving**: ``stats`` is the self-inspection entry point every host
+must call; besides two side-effect calls (lexicon heat sensing / writer heartbeat) and
+the six projections already extracted, the remaining return dict is ~120 lines,
+45 keys, each key carrying a design-rationale comment — pure "key-order-sensitive echo
+body assembly", exactly the same shape as knowledge_map_view's assemble_report.
 
-**依赖方向**：本模块零 import——所有值由壳算好传入：``tag_coverage`` /
+**Dependency direction**: this module has zero imports — all values are computed by the
+shell and passed in: brain-side capabilities such as ``tag_coverage`` /
 ``_recall_feedback_stats`` / ``_pin_stats`` / ``knowledge_stats`` /
 ``lexical_self_report`` / ``save_ledger_view`` / ``entity_origin_stats`` /
-``tag_extractor.describe`` 等 brain 侧能力按值注入；``load_config`` 的两个
-开关（layer_del / source_sig）与六个投影（state_counts / dangling_report
-/ daily_activity / source_sig_block / writers_block / forgotten_count）也由
-壳现取（不变式：六调用在壳内各恰一次）。
+``tag_extractor.describe`` are injected by value; the two ``load_config`` switches
+(layer_del / source_sig) and the six projections (state_counts / dangling_report
+/ daily_activity / source_sig_block / writers_block / forgotten_count) are also
+fetched fresh by the shell (invariant: each of the six calls happens exactly once in
+the shell).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (changing any one is a behavior change; parity will catch it)**:
 
-1. 45 键固定序（键序即信号——JSON 回显保序，宿主与测试都按序取用）；
-2. ``layer_del`` 是嵌套子字典：四个标量在组装位现拼，键序 enabled /
-   tombstones_n / blocked_last / gc_last；
-3. ``source_sig`` 是 enabled 在前 + ``**block``（键序 = enabled /
-   recorded / referenced，顺序即信号）；
-4. ``vectors_by_model`` 从注入的 model_stats 投影 ``v["vectors"]``；
-5. ``embedder_model_source`` 的「n/a（该后端不经模型名解析）」兜底文案是
-   契约值（计算留在壳：test_runtime_selfreport C1 按**行为**钉「不谎报
-   unknown」；test_f6 F3 按源码含 ``"embedder_shared"`` 字面量钉
-   共享嵌入器键——该键的计算同样留在壳里，注释锚点随行）。
+1. Fixed order of the 45 keys (key order is signal — the JSON echo preserves order, and
+   host and tests consume it in order);
+2. ``layer_del`` is a nested sub-dict: the four scalars are joined in place at the
+   assembly site, key order enabled / tombstones_n / blocked_last / gc_last;
+3. ``source_sig`` is enabled first + ``**block`` (key order = enabled /
+   recorded / referenced; order is signal);
+4. ``vectors_by_model`` projects ``v["vectors"]`` from the injected model_stats;
+5. The fallback copy of ``embedder_model_source``, 「n/a（该后端不经模型名解析）」,
+   is a contract value (the computation stays in the shell: test_runtime_selfreport C1
+   pins by **behavior** that unknown is not lied about; test_f6 F3 pins the
+   shared-embedder key by the source containing the ``"embedder_shared"`` literal —
+   that key's computation likewise stays in the shell, with the comment anchors moved
+   along with it).
 """
 from __future__ import annotations
 
@@ -54,27 +60,33 @@ def assemble_report(
     entity_origins: dict[str, Any], sources: int,
     save_ledger: dict[str, Any], l0_pending: int,
 ) -> dict[str, Any]:
-    """组装 stats 回显体（45 键固定序，键序即信号）。
+    """Assemble the stats echo body (fixed order of 45 keys; key order is signal).
 
-    壳按旧 dict 字面量的求值序传参（kwargs 自左向右求值），本函数只做
-    组装：四个标量现拼 ``layer_del`` 嵌套字典、enabled + ``**block`` 拼
-    ``source_sig``、从 model_stats 投影 ``vectors_by_model``，其余逐键
-    原样落位——每键上方的 rationale 注释随键转移，一字未删。
+    The shell passes arguments in the evaluation order of the old dict literal (kwargs
+    evaluate left to right); this function only assembles: the four scalars are joined
+    into the nested ``layer_del`` dict, enabled + ``**block`` into ``source_sig``,
+    ``vectors_by_model`` is projected from model_stats, and the rest land key by key
+    as-is — the rationale comment above each key moved here with the key, not a word
+    deleted.
     """
     return {
         "L0_raw": l0_raw,
         "L1_memories": l1_memories,
-        # 标签覆盖率 / 键分布：B1「按域查得到东西」的前提自曝
+        # Tag coverage / key distribution: the self-report prerequisite of B1 "finding
+        # things by domain"
         "tags": tags,
-        # 被 L1 引用却不在 L0 里的 id 数 / 受影响的 L1 条数。正常应为 0。
+        # Number of ids referenced by L1 yet absent from L0 / the number of affected L1
+        # entries. Normally 0.
         "l0_dangling_source_ids": l0_dangling_source_ids,
         "l0_dangling_memories": l0_dangling_memories,
         "daily_activity": daily_activity,
         "L1_by_state": l1_by_state,
-        # 召回反馈覆盖率。**自曝而非回填** —— 覆盖率低时
-        # 「多久没被用过」这类归档结论会失真，这里让宿主看得见。
+        # Recall-feedback coverage. **Self-report rather than backfill** — when coverage
+        # is low, archival conclusions like "how long since last used" become distorted;
+        # this makes it visible to the host.
         "recall_feedback": recall_feedback,
-        # pin 只进不退，堆积到一定比例会挤掉用层动态位
+        # pins only enter, never leave; once they pile up past a certain ratio they will
+        # crowd out the usage layer's dynamic slots
         "pin_stats": pin_stats,
         "L2_summaries": l2_summaries,
         "topic_layer": topic_layer,
@@ -82,95 +94,116 @@ def assemble_report(
         "entities": entities,
         "sessions": sessions,
         "open_intents": open_intents,
-        # 最近一次保存时从磁盘并回来的条数（按层）。
-        # 非 0 说明确实有别的写者在动这个库。
+        # Number of entries merged back from disk at the last save (per layer).
+        # Non-zero means another writer really is touching this library.
         "layer_merge_last": layer_merge_last,
-        # 删除账本自曝。
-        # tombstones_n = 这张账本上还立着多少碑；blocked_last = 上次保存
-        # 拦下了几条迟到的旧条目（>0 = 真的有人在拿旧快照复活东西）。
-        # "拦截生效没有"必须有数字，不能靠"我觉得应该生效了"。
+        # Deletion-ledger self-report.
+        # tombstones_n = how many tombstones still stand on this ledger; blocked_last =
+        # how many late stale entries the last save intercepted (>0 = someone really is
+        # reviving things from an old snapshot).
+        # "Did interception take effect" must have a number; it cannot rest on
+        # "I think it should have worked".
         "layer_del": {
             "enabled": layer_del_enabled,
             "tombstones_n": layer_del_tombstones_n,
             "blocked_last": layer_del_blocked_last,
             "gc_last": layer_del_gc_last,
         },
-        # 源签名层自曝。recorded=采集过签名的 source 数；
-        # referenced=库里有记忆带 source 标签的去重数。两者之差就是
-        # drift_audit 里 unbaselined/orphan 的池子——"采集覆盖率"
-        #必须看得见，否则"没漂移"和"没采集"分不开。
+        # Source-signature layer self-report. recorded = number of sources whose signature
+        # has been collected; referenced = deduplicated count of memories in the library
+        # carrying a source tag. The difference between the two is the pool of
+        # unbaselined/orphan in drift_audit — the "collection coverage"
+        #must be visible, otherwise "no drift" and "not collected" cannot be told apart.
         "source_sig": {
-            # 键序 = 旧实现的 enabled/recorded/referenced（顺序即信号）
+            # key order = the old implementation's enabled/recorded/referenced (order is signal)
             "enabled": source_sig_enabled,
             **source_sig_block,
         },
-        # 共库写者可见化。active>1 说明真有人在跟你抢这个库。
+        # Making co-library writers visible. active>1 means someone really is contending
+        # with you for this library.
         "writers": writers,
         "open_topics": open_topics,
         "pinned": pinned,
         "tombstones": tombstones,
         "raw_forgotten": raw_forgotten,
         "embed_model": embed_model,
-        # ---- 运行期自述：让用户能核对"实际生效的是什么"，而不是靠猜 ----
-        # 嵌入器后端（sentence_transformer / hash / …）。hash 后端是零依赖
-        # 快速验证路径，语义能力弱——跑评测时不该悄悄落在它上面。
+        # ---- Runtime self-description: lets the user verify "what is actually in effect"
+        # instead of guessing ----
+        # Embedder backend (sentence_transformer / hash / …). The hash backend is the
+        # zero-dependency quick-verification path with weak semantic capability — running
+        # benchmarks should not silently land on it.
         "embedder_backend": embedder_backend,
-        # **实际**推理后端（onnx / torch / hash）。与上一行的区别：
-        # 上一行是"配了什么"，这一行是"用什么在跑"。产物缺失时 ONNX 会
-        # 静默回退 torch，只看配置永远发现不了（真库实测）。
+        # The **actual** inference backend (onnx / torch / hash). Difference from the line
+        # above: the line above is "what is configured", this one is "what is actually
+        # running". When artifacts are missing, ONNX silently falls back to torch; looking
+        # only at the config will never reveal it (verified on a real library).
         "embedder_runtime": embedder_runtime,
-        # onnx 有两种形态（ST 包装器挂 _onnx / embedder 本身是
-        # OnnxEmbedder 直构），统一以 manager 的 runtime 判定为准；
-        # lnn_runtime 自曝 CfC 实际运行时（numpy=零 torch）。
+        # onnx comes in two forms (an ST wrapper holding _onnx / the embedder itself being
+        # a directly constructed OnnxEmbedder); the manager's runtime is the single arbiter;
+        # lnn_runtime self-reports the CfC actual runtime (numpy = zero torch).
         "onnx_attached": onnx_attached,
         "lnn_runtime": lnn_runtime,
-        # 会话分路自曝：还有会话未收尾时为 True（全局巩固推迟中）
+        # Session-split self-report: True while some sessions have not been closed out
+        # (global consolidation deferred)
         "pending_consolidate": pending_consolidate,
-        # 实际向量维度（由模型决定，不是构造参数）
+        # Actual vector dimension (decided by the model, not a constructor parameter)
         "embedding_dim": embedding_dim,
-        # 模型名的**来源**：参数 / env / 默认。这是"静默回落 MiniLM"那类
-        # 事故的唯一探测器——来源是 default 且用户以为配了中文模型时，
-        # 看这里一眼就能发现。
-        # 取不到时说明该后端不经模型名解析（如 hash），此时"来源"没有意义，
-        # 明确写出来，别让 unknown 被误读成"解析失败了"。
+        # The **source** of the model name: parameter / env / default. This is the only
+        # detector for incidents like "silently falling back to MiniLM" — when the source
+        # is default and the user believed a Chinese model was configured, one glance here
+        # reveals it.
+        # When it cannot be obtained, the backend does not resolve via a model name (e.g.
+        # hash); in that case "source" is meaningless — write that out explicitly, and do
+        # not let unknown be misread as "resolution failed".
         "embedder_model_source": embedder_model_source,
-        # 嵌入器共享自曝：本库的嵌入器是否复用了进程内共享的那份重对象。
-        # 双库同模型时第二库应为 True；为 False 说明它自己又装了一份权重。
+        # Embedder-sharing self-report: whether this library's embedder reuses the shared
+        # in-process heavy object. With two libraries on the same model the second library
+        # should be True; False means it loaded its own copy of the weights.
         "embedder_shared": embedder_shared,
-        # 进程级共享池现状：onnx_size / torch_size 各几份。双库同模型时
-        # 这里应当是 1；看到 2 就说明第二库又装了一份权重。
+        # Current state of the process-level shared pool: how many copies of onnx_size /
+        # torch_size each. With two libraries on the same model this should be 1; seeing 2
+        # means the second library loaded another copy of the weights.
         "embedder_pool": embedder_pool,
-        # 英文实体抽取后端。spaCy 装不上时这里会带上失败原因，
-        # 不会只显示一句 heuristic-only 让人以为是设计如此。
-        # 用**无副作用**版——启动日志走 stats()，若这里用 ner_backend
-        # 会把 spaCy→thinc→torch（+160MB 常驻）在启动时强行拉进进程。
+        # English entity-extraction backend. When spaCy cannot be installed, this carries
+        # the failure reason instead of showing only "heuristic-only" and making people
+        # think it is by design. Uses the **side-effect-free** version — the startup log
+        # goes through stats(); if this used ner_backend it would force
+        # spaCy→thinc→torch (+160MB resident) into the process at startup.
         "ner_backend": ner_backend,
-        # ---- 字面通道自曝（字面通道优化的验收口）----
-        # 「sqlite+FTS5 ⇒ 不建内存 BM25 ⇒ 省 34.5MB」这一优化必须有生产侧
-        # 观测入口，否则「到底省没省」只能靠猜。这一节把后端、FTS5 可用性、
-        # 内存索引条数、上次走的路一次给全。
+        # ---- Literal-channel self-report (the acceptance point of the literal-channel
+        # optimization) ----
+        # The "sqlite+FTS5 ⇒ no in-memory BM25 ⇒ saves 34.5MB" optimization must have a
+        # production-side observation entry point, otherwise "did it actually save" can
+        # only be guessed. This section provides the backend, FTS5 availability, in-memory
+        # index entry count, and the path taken last time, all at once.
         "lexical": lexical,
         "vectors_by_model": {
             k: v["vectors"] for k, v in model_stats.items()
         },
         "vectors_missing": vectors_missing,
-        # 覆盖率自检硬性口径：必须为 0，
-        # 否则说明库内向量与当前模型不符，检索会失真。
+        # Hard coverage self-check rule: it must be 0,
+        # otherwise the in-library vectors do not match the current model and retrieval
+        # will be distorted.
         "supersede_enabled": supersede_enabled,
         "entity_lexicon_size": entity_lexicon_size,
-        # 别名条目数：为 0 时"同一实体多个称法"不会归并（读取侧合并
-        # 与查询侧归一都依赖它）。宿主核对"我配的别名到底生效没有"看这里。
+        # Number of alias entries: at 0, "multiple names for the same entity" will not be
+        # merged (both read-side merging and query-side normalization depend on it).
+        # Hosts verifying "are my configured aliases actually in effect" look here.
         "entity_aliases": entity_aliases,
-        # 生效的标签抽取规则自述：键名是**调用方契约**，暴露出来才能
-        # 双端核对（键名不一致 = 过滤静默失效，且不报错）。
+        # Self-description of the effective tag-extraction rules: the key names are the
+        # **caller contract**; they must be exposed for both ends to cross-check
+        # (mismatched key names = filtering silently fails, with no error).
         "tag_schema": tag_schema,
-        # 实体来源分布：受信任(manual/lexicon/spacy) 才参与画像与检索加成，
-        # heuristic 是候选（中文文档下属噪声主要来源，约 84%）。见 ENTITY_ORIGIN_*。
+        # Entity-origin distribution: only trusted (manual/lexicon/spacy) origins
+        # participate in profile and retrieval boosts; heuristic is the candidate pool
+        # (the main noise source for Chinese documents, ~84%). See ENTITY_ORIGIN_*.
         "entity_origins": entity_origins,
         "sources": sources,
-        # 保存账本投影 —— 把「上次保存是几点、多久没落盘」变成一行。
+        # Save-ledger projection — turns "when was the last save, how long since persisted
+        # to disk" into one line.
         "save_ledger": save_ledger,
-        # 欠账的 raw 条数。看不见就等于不存在——这个坑拖了两个月，
-        # 就是因为「L1 在、L0 不在」这件事无处可见
+        # Number of outstanding raw entries. Invisible means nonexistent — this pit
+        # dragged on for two months precisely because "L1 present, L0 absent" was
+        # nowhere visible
         "l0_pending": l0_pending,
     }

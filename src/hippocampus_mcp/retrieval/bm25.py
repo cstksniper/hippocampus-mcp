@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""轻量 BM25（中英文混排）。
+"""Lightweight BM25 (mixed Chinese/English).
 
-评测结论（V9d）：向量 + BM25 混合（RRF 融合）比纯向量 MRR +38%。
-但 BM25 此前只存在于评测 harness，生产包 src 里没有——本模块把它补齐。
+Benchmark conclusion (V9d): vector + BM25 hybrid (RRF fusion) beats pure
+vector by MRR +38%. But BM25 previously existed only in the benchmark harness,
+not in the production src package -- this module fills that gap.
 
-中文没有空格分词，采用 bigram 切分（"布偶猫" → "布偶","偶猫"），
-英文按词切分。无需外部依赖。
+Chinese has no space tokenization, so bigram splitting is used
+("布偶猫" -> "布偶","偶猫"); English splits by word. No external dependencies.
 """
 
 from __future__ import annotations
@@ -21,7 +22,8 @@ _EN_WORD = re.compile(r"[a-z0-9']+")
 
 
 def tokenize(text: str) -> list[str]:
-    """中英文混排切词：英文按词、中文按 bigram（单字也保留，保证短词可命中）。"""
+    """Tokenize mixed Chinese/English: English by word, Chinese by bigram
+    (single characters are kept too, so short words can still hit)."""
     text = (text or "").lower()
     toks: list[str] = []
     for en in _EN_WORD.findall(text):
@@ -38,9 +40,9 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25:
-    """内存版 BM25 索引。
+    """In-memory BM25 index.
 
-    用法:
+    Usage:
         idx = BM25()
         idx.index(doc_ids, texts)
         scores = idx.query("查询文本")  # {doc_id: score}
@@ -53,7 +55,8 @@ class BM25:
         self.len: dict[str, int] = {}
         self.avg_len = 0.0
         self._dirty = False
-        # 增量维护用：文档总 token 数（avg_len 的分子）
+        # For incremental maintenance: total token count across documents
+        # (numerator of avg_len)
         self._total_len = 0
 
     def index(self, doc_ids: Iterable[str], texts: Iterable[str]) -> None:
@@ -77,7 +80,7 @@ class BM25:
         self._dirty = False
 
     # ------------------------------------------------------------------
-    # 增量维护（覆盖报告·低 14）
+    # Incremental maintenance (coverage report, low 14)
     # ------------------------------------------------------------------
     def _refresh_avg_len(self) -> None:
         n = len(self.docs)
@@ -87,10 +90,12 @@ class BM25:
         return doc_id in self.docs
 
     def add_doc(self, doc_id: str, text: str) -> None:
-        """新增/更新单篇文档的索引（O(该文档长度)，不重建整个索引）。
+        """Add/update the index for a single document (O(length of that
+        document), no full index rebuild).
 
-        原先 ``recall`` 每次都要对全部存活记录重跑 ``index()``：8k 条无感，
-        量级上去就是查询延迟的大头。改为随写入增量维护。
+        Previously ``recall`` re-ran ``index()`` over all alive records on every
+        call: invisible at 8k entries, but at scale it becomes the dominant
+        chunk of query latency. Now maintained incrementally as writes happen.
         """
         if doc_id in self.docs:
             self.remove_doc(doc_id)
@@ -108,7 +113,7 @@ class BM25:
         self._dirty = False
 
     def remove_doc(self, doc_id: str) -> bool:
-        """移除单篇文档的索引。"""
+        """Remove a single document's index entry."""
         tf_map = self.tf.pop(doc_id, None)
         if tf_map is None:
             return False
@@ -124,7 +129,7 @@ class BM25:
         return True
 
     def query(self, text: str, top_k: int = 50) -> dict[str, float]:
-        """返回 {doc_id: bm25_score}，按分数降序（截断 top_k）。"""
+        """Return {doc_id: bm25_score}, score descending (truncated to top_k)."""
         if not self.docs:
             return {}
         n = len(self.docs)
@@ -151,9 +156,10 @@ def rrf_fuse(
     weights: list[float] | None = None,
     k: int = 60,
 ) -> dict[str, float]:
-    """Reciprocal Rank Fusion：多路排序融合（V9d 评测采用的方式）。
+    """Reciprocal Rank Fusion: multi-ranked-list fusion (the method adopted by
+    the V9d benchmark).
 
-    score(d) = Σ_i w_i / (k + rank_i(d))
+    score(d) = sum_i w_i / (k + rank_i(d))
     """
     weights = weights or [1.0] * len(ranked_lists)
     out: dict[str, float] = {}

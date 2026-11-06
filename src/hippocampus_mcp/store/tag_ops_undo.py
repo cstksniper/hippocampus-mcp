@@ -1,21 +1,29 @@
-"""S2 撤销用例：update_tags 的 fail-closed 回滚（undo_tag_ops 方法体）。
+"""S2 undo use case: update_tags' fail-closed rollback (the undo_tag_ops
+method body).
 
-为什么放 store/ 而不是 brain：操作对象全是库存记录（``store.get`` /
-``store.update``）与 tag_ops 账本（本家 I/O 在 ``store/tag_ops.py``，由包装层
-注入），判定逻辑本身零领域知识——"当前值仍等于记录的 after 才改回 before"
-是一条纯数据比对规则。
+Why store/ and not brain: the objects operated on are all inventory records
+(``store.get`` / ``store.update``) and the tag_ops ledger (its home I/O is
+in ``store/tag_ops.py``, injected by the wrapper layer); the decision logic
+itself carries zero domain knowledge -- "revert to before only if the
+current value still equals the recorded after" is a pure data comparison
+rule.
 
-**为什么不是 application**：brain 不许 import application（依赖矩阵：用例
-逻辑只从 brain 单向流向 application，不回头），而撤销入口 ``undo_tag_ops``
-是 brain 公开方法、由 ``brain.update_tags(undo=...)`` 分发——M6 随
-update_tags 一起上收 application 时，本模块整体搬走，接口不用改。
+**Why not application**: brain must not import application (dependency
+matrix: use-case logic flows one way from brain to application, never
+back), while the undo entry point ``undo_tag_ops`` is a brain public method
+dispatched by ``brain.update_tags(undo=...)`` -- when M6 lifts update_tags
+into application, this module moves wholesale and the interface needs no
+change.
 
-**注入而非 import 的四件事**（测试 monkeypatch 面的保法，见各批「兼容面」
-纪律）：账本读取/追加、摘要、覆盖率、落盘都由包装层传入；两个闸门常量
-（``sample_max`` / ``confirm_above``）由包装层**调用时**从 brain 命名空间现
-取——``core.UPDATE_TAGS_CONFIRM_ABOVE`` 被测试 monkeypatch，快照进本模块会
-让闸门断言静默失效。``_now`` 无 monkeypatch 先例，直接 import（同
-``source_sig.py`` 例外）。
+**The four things injected rather than imported** (preserving the test
+monkeypatch surface; see each batch's "compatibility surface" discipline):
+ledger read/append, brief, coverage, and save are all passed in by the
+wrapper layer; the two gate constants (``sample_max`` / ``confirm_above``)
+are fetched fresh from the brain namespace **at call time** by the wrapper
+layer -- ``core.UPDATE_TAGS_CONFIRM_ABOVE`` is monkeypatched by tests;
+snapshotting it into this module would silently invalidate the gate
+assertions. ``_now`` has no monkeypatch precedent, so it is imported
+directly (the same exception as ``source_sig.py``).
 """
 from __future__ import annotations
 
@@ -39,27 +47,37 @@ def undo_tag_ops(
     sample_max: int,
     confirm_above: int,
 ) -> dict[str, Any]:
-    """撤销一次 update_tags 执行。
+    """Undo one update_tags execution.
 
-    **fail-closed 回滚**：只把"当前值仍等于记录的 after"的条目改回
-    before。期间被第三方（另一次 update_tags / update_memory）改过的
-    条目一律跳过并进 ``conflicts`` 自曝——盖掉后来的修改比不回滚更糟。
+    **fail-closed rollback**: only entries whose "current value still equals
+    the recorded after" are reverted to before. Entries changed in the
+    meantime by a third party (another update_tags / update_memory) are all
+    skipped and self-exposed in ``conflicts`` -- overwriting a later change
+    is worse than not rolling back.
 
-    撤销本身也记帐（op="undo"），所以撤错了可以再撤一次（对称恢复）。
+    The undo itself is also booked (op="undo"), so a mistaken undo can be
+    undone once more (symmetric recovery).
 
     Args:
-        ops: 账本全部条目（包装层已读，坏行已跳过）。
-        target: op id（``tagops_3``）或 ``"last"``（最近一次）。
-        dry_run: 默认 True —— 只出回滚计划。
-        confirm: 回滚条数超过 ``confirm_above`` 时须为真
-            （回滚和写入一样能造成大面积破坏，闸门同级）。
-        store: 库存实例（``manager.store``），只用 ``get`` / ``update``。
-        append_op: 记账回调（包装层 ``_tag_ops_append``），返回 op id。
-        brief: 摘要回调（包装层 ``_tag_ops_brief``），给报错带路。
-        coverage: 覆盖率回调（brain ``tag_coverage``）。
-        save: 落盘回调（brain ``save``），失败由本函数捕获进返回体。
-        sample_max: ``conflicts`` / ``gone`` / ``sample`` 的截断上限。
-        confirm_above: 回滚条数闸门（与写入侧同常量）。
+        ops: all ledger entries (already read by the wrapper layer; bad
+            lines skipped).
+        target: an op id (``tagops_3``) or ``"last"`` (the most recent).
+        dry_run: default True -- produce the rollback plan only.
+        confirm: must be true when the rollback count exceeds
+            ``confirm_above`` (a rollback can cause damage on the same scale
+            as a write; the gates are peers).
+        store: the inventory instance (``manager.store``); only ``get`` /
+            ``update`` are used.
+        append_op: bookkeeping callback (the wrapper layer's
+            ``_tag_ops_append``); returns an op id.
+        brief: brief callback (the wrapper layer's ``_tag_ops_brief``);
+            gives error messages a path to follow.
+        coverage: coverage callback (brain ``tag_coverage``).
+        save: persist callback (brain ``save``); failures are caught by
+            this function into the return body.
+        sample_max: truncation cap for ``conflicts`` / ``gone`` / ``sample``.
+        confirm_above: rollback-count gate (same constant as the write
+            side).
     """
     if not ops:
         return {"ok": False, "error": "the ledger is empty: no reversible update_tags execution",
@@ -150,15 +168,17 @@ def undo_tag_ops(
                                      "after": before})
             else:
                 failed.append(mid)
-        except Exception as exc:  # noqa: BLE001 —— 单条失败不该吞掉整批
+        except Exception as exc:  # noqa: BLE001 -- one entry failing must not swallow the whole batch
             failed.append(f"{mid}: {type(exc).__name__}: {exc}")
     payload["applied"] = True
     payload["reverted"] = reverted
     if failed:
         payload["failed"] = failed[:sample_max]
         payload["failed_n"] = len(failed)
-    # 记账：撤销也是一次变更（对称记录 ⇒ 可再撤一次）。先记账后落盘，
-    # 与 update_tags 同序——内存已改，账本必须留下"改之前是什么"。
+    # Bookkeeping: the undo is itself a change (symmetric recording => it
+    # can be undone once more). Book first, persist after, same order as
+    # update_tags -- memory is already changed; the ledger must record
+    # "what it was before the change".
     op_id = append_op({
         "op": "undo",
         "target": op.get("op_id"),

@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
-"""WriteService：唯一写入口径（9 工具）。
+"""WriteService: the single write-path source of truth (9 tools).
 
-工具面：store_memory / update_memory /
+Tool surface: store_memory / update_memory /
 update_tags / forget_memory / forget_by_query / ingest / ingest_batch /
-retry_save / save_state。
+retry_save / save_state.
 
-本类的每个方法都是**从 server.py 工具体逐字搬来的编排逻辑**（去掉了
-``_await_warmup`` / brain 获取 / ``json.dumps``，``_with_library`` 换成
-基类 ``_envelope``）——只挪位置不改行为，行为等值由全量回归门禁
-保证；后续脑方法体上收进本类时，本类 API 不动。
+Every method here is **orchestration logic moved verbatim from the server.py
+tool bodies** (minus ``_await_warmup`` / brain acquisition / ``json.dumps``,
+with ``_with_library`` replaced by the base class's ``_envelope``) — relocation
+only, no behavior change; behavioral equivalence is guaranteed by the full
+regression gate. When brain method bodies are later lifted into this class,
+this class's API stays put.
 
-「谁解析参数」的切分（按**现行错误路径的信封形状**定，保字节级一致）：
+The "who parses the parameters" split (fixed by the **envelope shape of the
+current error paths**, to keep byte-level identical outputs):
 
-* 错误体带 ``library`` 首键的（ingest / ingest_batch 的 tags、items
-  解析）→ 服务内解析（信封在服务侧，适配器不碰）；
-* 错误体不带信封的（update_tags 四解析、session_start 的
-  filter_tags 解析）→ 留在适配器，且必须排在工厂（库解析）**之前**
-  ——现行代码就是这样，调序会让「坏 JSON + 坏库名」的错误体漂移。
+* Error bodies carrying a ``library`` first key (tags / items parsing of
+  ingest / ingest_batch) → parsed inside the service (the envelope lives on
+  the service side; adapters don't touch it);
+* Error bodies without an envelope (the four update_tags parses, session_start's
+  filter_tags parse) → stay in the adapter and must come **before** the factory
+  (library parsing) — the current code already does this; reordering would make
+  the "bad JSON + bad library name" error body drift.
 """
 from __future__ import annotations
 
@@ -42,20 +47,20 @@ logger = logging.getLogger("hippocampus_mcp")
 
 
 class WriteService(BaseService):
-    """写用例：校验→策略→落盘→账本→回显（策略与落盘细节暂居 brain/manager，后续上收）。"""
+    """Write use cases: validate → policy → persist → ledger → echo (policy and persistence details still live in brain/manager; to be lifted later)."""
 
-    # ---------------------------------------------------------------- 单条裸写
+    # ---------------------------------------------------------------- Bare single writes
 
-    # ---------------------------------------------------------------- D2a 隔离
+    # ---------------------------------------------------------------- D2a quarantine
 
     def _user_lib_label(self, content: str) -> str:
-        """目标 = user 库时的 D1 打标（user 库自动入库默认 personal）。"""
+        """D1 labeling when the target is the user library (the user library auto-assigns personal by default)."""
         return sensitivity_label(classify_sensitivity(content or ""))
 
     def _log_access(self, *, kind: str, tool: str, quarantined: bool,
                     sensitivity: str, content: str,
                     memory_id: str | None = None) -> None:
-        """追加写侧审计事件（旁路：失败只 warning，绝不影响主路径）。"""
+        """Append a write-side audit event (side path: failures only warn, never affect the main path)."""
         if not self.access_log_dir:
             return
         ev = build_access_event(
@@ -74,10 +79,11 @@ class WriteService(BaseService):
                                    policy: str,
                                    quarantine: bool = False,
                                    sensitivity: str = "") -> dict[str, Any] | None:
-        """超长内容按策略处置。**返回 None = 不干预**，走原写入路径。
+        """Handle over-long content per policy. **Returning None = no intervention**; the original write path proceeds.
 
-        只在用户显式开了 ``split`` / ``reject`` 时被调用（``warn`` 整段跳过，
-        保持改动前的逐字节行为）。
+        Called only when the user explicitly enabled ``split`` / ``reject``
+        (``warn`` skips this whole section, preserving the byte-for-byte
+        pre-change behavior).
         """
         mgr = self.manager
         embedder = getattr(mgr, "embedder", None)
@@ -89,15 +95,17 @@ class WriteService(BaseService):
         except (TypeError, ValueError):
             limit = 0
         if limit <= 0:
-            # 拿不到上限（hash 后端 / 元数据缺失）⇒ 无从判定，不干预。
+            # Cannot get the limit (hash backend / missing metadata) ⇒ nothing
+            # to judge against; don't intervene.
             return None
-        # 字符数都不超过 token 上限 ⇒ 任何语言都不可能超窗（中文 1 字≈1
-        # token，英文 1 token≈4 字）。让短卡保持零额外开销。
+        # Character count not exceeding the token limit ⇒ no language can
+        # exceed the window (Chinese: 1 char ≈ 1 token, English: 1 token ≈ 4
+        # chars). Keeps short cards at zero extra overhead.
         if len(content or "") <= limit:
             return None
         try:
             cov = cov_fn(content or "") or {}
-        except Exception:  # 自曝绝不能反过来把写入搞挂（与截断自曝同口径）
+        except Exception:  # self-reporting must never break the write itself (same stance as the truncation self-report)
             return None
 
         plan = plan_long_content(
@@ -123,11 +131,12 @@ class WriteService(BaseService):
             ids.append(mgr.store_memory(
                 content=piece, importance=importance,
                 memory_type=memory_type, client=client,
-                # D2a：拆分产物继承隔离标记——拆分不能变成隔离的绕路口。
+                # D2a: split products inherit the quarantine flag — splitting
+                # must not become a quarantine bypass.
                 quarantine=quarantine, sensitivity=sensitivity))
         out: dict[str, Any] = {
             "status": "stored_split",
-            "memory_id": ids[0] if ids else None,  # 兼容单条回显的旧字段
+            "memory_id": ids[0] if ids else None,  # back-compat with the old single-item echo field
             "memory_ids": ids,
             "piece_count": len(ids),
             "long_content_policy": policy,
@@ -139,13 +148,15 @@ class WriteService(BaseService):
         if plan.note:
             out["long_content_note"] = plan.note
         if quarantine:
-            # 与单条路径同口径：隔离态自曝不缺席（拆分也进待审队列）。
+            # Same stance as the single-item path: the quarantine self-report
+            # is never missing (splits also enter the review queue).
             out["quarantined"] = True
             out["quarantine_note"] = (
                 "All cards produced by this split entered the user-library review queue: they are excluded from recall and "
                 "the user_scope slot. Review them in drift_audit, then promote or delete.")
         if sensitivity:
-            # D1：打标结果自曝（拆分产物与单条同口径，家库写入也带）。
+            # D1: self-report the label (split products match the single-item
+            # path; home-library writes carry it too).
             out["sensitivity"] = sensitivity
         return self._envelope(out)
 
@@ -153,15 +164,19 @@ class WriteService(BaseService):
                      memory_type: str, client: str,
                      origin: dict[str, str] | None = None,
                      idem_key: str = "") -> dict[str, Any]:
-        """单条事实裸写（无 L0 溯源、不建实体；长文走 :meth:`ingest`）。
+        """Bare write of a single fact (no L0 provenance, no entities; long content goes through :meth:`ingest`).
 
-        敏感过滤红线：目标库名为 ``user``（用户级库约定名）
-        时走**专属敏感过滤**（堵直写绕路）——命中即拒写，
-        返回体自曝命中词与位置（不静默）。**存量库行为不变**：非 user
-        库零分支、零 I/O。词表内容由组合根注入
-        （application 不读 env）；模式级内置兜底在 domain（词表缺省
-        也生效）。工厂层的家库写守卫与本过滤**正交组合**——
-        守卫也不得绕过这道过滤另开写口。
+        Sensitive-filter red line: when the target library is named ``user``
+        (the user-level library's convention name), a **dedicated sensitive
+        filter** applies (closing the direct-write bypass) — a hit means the
+        write is rejected, and the response self-reports the hit words and
+        positions (never silent). **Existing-library behavior unchanged**:
+        non-user libraries see zero branching and zero I/O. The word list is
+        injected by the composition root (application does not read env); a
+        mode-level built-in fallback lives in domain (effective even when the
+        word list is absent). The factory layer's home-write guard composes
+        **orthogonally** with this filter — the guard must not open another
+        write path that bypasses this filter.
         """
         if (self.library_self or {}).get("name") == "user":
             hits = match_sensitive(content or "", words=self.sensitive_words)
@@ -174,17 +189,20 @@ class WriteService(BaseService):
                     "note": ("The user-level library rejects sensitive content. See "
                              "hits for details; rewrite and resend, or use the two-step manual promotion flow."),
                 })
-        # D2a/D1：目标 = user 库 ⇒ 打标（user 库自动入库默认 personal，
-        # 宁枉勿纵）；非家工作区（工厂注入的隔离判据为真）⇒ 隔离标记
-        # + 审计事件。非 user 库目标零分支零开销。
+        # D2a/D1: target = user library ⇒ label (the user library auto-assigns
+        # personal by default, better safe than sorry); non-home workspace
+        # (factory-injected quarantine criterion true) ⇒ quarantine flag
+        # + audit event. Non-user library targets: zero branching, zero overhead.
         quarantined = bool(self.user_write_quarantine)
         label = ""
         if (self.library_self or {}).get("name") == "user":
             label = self._user_lib_label(content)
-        # 超长内容策略。**warn（默认）整段跳过**——现状是
-        # 「先写、再自曝」，前置再算一次 coverage 会多付一次 tokenizer，
-        # 且没必要改一条人人依赖的默认路径。只有用户显式开 split/reject
-        # 才走下面的分支（白名单语义，写错等同于没写）。
+        # Over-long content policy. **warn (default) skips this whole
+        # section** — the current behavior is "write first, self-report
+        # after"; computing coverage up front would pay for the tokenizer one
+        # extra time, and there is no reason to change a default path everyone
+        # depends on. Only an explicit split/reject takes the branch below
+        # (whitelist semantics: a mistyped value is the same as unset).
         policy = parse_policy(self.long_content_policy)
         if policy != POLICY_WARN:
             decided = self._apply_long_content_policy(
@@ -203,19 +221,23 @@ class WriteService(BaseService):
             content=content,
             importance=importance,
             memory_type=memory_type,
-            # client 接线（daemon 多会话实测教训）：不传 client 时 LNN 隐状态
-            # 恒落在 __default__ 那一路 —— stdio 下无所谓（一进程一会话），
-            # daemon 下 N 条连接就全挤在一路，A 的写入直接改写 B 的检索起点，
-            # 无异常、无日志，只掉时序分。
+            # client wiring (a lesson measured on daemon multi-session): without
+            # client, the LNN hidden state always lands on the __default__ lane
+            # — irrelevant under stdio (one process, one session), but under
+            # the daemon N connections all crowd onto one lane, and A's writes
+            # directly rewrite B's retrieval starting point, with no exception
+            # and no log — only degraded temporal scores.
             client=client,
             quarantine=quarantined,
             sensitivity=label,
             origin=origin,
             idem_key=idem_key,
         )
-        # P0-2 幂等命中：manager 在嵌入前就返回了既有 id（省掉最贵那一步），
-        # 此时 last_truncation 是**上一次调用**的残留值——绝不能拿它拼返回体，
-        # 否则宿主会看到一条与本次无关的截断告警。这里走极简回执。
+        # P0-2 idempotent hit: the manager returned the existing id before
+        # embedding (skipping the most expensive step), so last_truncation is
+        # the **previous call's** leftover value — never use it to build the
+        # response, otherwise the host sees a truncation warning unrelated to
+        # this call. Take the minimal-receipt path here.
         if getattr(mgr, "last_idem_hit", None):
             return self._envelope({
                 "status": "duplicate",
@@ -229,10 +251,13 @@ class WriteService(BaseService):
             self._log_access(kind="store_memory", tool="store_memory",
                              quarantined=quarantined, sensitivity=label,
                              content=content, memory_id=memory_id)
-        # 截断自曝。嵌入模型有 token **硬上限**（BGE / MiniLM = 512），
-        # 超出的部分在 encode 时被静默丢弃、对向量零贡献——写入成功、回读在库、
-        # brain_stats 正常，**只有检索悄悄差一截**。这里把「实际纳入嵌入多少字」
-        # 摆在返回体前面，让宿主当场就能看见，而不是等检索不到才发现。
+        # Truncation self-report. The embedding model has a token **hard limit**
+        # (BGE / MiniLM = 512); the excess is silently dropped at encode time
+        # and contributes nothing to the vector — the write succeeds, the
+        # record is in the library, brain_stats looks normal, and **only recall
+        # quietly falls short**. This puts "how many characters actually
+        # entered the embedding" up front in the response, so the host sees it
+        # immediately instead of discovering it when recall misses.
         tcov = getattr(mgr, "last_truncation", None) or {}
         truncated = bool(tcov.get("truncated"))
         out: dict[str, Any] = {
@@ -251,30 +276,36 @@ class WriteService(BaseService):
                 f"the remainder was written but is not retrievable. Split long content into cards under 500 characters."
             )
         if quarantined:
-            # 拍板①：写入返回体自曝隔离态（绝不静默）——「写成功但对所有
-            # 下游通道不可见」必须当场可见，否则宿主以为记忆已生效。
+            # Decision ①: the write response self-reports the quarantined state
+            # (never silent) — "written successfully yet invisible to every
+            # downstream channel" must be visible on the spot, otherwise the
+            # host believes the memory took effect.
             out["quarantined"] = True
             out["quarantine_note"] = (
                 "This item entered the user-library review queue (non-home direct write through the exemption channel): "
                 "it is excluded from recall and the user_scope slot. Have the user review it in drift_audit, "
                 "then promote or delete through the managed channel.")
         if label:
-            # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
+            # D1: self-report the label (home-library writes carry it too — the
+            # host should know what label a card received).
             out["sensitivity"] = label
         return self._envelope(out)
 
-    # ---------------------------------------------------------------- 字段更新
+    # ---------------------------------------------------------------- Field updates
 
     def update_memory(self, *, memory_id: str, content: str,
                       importance: float, memory_type: str, state: str,
                       superseded_by: str,
                       clear_quarantine: bool = False) -> dict[str, Any]:
-        """只更新提供的字段，其余保持不变（「改成 X」通道）。
+        """Update only the provided fields, leaving the rest unchanged (the "change to X" channel).
 
-        ``clear_quarantine``（D2a 受管转正）：把 user 库的待审卡转正。
-        **提权键不在 agent 手里**：只对家库会话开放（或逃生门开——工厂把
-        两种情况都算进 ``is_home_write``）；非家会话请求 = 显式报错，
-        绝不静默忽略。转正动作本身也进 access_log（谁转的正，可审）。
+        ``clear_quarantine`` (D2a managed promotion): promote a pending-review
+        card in the user library. **The privilege key is not in the agent's
+        hands**: open only to home-library sessions (or when the escape hatch
+        is open — the factory counts both cases into ``is_home_write``); a
+        request from a non-home session = explicit error, never silently
+        ignored. The promotion action itself also goes into access_log (who
+        promoted what stays auditable).
         """
         mgr = self.manager
         if clear_quarantine:
@@ -333,13 +364,15 @@ class WriteService(BaseService):
                      "error": f"superseded_by points to a missing memory: {superseded_by}"})
             fields["superseded_by"] = superseded_by
             if not state:
-                # 只给了 superseded_by 没给 state：按语义补齐，而不是留下
-                # "有指针但状态仍 active" 的自相矛盾状态。
+                # Only superseded_by given without state: complete it by
+                # semantics rather than leaving the self-contradictory state of
+                # "a pointer exists but the state is still active".
                 fields["state"] = MemoryState.SUPERSEDED.value
                 warnings.append("state was omitted; inferred as superseded from the superseded_by semantics")
 
         if not fields:
-            # 注意：此错误体**不带** library 首键（与现行工具逐位一致）。
+            # Note: this error body does **not** carry a library first key
+            # (bit-identical with the current tool).
             return {"error": "no fields to update"}
 
         success = mgr.update_memory(memory_id, **fields)
@@ -352,18 +385,20 @@ class WriteService(BaseService):
             payload["warnings"] = warnings
         return self._envelope(payload)
 
-    # ---------------------------------------------------------------- 批量标签
+    # ---------------------------------------------------------------- Bulk tags
 
     def update_tags(self, *, tags: dict[str, Any] | None, clear_keys: list[str] | None,
                     source: str, source_contains: str, contains: str, state: str,
                     untagged_only: bool, missing_keys: list[str] | None,
                     memory_ids: list[str] | None, mode: str, dry_run: bool,
                     limit: int, confirm: bool, undo: str) -> dict[str, Any]:
-        """存量标签回填（默认 dry_run；可撤销，fail-closed）。
+        """Backfill tags on existing records (dry_run by default; undoable, fail-closed).
 
-        入参的 JSON 解析在适配层完成（其错误体不带信封，见模块 docstring）；
-        这里收已解析值。dry_run / confirm 闸门 / 幂等 / 账本 semantics 全在
-        ``brain.update_tags``（后续随方法体一起上收）。
+        JSON parsing of the inputs happens in the adapter layer (its error body
+        carries no envelope; see the module docstring); this receives parsed
+        values. dry_run / confirm gates / idempotency / ledger semantics all
+        live in ``brain.update_tags`` (to be lifted together with the method
+        body later).
         """
         return self._envelope(self.brain.update_tags(
             tags=tags, clear_keys=clear_keys,
@@ -373,40 +408,44 @@ class WriteService(BaseService):
             confirm=confirm, undo=undo,
         ))
 
-    # ---------------------------------------------------------------- 删除
+    # ---------------------------------------------------------------- Deletion
 
     def forget_memory(self, *, memory_id: str, reason: str) -> dict[str, Any]:
-        """按 ID 级联删除（清实体倒排 / L3 派生 / 墓碑 / 恢复被取代者）。"""
+        """Cascade delete by ID (clear entity inverted index / L3 derivatives / tombstones / restore superseded records)."""
         return self._envelope(self.brain.forget(memory_id, reason=reason))
 
     def forget_by_query(self, *, query: str, top_k: int, dry_run: bool,
                         min_similarity: float, allow_multiple: bool) -> dict[str, Any]:
-        """按自然语言定位疑似错误记忆并删除（默认预览、默认单删）。"""
+        """Locate suspected wrong memories by natural language and delete them (preview by default, single delete by default)."""
         return self._envelope(self.brain.forget_by_query(
             query, top_k=top_k, dry_run=dry_run, allow_multiple=allow_multiple,
             min_similarity=None if min_similarity < 0 else min_similarity,
         ))
 
-    # ---------------------------------------------------------------- 导入
+    # ---------------------------------------------------------------- Ingest
 
     def ingest(self, *, text: str, speaker: str, importance: float,
                cognitive_type: str, entities: str, source: str,
                tags: str, auto_tags: bool,
                origin: dict[str, str] | None = None,
                idem_key: str = "") -> dict[str, Any]:
-        """推荐写入口：原文进 L0、抽句进 L1、维护实体索引。
+        """Recommended write entry: raw text into L0, extracted sentences into L1, entity index maintained.
 
-        与工具层的切分：``tags`` 的解析错误体带 library 首键，故在服务内
-        解析（保字节级一致）；``entities`` / ``importance`` /
-        ``cognitive_type`` 的哨兵归一无错误路径，随编排放这里。
+        Split against the tool layer: ``tags`` parse errors carry a library
+        first key, so parsing happens inside the service (keeping byte-level
+        identical outputs); ``entities`` / ``importance`` / ``cognitive_type``
+        sentinel normalization has no error path and sits here with the
+        orchestration.
         """
         logger.info("[ingest] start: %s", text[:40])
         parsed_tags, tag_err = parse_tags_json(tags)
         if tag_err:
             return self._envelope(
                 {"error": f"tags parse failed: {tag_err}", "input": tags[:200]})
-        # D2a/D1：目标 = user 库 ⇒ 整批 L1 打标（对原文分类一次，批内共用，
-        # 宁枉勿纵）；非家工作区 ⇒ 整批 L1 带隔离标记 + 审计事件。
+        # D2a/D1: target = user library ⇒ label the whole batch's L1 records
+        # (classify the raw text once, shared within the batch, better safe
+        # than sorry); non-home workspace ⇒ the whole batch's L1 records carry
+        # the quarantine flag + audit event.
         quarantined = bool(self.user_write_quarantine)
         label = ""
         if (self.library_self or {}).get("name") == "user":
@@ -437,11 +476,14 @@ class WriteService(BaseService):
                     "Review them in drift_audit, then promote or delete through the managed channel."
                     % len(result.get("memory_ids", [])))
             if label:
-                # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
+                # D1: self-report the label (home-library writes carry it too —
+                # the host should know what label a card received).
                 result["sensitivity"] = label
         logger.info("[ingest] done: %d memories", len(result.get("memory_ids", [])))
-        # 自动保存被并发保护拒绝时必须当场告警：宿主看到"已写入"会以为落盘了，
-        # 实际这批只在内存里，进程重启即丢（此前这里完全静默 —— zcode 反馈）。
+        # When auto-save is rejected by concurrency protection, warn on the
+        # spot: seeing "written", the host believes it persisted, when in fact
+        # this batch lives only in memory and is lost on process restart
+        # (previously completely silent here — zcode feedback).
         save_err = self.manager.last_save_error
         if save_err:
             result["save_warning"] = (
@@ -455,11 +497,13 @@ class WriteService(BaseService):
                      granularity: str, detect_supersede: bool, save: bool,
                      auto_tags: bool,
                      origin: dict[str, str] | None = None) -> dict[str, Any]:
-        """批量写入（逐项错误隔离 + 整批收尾只落盘一次）。
+        """Batch write (per-item error isolation + a single persist at batch end).
 
-        ``items`` 的 JSON 解析错误体带 library 首键，故在服务内解析
-        （理由同 :meth:`ingest`）；``items`` 形态标注 ``Any``：工具签名
-        写 ``str``，但历史上 Host 直传数组也走到这（防御分支保留）。
+        ``items`` JSON parse errors carry a library first key, so parsing
+        happens inside the service (same rationale as :meth:`ingest`);
+        ``items`` is annotated ``Any``: the tool signature says ``str``, but
+        historically hosts passing arrays directly also reached this (the
+        defensive branch is kept).
         """
         parsed_tags, tag_err = parse_tags_json(tags)
         if tag_err:
@@ -473,14 +517,18 @@ class WriteService(BaseService):
             try:
                 parsed_items = json.loads(s)
             except Exception as e:  # noqa: BLE001
-                # 解析失败必须显式报错——静默当空会让宿主以为整批写进去了。
+                # A parse failure must raise explicitly — silently treating it
+                # as empty would make the host believe the whole batch was
+                # written.
                 return self._envelope(
                     {"error": f"items JSON parse failed: {e}", "input": s[:200]})
         else:
             parsed_items = items
         try:
-            # D2a/D1：与单条 ingest 同口径（标签对批内全部条目原文合并分类
-            # 一次；隔离是批次级策略，见 brain.ingest_batch 的注入点注释）。
+            # D2a/D1: same stance as single-item ingest (labels classify the
+            # merged raw text of all items in the batch once; quarantine is a
+            # batch-level policy, see the injection-point comment in
+            # brain.ingest_batch).
             quarantined = bool(self.user_write_quarantine)
             label = ""
             if (self.library_self or {}).get("name") == "user":
@@ -499,7 +547,8 @@ class WriteService(BaseService):
                 origin=origin,
             )
         except ValueError as e:
-            # 非数组 / 超单批上限：直接回错误，别让宿主以为写成功了。
+            # Non-array / over the per-batch cap: return an error directly;
+            # don't let the host believe the write succeeded.
             return self._envelope({"error": str(e)})
         if quarantined or label:
             self._log_access(kind="ingest_batch", tool="ingest_batch",
@@ -513,16 +562,17 @@ class WriteService(BaseService):
                     "the user_scope slot. Review them in drift_audit, then "
                     "promote or delete through the managed channel.")
         if label:
-            # D1：打标结果自曝（家库写入也带——宿主该知道卡被打了什么标签）。
+            # D1: self-report the label (home-library writes carry it too — the
+            # host should know what label a card received).
             result["sensitivity"] = label
         logger.info("[ingest_batch] done: %d/%d items, %d failed",
                     result["count"], result["total_input"], result["failed"])
         return self._envelope(result)
 
-    # ---------------------------------------------------------------- 落盘
+    # ---------------------------------------------------------------- Persistence
 
     def save_state(self) -> dict[str, Any]:
-        """全量持久化（向量库 + LNN + L0~L3 + 实体索引）。"""
+        """Full persistence (vector store + LNN + L0–L3 + entity index)."""
         try:
             self.brain.save()
         except ConcurrentWriteError as e:
@@ -533,7 +583,7 @@ class WriteService(BaseService):
             {"status": "saved", "persist_dir": self.persist_dir})
 
     def retry_save(self) -> dict[str, Any]:
-        """并发冲突后重试：取磁盘最新版，只补「磁盘上没有的增量」。"""
+        """Retry after a concurrency conflict: take the latest on-disk version and fill in only "the increments the disk doesn't have"."""
         try:
             result = self.brain.retry_save()
         except ConcurrentWriteError as e:

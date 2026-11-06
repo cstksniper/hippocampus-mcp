@@ -1,46 +1,62 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.refresh_knowledge`` 的三块逻辑（从 core 抽取）。
+"""The three logic blocks of ``brain.core.refresh_knowledge`` (extracted from
+core).
 
-**为什么值得搬**：``refresh_knowledge`` 是主题层总刷新入口，81 行里
-「force/增量分叉决策」「宿主归纳迁移清点」「19 键回显体组装」三块全是
-纯逻辑，剩下的 build/refresh/migrate 三个 topic 调用与 self 状态写
-（``_knowledge_last_*``）归壳。搬走后壳只剩「门禁 → 取数 → 注入 →
-计时帧」一条直线。
+**Why it is worth moving**: ``refresh_knowledge`` is the topic layer's total
+refresh entry point; within its 81 lines, the "force/incremental fork
+decision", "host summary migration count", and "19-key echo body assembly"
+blocks are all pure logic, while the three topic calls build/refresh/migrate
+and the self-state writes (``_knowledge_last_*``) stay in the shell. After the
+move, the shell is a single straight line of "gate -> fetch data -> inject ->
+timing frame".
 
-**依赖方向**：本模块零 import——``layer_epoch`` / ``reclip`` / ``build``
-/ ``refresh`` / ``migrate_host_summaries`` / ``coverage_of`` /
-``by_status`` / ``SUMMARY_KIND_HOST`` 八个 topic 包符号全由壳调用时现取
-后注入（domain 同层禁互引，topic 住在 domain 但 G1 只准依赖 common；
-沿用 knowledge_batch / knowledge_map_view 先例）。
-``defaults`` / ``max_topics`` / ``now`` / ``t0`` / ``clock`` 是壳侧
-装配值（配置现取、LNN 参考时间、计时窗）。
+**Dependency direction**: this module has zero imports -- the eight topic
+package symbols ``layer_epoch`` / ``reclip`` / ``build`` / ``refresh`` /
+``migrate_host_summaries`` / ``coverage_of`` / ``by_status`` /
+``SUMMARY_KIND_HOST`` are all fetched live by the shell at call time and then
+injected (same-layer mutual imports are forbidden in domain; topic lives in
+domain but G1 allows only common; follows the knowledge_batch /
+knowledge_map_view precedent). ``defaults`` / ``max_topics`` / ``now`` / ``t0``
+/ ``clock`` are shell-side assembly values (config fetched live, LNN reference
+time, timing window).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (changing any one is a behavior change; the parity probe
+will catch it)**:
 
-1. **force + 空层走增量分支**：``if force and knowledge``——对空层 force
-   不世代 +1、不取 old 快照、不调 reclip，但报告 ``rebuilt=True`` 且
-   ``new_topics=len(全部)``。「重建」旗标与世代/迁移**解耦**。
-2. **增量分支的 reclip 守卫**：``if knowledge``——空层不调 reclip
-   （空 dict 调了也返回 0，但调用次数与原实现逐次对齐）。
-3. **reclip 原地改成员，build 再裁一遍**：build 对已有簇按同一 alive
-   集合二次裁剪（幂等），所以报的 ``members_dropped`` 只来自 reclip
-   那一次。
-4. **build 返回新 dict（浅拷贝），旧 topic dict 被原地改** ⇒ force
-   分支的 ``old = dict(knowledge)`` 快照必须在 build **之前**取，迁移
-   读到的才是真旧层（collect 内 plan_rebuild 先行即为此）。
-5. ``now`` = ``manager._reference_time or _now()``——LNN 参考时间优先
-   于墙钟，由壳算好注入（store_memory 会把 _reference_time 写成 seed
-   时间戳，探针冻结必须在 seed 之后）。
-6. ``took`` 跨「取数 + build + refresh + migrate」整窗：``t0`` 与
-   ``clock`` 都由壳给（域内只取差），报告 ``took_s=round(took,3)``，
-   而 ``_knowledge_last_took`` 存**未取整**的原值（壳从 collect 第四
-   返回值拿，不读回显体——避免二次取整）。
-7. ``at_cap`` 的 ``max_topics`` 是**第二次** ``_topic_defaults()``
-   现取（与开头的 ``_td`` 分离：测试猴子补丁 ``_topic_defaults`` 时
-   两处都必须是调用时求值，M1b 纪律）。
-8. ``count_lost_host`` 的 ``max(0, ...)`` 是防御性的：迁移数不可能超
-   过旧宿主归纳数，但别报负数；只数 old 里 ``kind==host`` 且 summary
-   非空的簇。
+1. **force + empty layer takes the incremental branch**: ``if force and
+   knowledge`` -- forcing an empty layer does not bump the epoch, does not
+   take the old snapshot, and does not call reclip, but reports
+   ``rebuilt=True`` with ``new_topics=len(all)``. The "rebuilt" flag is
+   **decoupled** from epoch/migration.
+2. **The incremental branch's reclip guard**: ``if knowledge`` -- an empty
+   layer does not call reclip (calling it on an empty dict would also return
+   0, but the call count aligns with the original implementation call by
+   call).
+3. **reclip mutates members in place, build trims again**: build re-trims
+   existing clusters against the same alive set (idempotent), so the reported
+   ``members_dropped`` comes only from the reclip pass.
+4. **build returns a new dict (shallow copy) while old topic dicts are mutated
+   in place** => the force branch's ``old = dict(knowledge)`` snapshot must be
+   taken **before** build, so migration reads the truly old layer (collect
+   calling plan_rebuild first exists for exactly this).
+5. ``now`` = ``manager._reference_time or _now()`` -- the LNN reference time
+   takes precedence over the wall clock, computed by the shell and injected
+   (store_memory writes _reference_time as the seed timestamp; the probe's
+   freeze must come after the seed).
+6. ``took`` spans the whole "fetch + build + refresh + migrate" window: both
+   ``t0`` and ``clock`` are given by the shell (domain only takes the
+   difference); the report carries ``took_s=round(took,3)``, while
+   ``_knowledge_last_took`` stores the **unrounded** original value (the shell
+   takes it from collect's fourth return value instead of reading the echo
+   body -- avoiding double rounding).
+7. ``at_cap``'s ``max_topics`` is a **second** live fetch of
+   ``_topic_defaults()`` (kept separate from the ``_td`` at the top: when
+   tests monkeypatch ``_topic_defaults``, both places must evaluate at call
+   time, the M1b discipline).
+8. ``count_lost_host``'s ``max(0, ...)`` is defensive: the migrated count
+   cannot exceed the old host summary count, but never report a negative;
+   only clusters in old with ``kind==host`` and a non-empty summary are
+   counted.
 """
 from __future__ import annotations
 
@@ -48,7 +64,7 @@ from typing import Any, Callable
 
 
 # ======================================================================
-# 块 1：force / 增量分叉决策（旧壳 2928-2936）
+# Block 1: force / incremental fork decision (old shell 2928-2936)
 # ======================================================================
 def plan_rebuild(
     knowledge: dict[str, Any],
@@ -58,28 +74,34 @@ def plan_rebuild(
     layer_epoch: Callable[[dict[str, Any]], int],
     reclip: Callable[[dict[str, Any], list[str]], int],
 ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None, int]:
-    """决定这一轮刷新是「重画」还是「增量」，返回重建三参 + 摘掉的成员数。
+    """Decide whether this refresh round is a "redraw" or "incremental";
+    return the three rebuild parameters + the number of members removed.
 
     Args:
-        knowledge: 当前主题层（壳直传 ``self.knowledge``）。
-        alive: 存活记录 id 全集（含暂无向量的）。
-        force: 是否重画簇边界。
-        layer_epoch: ``topic_mod.layer_epoch``（层世代读取）。
-        reclip: ``topic_mod.reclip``（按 alive 重裁成员，原地改）。
+        knowledge: the current topic layer (the shell passes ``self.knowledge``
+            straight through).
+        alive: the full set of surviving record ids (including those without
+            vectors yet).
+        force: whether to redraw cluster boundaries.
+        layer_epoch: ``topic_mod.layer_epoch`` (reads the layer epoch).
+        reclip: ``topic_mod.reclip`` (re-trims members against alive, mutating
+            in place).
 
     Returns:
-        ``(base, old, epoch, dropped)``——``base`` 是传给 build 的底册
-        （force 为全新空 dict，增量为原层对象）；``old`` 仅 force 且
-        层非空时为旧层浅拷贝快照（供归纳迁移），否则 None；``epoch``
-        仅重画时为旧世代 +1，否则 None；``dropped`` 是本轮摘掉的
-        成员引用条数。
+        ``(base, old, epoch, dropped)`` -- ``base`` is the ledger passed to
+        build (a brand-new empty dict when force, the original layer object
+        when incremental); ``old`` is a shallow-copy snapshot of the old layer
+        (for summary migration) only when force and the layer is non-empty,
+        otherwise None; ``epoch`` is the old epoch +1 only on redraw, otherwise
+        None; ``dropped`` is the number of member references removed this
+        round.
 
-    怪癖复刻：force + 空层走增量分支（怪癖 1）；空层不调 reclip
-    （怪癖 2）。
+    Quirk replication: force + empty layer takes the incremental branch
+    (quirk 1); an empty layer does not call reclip (quirk 2).
     """
     if force and knowledge:
-        # 重画：旧层留着做归纳迁移，然后从空开始建（不 reclip——
-        # 新层里没有需要裁掉的死成员）。
+        # Redraw: keep the old layer for summary migration, then build from
+        # empty (no reclip -- the new layer has no dead members to trim).
         old = dict(knowledge)
         epoch = layer_epoch(old) + 1
         base: dict[str, Any] = {}
@@ -93,7 +115,7 @@ def plan_rebuild(
 
 
 # ======================================================================
-# 块 2：宿主归纳迁移清点（旧壳 2947-2952）
+# Block 2: host summary migration count (old shell 2947-2952)
 # ======================================================================
 def count_lost_host(
     old: dict[str, Any],
@@ -101,18 +123,22 @@ def count_lost_host(
     *,
     summary_kind_host: str,
 ) -> int:
-    """重画时没搬过去的旧宿主归纳条数（自曝，不静默）。
+    """The count of old host summaries not carried over on redraw (self
+    -disclosed, never silent).
 
     Args:
-        old: 旧层快照（force 分支的 ``dict(knowledge)``）。
-        migrated: ``migrate_host_summaries`` 的返回（搬成的列表）。
-        summary_kind_host: ``topic_mod.SUMMARY_KIND_HOST`` 常量。
+        old: the old layer snapshot (the force branch's ``dict(knowledge)``).
+        migrated: the return of ``migrate_host_summaries`` (the list actually
+            moved).
+        summary_kind_host: the ``topic_mod.SUMMARY_KIND_HOST`` constant.
 
     Returns:
-        ``max(0, 旧宿主归纳数 - 搬成数)``（怪癖 8：防御性下界）。
+        ``max(0, old host summary count - moved count)`` (quirk 8: defensive
+        lower bound).
 
-    只数 ``summary_kind == host`` 且 summary 非空的簇——空 summary 的
-    host 簇本来就没有可搬的资产。
+    Only clusters with ``summary_kind == host`` and a non-empty summary are
+    counted -- a host cluster with an empty summary has no assets to move in
+    the first place.
     """
     n_old_host = sum(
         1 for t in old.values()
@@ -123,7 +149,7 @@ def count_lost_host(
 
 
 # ======================================================================
-# 块 3：回显体组装（旧壳 2960-2980）
+# Block 3: echo body assembly (old shell 2960-2980)
 # ======================================================================
 def assemble_report(
     *,
@@ -142,17 +168,22 @@ def assemble_report(
     by_status: Callable[[dict[str, Any]], dict[str, int]],
     layer_epoch: Callable[[dict[str, Any]], int],
 ) -> dict[str, Any]:
-    """组装刷新回显体：coverage 七键在前 + 12 键更新（键序即信号）。
+    """Assemble the refresh echo body: coverage's seven keys first + a 12-key
+    update (key order is itself a signal).
 
-    怪癖复刻：
+    Quirk replication:
 
-    - ``new_topics`` 跟 ``force`` 旗标不跟 ``old``：force（含空层
-      force）报全部簇数，增量报增量差（怪癖 1）。
-    - ``dropped_old_topics = len(old) if old else 0``——空层 force 报 0。
-    - ``at_cap`` 用 ``>=``（撞到主题数上限 ⇒ 之后的记录是被**强制归入**
-      最相近的簇，必须看得见，HIPPOCAMPUS_TOPIC_MAX）。
-    - ``took_s = round(took, 3)``；分母 ``alive_total`` 是 **active
-      总数**（含无向量），不是「有向量的条数」——后者会让覆盖率虚高。
+    - ``new_topics`` follows the ``force`` flag, not ``old``: force (including
+      force on an empty layer) reports the full cluster count, incremental
+      reports the incremental difference (quirk 1).
+    - ``dropped_old_topics = len(old) if old else 0`` -- force on an empty
+      layer reports 0.
+    - ``at_cap`` uses ``>=`` (hitting the topic count cap => later records are
+      **forcibly assigned** to the nearest cluster and must be visible,
+      HIPPOCAMPUS_TOPIC_MAX).
+    - ``took_s = round(took, 3)``; the denominator ``alive_total`` is the
+      **total active count** (including vectorless ones), not "the count with
+      vectors" -- the latter would inflate the coverage ratio.
     """
     out = coverage_of(knowledge, alive_total)
     out.update({
@@ -162,12 +193,14 @@ def assemble_report(
         "migrated_host": migrated,
         "lost_host": lost_host,
         "epoch": layer_epoch(knowledge),
-        # force 是清空重画，减 before 会算出负数——那时"新增"就等于全部。
+        # force is a clear-and-redraw; subtracting before would go negative --
+        # in that case "new" equals everything.
         "new_topics": (len(knowledge) if force
                        else len(knowledge) - before),
         "members_dropped": dropped,
-        # 无向量的存活记录数：覆盖率里的 unassigned 有一部分就是它们。
-        # 不报出来，用户只会看到"覆盖率掉了"而找不到原因。
+        # The count of surviving records without vectors: part of coverage's
+        # unassigned is exactly them. Without reporting it, users only see
+        # "coverage dropped" and cannot find the cause.
         "no_vector": no_vec,
         "took_s": round(took, 3),
         "at_cap": len(knowledge) >= max_topics,
@@ -177,7 +210,7 @@ def assemble_report(
 
 
 # ======================================================================
-# 编排入口（壳的唯一调用点）
+# Orchestration entry (the shell's only call site)
 # ======================================================================
 def collect(
     items: list[dict[str, Any]],
@@ -199,26 +232,37 @@ def collect(
     by_status: Callable[[dict[str, Any]], dict[str, int]],
     summary_kind_host: str,
 ) -> tuple[dict[str, Any], dict[str, Any], float, int]:
-    """refresh_knowledge 全流程：分叉 → build → refresh → 迁移 → 回显。
+    """The full refresh_knowledge flow: fork -> build -> refresh -> migrate ->
+    echo.
 
-    三步顺序有语义（与原实现逐行对齐）：先按存活记录重裁 → 再增量归入
-    未分配的 → 最后重算派生字段。反过来会先把已删的成员算进质心里。
+    The three-step order carries semantics (line-by-line aligned with the
+    original implementation): first re-trim against surviving records -> then
+    incrementally absorb the unassigned -> finally recompute derived fields.
+    Reversed, deleted members would be baked into the centroids first.
 
     Args:
-        items: 有向量的存活记录（``_knowledge_items()``）。
-        info: 存活全集 ``id -> item``（含无向量，``require_vec=False``）。
-        knowledge: 当前主题层（壳直传 ``self.knowledge``）。
-        force: 是否重画簇边界。
-        defaults: ``_topic_defaults()`` 现取快照（开头那次）。
-        max_topics: **第二次** ``_topic_defaults()`` 现取的 max_topics。
-        now: ``manager._reference_time or _now()``（壳算好注入）。
-        t0: 计时窗起点（壳在取数前打戳）。
-        clock: 取当前墙钟的 callable（壳给 ``time.time``）。
-        其余: 八个 topic 包符号（见模块 docstring）。
+        items: surviving records with vectors (``_knowledge_items()``).
+        info: the full surviving set ``id -> item`` (including vectorless,
+            ``require_vec=False``).
+        knowledge: the current topic layer (the shell passes
+            ``self.knowledge`` straight through).
+        force: whether to redraw cluster boundaries.
+        defaults: a live snapshot of ``_topic_defaults()`` (the one at the
+            top).
+        max_topics: the max_topics from the **second** live fetch of
+            ``_topic_defaults()``.
+        now: ``manager._reference_time or _now()`` (computed by the shell and
+            injected).
+        t0: the start of the timing window (the shell stamps it before
+            fetching).
+        clock: a callable returning the current wall clock (the shell gives
+            ``time.time``).
+        others: the eight topic package symbols (see the module docstring).
 
     Returns:
-        ``(new_knowledge, report, took, dropped)``——新主题层（壳负责
-        赋回 ``self.knowledge``）、回显体、未取整耗时、摘掉的成员数。
+        ``(new_knowledge, report, took, dropped)`` -- the new topic layer (the
+        shell assigns it back to ``self.knowledge``), the echo body, the
+        unrounded elapsed time, and the number of members removed.
     """
     alive = list(info.keys())
     no_vec = len(info) - len(items)
@@ -229,8 +273,9 @@ def collect(
     new_knowledge = build(items, base, alive_ids=alive, epoch=epoch,
                           defaults=defaults)
     refresh(new_knowledge, info, defaults=defaults, now=now)
-    # 归纳迁移：host 归纳是宿主资产，重画边界不该把它冲掉。
-    # 搬过去后**故意不重算签名** ⇒ 地图上标 stale ⇒ 提示复核。
+    # Summary migration: host summaries are host assets; redrawing boundaries
+    # must not wash them away. After moving, the signature is **deliberately
+    # not recomputed** => the map flags it stale => prompting a re-check.
     migrated: list[dict[str, Any]] = []
     lost_host = 0
     if old:

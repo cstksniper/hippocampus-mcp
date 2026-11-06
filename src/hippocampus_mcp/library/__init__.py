@@ -1,22 +1,31 @@
 # -*- coding: utf-8 -*-
-"""库清单与发现层（**只读**：不改任何现有数据文件）。
+"""Library catalog and discovery layer (**read-only**: never modifies any
+existing data files).
 
-这一层存在的理由：多库的第一件事不是"切"，而是"**先知道有哪些库**"。
-在库名能被解析之前，``library_use("写作")`` 这类调用只能靠猜，而猜错就是
-把记忆写进别人的库 —— 那是比丢数据更难发现的事故（两边都无报错）。
+Why this layer exists: the first thing multi-library support needs is not
+"switching" but "**knowing which libraries exist**". Before a library name
+can be resolved, calls like ``library_use("写作")`` can only guess, and a
+wrong guess writes memories into someone else's library -- an accident
+harder to discover than data loss (no error on either side).
 
-三条设计前提（都来自实测，别凭直觉改）：
+Three design premises (all from field measurements; do not change on
+intuition):
 
-1. **路径必须归一**：实测同一工作区会给出 ``d:\\`` 与 ``D:\\`` 两种盘符，
-   不归一就会把同一个库当成两个，进而"建了两个 brain 指向一份存储"。
-   全模块一律用 :func:`normpath`。
-2. **备份只读**：``.bak-*`` / ``.snap-*`` / ``corrupt`` 目录**必须**标 ``backup``
-   且不参与名字解析 —— 否则 ``library_use("写作")`` 可能选中一次历史快照，
-   之后的写入全落在快照里，真库一条没动。
-3. **老库懒补、不写盘**：存量库没有 ``library.json``，只在**内存里**
-   按目录名补出名字（去掉 ``hippo_`` 前缀），**不落任何文件** —— 本层的
-   硬约束就是「不改任何现有数据文件」。真正写清单只在 ``library_create``
-   建新库时发生。
+1. **Paths must be normalized**: measurements show the same workspace can
+   yield both ``d:\\`` and ``D:\\`` drive letters; without normalization the
+   same library is seen as two, leading to "two brains pointing at one
+   store". The whole module uses :func:`normpath` exclusively.
+2. **Backups are read-only**: ``.bak-*`` / ``.snap-*`` / ``corrupt``
+   directories **must** be flagged ``backup`` and excluded from name
+   resolution -- otherwise ``library_use("写作")`` could pick a historical
+   snapshot, and all subsequent writes would land in the snapshot while the
+   real library got nothing.
+3. **Legacy libraries are lazily backfilled, never written to disk**:
+   existing libraries have no ``library.json``; their names are inferred
+   in **memory** from the directory name (stripping the ``hippo_`` prefix),
+   **without persisting any file** -- the hard constraint of this layer is
+   "never modify any existing data files". The manifest is only written
+   when ``library_create`` builds a new library.
 """
 from __future__ import annotations
 
@@ -27,53 +36,63 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-# 构造注入缝：旋钮登记在 config（library_roots），生产路径由 engine
-# import 时灌入；解析序（env 先、注入值回退）见 common/config_bridge。
+# Construction injection seam: the knob is registered in config
+# (library_roots) and fed in by engine at import time in production; for the
+# parse order (env first, injected value as fallback) see common/config_bridge.
 from ..common.config_bridge import apply_config, resolve as _resolve
 
-#: 库清单文件名（放在库目录内）
+#: Library manifest file name (lives inside the library directory)
 MANIFEST_NAME = "library.json"
 
-# 判定「这个目录是不是一个记忆库」：命中任一层文件即可。
-# 用层文件而不是"有没有子目录"，是因为空库也该算库（零库首启会建它）。
+# Decide "is this directory a memory library": hitting any layer file counts.
+# Layer files rather than "has subdirectories", because an empty library is
+# still a library (the zero-library first start creates it).
 _LAYER_MARKERS = (
     "memories.json",
     "brain_meta.json",
     "brain_raw.json",
     MANIFEST_NAME,
-    # ⚠️ 注意：较新的库可能只有 hippocampus.db（sqlite 后端），从没写过
-    # json 层。漏了它 ⇒ 纯 sqlite 库进不了库清单 ⇒ library_use / 工作区引导文件
-    # 对它全部解析失败（实测三种写法全抛
-    # LibraryResolutionError；宿主 PERSIST_DIR 直通不过清单，所以一直没暴露）。
+    # ⚠️ Note: newer libraries may only have hippocampus.db (sqlite backend)
+    # and never wrote a json layer. Missing it ⇒ a pure sqlite library never
+    # enters the library catalog ⇒ library_use / the workspace guide file
+    # both fail to resolve it (measured: all three spellings raise
+    # LibraryResolutionError; the host's PERSIST_DIR bypasses the catalog,
+    # which is why it never surfaced).
     "hippocampus.db",
 )
 
-# 备份 / 快照 / 损坏隔离目录：**只读**，不参与自动选择
+# Backup / snapshot / corrupted-quarantine directories: **read-only**,
+# excluded from automatic selection
 _BACKUP_PREFIXES = (".bak", ".snap", ".corrupt")
 _BACKUP_TOKENS = ("corrupt",)
 
-# 老库懒补时要剥掉的目录名前缀（data/hippo_写作 → 写作）
+# Directory-name prefixes stripped when lazily backfilling legacy library
+# names (data/hippo_写作 → 写作)
 _NAME_PREFIXES = ("hippo_",)
 
 
 class LibraryResolutionError(ValueError):
-    """库寻址失败。
+    """Library addressing failure.
 
-    **必须显式抛出，绝不静默回落到默认库** —— 多库正确性的硬规则。
-    "找不到你指定的库"和"用默认库"是两件完全不同的事，混在一起就是串库。
+    **Must be raised explicitly, never silently falling back to the default
+    library** -- the hard rule of multi-library correctness. "The library you
+    named was not found" and "use the default library" are two entirely
+    different things; conflating them is cross-library contamination.
     """
 
 
 def normpath(p: str) -> str:
-    """路径归一：大小写 + 绝对化（实测盘符大小写会不一致）。"""
+    """Path normalization: casing + absolutization (measured: drive-letter
+    casing is inconsistent)."""
     return os.path.normcase(os.path.abspath(p))
 
 
 def library_id_for(path: str) -> str:
-    """库 id：由**归一后的绝对路径**派生。
+    """Library id: derived from the **normalized absolute path**.
 
-    用路径而不是名字派生，保证 id 稳定：库改名、或被复制成
-    ``.bak`` 之后 id 仍同源，两处同 id 可被识别为 ``duplicate_of``。
+    Derived from the path rather than the name so the id stays stable: after
+    a rename, or a copy into ``.bak``, the id still shares the same origin,
+    and identical ids in two places can be recognized as ``duplicate_of``.
     """
     return "lib_" + hashlib.sha1(normpath(path).encode("utf-8")).hexdigest()[:12]
 
@@ -88,12 +107,14 @@ def _looks_like_library(path: str) -> bool:
 
 
 def _is_backup(dirname: str) -> bool:
-    """备份/快照判定。
+    """Backup/snapshot detection.
 
-    ⚠️ **不能只查前缀**：实际备份目录名是 ``hippo_写作.bak-<时间戳>`` ——
-    ``.bak`` 在**中间**而不是开头（备份脚本用 `<原名>.bak-<时间戳>` 命名）。
-    只判 ``startswith(".bak")`` 会把这类备份全判成真库，直接违反
-    「备份不参与自动选择」。故改判"包含"。
+    ⚠️ **Checking the prefix alone is not enough**: the actual backup
+    directory name is ``hippo_写作.bak-<timestamp>`` -- ``.bak`` sits in the
+    **middle**, not at the start (the backup script names it
+    `<original>.bak-<timestamp>`). Testing only ``startswith(".bak")`` would
+    classify all such backups as real libraries, directly violating "backups
+    are excluded from automatic selection". Hence the "contains" test.
     """
     low = os.path.basename(dirname.rstrip("\\/")).lower()
     for tok in (*_BACKUP_PREFIXES, *_BACKUP_TOKENS):
@@ -103,7 +124,8 @@ def _is_backup(dirname: str) -> bool:
 
 
 def _guess_name(path: str) -> str:
-    """老库懒补：目录名去 ``hippo_`` 前缀、去前导点。"""
+    """Legacy-library lazy backfill: strip the ``hippo_`` prefix and leading
+    dots from the directory name."""
     base = os.path.basename(path.rstrip("\\/")) or path
     low = base.lower()
     for pref in _NAME_PREFIXES:
@@ -114,16 +136,21 @@ def _guess_name(path: str) -> str:
 
 
 def display_name(path: str) -> str:
-    """库的展示名：library.json 的 name → 目录名懒补。
+    """Display name of a library: library.json's name → directory-name lazy
+    backfill.
 
-    读不到清单时按 ``_guess_name`` 的规则从 path 推——权威身份
-    始终在 session_start 返回体的 ``library`` 键里，这里只是卡片上的
-    一行标签，推不出来时用目录名不丢人。
+    When the manifest cannot be read, it is inferred from path by the
+    ``_guess_name`` rules -- the authoritative identity always lives in the
+    ``library`` key of the session_start response; this is just one label on
+    a card, and falling back to the directory name when inference fails is
+    nothing to be ashamed of.
 
-    与 ``_info_for(path).name`` 同口径但**刻意不复用**：那边先
-    ``normpath`` 再推名，本函数按调用方给的原始 path 推（brain 的
-    persist_dir 已是归一绝对路径，两种输入下等价，但边缘形态——
-    如未归一路径——的行为以本实现为准）。
+    Same criterion as ``_info_for(path).name`` but **deliberately not
+    reused**: that one ``normpath``s first and then infers the name, while
+    this function infers from the raw path the caller provided (brain's
+    persist_dir is already a normalized absolute path, so the two agree for
+    those inputs, but for edge shapes -- e.g. un-normalized paths -- this
+    implementation's behavior is authoritative).
     """
     try:
         fp = os.path.join(path or "", MANIFEST_NAME)
@@ -132,22 +159,25 @@ def display_name(path: str) -> str:
         name = str((data or {}).get("name") or "").strip()
         if name:
             return name
-    except Exception:  # noqa: BLE001 —— 缺文件/坏文件都按"没有"处理
+    except Exception:  # noqa: BLE001 -- a missing/bad file is both treated as "absent"
         pass
     return _guess_name(path or "") or "unnamed"
 
 
 @dataclass
 class LibraryInfo:
-    """一个被发现的记忆库。
+    """A discovered memory library.
 
     Attributes:
-        path: 归一后的绝对路径（**唯一标识**）。
-        library_id: ``lib_<sha1 前 12 位>``，由 path 派生 ⇒ 稳定。
-        name: 人类可读名字（清单优先，否则懒补）。
-        aliases: 别名列表，参与名字解析。
-        backup: True = 备份/快照/损坏目录，**只读且不参与自动选择**。
-        explicit: True = 目录里有 ``library.json``（False = 懒补，内存态）。
+        path: normalized absolute path (**unique identity**).
+        library_id: ``lib_<first 12 hex of sha1>``, derived from path ⇒
+            stable.
+        name: human-readable name (manifest first, otherwise lazy backfill).
+        aliases: alias list, participates in name resolution.
+        backup: True = backup/snapshot/corrupted directory, **read-only and
+            excluded from automatic selection**.
+        explicit: True = the directory has ``library.json`` (False = lazy
+            backfill, in-memory only).
     """
 
     path: str
@@ -173,12 +203,13 @@ class LibraryInfo:
 
 
 def _read_manifest(path: str) -> dict[str, Any]:
-    """读 ``library.json``。缺失/损坏**都不是错误**（老库本就没有）。"""
+    """Read ``library.json``. Missing/corrupt are **not errors** (legacy
+    libraries simply lack it)."""
     fp = os.path.join(path, MANIFEST_NAME)
     try:
         with open(fp, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except Exception:  # noqa: BLE001 —— 缺文件是常态，坏文件按"没有"处理
+    except Exception:  # noqa: BLE001 -- a missing file is the norm; a bad file is treated as "absent"
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -203,25 +234,29 @@ def _info_for(path: str) -> LibraryInfo:
 
 
 # ----------------------------------------------------------------------
-# 扫描
+# Scanning
 # ----------------------------------------------------------------------
 def _repo_root() -> str:
-    """仓库根 = ``src/hippocampus_mcp/library`` 的上三级。
+    """Repo root = three dirname levels up from
+    ``src/hippocampus_mcp/library``.
 
-    ⚠️ 三级 dirname 与本模块在 ``src/hippocampus_mcp/library/`` 包内的
-    深度一一对应；模块若再挪层级必须同步加减，否则 ``<仓库>/data`` 会
-    算成 ``src/data`` 而静默少扫一个库根。
+    ⚠️ The three dirnames correspond one to one with this module's depth
+    inside the ``src/hippocampus_mcp/library/`` package; if the module moves
+    a level, these must change in lockstep, otherwise ``<repo>/data`` gets
+    computed as ``src/data`` and one library root is silently missed by the
+    scan.
     """
     return os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))))
 
 
 def default_roots() -> list[str]:
-    """默认扫描根：env ``HIPPOCAMPUS_LIBRARY_ROOTS``（``os.pathsep`` 分隔）>
-    ``~/.hippocampus_mcp`` + ``<仓库>/data``。
+    """Default scan roots: env ``HIPPOCAMPUS_LIBRARY_ROOTS`` (separated by
+    ``os.pathsep``) > ``~/.hippocampus_mcp`` + ``<repo>/data``.
 
-    两个根都要扫：前者是 MCP 默认 persist_dir（老部署就在那），
-    后者是本项目把库按目录铺开的地方。
+    Both roots must be scanned: the former is the MCP default persist_dir
+    (older deployments live there), the latter is where this project lays
+    libraries out as directories.
     """
     env = _resolve("HIPPOCAMPUS_LIBRARY_ROOTS", "library_roots", "").strip()
     if env:
@@ -234,10 +269,12 @@ def default_roots() -> list[str]:
 
 
 def scan_libraries(roots: list[str] | None = None) -> list[LibraryInfo]:
-    """扫描目录发现库。**只读**，不创建也不修改任何文件。
+    """Scan directories to discover libraries. **Read-only**: creates and
+    modifies nothing.
 
-    每个 root 先自查是不是库（老部署把库直接放在 ``~/.hippocampus_mcp``），
-    再扫它的**直接**子目录（不递归：库不会层层嵌套）。
+    Each root first checks whether it is itself a library (older deployments
+    put the library directly under ``~/.hippocampus_mcp``), then scans its
+    **direct** subdirectories (no recursion: libraries do not nest).
     """
     found: dict[str, LibraryInfo] = {}
     for root in (roots if roots is not None else default_roots()):
@@ -252,7 +289,7 @@ def scan_libraries(roots: list[str] | None = None) -> list[LibraryInfo]:
                 sub = os.path.join(root, entry)
                 if os.path.isdir(sub):
                     candidates.append(sub)
-        except OSError:  # noqa: BLE001 —— 无权读的目录跳过，不该让整个扫描失败
+        except OSError:  # noqa: BLE001 -- skip unreadable directories; the whole scan must not fail
             continue
         for cand in candidates:
             if not _looks_like_library(cand):
@@ -264,7 +301,7 @@ def scan_libraries(roots: list[str] | None = None) -> list[LibraryInfo]:
 
 
 # ----------------------------------------------------------------------
-# 寻址：三态解析（id → 名字/别名 → 路径）
+# Addressing: three-state resolution (id → name/alias → path)
 # ----------------------------------------------------------------------
 def _match_by_id(query: str, libs: list[LibraryInfo]) -> LibraryInfo | None:
     q = query.strip().lower()
@@ -275,7 +312,8 @@ def _match_by_id(query: str, libs: list[LibraryInfo]) -> LibraryInfo | None:
 
 
 def _match_by_name(query: str, libs: list[LibraryInfo]) -> tuple[LibraryInfo | None, list[LibraryInfo]]:
-    """按名字/别名精确匹配。**歧义不猜** —— 返回候选让调用方显式报错。"""
+    """Exact match by name/alias. **Never guess on ambiguity** -- return the
+    candidates so the caller can fail explicitly."""
     q = query.strip()
     ql = q.lower()
     hits = [i for i in libs if not i.backup and (i.name.lower() == ql or ql in [a.lower() for a in i.aliases])]
@@ -291,7 +329,8 @@ def _match_by_path(query: str, libs: list[LibraryInfo]) -> LibraryInfo | None:
     for info in libs:
         if info.path == key:
             return info
-    # 路径存在且像个库，但不在扫描结果里（例如扫描根没覆盖它）→ 就地补一个
+    # The path exists and looks like a library but is not in the scan result
+    # (e.g. no scan root covers it) → synthesize an entry in place
     if _looks_like_library(key):
         return _info_for(key)
     return None
@@ -303,17 +342,20 @@ def resolve_library(
     libs: list[LibraryInfo] | None = None,
     default_path: str | None = None,
 ) -> LibraryInfo | None:
-    """三态解析：``lib_`` id → 名字/别名 → 路径。
+    """Three-state resolution: ``lib_`` id → name/alias → path.
 
     Args:
-        query: 调用方给的库标识。**留空返回 None**（＝"没指定"，由调用方决定
-            是否走粘性/默认库）—— "没指定"与"指定了一个不存在的"必须分开处理。
-        default_path: 默认库路径。它即便不在扫描结果里也必须可解析（老部署
-            的 persist_dir 常常不在任何扫描根下）。
+        query: library identifier given by the caller. **Empty returns
+            None** (= "not specified"; the caller decides whether to use the
+            sticky/default library) -- "not specified" and "specified but
+            nonexistent" must be handled separately.
+        default_path: default library path. It must stay resolvable even
+            when absent from the scan result (older deployments' persist_dir
+            often lies under no scan root).
 
     Raises:
-        LibraryResolutionError: 指定了但解析不明（含重名歧义）。
-            **绝不静默回落**。
+        LibraryResolutionError: specified but unresolvable (including
+            duplicate-name ambiguity). **Never silently falls back**.
     """
     if query is None or not str(query).strip():
         return None
@@ -336,8 +378,10 @@ def resolve_library(
     if hit is not None:
         return hit
 
-    # 名字只命中**备份**目录时必须把话说清楚。说"找不到"是错的：库确实在，
-    # 只是只读。运维看到"找不到"会以为路径配错了，转头去改配置 —— 白折腾。
+    # When the name only hits **backup** directories, the message must be
+    # precise. Saying "not found" is wrong: the library is there, just
+    # read-only. Seeing "not found", ops would assume a misconfigured path
+    # and go tweak config -- effort wasted.
     ql = q.lower()
     bak_hits = [
         i for i in pool if i.backup
@@ -360,7 +404,8 @@ def resolve_library(
     if hit is not None:
         return hit
 
-    # 走到这里＝"指定了但解析不明"，必须报错。给出近似名建议（编辑距离 ≤2）。
+    # Reaching here = "specified but unresolvable"; must raise. Offer
+    # near-name suggestions (edit distance ≤ 2).
     suggestions = _suggest(q, pool)
     tail = f"Did you mean: {suggestions}?" if suggestions else "Use library_list to see available libraries."
     raise LibraryResolutionError(f"Memory library {q} not found. {tail}")
@@ -395,11 +440,12 @@ def _suggest(query: str, libs: list[LibraryInfo], max_dist: int = 2) -> str:
 
 
 # ----------------------------------------------------------------------
-# 建库：扫描路径不调用，留给 library_create
+# Library creation: not called from the scan path, reserved for library_create
 # ----------------------------------------------------------------------
 def write_manifest(path: str, name: str, aliases: list[str] | None = None,
                    embedder_model: str = "") -> LibraryInfo:
-    """新建库清单。**只在 library_create 时调用**，扫描路径绝不写盘。"""
+    """Write a new library manifest. **Called only from library_create**;
+    the scan path never writes to disk."""
     path = normpath(path)
     os.makedirs(path, exist_ok=True)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")

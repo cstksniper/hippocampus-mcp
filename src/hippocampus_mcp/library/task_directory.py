@@ -1,22 +1,32 @@
 # -*- coding: utf-8 -*-
-"""任务目录 sidecar 的读写：``<user 库>/directory.json``。
+"""Read/write for the task directory sidecar: ``<user 库>/directory.json``.
 
-三条形态约束：
+Three structural constraints:
 
-1. **sidecar 不是记忆**：与 ``memories.json`` 同级的普通 JSON 文件
-   （同信息地图层 ``maps.json`` 侧车的形态）。**不进召回池、不做向量记忆**
-   ——目录要的是精确命中，语义检索漏检＝寻址失败。
-2. **受管结构**：写路径只有受管通道（``library_create`` 建库即登记）。
-   本模块提供 ``upsert_entry`` 这一个写原语，**不开放普通写工具**：
-   目录若被任意 agent 裸写，改掉一个任务地址就会污染此后所有跨库寻址。
-   读路径任意——它本来就该被读。
-3. **坏文件不静默**：JSON 坏/结构坏一律返回 issue 码交给调用方自曝，**绝不
-   当空目录继续**（空目录＝「这个任务没登记过」，与「文件坏了」是两回事）。
-   写路径遇到坏文件则**拒绝覆盖**（抛错），避免把用户手写的条目冲掉。
+1. **The sidecar is not memory**: a plain JSON file at the same level as
+   ``memories.json`` (same shape as the knowledge-map layer's ``maps.json``
+   sidecar). **It never enters the recall pool and is not vector memory** --
+   the directory needs exact hits; a semantic-retrieval miss = an addressing
+   failure.
+2. **Managed structure**: the write path has only the managed channel
+   (``library_create`` registers on library creation). This module provides
+   the single write primitive ``upsert_entry`` and **exposes no ordinary write
+   tool**: if any agent could write the directory raw, changing one task
+   address would pollute all future cross-library addressing. Reads are open
+   -- it is meant to be read.
+3. **A bad file is never silent**: broken JSON / broken structure always
+   returns an issue code for the caller to self-report, and **never proceeds
+   as an empty directory** (an empty directory = "this task was never
+   registered", which is a different thing from "the file is broken"). The
+   write path **refuses to overwrite** a bad file (raises), to avoid wiping
+   user-hand-written entries.
 
-原子写：临时文件 + ``os.replace``（同目录，跨盘符也不会失败）。进程内用
-模块级锁串行化读改写；**跨进程**（多个 stdio 服务同指一个 user 库）理论上
-仍可能丢一次更新——代价是「新库漏登记」（可见、可手工补），故不引文件锁。
+Atomic write: temp file + ``os.replace`` (same directory, cannot fail even
+across drive letters). In-process read-modify-write is serialized by a
+module-level lock; **across processes** (multiple stdio services pointing at
+one user library) one update can in theory still be lost -- the cost is "a new
+library missed registration" (visible, fixable by hand), so no file lock is
+introduced.
 """
 
 from __future__ import annotations
@@ -40,31 +50,36 @@ __all__ = [
     "upsert_entry",
 ]
 
-#: 与 ``memories.json`` / ``library.json`` 同级的侧车文件名。
+#: Sidecar file name, at the same level as ``memories.json`` / ``library.json``.
 DIRECTORY_NAME = "directory.json"
 
-#: 读改写串行化（进程内）。只保护写路径——读不持锁，坏文件由调用方兜。
+#: Read-modify-write serialization (in-process). Protects only the write path --
+#: reads take no lock; bad files are the caller's to handle.
 _WRITE_LOCK = threading.Lock()
 
 
 class TaskDirectoryError(ValueError):
-    """任务目录写失败（坏文件 / 条目非法）。**不吞**：调用方要出声。"""
+    """Task directory write failure (bad file / invalid entry). **Never
+    swallowed**: the caller must make noise."""
 
 
 def directory_path(library_path: str) -> str:
-    """``<user 库>/directory.json`` 的绝对路径。"""
+    """Absolute path of ``<user 库>/directory.json``."""
     return os.path.join(normpath(library_path), DIRECTORY_NAME)
 
 
 def load_directory(library_path: str) -> tuple[dict[str, Any], str | None]:
-    """读 sidecar，返回 ``(data, issue)``。
+    """Read the sidecar, returning ``(data, issue)``.
 
-    ``data`` 恒为 ``{"schema": int, "entries": [...]}``（条目已归一）；
-    ``issue`` 为 ``None`` 表示读到了（含**文件不存在**——新装即空目录，
-    不是错误），否则是自曝码 ``"task_directory_read_failed"``。
+    ``data`` is always ``{"schema": int, "entries": [...]}`` (entries already
+    normalized); ``issue`` being ``None`` means it was read (including **file
+    does not exist** -- a fresh install is an empty directory, not an error);
+    otherwise it is the self-report code ``"task_directory_read_failed"``.
 
-    统计口径：``entries`` 只含**归一后有效**的条目，坏条目在这里被丢弃
-    （缺 ``task``/``path`` 的没法寻址）。丢弃条数由 ``data["dropped"]`` 自曝。
+    Counting contract: ``entries`` contains only **valid-after-normalization**
+    entries; bad entries are dropped here (ones lacking ``task``/``path``
+    cannot be addressed). The dropped count is self-reported via
+    ``data["dropped"]``.
     """
     path = directory_path(library_path)
     try:
@@ -94,7 +109,8 @@ def load_directory(library_path: str) -> tuple[dict[str, Any], str | None]:
 
 
 def save_directory(library_path: str, data: dict[str, Any]) -> str:
-    """原子写 sidecar（临时文件 + ``os.replace``）。返回写到的路径。"""
+    """Atomically write the sidecar (temp file + ``os.replace``). Returns the
+    written path."""
     path = directory_path(library_path)
     payload = {
         "schema": int(data.get("schema") or DIRECTORY_SCHEMA),
@@ -107,7 +123,8 @@ def save_directory(library_path: str, data: dict[str, Any]) -> str:
             fh.write("\n")
         os.replace(tmp, path)
     except OSError:
-        # 临时文件残留会让下次判断「目录里多了个怪文件」，清掉再抛。
+        # A leftover temp file would make the next reader think "the directory
+        # grew a weird file"; clean up before re-raising.
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -119,19 +136,24 @@ def save_directory(library_path: str, data: dict[str, Any]) -> str:
 
 def upsert_entry(library_path: str, entry: dict[str, Any],
                  *, now: float | None = None) -> dict[str, Any]:
-    """登记/更新一条 ``任务 → 库`` 映射（**唯一的写原语**）。
+    """Register/update one ``task -> library`` mapping (**the only write
+    primitive**).
 
-    去重键是**归一后的路径**（``normpath``：盘符大小写/相对路径都算同一个），
-    不是 ``library_id``——id 只作人读与将来去重，寻址主键是路径。
-    同一任务名换了库（重建/迁址后重新登记）时，旧条目原地改成新路径，
-    避免一个任务名指向两个库这种歧义（「不猜」的反面是别制造歧义）。
+    The dedup key is the **normalized path** (``normpath``: drive-letter case
+    and relative paths all count as the same), not ``library_id`` -- the id is
+    for human reading and future dedup; the addressing primary key is the path.
+    When the same task name switches library (re-registration after a rebuild
+    or relocation), the old entry is updated in place to the new path, avoiding
+    the ambiguity of one task name pointing at two libraries (the flip side of
+    "don't guess" is: don't manufacture ambiguity).
 
     Returns:
-        ``{"registered": True, "created": bool, "moved": bool, "count": int}``。
+        ``{"registered": True, "created": bool, "moved": bool, "count": int}``.
 
     Raises:
-        TaskDirectoryError: sidecar 坏/不可读，或条目缺 ``task``/``path``。
-            **不覆盖坏文件**——那可能是用户手写的目录，冲掉就找不回来了。
+        TaskDirectoryError: the sidecar is bad/unreadable, or the entry lacks
+            ``task``/``path``. **A bad file is never overwritten** -- it may be
+            a user-hand-written directory; wiping it loses it forever.
     """
     item = normalize_entry(entry)
     if item is None:
@@ -149,12 +171,12 @@ def upsert_entry(library_path: str, entry: dict[str, Any],
         idx = next((i for i, e in enumerate(entries)
                     if normpath(e["path"]) == key), None)
         if idx is not None:
-            entries[idx] = item           # 同一个库重新登记 = 原地更新
+            entries[idx] = item           # same library re-registered = in-place update
         else:
             old = next((i for i, e in enumerate(entries)
                         if e["task"].casefold() == item["task"].casefold()), None)
             if old is not None:
-                entries[old] = item       # 同名任务换库：原地搬过去
+                entries[old] = item       # same-named task switched library: move in place
                 moved = True
             else:
                 entries.append(item)

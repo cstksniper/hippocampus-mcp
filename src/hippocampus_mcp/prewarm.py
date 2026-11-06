@@ -1,48 +1,62 @@
-"""prewarm —— 把 daemon 的创建者从「宿主进程树」换成「用户会话级」。
+"""prewarm -- moving the daemon's creator from the "host process tree" to
+the "user session level".
 
-## 为什么需要这个模块
+## Why this module exists
 
-实测结论：
+Measured conclusions:
 
-- daemon 的创建者是**宿主 spawn 的 launcher** ⇒ daemon 落在宿主的**进程树**里
-- 宿主空闲约 5 分钟后回收会话，daemon 被一起终止
-  —— 日志里 **0 条退出记录、0 条崩溃痕迹**，看起来像"无声消失"
-- ``CREATE_BREAKAWAY_FROM_JOB`` 治不了它：已用行为实验证伪，
-  daemon 本来就不在宿主 Job 里（``0x2400 = JOB_MEMORY|SILENT_BREAKAWAY_OK``），
-  那是条伪需求
+- the daemon's creator is the **launcher spawned by the host** ⇒ the daemon
+  lands in the host's **process tree**
+- the host reclaims the session after roughly 5 minutes idle, terminating
+  the daemon with it
+  -- the log shows **0 exit records and 0 crash traces**, looking like a
+  "silent disappearance"
+- ``CREATE_BREAKAWAY_FROM_JOB`` cannot cure it: already falsified by a
+  behavioral experiment, the daemon was never inside the host's Job
+  (``0x2400 = JOB_MEMORY|SILENT_BREAKAWAY_OK``); that was a pseudo
+  requirement
 
-**治本解是换创建者**。让 daemon 由「登录启动 / 计划任务」拉起，它的父进程就是
-explorer 或 Schedule 服务，宿主回收会话时够不着它。
+**The root fix is changing the creator**. Let the daemon be started by
+"login startup / a scheduled task"; its parent is then explorer or the
+Schedule service, out of the host's reach when it reclaims the session.
 
-launcher 侧**一行都不用改**：它本来就先查 registry，有活的就直接复用
-（``ensure_daemon`` 的路径 ①）。所以预热只是"提前把 registry 填好"。
+The launcher side needs **zero changes**: it already checks the registry
+first and reuses a live daemon when found (path ① of ``ensure_daemon``).
+So prewarming is just "filling the registry ahead of time".
 
-## 用法
+## Usage
 
 ::
 
-    # 预热（幂等：已有可用 daemon 就跳过）
+    # Prewarm (idempotent: skips when a usable daemon already exists)
     python -m hippocampus_mcp.prewarm --cwd D:\\work\\proj
 
-    # 带显式库 / 模型（必须与宿主给 launcher 的环境变量一致）
+    # With explicit library / model (must match the env vars the host gives
+    # the launcher)
     python -m hippocampus_mcp.prewarm --cwd D:\\work\\proj \\
         --library D:\\data\\hippo_proj --model BAAI/bge-base-zh-v1.5
 
-    # 只查询，不启动
+    # Query only, no start
     python -m hippocampus_mcp.prewarm --status --cwd D:\\work\\proj
 
-    # 机器可读（计划任务 / 包装脚本用）
+    # Machine-readable (for scheduled tasks / wrapper scripts)
     python -m hippocampus_mcp.prewarm --cwd ... --json
 
-退出码：0＝已有或已起好；1＝起不来；2＝参数错误。
+Exit codes: 0 = already there or started fine; 1 = could not start; 2 =
+argument error.
 
-## 🔴 正确性前提（错了不报错，只会白起一个）
+## 🔴 Correctness preconditions (getting them wrong does not error; it just
+starts a useless one)
 
-1. **key 必须一致**：``key = daemon_key(library, model, version)``，与 launcher
-   从环境变量算出来的必须同一个。三者任一不同 ⇒ 预热起的是**另一个** daemon，
-   宿主会话里的 launcher 会另起一个真的，预热这个变成没人用的孤儿。
-2. **cwd 必须正确**：``library`` 为空时 daemon 按**自己的 cwd** 定位库。
-   cwd 错了会起来一个指向别处的 daemon —— 照样能起、照样写登记，只是库不对。
+1. **The key must match**: ``key = daemon_key(library, model, version)``
+   must be the same one the launcher computes from its env vars. If any of
+   the three differs ⇒ prewarming starts **another** daemon; the launcher
+   in the host session will start its own real one, and the prewarmed one
+   becomes an orphan nobody uses.
+2. **The cwd must be right**: when ``library`` is empty, the daemon locates
+   the library by **its own cwd**. A wrong cwd starts a daemon pointing
+   somewhere else -- it starts fine and registers fine, just against the
+   wrong library.
 """
 from __future__ import annotations
 
@@ -64,7 +78,8 @@ __all__ = ["prewarm", "state", "main"]
 
 
 def state(key: str) -> dict[str, Any]:
-    """该 key 当前有没有可用 daemon。只读，不启动任何东西。"""
+    """Whether a usable daemon currently exists for this key. Read-only,
+    starts nothing."""
     info = read_registry(key)
     return {
         "key": key,
@@ -76,10 +91,11 @@ def state(key: str) -> dict[str, Any]:
 
 def prewarm(cwd: str = "", library: str = "", model: str = "",
             version: str = "") -> dict[str, Any]:
-    """拉起常驻 daemon（若尚未有可用的）。**幂等**。
+    """Start the resident daemon (if none usable yet). **Idempotent**.
 
-    返回 dict，至少含 ``ok`` / ``action`` / ``key``。
-    ``action`` ∈ ``skip``（已有，复用）| ``spawned``（本次拉起）| ``failed``。
+    Returns a dict with at least ``ok`` / ``action`` / ``key``.
+    ``action`` ∈ ``skip`` (already there, reused) | ``spawned`` (started
+    this time) | ``failed``.
     """
     key = daemon_key(library, model, version)
     before = read_registry(key)

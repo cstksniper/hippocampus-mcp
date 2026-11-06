@@ -1,29 +1,38 @@
 # -*- coding: utf-8 -*-
-"""保存账本（save_ledger.jsonl，从 brain/core.py 提取）。
+"""Save ledger (save_ledger.jsonl, extracted from brain/core.py).
 
-定位（承 common/constants.py 里 LEDGER_FILENAME 的注释）：一次保存 =
-``begin`` + ``end`` 两行，异常路径记 ``fail``。**追加式是硬要求**——
-全量重写会让账本自己变成新的丢数据点。ring buffer 防无限增长。
+Positioning (inheriting the LEDGER_FILENAME comment in common/constants.py):
+one save = ``begin`` + ``end`` rows; the exception path records ``fail``.
+**Append-only is a hard requirement** -- a full rewrite would turn the ledger
+itself into a new data-loss point. A ring buffer prevents unbounded growth.
 
-为什么放 store/ 而不是 brain：这是纯持久化设施（JSONL 读写 + 环裁剪 +
-坏文件隔离 + 启动对账判定），零领域逻辑；brain 只留薄包装（路径/读尾/
-追加/裁剪/对账）当适配层。账本行数（``lines``）与末条（``last``）的状态
-语义由包装层落回实例属性，本模块只返回纯结果：
+Why store/ and not brain: this is a pure persistence facility (JSONL I/O +
+ring trimming + corrupt-file quarantine + boot reconciliation decision) with
+zero domain logic; brain keeps only thin wrappers (path / read tail / append /
+trim / reconcile) as the adapter layer. The state semantics of the ledger line
+count (``lines``) and last entry (``last``) are written back to instance
+attributes by the wrapper layer; this module returns pure results only:
 
-- :func:`append` 返回 ``(是否落盘, 追加后行数)``——写失败时行数不动、
-  末条不更新（「改之前是什么」不能指向一条没写成功的记录）；
-- :func:`trim` 返回新行数或 ``None``（``None`` = 调用方保持原值：
-  无 persist_dir / 读失败 / 写失败三种「没法数」的情形）。
+- :func:`append` returns ``(persisted or not, line count after the append)`` --
+  on write failure the line count stays put and the last entry is not updated
+  ("what it was before the change" must not point at a record that never got
+  written);
+- :func:`trim` returns the new line count or ``None`` (``None`` = the caller
+  keeps its current value: the three "cannot count" cases -- no persist_dir /
+  read failure / write failure).
 
-旋钮面（同 tag_ops）：``core.LEDGER_RING`` 被测试 monkeypatch
-控环大小（test_save_ledger L5）⇒ 本模块函数只认显式 ``ring`` 参数，
-**不 import 任何 Config/常量旋钮**；包装层在调用时从 core 命名空间现取
-（``LEDGER_TRIM_AT`` 虽无 monkeypatch 先例，同路径一并现取，少一处
-特例）。唯一例外是文件名 ``LEDGER_FILENAME`` 与尾部长 ``_LEDGER_TAIL_KEEP``
-——全仓无 monkeypatch 先例，从 common.constants 导入。
+Knob surface (same as tag_ops): tests monkeypatch ``core.LEDGER_RING`` to
+control the ring size (test_save_ledger L5) => this module's functions accept
+only an explicit ``ring`` argument and **import no Config/constants knobs**;
+the wrapper layer fetches them from the core namespace at call time
+(``LEDGER_TRIM_AT`` has no monkeypatch precedent but is fetched along the same
+path -- one less special case). The only exceptions are the file name
+``LEDGER_FILENAME`` and the tail length ``_LEDGER_TAIL_KEEP`` -- no
+monkeypatch precedent anywhere in the repo, imported from common.constants.
 
-ring=0 的 Python 切片怪癖（``lines[-0:]`` = 全量）按「只挪位置不改
-行为」纪律原样保留：ring=0 时裁剪是逐字重写（行数不变）。
+The ring=0 Python slicing quirk (``lines[-0:]`` = everything) is preserved
+as-is under the "move it, don't change it" discipline: at ring=0 a trim is a
+verbatim rewrite (line count unchanged).
 """
 from __future__ import annotations
 
@@ -36,19 +45,23 @@ from ..common.constants import LEDGER_FILENAME, _LEDGER_TAIL_KEEP
 
 
 def ledger_path(persist_dir: str | None) -> str | None:
-    """账本文件路径；无 persist_dir（纯内存 brain）返回 None。"""
+    """Ledger file path; returns None without a persist_dir (pure in-memory
+    brain)."""
     if not persist_dir:
         return None
     return os.path.join(persist_dir, LEDGER_FILENAME)
 
 
 def read_tail(persist_dir: str | None) -> tuple[dict[str, Any] | None, int, list]:
-    """读账本：最后一条 + 总行数 + 尾部若干行（启动对账用）。
+    """Read the ledger: last entry + total line count + the trailing few rows
+    (for boot reconciliation).
 
-    坏行逐行跳过、坏文件按惯例隔离为 ``.corrupt-<ts>``，
-    **绝不阻塞启动**（设计 §8 风险 9：账本缺失/损坏报 unknown 并继续）。
-    尾部只留最近 ``_LEDGER_TAIL_KEEP`` 行：fail 行要回看同 seq 的 begin
-    才知道「当时声明要写什么」，全量读没必要。
+    Bad lines are skipped line by line; a bad file is quarantined by convention
+    as ``.corrupt-<ts>``; startup is **never blocked** (design section 8, risk
+    9: a missing/corrupt ledger reports unknown and continues). The tail keeps
+    only the most recent ``_LEDGER_TAIL_KEEP`` rows: a fail row needs the
+    same-seq begin from the look-back to know "what the save declared it would
+    write"; a full read is unnecessary.
     """
     path = ledger_path(persist_dir)
     if not path or not os.path.exists(path):
@@ -70,7 +83,7 @@ def read_tail(persist_dir: str | None) -> tuple[dict[str, Any] | None, int, list
                     if len(tail) > _LEDGER_TAIL_KEEP:
                         tail.pop(0)
                 except ValueError:
-                    bad = True      # 坏行跳过，但行数照记
+                    bad = True      # skip the bad line, but still count it
     except OSError:
         return None, 0, []
     if bad:
@@ -83,11 +96,13 @@ def read_tail(persist_dir: str | None) -> tuple[dict[str, Any] | None, int, list
 
 def append(persist_dir: str | None, entry: dict[str, Any], lines: int,
            trim_at: int, ring: int) -> tuple[bool, int]:
-    """追加一行（达到 trim_at 时顺手裁剪到 ring）。
+    """Append one row (trimming to the ring when trim_at is reached).
 
-    返回 ``(是否落盘, 追加后行数)``：写失败（OSError）时行数不动，
-    调用方不应更新末条；裁剪读失败/写失败时行数保持追加后的值
-    （账本行数与磁盘实况允许短暂不一致，但绝不超过 trim_at 长期失控）。
+    Returns ``(persisted or not, line count after the append)``: on write
+    failure (OSError) the line count stays put and the caller must not update
+    the last entry; if the trim's read/write fails the line count keeps the
+    post-append value (a brief divergence between the ledger line count and
+    disk reality is tolerated, but it must never run away beyond trim_at).
     """
     path = ledger_path(persist_dir)
     if not path:
@@ -107,10 +122,13 @@ def append(persist_dir: str | None, entry: dict[str, Any], lines: int,
 
 
 def trim(persist_dir: str | None, ring: int) -> int | None:
-    """ring buffer：只保留最近 ring 条，保证账本体积有界。
+    """Ring buffer: keep only the most recent ring rows, bounding the ledger's
+    size.
 
-    返回新的行数；``None`` = 调用方保持原值（无 persist_dir / 读失败 /
-    写失败）。行数不超 ring 时按磁盘实况重数后返回（自愈路径）。
+    Returns the new line count; ``None`` = the caller keeps its current value
+    (no persist_dir / read failure / write failure). When the line count is
+    within the ring, returns a recount from disk reality (the self-healing
+    path).
     """
     path = ledger_path(persist_dir)
     if not path:
@@ -139,29 +157,40 @@ def reconcile_on_boot(
     layer_names: Sequence[str],
     layer_fp: Callable[[str], str],
 ) -> dict[str, Any]:
-    """启动对账：报「哪层有改动却没写下去」（lost_since_last_save）。
+    """Boot reconciliation: report "which layer changed but was never written
+    down" (lost_since_last_save).
 
-    load 之后内存 == 磁盘，所以「内存指纹 vs 账本指纹」即「磁盘 vs 账本」。
-    三种可判情形（四象限判定）：
+    After load, memory == disk, so "memory fingerprint vs ledger fingerprint"
+    is the same as "disk vs ledger". Three decidable cases (quadrant
+    decision):
 
-    * 末条 ``end`` 且带层指纹 → 磁盘与账本不符的层进 ``disk_mismatch``
-      （外部工具改了内容 / 写坏；多写进程正常落盘会 append 自己的 end，
-      不会误报）；
-    * 末条 ``begin``（无同 seq 的 end/fail）→ 上次保存**没走完**：
-      磁盘指纹 ≠ begin 指纹的层 ⇒ 声明要写但磁盘上不是那份 ⇒ 报 lost；
-    * 末条 ``fail`` → 回看尾部找同 seq 的 begin，按上一条判，error 带出。
+    * Last entry ``end`` with layer fingerprints -> layers whose disk content
+      differs from the ledger go into ``disk_mismatch`` (an external tool
+      changed the content / write corruption; a multi-writer process's normal
+      persist appends its own end, so no false positives);
+    * Last entry ``begin`` (no same-seq end/fail) -> the previous save **did
+      not finish**: layers whose disk fingerprint differs from the begin
+      fingerprint => declared a write but the disk no longer holds that
+      content => reported as lost;
+    * Last entry ``fail`` -> look back through the tail for the same-seq
+      begin, decide as in the previous case, and carry the error out.
 
-    行里没有 ``layer_fps``（旧格式/指纹关）→ ``layer_fps_absent``，不判内容。
-    ``layer_fp`` 按层名取当前指纹，**惰性调用**（只在行里带了该层指纹时
-    才算）——由包装层从 brain 实例注入（本模块不 import brain）。
-    双钟纪律：不新增时间字段，lost 的时间语义引用账本行的 at_wall/at_mono。
-    **已知局限**：进程带着改动被杀且从未发起 save（无 begin）⇒ 账本无从
-    知晓——那是 F11 的领域。
+    A row without ``layer_fps`` (old format / fingerprints off) ->
+    ``layer_fps_absent``, no content judgment. ``layer_fp`` fetches the current
+    fingerprint by layer name and is called **lazily** (computed only when the
+    row carries that layer's fingerprint) -- injected by the wrapper layer from
+    the brain instance (this module does not import brain). Dual-clock
+    discipline: no new time fields added; lost's time semantics reference the
+    ledger row's at_wall/at_mono. **Known limitation**: a process killed with
+    uncommitted changes that never even started a save (no begin) => the ledger
+    cannot know -- that is F11's territory.
 
     Returns:
-        对账报告 dict：``phase`` / ``seq`` / ``at_wall`` / ``error`` 原样
-        带出 + 判定结果 + 人话 note。告警日志与 ``_boot_reconcile`` 状态
-        落回由包装层负责（本模块无日志副作用）。
+        The reconciliation report dict: ``phase`` / ``seq`` / ``at_wall`` /
+        ``error`` passed through as-is + the decision results + a
+        human-readable note. Warning logs and the ``_boot_reconcile`` state
+        write-back are the wrapper layer's responsibility (this module has no
+        logging side effects).
     """
     phase = last.get("phase")
     seq = last.get("seq")

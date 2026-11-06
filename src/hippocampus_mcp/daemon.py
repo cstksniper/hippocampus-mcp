@@ -1,28 +1,36 @@
 # -*- coding: utf-8 -*-
-"""hippocampusd：常驻 daemon。**模型全局一份**的关键就在这里。
+"""hippocampusd: the resident daemon. **One global copy of the model** lives here.
 
-分工：
-- :mod:`hippocampus_mcp.launcher` 是纯标准库的薄壳，只负责找/起 daemon + 转发字节
-- 本模块是常驻进程，**持有全部 HippoBrain**，一只进程可能同时服务多个库
+Division of labor:
+- :mod:`hippocampus_mcp.launcher` is a thin pure-stdlib shell that only finds/starts
+  the daemon and forwards bytes
+- This module is the resident process, **holding all HippoBrain instances**; one
+  process may serve multiple libraries at once
 
-为什么能省内存：单进程固定开销 755 MB 里的大头是嵌入模型权重，与记忆条数无关。
-N 个会话各自起进程 = N 份权重；daemon 化之后是 1 份。
+Why this saves memory: of the fixed 755 MB single-process overhead, the bulk is
+embedding model weights, which is independent of the number of memory records.
+N sessions each spawning a process = N copies of the weights; after daemonizing
+there is 1.
 
-连接语义：每条 TCP 连接是一个独立的 MCP ``ServerSession``，
-所以 ``ctx.session`` 天然按连接分路 —— 这就是会话自动寻址的通道。
-**绝不复用连接**，否则分路出来的隐状态又粘回一起。
+Connection semantics: each TCP connection is an independent MCP ``ServerSession``,
+so ``ctx.session`` naturally routes by connection — this is the channel for
+automatic session addressing.
+**Never reuse a connection**, otherwise the per-connection hidden state gets glued
+back together.
 
-用法::
+Usage::
 
     HIPPOCAMPUS_DAEMON=1 python -m hippocampus_mcp.daemon
 
-状态：实现已落地并在本地回环验证；**默认仍是直连**（见 launcher 的开关）。
-切换默认需要一次有人值守的验证（宿主 stdio 语义 / 热升级 / 多库），
-不在无人值守的自动化里改默认。
+Status: implemented and verified on local loopback; **the default is still direct
+connection** (see the switch in launcher).
+Changing the default requires one attended verification (host stdio semantics /
+hot upgrade / multi-library), so it is not changed in unattended automation.
 """
 
-# 豁免登记：本文件的 env 直读属进程拓扑 plumbing（socket/key /
-# 哨兵阈值 / 诊断），封闭清单见 config.py「根层豁免清单」。
+# Exemption registration: this file's direct env reads are process-topology
+# plumbing (socket/key / sentinel thresholds / diagnostics); the closed list is
+# in config.py's "root-layer exemption list".
 from __future__ import annotations
 
 import json
@@ -39,19 +47,25 @@ from .engine import model_lifecycle
 from .library.registry import DEFAULT_KEY
 
 
-#: 心跳间隔（秒）。30s 是权衡：太密 ⟹ 白写盘；太疏 ⟹ 死亡时刻定位不准。
-#: ``0`` 关闭（测试里不想轮询时用它）。
+#: Heartbeat interval (seconds). 30s is a tradeoff: too dense ⟹ wasted disk
+#: writes; too sparse ⟹ imprecise death-time localization.
+#: ``0`` disables it (use it in tests that don't want polling).
 HEARTBEAT_INTERVAL = float(
     os.environ.get("HIPPOCAMPUS_DAEMON_HEARTBEAT", "30") or 0)
-#: 每多少轮心跳往日志里落一行（避免 30s 一行把日志刷爆）。
+#: Write one log line every N heartbeat rounds (to keep 30s-per-line from
+#: flooding the log).
 HEARTBEAT_LOG_EVERY = 10
 
-#: 空闲多久就把嵌入模型卸掉（秒）。**默认 30 分钟**：够盖住一次起身接水，
-#: 又不至于让连续对话被反复加载拖垮；实测重载只要 2.5–3.7s。
-#: ``0`` 关闭（保留"进程活着就永远加载"的旧行为）。
+#: How long to idle before unloading the embedding model (seconds).
+#: **Default 30 minutes**: enough to cover getting up for a glass of water,
+#: without letting a continuous conversation get bogged down by repeated
+#: reloads; measured reload takes only 2.5–3.7s.
+#: ``0`` disables it (keeps the old "loaded as long as the process lives"
+#: behavior).
 DEFAULT_MODEL_UNLOAD = 1800.0
 ENV_MODEL_UNLOAD = "HIPPOCAMPUS_MODEL_IDLE_UNLOAD"
-#: 卸载哨兵的巡检间隔（秒）。30s 一次，误差对 30 分钟阈值毫无意义。
+#: Poll interval of the unload sentinel (seconds). Every 30s; the error is
+#: meaningless against a 30-minute threshold.
 MODEL_UNLOAD_POLL = 30.0
 
 #: Cooperative stop marker poll / timed-flush tick (seconds).
@@ -63,41 +77,49 @@ DEFAULT_SAVE_IDLE = 900.0
 ENV_SAVE_IDLE = "HIPPOCAMPUS_DAEMON_SAVE_IDLE"
 
 # ----------------------------------------------------------------------
-# 空闲「睡眠窗口」——离线重放式巩固的宿主侧旋钮。
-# 与 model unload 同款模式：daemon 进程拓扑决定，env 直读不走 config
-# （口径：根层入口属启动拓扑 plumbing）。脑侧的三个语义旋钮
-# （重放窗口 / 限幅 / 成簇下限）在 config.py，brain.core.sleep_batch
-# 调用时现取。
+# Idle "sleep window" — the host-side knob for offline replay-style
+# consolidation. Same pattern as model unload: decided by the daemon process
+# topology, direct env reads bypassing config (rationale: root-layer entry
+# points are startup topology plumbing). The three semantic knobs on the
+# brain side (replay window / rate limit / cluster minimum) live in
+# config.py and are fetched at call time by brain.core.sleep_batch.
 # ----------------------------------------------------------------------
-#: 空闲多少秒才允许开睡。**默认 0 = 关**（检索强度接线前先不改变
-#: 生产行为；接线完成后翻默认另行验证）。判据是「大脑真实空闲」：
-#: 无活跃连接 **且** ``model_lifecycle.idle_seconds()`` ≥ 本值。
+#: How many seconds of idle before sleeping is allowed. **Default 0 = off**
+#: (don't change production behavior until retrieval-strength wiring is
+#: done; flip the default for separate verification once wiring completes).
+#: The criterion is "the brain is genuinely idle": no active connections
+#: **and** ``model_lifecycle.idle_seconds()`` >= this value.
 DEFAULT_SLEEP_IDLE = 0.0
 ENV_SLEEP_IDLE = "HIPPOCAMPUS_SLEEP_IDLE"
-#: 单次睡眠批的时间预算兜底（秒），传给 ``brain.sleep_batch``。
+#: Fallback time budget for a single sleep batch (seconds), passed to
+#: ``brain.sleep_batch``.
 DEFAULT_SLEEP_BUDGET = 120.0
 ENV_SLEEP_BUDGET = "HIPPOCAMPUS_SLEEP_BUDGET_S"
-#: 睡眠哨兵的巡检间隔（秒）。同 MODEL_UNLOAD_POLL 的理由：30s 粒度
-#: 对睡眠这种分钟级活动毫无意义。
+#: Poll interval of the sleep sentinel (seconds). Same rationale as
+#: MODEL_UNLOAD_POLL: 30s granularity is meaningless for minute-scale
+#: activity like sleeping.
 SLEEP_POLL = 30.0
-from .library.registry import BrainRegistry  # 多库注册表下沉为公共模块
+from .library.registry import BrainRegistry  # multi-library registry sunk into a shared module
 
-# 每条连接一次读多少字节
+# How many bytes to read from each connection at once
 CONN_CHUNK = 65536
-# 待办队列上限：单连接压过来的消息不会无限堆积
+# Pending-queue cap: messages pushed by a single connection must not pile
+# up without bound
 CONN_QUEUE = 256
 
 
 # ======================================================================
-# 连接处理
+# Connection handling
 # ======================================================================
-# 库注册表已下沉到 .registry（server 侧直连 stdio 也要多库，共用同一份）
+# The library registry has sunk into .registry (server-side direct stdio
+# also needs multi-library, sharing the same copy)
 class Connection:
-    """一条客户端连接。
+    """One client connection.
 
-    当前实现是**字节泵 + 会话登记**：把连接交给真正的 MCP server 之前，
-    先在这里挂上「这条连接 = 一个会话」的身份，供 ``ctx.session``
-    分路使用。真正的 MCP 会话跑在 ``handle()`` 里（由 server 侧接手）。
+    The current implementation is a **byte pump + session registration**: before
+    handing the connection to the real MCP server, the identity of "this
+    connection = one session" is attached here, for ``ctx.session`` to route by.
+    The real MCP session runs in ``handle()`` (taken over by the server side).
     """
 
     def __init__(self, sock: socket.socket, addr, conn_id: int) -> None:
@@ -108,15 +130,16 @@ class Connection:
         self.closed = False
 
     def session_key(self) -> str:
-        """自动通道：一条连接一个 key，天然按会话分路。"""
+        """Automatic channel: one key per connection, naturally routed by session."""
         return f"conn-{self.conn_id}"
 
 
 def _pump(src, dst) -> None:
-    """单向字节泵（echo 排障通道用）。
+    """One-way byte pump (used by the echo diagnostics channel).
 
-    与 ``launcher._pump`` 同一条纪律：**用 ``read1`` 不用 ``read``**——
-    ``read(n)`` 要读满 n 字节或 EOF 才返回，对管道会永久阻塞。
+    Same discipline as ``launcher._pump``: **use ``read1``, not ``read``** —
+    ``read(n)`` only returns after reading n bytes or EOF, which blocks forever
+    on pipes.
     """
     try:
         while True:
@@ -137,10 +160,12 @@ def _pump(src, dst) -> None:
 
 
 def serve_connection(conn: Connection, handler, on_exit=None) -> None:
-    """把一条连接交给 handler（bytes -> bytes）。
+    """Hand one connection to the handler (bytes -> bytes).
 
-    handler 抛异常不能带走 daemon —— 记一行，然后正常关连接。
-    ``on_exit``：连接收尾回调（孤儿回收用它递减活跃连接计数）。
+    A handler exception must not take the daemon down — log one line, then
+    close the connection normally.
+    ``on_exit``: connection teardown callback (orphan cleanup uses it to
+    decrement the active-connection count).
     """
     try:
         handler(conn)
@@ -156,17 +181,19 @@ def serve_connection(conn: Connection, handler, on_exit=None) -> None:
         if on_exit is not None:
             try:
                 on_exit(conn)
-            except Exception:  # noqa: BLE001 —— 计数失败不该拖垮收尾
+            except Exception:  # noqa: BLE001 -- a counting failure must not wreck teardown
                 pass
 
 
 class Daemon:
-    """TCP daemon：监听 127.0.0.1，每条连接一个线程。
+    """TCP daemon: listens on 127.0.0.1, one thread per connection.
 
-    孤儿回收：launchers 全部死掉后 daemon 不该永久空转
-    （它手里攥着 ~1GB 的模型）。``idle_exit_seconds`` > 0 时，活跃连接数
-    归零并持续超过该秒数 ⇒ 自动 save 全部 brain + 清注册表 + 退出。
-    有新连接进来即重置空闲计时。``0``/负值关闭（保留旧行为，测试用）。
+    Orphan cleanup: after all launchers die, the daemon must not spin forever
+    (it holds ~1GB of model). When ``idle_exit_seconds`` > 0, once the active
+    connection count reaches zero and stays there past that many seconds ⇒
+    automatically save all brains + clear the registry + exit.
+    Any new connection resets the idle timer. ``0``/negative disables it
+    (keeps the old behavior; used by tests).
     """
 
     def __init__(self, registry: BrainRegistry, handler=None,
@@ -177,16 +204,19 @@ class Daemon:
         self.key = key
         self.idle_exit_seconds = float(idle_exit_seconds or 0)
         self.heartbeat_seconds = float(heartbeat_seconds or 0)
-        # 空闲卸载模型（注意：**不是**空闲退出进程）。
-        # 与 idle_exit_seconds 的区别必须讲清楚：前者只是把 ~400MB 的嵌入模型
-        # 还给系统，进程与记忆库都还在，下次调用自动重载（实测 2.5–3.7s）
-        # 且结果与卸载前完全一致（余弦相似度 1.000000）；后者是连进程一起走。
-        # 默认 1800s（30 分钟）；0/负值关闭。
+        # Idle-unload the model (note: **not** idle-exit the process).
+        # The difference from idle_exit_seconds must be spelled out: the former
+        # merely returns the ~400MB embedding model to the system; the process
+        # and memory libraries remain, the next call auto-reloads (measured
+        # 2.5–3.7s) with results identical to before unloading (cosine
+        # similarity 1.000000); the latter takes the process down too.
+        # Default 1800s (30 minutes); 0/negative disables.
         self.model_unload_seconds = float(
             os.environ.get(ENV_MODEL_UNLOAD, str(DEFAULT_MODEL_UNLOAD))
             or 0)
-        # O2 睡眠窗口（同 model unload 的读法：垃圾取值直接炸出来，
-        # 不做静默兜底——睡眠打错 env 该在启动时暴露，不是悄悄不生效）。
+        # O2 sleep window (read the same way as model unload: garbage values
+        # blow up immediately, no silent fallback — a mistyped sleep env should
+        # surface at startup, not silently do nothing).
         self.sleep_idle_seconds = float(
             os.environ.get(ENV_SLEEP_IDLE, str(DEFAULT_SLEEP_IDLE))
             or 0)
@@ -205,19 +235,21 @@ class Daemon:
         self.save_idle_seconds = float(
             os.environ.get(ENV_SAVE_IDLE, str(DEFAULT_SAVE_IDLE)) or 0)
         self._last_flush_at = time.time()
-        # 收尾完成信号 + 空闲回收线程句柄（见 join_idle 的说明：
-        # 线程必须是**非 daemon**，否则收尾会被解释器关闭掐断）
+        # Teardown-complete signal + idle-reclaim thread handle (see join_idle:
+        # the thread must be **non-daemon**, otherwise teardown gets cut off by
+        # interpreter shutdown)
         self._finished = threading.Event()
         self._idle_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
         self._model_unload_thread: threading.Thread | None = None
         self._maintenance_thread: threading.Thread | None = None
-        # O2 睡眠批：取消信号（新连接到来即置位）+ 单飞标志 + 线程句柄
+        # O2 sleep batch: cancel signal (set as soon as a new connection
+        # arrives) + single-flight flag + thread handle
         self._sleep_cancel = threading.Event()
         self._sleep_running = False
         self._sleep_thread: threading.Thread | None = None
 
-    # -- 生命周期 ------------------------------------------------------
+    # -- Lifecycle -------------------------------------------------------
     def bind(self) -> int:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -227,7 +259,7 @@ class Daemon:
         return self.port
 
     def announce(self, key: str, library: str = "", model: str = "") -> bool:
-        """把「我在哪」写进注册表，launcher 才能找过来。"""
+        """Write "where I am" into the registry so the launcher can find us."""
         self.key = key
         return write_registry(key, {
             "pid": os.getpid(),
@@ -242,7 +274,7 @@ class Daemon:
         })
 
     def _idle_watch(self) -> None:
-        """孤儿回收哨兵：空闲超时 ⇒ 自愿退出（save 在 stop() 里做）。"""
+        """Orphan cleanup sentinel: on idle timeout ⇒ exit voluntarily (saving happens in stop())."""
         interval = min(5.0, max(0.2, self.idle_exit_seconds / 4 or 5.0))
         while not self._stop.wait(interval):
             if self._active_conns > 0:
@@ -258,21 +290,26 @@ class Daemon:
             self.stop()
             return
 
-    # -- 心跳 ----------------------------------------------------------
+    # -- Heartbeat --------------------------------------------------------
     def _touch_registry(self) -> bool:
-        """把「我还活着」刷进注册表。
+        """Refresh "I'm still alive" into the registry.
 
-        为什么需要这个：真宿主里出现过**单日 15 个 daemon 无一例
-        干净退出**（日志里 0 条"孤儿回收"）。要区分"它自愿退了"和"它被人杀了"，
-        唯一的办法是留一个**不在崩溃路径上**的、持续刷新的时间戳：
+        Why this is needed: in real hosts there was a day where **15 daemons ran
+        and not one exited cleanly** (0 "orphan cleanup" entries in the logs).
+        To tell "it exited voluntarily" from "it was killed", the only way is to
+        leave a continuously refreshed timestamp that is **not on the crash
+        path**:
 
-          · 最后一条 ``alive_at`` ≈ 被杀的时刻（真 daemon 的 dated sepulchre）
-          · 拿它与宿主的 ``mcp.server.closed`` 对表，就能证明回收动作来自
-            **宿主进程树**，而不是我们自己的空闲哨兵 —— 这一步坐实之后，
-            给 ``spawn_daemon`` 加 ``CREATE_BREAKAWAY_FROM_JOB`` 才有依据。
+          · The last ``alive_at`` ≈ the moment of death (the real daemon's
+            dated sepulchre)
+          · Cross-checking it against the host's ``mcp.server.closed`` proves
+            the reclamation came from the **host process tree**, not our own
+            idle sentinel — once that is established, there is grounding for
+            adding ``CREATE_BREAKAWAY_FROM_JOB`` to ``spawn_daemon``.
 
-        🔴 **注册表里已经不是我时就别再写**：那说明后来者把我盖掉了，我是
-        孤儿（"看不见的孤儿"），继续写会把活着的 daemon 的数据搅乱。
+        🔴 **Stop writing once the registry is no longer mine**: that means a
+        later daemon overwrote me and I am an orphan (an "invisible orphan");
+        continuing to write would scramble the living daemon's data.
         """
         if not self.key:
             return False
@@ -294,7 +331,7 @@ class Daemon:
         while not self._stop.wait(interval):
             try:
                 self._touch_registry()
-            except Exception:  # noqa: BLE001 —— 心跳绝不能带动主流程出错
+            except Exception:  # noqa: BLE001 -- the heartbeat must never make the main flow fail
                 pass
             self._heartbeat_round += 1
             if self._heartbeat_round % HEARTBEAT_LOG_EVERY == 0:
@@ -363,14 +400,16 @@ class Daemon:
                       f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
     def _model_unload_watch(self) -> None:
-        """空闲卸载哨兵：超阈值且无人在用 ⇒ 把嵌入模型卸掉。
+        """Idle-unload sentinel: past the threshold with nobody using it ⇒ unload the embedding model.
 
-        为什么看「最后一次用模型」而不是「活跃连接数」
-        -------------------------------------------
-        宿主侧的 launcher 会把 socket 一直攥到会话结束，僵尸 launcher 更是
-        永不放手 ⇒ ``_active_conns`` 可能长期不为 0。这大概率就是"横幅写着
-        ``idle_exit=600s`` 却一次都没退过"的原因。用 :func:`model_lifecycle
-        .idle_seconds` 看真实用量，才不会被一条空连接骗过去。
+        Why watch "last model use" instead of "active connection count"
+        --------------------------------------------------------------
+        The host-side launcher holds the socket until the session ends, and
+        zombie launchers never let go ⇒ ``_active_conns`` may stay non-zero
+        indefinitely. This is most likely why "the banner said
+        ``idle_exit=600s`` yet it never exited once". Using
+        :func:`model_lifecycle.idle_seconds` to see real usage is the only way
+        not to be fooled by an idle connection.
         """
         while not self._stop.wait(MODEL_UNLOAD_POLL):
             try:
@@ -378,8 +417,10 @@ class Daemon:
                 if idle < self.model_unload_seconds:
                     continue
                 res = model_lifecycle.release_models(reason="idle-timeout")
-                # busy（有人在用）不是错误：下一轮自然会再试。只在**真的卸了**
-                # 或者出了意外时留痕，避免日志被"每次都说忙"刷满。
+                # busy (someone is using it) is not an error: the next round
+                # naturally retries. Log only when it **actually unloaded** or
+                # something went wrong, to keep the log from filling up with
+                # "busy every time".
                 if res.get("ok"):
                     print(
                         f"[daemon] idle model unload pid={os.getpid()} "
@@ -391,29 +432,36 @@ class Daemon:
                 elif res.get("reason") != "busy":
                     print(f"[daemon] model unload failed: {res}",
                           file=sys.stderr, flush=True)
-            except Exception as exc:  # noqa: BLE001 —— 哨兵绝不能带崩 daemon
+            except Exception as exc:  # noqa: BLE001 -- a sentinel must never crash the daemon
                 print(f"[daemon] unload sentinel failed: {type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
 
-    # -- O2 睡眠窗口 ----------------------------------------------------
+    # -- O2 sleep window --------------------------------------------------
     def _sleep_watch(self) -> None:
-        """睡眠哨兵：空闲期对每个驻留库跑一轮「睡眠批」（离线重放式巩固）。
+        """Sleep sentinel: during idle, run one "sleep batch" (offline replay-style
+        consolidation) per resident library.
 
-        空闲判据是两个条件的**与**，各有不可替代的理由：
+        The idle criterion is the **AND** of two conditions, each irreplaceable:
 
-        - ``_active_conns == 0``：正在接客 ⇒ 不睡。但它**不能单独**作判据——
-          宿主侧 launcher 会把 socket 攥到会话结束，僵尸 launcher 更是永不
-          放手（model-unload 哨兵的同款病理）；
-        - ``model_lifecycle.idle_seconds() >= sleep_idle_seconds``：大脑
-          真实空闲。``idle_seconds()==0`` 表示「从未用过」⇒ 也不睡，这是
-          **刻意**的：一台没服务过任何会话的 daemon 没有「最近会话」可以
-          重放，睡眠无米下锅。
+        - ``_active_conns == 0``: currently serving clients ⇒ don't sleep. But
+          it **cannot stand alone** as the criterion — the host-side launcher
+          holds the socket until the session ends, and zombie launchers never
+          let go (the same pathology as the model-unload sentinel);
+        - ``model_lifecycle.idle_seconds() >= sleep_idle_seconds``: the brain
+          is genuinely idle. ``idle_seconds()==0`` means "never used" ⇒ don't
+          sleep either, which is **deliberate**: a daemon that has served no
+          session has no "recent session" to replay — sleep has nothing to
+          chew on.
 
-        中断契约：新连接进来时 ``serve_forever`` 立刻置 ``_sleep_cancel``，
-        睡眠批（``brain.sleep_batch``）在簇/阶段等**单元边界**感知并尽快
-        让路——在线请求与睡眠分属不同线程，请求不必等睡眠结束，睡眠只是
-        尽快停手减少 CPU / 锁竞争。单飞由 ``_sleep_running`` 保证（脑内
-        ``sleep_batch`` 的重入守卫是第二道防线）。
+        Interruption contract: when a new connection arrives, ``serve_forever``
+        sets ``_sleep_cancel`` immediately; the sleep batch
+        (``brain.sleep_batch``) notices at **unit boundaries** such as
+        clusters/phases and yields as soon as it can — online requests and
+        sleeping live on different threads, requests need not wait for sleep
+        to finish, and sleep merely stops promptly to reduce CPU / lock
+        contention. Single-flight is guaranteed by ``_sleep_running`` (the
+        re-entrancy guard inside the brain's ``sleep_batch`` is the second
+        line of defense).
         """
         while not self._stop.wait(SLEEP_POLL):
             if self.sleep_idle_seconds <= 0:
@@ -422,7 +470,7 @@ class Daemon:
                 continue
             try:
                 idle = model_lifecycle.idle_seconds()
-            except Exception:  # noqa: BLE001 —— 计时失败按「不睡」处理
+            except Exception:  # noqa: BLE001 -- on timer failure, treat as "don't sleep"
                 continue
             if idle < self.sleep_idle_seconds:
                 continue
@@ -430,30 +478,35 @@ class Daemon:
             self._sleep_running = True
             try:
                 self._run_sleep_once(idle)
-            except Exception as exc:  # noqa: BLE001 —— 哨兵绝不能带崩 daemon
+            except Exception as exc:  # noqa: BLE001 -- a sentinel must never crash the daemon
                 print(f"[daemon] sleep batch failed: {type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
             finally:
                 self._sleep_running = False
 
     def _run_sleep_once(self, idle: float) -> None:
-        """对**驻留**库各跑一轮睡眠批。
+        """Run one sleep batch per **resident** library.
 
-        为什么只遍历 ``registry.keys()`` 而不用别的入口：构造一个 brain
-        要 25–33s 还要加载模型，而睡眠恰恰发生在模型已卸载之后——为睡眠
-        去构造 brain 是把语义整个倒过来。keys() 只返回驻留库；keys() 与
-        get() 之间若有并发 get() 换出该库，get() 会重新构造——空闲期没有
-        连接、没人触发换出，该窗口可忽略，且就算踩中也只是浪费（同 key
-        = 同一份存储），不是正确性问题。
+        Why iterate only ``registry.keys()`` and use no other entry point:
+        constructing a brain takes 25–33s plus model loading, while sleep
+        happens precisely after the model has been unloaded — constructing a
+        brain for sleep's sake inverts the whole semantics. keys() only
+        returns resident libraries; if a concurrent get() between keys() and
+        get() swaps that library out, get() would reconstruct it — during
+        idle there are no connections and nobody triggers a swap, so that
+        window is negligible, and even if hit it is only wasted work (same
+        key = same store), not a correctness problem.
         """
         for key in self.registry.keys():
             if self._stop.is_set() or self._sleep_cancel.is_set():
                 return
-            # 🔴 keys() 返回的是**注册表键**（DEFAULT_KEY 或归一化绝对路径），
-            # get() 吃的是**库路径**——DEFAULT_KEY 不是路径，直接喂给 get()
-            # 会被 abspath 成 "<cwd>/__default__"，同一条逻辑库被建成两个
-            # brain（C2e 目标测试实测抓到）。路径键喂回去是恒等（normcase
-            # ∘ abspath 幂等），只有默认键需要映射回 None。
+            # 🔴 keys() returns **registry keys** (DEFAULT_KEY or a normalized
+            # absolute path), while get() takes **library paths** — DEFAULT_KEY
+            # is not a path; feeding it straight to get() would abspath it into
+            # "<cwd>/__default__", building two brains for one logical library
+            # (caught in practice by the C2e targeted test). Feeding a path key
+            # back is an identity (normcase ∘ abspath is idempotent); only the
+            # default key needs mapping back to None.
             brain = self.registry.get(None if key == DEFAULT_KEY else key)
             if brain is None or not hasattr(brain, "sleep_batch"):
                 continue
@@ -461,7 +514,7 @@ class Daemon:
             try:
                 report = brain.sleep_batch(
                     cancel=self._sleep_cancel, budget_s=self.sleep_budget_s)
-            except Exception as exc:  # noqa: BLE001 —— 单库失败不挡其它库睡
+            except Exception as exc:  # noqa: BLE001 -- one library failing must not block other libraries' sleep
                 print(f"[daemon] sleep batch failed for library={key}: "
                       f"{type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
@@ -482,27 +535,30 @@ class Daemon:
         if self.sock is None:
             raise RuntimeError("bind() must run first")
         if self.model_unload_seconds > 0:
-            # daemon=True：这条线程不持有任何需要收尾的东西
+            # daemon=True: this thread holds nothing that needs teardown
             if self._model_unload_thread is None:
                 self._model_unload_thread = threading.Thread(
                     target=self._model_unload_watch, name="model-unload",
                     daemon=True)
                 self._model_unload_thread.start()
         if self.sleep_idle_seconds > 0:
-            # O2 睡眠哨兵。daemon=True：不持有需要收尾的东西（睡眠批
-            # 中途被解释器关闭掐断与被 cancel 掐断同义——各步幂等）。
+            # O2 sleep sentinel. daemon=True: holds nothing needing teardown
+            # (the sleep batch being cut off by interpreter shutdown is
+            # equivalent to being cut off by cancel — every step is idempotent).
             if self._sleep_thread is None:
                 self._sleep_thread = threading.Thread(
                     target=self._sleep_watch, name="sleep-watch",
                     daemon=True)
                 self._sleep_thread.start()
         if self.idle_exit_seconds > 0:
-            # daemon=False：**不要**让解释器关闭时把正在收尾的线程掐断
+            # daemon=False: **do not** let interpreter shutdown cut off the
+            # thread mid-teardown
             self._idle_thread = threading.Thread(
                 target=self._idle_watch, name="idle-watch", daemon=False)
             self._idle_thread.start()
         if self.heartbeat_seconds > 0:
-            # daemon=True：心跳不持有任何需要收尾的东西，解释器关闭时可以被掐
+            # daemon=True: the heartbeat holds nothing needing teardown and may
+            # be cut off at interpreter shutdown
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_watch, name="heartbeat", daemon=True)
             self._heartbeat_thread.start()
@@ -518,9 +574,11 @@ class Daemon:
             except OSError:
                 break
             if self._stop.is_set():
-                # ``stop()`` 的自连接唤醒包：不能交给 handler，也不能计入
-                # ``_active_conns``（否则空闲计时会被这条假连接重置）。
-                # 这里直接关掉并退出循环，让主线程能走到 finally 的收尾。
+                # ``stop()``'s self-connection wake-up packet: must not go to
+                # the handler, and must not count into ``_active_conns``
+                # (otherwise the idle timer would be reset by this fake
+                # connection). Close it here and break, so the main thread can
+                # reach the finally teardown.
                 try:
                     client.close()
                 except OSError:
@@ -530,8 +588,10 @@ class Daemon:
             conn = Connection(client, addr, self._conn_seq)
             self._active_conns += 1
             self._last_conn_at = time.time()
-            # O2：唤醒睡眠批——新连接立即被接（线程已起），睡眠批在下一个
-            # 单元边界感知 cancel 让路，减少与在线请求的 CPU / 锁竞争。
+            # O2: wake the sleep batch — the new connection is accepted
+            # immediately (thread already started), and the sleep batch notices
+            # cancel at the next unit boundary and yields, reducing CPU / lock
+            # contention with online requests.
             self._sleep_cancel.set()
             t = threading.Thread(
                 target=serve_connection,
@@ -547,20 +607,25 @@ class Daemon:
         self._last_conn_at = time.time()
 
     def _wake_accept(self) -> None:
-        """把阻塞在 ``accept()`` 的主线程叫醒（跨平台，见下方说明）。
+        """Wake the main thread blocked in ``accept()`` (cross-platform; see below).
 
-        🔴 Linux 上**从别的线程 close(listening fd) 不会中断已经在 accept()
-        里阻塞的调用**：该 syscall 仍持有 file 结构的引用，``close()`` 只减掉
-        fd 的引用，socket 照旧 LISTEN、accept 照旧等。两个后果：
+        🔴 On Linux, **close(listening fd) from another thread does not
+        interrupt a call already blocked in accept()**: the syscall still holds
+        a reference to the file structure, ``close()`` only drops the fd
+        reference, the socket keeps LISTENing and accept keeps waiting. Two
+        consequences:
 
-        - ``serve_forever`` 永不返回 ⇒ 空闲哨兵调完 ``stop()`` 后进程仍然
-          活着（CI 上 ``batch2_finalize_daemon`` 的 D1/D2 ``returncode=None``）；
-        - 端口仍可连接 ⇒ ``f9_4_launcher_daemon`` 的 L4「stop 后连不上」红。
+        - ``serve_forever`` never returns ⇒ after the idle sentinel calls
+          ``stop()`` the process stays alive (``batch2_finalize_daemon``'s
+          D1/D2 ``returncode=None`` on CI);
+        - the port still accepts connections ⇒ ``f9_4_launcher_daemon``'s L4
+          "cannot connect after stop" goes red.
 
-        Windows 的 ``closesocket`` 会让 accept 抛 OSError，所以本机从没暴露。
-        唯一跨平台可靠的办法是**自己连自己一次**：accept 拿到一个连接自然
-        返回，主循环看到 ``_stop`` 已置位就退出；随后 fd 的最后一个引用被
-        释放，监听端口才真正关闭。
+        Windows' ``closesocket`` makes accept raise OSError, so this machine
+        never exposed the bug. The only cross-platform reliable way is to
+        **connect to yourself once**: accept gets a connection and returns
+        naturally, the main loop sees ``_stop`` set and exits; only after the
+        fd's last reference is released does the listening port really close.
         """
         sock = self.sock
         if sock is None:
@@ -573,8 +638,8 @@ class Daemon:
             with socket.create_connection(("127.0.0.1", port), timeout=1.0):
                 pass
         except OSError:
-            # 端口已经关了 / 已经没人 listen 都不影响：那说明 accept 本来
-            # 就能返回，唤醒只是白跑一趟。
+            # Port already closed / nobody listening either way: that means
+            # accept could return on its own, and the wake-up was a wasted trip.
             pass
 
     def stop(self) -> None:
@@ -582,23 +647,27 @@ class Daemon:
             return
         self._stopped = True
         self._stop.set()
-        # O2：叫停可能在跑的睡眠批（各步幂等，停在哪一层都安全）
+        # O2: halt any running sleep batch (each step idempotent; safe to stop
+        # at any layer)
         self._sleep_cancel.set()
-        # 🔴 顺序：先唤醒再 close。close 之后 getsockname() 就失效了；而
-        # Linux 上单靠 close 根本叫不醒 accept（见 _wake_accept 的说明）。
+        # 🔴 Order: wake first, then close. After close, getsockname() is
+        # invalid; and on Linux close alone cannot wake accept at all (see
+        # _wake_accept).
         self._wake_accept()
         if self.sock is not None:
             try:
                 self.sock.close()
             except OSError:
                 pass
-        # 收尾落盘：**不能因为保存失败就不退出**，但要把失败吼出来
+        # Teardown persistence: **must not refuse to exit just because a save
+        # failed**, but the failure must be shouted out
         errors = self.registry.save_all()
         if errors:
             print(f"[daemon] save before exit failed: {json.dumps(errors, ensure_ascii=False)}",
                   file=sys.stderr)
-        # 清注册表：本 daemon 已退出，别让 launcher 撞上死条目多等一轮探测
-        # （launcher 本就有 pid+port 存活校验，这里只是把现场擦干净）
+        # Clear the registry: this daemon has exited; don't let a launcher hit
+        # a dead entry and wait an extra round of probing (the launcher already
+        # validates pid+port liveness; this just cleans up the scene)
         if self.key:
             try:
                 os.remove(stop_request_path(self.key))
@@ -609,51 +678,64 @@ class Daemon:
                 os.remove(path)
                 print(f"[daemon] registry removed: {path}", file=sys.stderr)
             except OSError as e:
-                # 擦不掉要吼出来：残留条目会让下一个 launcher 多等一轮存活探测，
-                # 而它看起来和"daemon 还活着"一模一样。
+                # If it can't be removed, shout: a leftover entry makes the next
+                # launcher wait an extra round of liveness probing, which looks
+                # exactly like "the daemon is still alive".
                 print(f"[daemon] failed to remove registry: {path} -> {type(e).__name__}: {e}",
                       file=sys.stderr)
         self._finished.set()
 
     def join_idle(self, timeout: float = 20.0) -> None:
-        """等空闲回收线程把收尾跑完。
+        """Wait for the idle-reclaim thread to finish its teardown.
 
-        🔴 为什么必须有这一步（实测踩过的真 bug）：
-        空闲线程是 **daemon 线程**，它调用 ``stop()`` → 关 socket → 主线程 ``accept()``
-        抛 OSError → ``serve_forever`` 返回 → 解释器进入关闭流程，**直接把还在跑收尾的
-        daemon 线程掐断**。后果是：
+        🔴 Why this step must exist (a real bug hit in practice):
+        the idle thread is a **daemon thread**; it calls ``stop()`` → closes
+        the socket → the main thread's ``accept()`` raises OSError →
+        ``serve_forever`` returns → the interpreter enters shutdown and
+        **directly cuts off the daemon thread still running teardown**.
+        Consequences:
 
-        - 日志里明明写着「孤儿回收：…save 后退出」，但 ``save_all()`` 和
-          **擦注册表** 都没跑完 ⇒ 注册表留下死条目，下一个 launcher 会撞上它
-          多等一轮存活探测（表现与"daemon 还活着"一模一样）；
-        - ``test_batch2_finalize_daemon`` 的 D1 就是被这个坑掉的（不是 flaky）。
+        - The log says "orphan cleanup: … save then exit", but ``save_all()``
+          and **registry clearing** never complete ⇒ the registry keeps a dead
+          entry and the next launcher hits it and waits an extra round of
+          liveness probing (indistinguishable from "the daemon is still
+          alive");
+        - ``test_batch2_finalize_daemon``'s D1 was killed by exactly this (not
+          flaky).
 
-        修法两条一起：空闲线程改**非 daemon**（解释器关闭前会等它）+ 这里显式 join。
+        Fix, both together: make the idle thread **non-daemon** (the
+        interpreter waits for it before shutting down) + an explicit join here.
         """
         t = self._idle_thread
         if t is not None and t is not threading.current_thread():
             t.join(timeout=timeout)
-        # 兜底：万一线程没能自己收尾（例如被卡住），在这里补一次——
-        # 幂等（_stopped 已置位时 stop() 直接返回，不会重复 save）。
+        # Fallback: if the thread somehow failed to tear down on its own (e.g.
+        # stuck), do it once here — idempotent (when _stopped is already set,
+        # stop() returns immediately without saving again).
         if not self._finished.is_set():
             self.stop()
 
 
 def _default_handler(conn: Connection) -> None:
-    """占位 handler：收到什么回什么（便于本地回环验证，也便于排障）。
+    """Placeholder handler: echo back whatever is received (handy for local
+    loopback verification and for diagnostics).
 
-    真正的 MCP 会话由 server 侧接手后替换；这里刻意**不**假装能处理 JSON-RPC。
+    Replaced once the server side takes over the real MCP session; this
+    deliberately does **not** pretend to handle JSON-RPC.
     """
     _pump(conn.sock, conn.sock)
 
 
 def _make_handler():
-    """挑 handler。**默认必须是真 MCP 会话**，不是 echo 泵。
+    """Pick a handler. **The default must be a real MCP session**, not an echo pump.
 
-    echo 泵会让宿主「连上了、却永远收不到合法响应」，于是工具数静默变成 0——
-    比「连不上」难排得多（实测 41% 丢工具就是这样没有线索的）。
-    所以桥不可用就**明确报错**，让 launcher 退回 inline server；
-    只有显式 ``HIPPOCAMPUS_DAEMON_ECHO=1`` 才允许退化成 echo（本地排障用）。
+    An echo pump leaves the host "connected yet never receiving a valid
+    response", so the tool count silently becomes 0 — much harder to diagnose
+    than "cannot connect" (in practice 41% tool loss happened exactly like
+    this, with no clue).
+    So if the bridge is unavailable, **raise explicitly** and let the launcher
+    fall back to the inline server; only an explicit
+    ``HIPPOCAMPUS_DAEMON_ECHO=1`` may degrade to echo (for local diagnostics).
     """
     if os.environ.get("HIPPOCAMPUS_DAEMON_ECHO", "").strip() == "1":
         print("[daemon] HIPPOCAMPUS_DAEMON_ECHO=1 -> echo pump (local diagnostics only)",
@@ -671,41 +753,49 @@ def _make_handler():
 
 
 def _install_crash_diagnostics() -> str:
-    """给 **native 级**死亡留痕（此前唯一的观测缺口）。
+    """Leave a trace for **native-level** death (previously the only observability gap).
 
-    背景：真宿主里出现过 daemon **无声死亡**——日志无 traceback、无 WER 记录、
-    注册表也没被清理（区别于正常的空闲回收），进程甚至没来得及初始化 brain。
-    Python 层异常本来就会打到 stderr（launcher 已把 stderr 落盘到
-    ``daemon-<key>.log``），所以这里补的是**连 Python 都没机会出手**的那部分：
-    ``SIGSEGV`` / ``SIGABRT`` / ``SIGFPE`` / ``SIGILL`` 这类致命信号。
+    Background: real hosts saw daemons **die silently** — no traceback in the
+    log, no WER record, the registry not cleaned up (unlike normal orphan
+    cleanup), and the process never even got to initialize a brain.
+    Python-level exceptions already go to stderr (the launcher persists stderr
+    to ``daemon-<key>.log``), so what is added here is the part where **even
+    Python never gets a chance to act**: ``SIGSEGV`` / ``SIGABRT`` /
+    ``SIGFPE`` / ``SIGILL`` and other fatal signals.
 
-    一条判据（写在注释里备用，将来复盘无声死亡时直接用）：
+    One diagnostic criterion (kept in this docstring for later; use directly
+    when reviewing silent deaths):
 
-    - 装了 faulthandler **仍然一字未留** ⇒ 进程是被外部终止的
-      （Windows 的 ``TerminateProcess`` 不触发任何 handler，Python 的
-      ``os.kill(pid, SIGTERM)`` 在 Windows 上同样是 TerminateProcess）；
-    - 装了之后有 dump ⇒ 是 native 层崩溃，按栈继续查。
+    - faulthandler installed yet **not a single word written** ⇒ the process
+      was terminated externally (Windows ``TerminateProcess`` triggers no
+      handler; Python's ``os.kill(pid, SIGTERM)`` is also TerminateProcess on
+      Windows);
+    - faulthandler installed and a dump appeared ⇒ a native-level crash; keep
+      investigating via the stack.
 
-    为什么 ``chain=True`` 不能改成 ``False``：``False`` 会在 dump 完之后
-    **不再调用原 handler**，也就是收到 ``SIGTERM`` 后进程**继续活着**——
-    宿主以为自己杀了 daemon，其实它还在那里攥着 ~1GB。``chain=True``
-    是「dump 之后照旧终止」，语义不变。
+    Why ``chain=True`` must not become ``False``: ``False`` **no longer calls
+    the original handler** after dumping, meaning the process **keeps living**
+    after receiving ``SIGTERM`` — the host believes it killed the daemon while
+    the daemon still holds ~1GB there. ``chain=True`` is "terminate as usual
+    after the dump"; semantics unchanged.
 
-    逃生开关：``HIPPOCAMPUS_DAEMON_FAULTHANDLER=0`` 关闭。
+    Escape switch: ``HIPPOCAMPUS_DAEMON_FAULTHANDLER=0`` disables.
     """
     if os.environ.get("HIPPOCAMPUS_DAEMON_FAULTHANDLER", "1").strip() in ("0", "false", "no", "off"):
         return "off"
     try:
         import faulthandler
         faulthandler.enable(file=sys.stderr, all_threads=True)
-    except Exception:  # noqa: BLE001 —— 诊断设施不能让它自己的失败拖垮 daemon
+    except Exception:  # noqa: BLE001 -- diagnostics must not let their own failure drag down the daemon
         return "unavailable"
-    # enable() 本身就会给 SIGSEGV / SIGFPE / SIGABRT / SIGILL 这类**致命信号**
-    # 装 handler —— 也就是说 native 崩溃留痕的主体能力它已经给了。
-    # register() 只是补充"给任意信号也加一次 dump"；实测两个主流解释器
-    # （CPython 3.11 与 3.13）的 faulthandler 都是**精简内置版**，
-    # hasattr(faulthandler, "register") == False，故这条通道通常拿不到，
-    # 拿到不到就明确记出来，别让复盘的人误以为注册过。
+    # enable() itself installs handlers for **fatal signals** like
+    # SIGSEGV / SIGFPE / SIGABRT / SIGILL — i.e. the core native-crash tracing
+    # capability is already there. register() only adds "dump for arbitrary
+    # signals too"; in practice both mainstream interpreters (CPython 3.11 and
+    # 3.13) ship a **stripped-down built-in** faulthandler with
+    # hasattr(faulthandler, "register") == False, so this path is usually
+    # unavailable; record that absence explicitly so a later reviewer doesn't
+    # mistake it for registered.
     if not hasattr(faulthandler, "register"):
         return "enable(no-register)"
     installed = ["enable"]
@@ -716,7 +806,7 @@ def _install_crash_diagnostics() -> str:
         try:
             faulthandler.register(signum, file=sys.stderr, all_threads=True, chain=True)
             installed.append(signame)
-        except Exception:  # noqa: BLE001 —— 个别平台没有这些信号，忽略即可
+        except Exception:  # noqa: BLE001 -- some platforms lack these signals; just ignore
             pass
     return "+".join(installed)
 
@@ -725,8 +815,9 @@ def main(argv: list[str] | None = None) -> int:
     key = os.environ.get("HIPPOCAMPUS_DAEMON_KEY", "") or "default"
     library = os.environ.get("HIPPOCAMPUS_DAEMON_LIBRARY", "")
     model = os.environ.get("HIPPOCAMPUS_DAEMON_MODEL", "")
-    # 孤儿回收：launchers 全死后空闲超时自动退出。默认 600s；
-    # <=0 关闭（保留"永不自动退出"的旧行为，测试用）。
+    # Orphan cleanup: once all launchers die, exit automatically on idle
+    # timeout. Default 600s; <=0 disables (keeps the old "never auto-exit"
+    # behavior; used by tests).
     try:
         idle_exit = float(os.environ.get("HIPPOCAMPUS_DAEMON_IDLE_EXIT", "600") or 600)
     except ValueError:
@@ -748,13 +839,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        d.join_idle()      # 先等空闲回收线程把收尾（save + 擦注册表）跑完
-        d.stop()           # 幂等兜底
+        d.join_idle()      # first wait for the idle-reclaim thread's teardown (save + registry clearing)
+        d.stop()           # idempotent fallback
     return 0
 
 
 def _default_factory(library: str | None = None):
-    """惰性建 brain（这里才 import 重库）。"""
+    """Construct the brain lazily (the heavy imports happen here)."""
     from .brain import HippoBrain
     return HippoBrain(persist_dir=library or None)
 

@@ -1,24 +1,27 @@
 # -*- coding: utf-8 -*-
-"""B2-3 P1：HippoBrain 的纯方法（不碰实例状态）
+"""B2-3 P1: pure methods of HippoBrain (never touch instance state)
 
-本簇从 ``brain.py`` 逐字搬来。
+This cluster was moved over from ``brain.py`` verbatim.
 
-判定口径是 AST 实证，不是感觉：**既不读写 ``self.*``、也不调用任何
-``self`` 方法** —— 它们与 HippoBrain 的实例状态毫无关系，抽出去
-必然等价。
+The criterion is AST-verified, not gut feeling: **neither reads/writes
+``self.*`` nor calls any ``self`` method** -- they have nothing to do with
+HippoBrain's instance state, so extracting them is necessarily equivalent.
 
-用 Mixin 而不是「传 manager 进去」：``self.manager`` 有 62 个读点，
-任何改签名的做法都会触发大规模调用点改动，那正是大重构失控的
-典型入口。Mixin 里仍然写 ``self``，靠 MRO 解析，调用点一行不动。
+A Mixin instead of "pass the manager in": ``self.manager`` has 62 read
+sites; any signature change would trigger mass call-site edits, which is
+the classic way a big refactor spirals out of control. The Mixin still
+writes ``self``, resolved via the MRO, so call sites don't change a line.
 
-⚠️ ``_is_restatement`` **故意留**在 brain.py：``scripts/test_batch2.py``
-用 ``src.split("def _is_restatement")[1]`` 定位它做结构守卫，搬走会
-IndexError。那是「判据单一真相源」的守卫，比 32 行代码位置更值钱。
+⚠️ ``_is_restatement`` is **deliberately left** in brain.py:
+``scripts/test_batch2.py`` locates it via
+``src.split("def _is_restatement")[1]`` as a structural guard; moving it
+away raises IndexError. That guard is the "single source of truth for the
+criterion", worth more than the location of 32 lines of code.
 """
 
 from __future__ import annotations
 
-from ..common.constants import *  # noqa: F401,F403  （常量表：见 common/constants.__all__）
+from ..common.constants import *  # noqa: F401,F403  (constants table: see common/constants.__all__)
 from ..common.constants import logger
 from ..config import load_config
 import hashlib
@@ -32,34 +35,40 @@ from ..domain import topic as topic_mod
 from ..store.memory import CognitiveType
 from ..store import source_sig as _source_sig
 
-#: 用户级继承槽默认条数：param==0 且 env 空时回落这里。
-#: 刻意住消费方（resolve_user_scope_limit）而不是 common/constants——
-#: 架构守卫钉死 constants 行数天花板，新常量按守卫指引进 domain/config/
-#: 消费模块。与 ``Config.user_scope_limit`` 的字面默认同值，对齐由
-#: tests/test_u1_user_scope.py C6 钉住（test_config_parity P7 同口径）。
+#: Default count for the user-scope inheritance slot: fallback when
+#: param==0 and env is empty. Deliberately lives with its consumer
+#: (resolve_user_scope_limit), not common/constants -- the architecture
+#: guard pins a hard line-count ceiling on constants, so new constants
+#: follow the guard's guidance into domain/config/consumer modules. Same
+#: literal default as ``Config.user_scope_limit``; parity pinned by
+#: tests/test_u1_user_scope.py C6 (test_config_parity P7, same criterion).
 USER_SCOPE_LIMIT_DEFAULT = 3
 
-#: 用户级任务目录默认条数：param==0 且 env 空时回落这里。
-#: 目录是**索引**不是正文（设计 §3.4），8 条足够覆盖「手头这条 + 最近几条」；
-#: 超出的老任务由 ``task_directory.total`` 自曝后被截断，宿主可按需再查。
-#: 与 ``Config.task_directory_limit`` 的字面默认同值，对齐由
-#: tests/test_u5_task_directory.py C6 钉住（test_config_parity P7 同口径）。
+#: Default count for the task-directory slot: fallback when param==0 and
+#: env is empty. The directory is an **index**, not the body (design §3.4);
+#: 8 entries cover "the one at hand + the recent few". Older tasks beyond
+#: that are truncated after ``task_directory.total`` self-reports the
+#: total, and the host can query more as needed. Same literal default as
+#: ``Config.task_directory_limit``; parity pinned by
+#: tests/test_u5_task_directory.py C6 (test_config_parity P7, same criterion).
 TASK_DIRECTORY_LIMIT_DEFAULT = 8
 
 
 class _PureMixin:
-    """B2-3 P1：HippoBrain 的纯方法（不碰实例状态）"""
+    """B2-3 P1: pure methods of HippoBrain (never touch instance state)"""
 
     # ==================================================================
-    # 项目专名词库（覆盖报告·高 6）
+    # Project proper-noun lexicon (coverage report, High 6)
     # ==================================================================
     @staticmethod
     def _resolve_lexicon_path(explicit: str | None, persist_dir: str | None) -> str | None:
-        """解析词库文件路径：显式参数 > env > ``<记忆库>/entity_lexicon.txt``。
+        """Resolve the lexicon file path: explicit param > env > ``<memory library>/entity_lexicon.txt``.
 
-        默认路径**每次现算而不缓存解析结果**——若在服务启动后才把
-        entity_lexicon.txt 放进记忆库（很常见的操作顺序），缓存的 "None"
-        会让 ``reload_lexicon()`` 永远读到空词库，且毫无提示。
+        The default path is **computed fresh each time, never cached** -- if
+        entity_lexicon.txt is placed into the memory library only after
+        service startup (a very common order of operations), a cached "None"
+        would make ``reload_lexicon()`` read an empty lexicon forever, with
+        no warning at all.
         """
         if explicit:
             return explicit
@@ -77,7 +86,7 @@ class _PureMixin:
 
     @staticmethod
     def _lexicon_mtime_of(path: str | None) -> float | None:
-        """词库文件的 mtime；文件不存在 / 读不到都返回 None（**不当错误抛**）。"""
+        """The lexicon file's mtime; returns None if missing / unreadable (**never raised as an error**)."""
         try:
             return os.path.getmtime(path) if path and os.path.isfile(path) else None
         except OSError:
@@ -88,21 +97,26 @@ class _PureMixin:
 
     @classmethod
     def _parse_lexicon_text(cls, text: str) -> tuple[set[str], dict[str, str], list[str]]:
-        """解析词库文本 → ``(词条集合, 别名映射, 问题行)``。
+        """Parse lexicon text -> ``(term set, alias map, problem lines)``.
 
-        行语法（UTF-8，``#`` 开头为注释，空行忽略）::
+        Line syntax (UTF-8, ``#`` starts a comment, blank lines ignored)::
 
-            顾言                     # 普通词条
-            子安 => 顾言              # 别名行：左=别名，右=规范名
-            陆暄 -> 暄儿             # 箭头写法等价（-> / → / ⇒）
+            顾言                     # plain term
+            子安 => 顾言              # alias line: left=alias, right=canonical name
+            陆暄 -> 暄儿             # arrow form is equivalent (-> / → / ⇒)
 
-        **别名与规范名都进词条集合**（两者都要参与子串命中，否则"别名根本没被
-        认出来"就谈不上归一）；别名映射另存一份 ``{别名lower: 规范名原样}``，
-        供抽取侧与查询侧归一。
+        **Both aliases and canonical names go into the term set** (both must
+        participate in substring hits; if "the alias is never even
+        recognized" there is nothing to normalize). The alias map is stored
+        separately as ``{alias_lower: canonical_verbatim}`` for
+        normalization on both the extraction side and the query side.
 
-        为什么要别名：**同一实体的多种称法在任何知识库都存在**（表字/简称/
-        全称/旧称/代号）。小说人物只是最显眼的一例——查"子安"吃不到"顾言"
-        的实体加成、档案还各存一份互不连通，是通用缺陷，不是某个项目的私事。
+        Why aliases: **multiple names for the same entity exist in any
+        knowledge base** (courtesy name / abbreviation / full name / old
+        name / codename). Novel characters are just the most visible case
+        -- querying "子安" missing the entity boost for "顾言", with
+        profiles stored separately and unconnected, is a generic defect,
+        not any single project's private matter.
         """
         terms: set[str] = set()
         aliases: dict[str, str] = {}
@@ -118,7 +132,7 @@ class _PureMixin:
             alias = line[:m.start()].strip().lstrip("#").strip()
             canon = line[m.end():].strip()
             if not alias or not canon:
-                # 不静默丢弃：写坏了必须让人知道（否则表现为"别名没生效"）
+                # Not silently dropped: a malformed line must be made known (otherwise it shows up as "the alias never took effect")
                 problems.append(f"line {lineno} alias syntax incomplete: {line!r}")
                 continue
             if alias.lower() == canon.lower():
@@ -140,10 +154,12 @@ class _PureMixin:
 
     @classmethod
     def _load_lexicon(cls, path: str | None) -> set[str]:
-        """读取词库文件，返回小写化词条集合（含别名）。
+        """Read the lexicon file, return the lowercased term set (aliases included).
 
-        文档场景下，靠启发式规则猜中文专名注定噪声缠身；让项目自己给一份
-        专名清单（人名 / 地名 / 商号 / 书名），命中即链，既准又便宜。
+        For document corpora, guessing Chinese proper nouns via heuristic
+        rules is doomed to drown in noise; instead have the project supply
+        its own proper-noun list (person names / place names / trade names /
+        book titles) -- a hit links immediately, both accurate and cheap.
         """
         return cls._read_lexicon(path)[0]
 
@@ -151,7 +167,7 @@ class _PureMixin:
 
     @classmethod
     def _read_lexicon(cls, path: str | None) -> tuple[set[str], dict[str, str]]:
-        """读取词库文件，返回 ``(词条集合, 别名映射)``。读不到就是空。"""
+        """Read the lexicon file, return ``(term set, alias map)``. Unreadable means empty."""
         if not path or not os.path.isfile(path):
             return set(), {}
         try:
@@ -170,12 +186,14 @@ class _PureMixin:
 
     @staticmethod
     def _preprocess_for_entities(text: str) -> str:
-        """剥离 markdown 结构后再抽实体（覆盖报告·高 6）。
+        """Strip markdown structure before extracting entities (coverage report, High 6).
 
-        文档类语料里，表格行（``| 卷末（1664 | ...``）、树形目录
-        （``│  ├─ 伏笔表.md``）、围栏代码块会被启发式规则当成专名，
-        实测 Top15 实体里 11 个是这类碎片。这些字符不承载"实体"语义，
-        在抽取前整段去掉，噪声源就没了。
+        In document-like corpora, table rows (``| 卷末（1664 | ...``), tree
+        listings (``│  ├─ 伏笔表.md``) and fenced code blocks get mistaken
+        for proper nouns by the heuristic rules -- measured: 11 of the
+        Top15 entities were such fragments. These characters carry no
+        "entity" semantics; removing them wholesale before extraction
+        removes the noise source.
         """
         if not text:
             return ""
@@ -184,7 +202,7 @@ class _PureMixin:
         for line in t.split("\n"):
             if _MD_TABLE_LINE.match(line):
                 continue
-            # 行内的树形符号也去掉（"├─ 顾言" → "顾言"）
+            # Tree-drawing symbols inside a line are stripped too ("├─ 顾言" → "顾言")
             if any(ch in line for ch in _MD_TREE_CHARS):
                 line = "".join(" " if ch in _MD_TREE_CHARS else ch for ch in line)
             lines.append(line)
@@ -194,7 +212,7 @@ class _PureMixin:
 
     @staticmethod
     def _cjk_ratio(text: str) -> float:
-        """中日韩字符占"非空白字符"的比例。"""
+        """Proportion of CJK characters among "non-whitespace" characters."""
         if not text:
             return 0.0
         dense = [c for c in text if not c.isspace()]
@@ -208,24 +226,25 @@ class _PureMixin:
 
     @classmethod
     def _clean_entity_name(cls, name: str) -> str | None:
-        """清洗抽出的候选实体：丢弃功能词、结构字符与编号式噪声。
+        """Clean extracted candidate entities: drop function words, structural characters and code-like noise.
 
-        覆盖报告·高 6 的实测垃圾样本（「├」「│  ├─ 伏笔表.md」「H05」
-        「本文件（人读）」「章自检（2026」）都在这里被拦下：
-        结构字符走 ``_ENTITY_BAD_CHARS``（markdown 已在预处理里剥离，
-        这里兜住残留），编号式走 ``_CODE_LIKE``。
+        The measured junk samples from coverage report High 6 (「├」「│  ├─ 伏笔表.md」「H05」
+        「本文件（人读）」「章自检（2026」) are all intercepted here:
+        structural characters go through ``_ENTITY_BAD_CHARS`` (markdown is
+        already stripped in preprocessing; this catches the residue), and
+        code-like names go through ``_CODE_LIKE``.
         """
         n = (name or "").strip()
         if not n:
             return None
-        # 中文名放 12 字，纯英文名放宽到 30（New York City / SentenceTransformer）
+        # Chinese names capped at 12 chars; pure-English names relaxed to 30 (New York City / SentenceTransformer)
         limit = 30 if n.isascii() else 12
         if not (1 < len(n) <= limit):
             return None
-        # 含标点 / markdown 结构字符 → 噪声（实体名不该带这些）
+        # Contains punctuation / markdown structural chars -> noise (entity names should not carry these)
         if any(c in _ENTITY_BAD_CHARS for c in n):
             return None
-        # 纯功能词 / 含功能词的短语 → 噪声
+        # Pure function words / phrases containing function words -> noise
         if any(c in n for c in cls._NOISE_CHARS):
             return None
         if re.fullmatch(r"[\d\W_]+", n):
@@ -239,7 +258,7 @@ class _PureMixin:
 
     @classmethod
     def _title_entities(cls, text: str) -> list[str]:
-        """抽取 `《书名号》` 内的专名。中文唯一的显式作品名标记，可信度单列一档。"""
+        """Extract proper names inside `《书名号》` (Chinese book-title brackets). The only explicit work-title marker in Chinese; given its own confidence tier."""
         names = []
         for m in cls._TITLE_RE.finditer(text):
             w = (m.group(1) or "").strip()
@@ -251,16 +270,21 @@ class _PureMixin:
 
     @classmethod
     def _heuristic_entities(cls, text: str, cjk: bool = True) -> list[str]:
-        """中英文启发式实体抽取（spaCy 不可用或非英文时的回退）。
+        """Heuristic entity extraction for Chinese and English (fallback when
+        spaCy is unavailable or the text is not English).
 
-        中文模式：我叫X / X品类 / X公司（句式特征）。
-        英文模式：额外启用引号模式 + 连续大写开头的词。
+        Chinese patterns: 我叫X / X品类 / X公司 (sentence-shape cues).
+        English patterns: additionally enables quote patterns + runs of
+        consecutive capitalized words.
 
-        `《书名》` 不在这里处理——它由 ``_title_entities`` 单独抽出并标 title 档。
+        `《书名》` is not handled here -- it is extracted separately by
+        ``_title_entities`` and tagged with the title tier.
 
         Args:
-            cjk: 文本是否以中文为主。为真时**停用引号类模式**（见
-                ``_QUOTE_PATTERNS`` 的说明——中文引号是强调标记而非专名标记）。
+            cjk: whether the text is predominantly Chinese. When true,
+                **quote-like patterns are disabled** (see the note on
+                ``_QUOTE_PATTERNS`` -- Chinese quotation marks are emphasis
+                markers, not proper-noun markers).
         """
         names: list[str] = []
         patterns = list(cls._STATEMENT_PATTERNS)
@@ -283,15 +307,16 @@ class _PureMixin:
 
     @staticmethod
     def _entity_origin(ent: dict[str, Any]) -> str:
-        """读取实体来源。**缺省 heuristic** —— 旧库序列化里没有该字段，
-        按不可信处理，绝不因为"数据老"就白给信任。"""
+        """Read the entity's origin. **Defaults to heuristic** -- older library
+        serializations lack this field; treat it as untrusted, never grant
+        trust just because "the data is old"."""
         return ent.get("origin", ENTITY_ORIGIN_HEURISTIC)
 
 
 
     @classmethod
     def _entity_trusted(cls, ent: dict[str, Any]) -> bool:
-        """该实体是否可信（参与检索加成 / 画像 / 矛盾检测）。"""
+        """Whether this entity is trusted (participates in retrieval boosts / profile / contradiction detection)."""
         return cls._entity_origin(ent) in TRUSTED_ENTITY_ORIGINS
 
 
@@ -303,9 +328,11 @@ class _PureMixin:
                    sig: dict[str, Any] | None,
                    cur: dict[str, Any] | None,
                    diff: list[str] | None = None) -> dict[str, Any]:
-        """漂移审计的一行（实现体在 ``store.source_sig.drift_row``，
-        此处为同名委托——C1b 漂移审计随 source_drift 成簇搬 store 侧，
-        ``_PureMixin`` 表面不变，行为由 tests/test_c1_source_drift.py 钉住）。"""
+        """One row of the drift audit (implementation lives in
+        ``store.source_sig.drift_row``; this is a same-name delegate -- the
+        C1b drift audit moved to the store side as a cluster with
+        source_drift, ``_PureMixin``'s surface unchanged, behavior pinned by
+        tests/test_c1_source_drift.py)."""
         return _source_sig.drift_row(source, category, ref, sig, cur, diff)
 
 
@@ -313,7 +340,7 @@ class _PureMixin:
 
     @staticmethod
     def _split_facts(text: str) -> list[str]:
-        """把一段文本切成可作为记忆的短句。"""
+        """Split a passage of text into short sentences usable as memories."""
         text = text.strip()
         if not text:
             return []
@@ -350,8 +377,9 @@ class _PureMixin:
 
     @staticmethod
     def _guess_importance(text: str) -> float:
-        """启发式重要性（判定核已迁 ``domain.policies.guess_importance``，
-        此处为同名委托，行为经 golden 测试 44 例钉住）。"""
+        """Heuristic importance (the decision core moved to
+        ``domain.policies.guess_importance``; this is a same-name delegate,
+        behavior pinned by 44 golden test cases)."""
         return _policies.guess_importance(text)
 
 
@@ -359,31 +387,33 @@ class _PureMixin:
 
     @staticmethod
     def _tokens_of(s: str) -> set[str]:
-        """中文 bigram + 英文词（委托 ``domain.policies.tokens_of``）。"""
+        """Chinese bigrams + English words (delegates to ``domain.policies.tokens_of``)."""
         return _policies.tokens_of(s)
 
 
 
     @classmethod
     def _overlap_of_sets(cls, ta: set[str], tb: set[str]) -> float:
-        """M2：委托 ``domain.policies.overlap_of_sets``（cls 形参保留防签名变动）。"""
+        """M2: delegates to ``domain.policies.overlap_of_sets`` (the cls param is kept to guard against signature changes)."""
         return _policies.overlap_of_sets(ta, tb)
 
 
 
     @classmethod
     def _token_overlap(cls, a: str, b: str) -> float:
-        """实词重叠率（用于判断两条记忆是否在讲同一件事）。"""
+        """Content-word overlap ratio (used to judge whether two memories are talking about the same thing)."""
         return cls._overlap_of_sets(cls._tokens_of(a), cls._tokens_of(b))
 
 
 
 
     def _resolve_daily_days(self, daily_days: int = 0) -> int:
-        """按日窗口条数：显式参数 > env ``HIPPOCAMPUS_DAILY_ACTIVITY_DAYS`` > 14。
+        """Daily-window entry count: explicit param > env
+        ``HIPPOCAMPUS_DAILY_ACTIVITY_DAYS`` > 14.
 
-        ``0`` = 按 env / 默认来。**不设上界校验**——要看全量就传个大数，
-        反正 ``daily_counts`` 本身最多只有 :data:`DAILY_COUNT_KEEP_DAYS` 天。
+        ``0`` = follow env / default. **No upper-bound validation** -- pass a
+        big number to see everything; ``daily_counts`` itself holds at most
+        :data:`DAILY_COUNT_KEEP_DAYS` days anyway.
         """
         if daily_days:
             return max(int(daily_days), 1)
@@ -401,7 +431,7 @@ class _PureMixin:
 
 
     def _mmr_select(self, items: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-        """MMR 选择：兼顾相关性与多样性，抑制重复内容霸榜。"""
+        """MMR selection: balances relevance and diversity, suppressing duplicate content from dominating the ranking."""
         selected: list[dict[str, Any]] = []
         pool = list(items)
         while pool and len(selected) < top_k:
@@ -417,14 +447,14 @@ class _PureMixin:
                         if s is None:
                             a, b = cand.get("_emb"), sel.get("_emb")
                             if a is None or b is None:
-                                # 缺当前模型向量的候选（BM25 单路命中）不做多样性惩罚
+                                # Candidates missing the current model's vector (BM25-only hits) get no diversity penalty
                                 continue
                             denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-12
                             s = float(a @ b / denom)
                             cand.setdefault("_sel_sim", {})[sel["memory_id"]] = s
                         max_sim = max(max_sim, s)
-                    # 字面强命中（BM25 单路前 N 名）豁免多样性惩罚：
-                    # 否则"带章号/数额的那条"会被近义的已选项折叠掉（见常量处实测）。
+                    # Literal strong hits (top N via the BM25 single route) are exempt from the diversity penalty:
+                    # otherwise "the entry carrying the chapter number/amount" gets folded away by near-synonyms (see the note at the constants).
                     penalty = 0.0 if cand.get("_literal") else 1.0
                     val = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * max_sim * penalty
                 if val > best_val:
@@ -446,12 +476,13 @@ class _PureMixin:
             "block_4_entity_state": "🧠 Related entity state",
             "block_5_open_topics": "🔄 Previously unfinished",
         }
-        budget = max(int(token_budget) * 2, 200)  # 中文约 2 字符/token
+        budget = max(int(token_budget) * 2, 200)  # Chinese is roughly 2 chars/token
 
-        # 先整块渲染，再按优先级（block_1 → block_5）装填。
-        # 覆盖报告·低 13：原来是 `out[: budget*2]` 硬截断，会把一行切成半句，
-        # 宿主拿到"【📋 当前相关信息】\n  - 顾言表字是"这种断头内容。
-        # 现在**只按整块/整条丢弃**，绝不切在行中间。
+        # Render whole blocks first, then pack by priority (block_1 → block_5).
+        # Coverage report, Low 13: it used to be a hard `out[: budget*2]` truncation,
+        # which cut a line into half a sentence -- the host received broken content
+        # like "【📋 当前相关信息】\n  - 顾言表字是". Now **only whole blocks/whole
+        # items are dropped**; never cut in the middle of a line.
         rendered: list[tuple[str, list[str]]] = []
         for k, label in labels.items():
             vals = [v for v in blocks.get(k, []) if v]
@@ -464,14 +495,14 @@ class _PureMixin:
         parts: list[str] = []
         used = 0
         for header, lines in rendered:
-            # 1) 整块能放下就整块放
+            # 1) If the whole block fits, place it whole
             block = header + "\n" + "\n".join(lines)
             gap = 2 if parts else 0
             if used + gap + len(block) <= budget:
                 parts.append(block)
                 used += gap + len(block)
                 continue
-            # 2) 放不下整块 → 保留块头、逐条装到放不下为止（条目仍完整）
+            # 2) Whole block doesn't fit → keep the header, pack item by item until full (items stay complete)
             kept: list[str] = []
             here = len(header) + gap
             if used + here <= budget:
@@ -483,16 +514,18 @@ class _PureMixin:
             if kept:
                 parts.append(header + "\n" + "\n".join(kept))
                 used += here
-            # 3) 连块头都放不下 → 整块丢弃（后面的块优先级更低，自然也不放）
+            # 3) Even the header doesn't fit → drop the whole block (later blocks are lower priority, so naturally not placed either)
         return "\n\n".join(parts)
 
 
 
 
     def resolve_knowledge_limit(self, knowledge_limit: int = 0) -> int:
-        """知识地图槽条数：显式参数 > env ``HIPPOCAMPUS_KNOWLEDGE_BLOCK_LIMIT`` > 默认 8。
+        """Knowledge-map slot count: explicit param > env
+        ``HIPPOCAMPUS_KNOWLEDGE_BLOCK_LIMIT`` > default 8.
 
-        ``0`` = 按 env / 默认来；**负数 = 关闭该槽**（与 ``pin_limit`` 同款语义）。
+        ``0`` = follow env / default; **negative = close the slot** (same
+        semantics as ``pin_limit``).
         """
         if knowledge_limit:
             return max(int(knowledge_limit), 0)
@@ -510,9 +543,10 @@ class _PureMixin:
 
 
     def resolve_pin_limit(self, pin_limit: int = 0) -> int:
-        """钉住槽条数：显式参数 > env ``HIPPOCAMPUS_PIN_BLOCK_LIMIT`` > 默认 3。
+        """Pin slot count: explicit param > env ``HIPPOCAMPUS_PIN_BLOCK_LIMIT`` > default 3.
 
-        ``0`` = 按 env / 默认来；**负数 = 关闭该槽**（与 ``recent_limit`` 同款语义）。
+        ``0`` = follow env / default; **negative = close the slot** (same
+        semantics as ``recent_limit``).
         """
         if pin_limit:
             return max(int(pin_limit), 0)
@@ -530,23 +564,26 @@ class _PureMixin:
 
 
     def resolve_user_scope_limit(self, user_scope: int = 0) -> int:
-        """用户级继承槽条数三态（逐行照抄的三态表）：
+        """User-scope inheritance slot count, three-state (table copied line by line):
 
         ====================  ==========================================
-        输入                  resolve_user_scope_limit
+        Input                 resolve_user_scope_limit
         ====================  ==========================================
         param > 0             param
-        param < 0             0（关）
-        param == 0，env > 0   env
-        param == 0，env < 0   0（关）
-        param == 0，env 0/空/非法  3（默认）
+        param < 0             0 (off)
+        param == 0, env > 0   env
+        param == 0, env < 0   0 (off)
+        param == 0, env 0/empty/invalid  3 (default)
         ====================  ==========================================
 
-        与 :meth:`resolve_pin_limit` 的**唯一**差别在 env 负值：pin 落回
-        默认（``v > 0`` 门），user_scope 的设计是显式关——``0``（关）与
-        "回默认"必须分得开，「注入可关」纪律才有 env 侧的关法。
-        env 的空/非法回落由 :func:`config.load_config` 的 ``_int`` 兜
-        （回落字段默认 3，与 :data:`USER_SCOPE_LIMIT_DEFAULT` 同值）。
+        The **only** difference from :meth:`resolve_pin_limit` is a negative
+        env: pin falls back to the default (the ``v > 0`` gate), while
+        user_scope is designed as an explicit off -- ``0`` (off) and "back
+        to default" must stay distinguishable, or the "injection can be
+        turned off" discipline would have no env-side way to turn off.
+        Empty/invalid env fallback is handled by ``_int`` in
+        :func:`config.load_config` (the fallback field defaults to 3, same
+        value as :data:`USER_SCOPE_LIMIT_DEFAULT`).
         """
         if user_scope:
             return max(int(user_scope), 0)
@@ -556,22 +593,23 @@ class _PureMixin:
         return USER_SCOPE_LIMIT_DEFAULT
 
     def resolve_task_directory_limit(self, task_directory: int = 0) -> int:
-        """任务目录槽条数三态（U5，设计 §3.4）：与 ``user_scope`` 同族。
+        """Task-directory slot count, three-state (U5, design §3.4): same family as ``user_scope``.
 
         ====================  ==================================
-        输入                  resolve_task_directory_limit
+        Input                 resolve_task_directory_limit
         ====================  ==================================
         param > 0             param
-        param < 0             0（关）
-        param == 0，env > 0   env
-        param == 0，env < 0   0（关）
-        param == 0，env 0/空/非法  8（默认）
+        param < 0             0 (off)
+        param == 0, env > 0   env
+        param == 0, env < 0   0 (off)
+        param == 0, env 0/empty/invalid  8 (default)
         ====================  ==================================
 
-        与 :meth:`resolve_user_scope_limit` 逐行同构（含 env 负值＝显式关），
-        唯一的差别是默认值 8。env 的空/非法回落由 ``config.load_config`` 的
-        ``_int`` 兜（回落字段默认 8，与 :data:`TASK_DIRECTORY_LIMIT_DEFAULT`
-        同值）。
+        Line-for-line isomorphic with :meth:`resolve_user_scope_limit`
+        (including negative env = explicit off); the only difference is the
+        default of 8. Empty/invalid env fallback is handled by ``_int`` in
+        ``config.load_config`` (the fallback field defaults to 8, same value
+        as :data:`TASK_DIRECTORY_LIMIT_DEFAULT`).
         """
         if task_directory:
             return max(int(task_directory), 0)
@@ -586,7 +624,7 @@ class _PureMixin:
     @staticmethod
     def _tag_ops_brief(ops: list[dict[str, Any]],
                        limit: int = 5) -> list[dict[str, Any]]:
-        """账本摘要（给'没有这个 op'的报错带路：宿主知道有哪些 id 可用）。"""
+        """Brief of the ledger (guides the 'no such op' error: the host learns which ids are available)."""
         return [
             {"op_id": o.get("op_id"), "op": o.get("op"), "ts": o.get("ts"),
              "to_change": o.get("to_change"), "applied": o.get("applied"),
@@ -598,11 +636,14 @@ class _PureMixin:
 
 
     def _knowledge_playbook(self, pending_n: int, shown_n: int) -> dict[str, Any]:
-        """「整理这个库」的操作说明书（给宿主看，跟着走就能完成一轮归纳）。
+        """Operating manual for "tidy up this library" (shown to the host; following it completes one distillation round).
 
-        刻意写得像菜谱而不是像文档：宿主是照着步骤执行的，含糊一句"你可以
-        归纳一下"换不来任何动作。三条规则是从踩过的坑里来的——evidence 凭空
-        引用会被整条退回、已有归纳不该重做、写坏了要能撤。
+        Deliberately written like a recipe, not like documentation: the host
+        executes step by step, and a vague "you could summarize a bit" buys
+        no action. The three rules come from pits already stepped in --
+        evidence citing fabricated ids gets the whole item rejected,
+        existing summaries should not be redone, and a bad write must be
+        undoable.
         """
         batch = min(10, max(1, pending_n))
         return {
@@ -624,8 +665,9 @@ class _PureMixin:
                 "to rewrite, name them explicitly via topics",
                 "If one write goes wrong: undo via knowledge_topic(action=\"revert\", topic_id=...)",
                 "Write-back persists to disk (with a ledger); no separate save call needed",
-                # S3：四字段契约。写进 rules 而不是新增参数文档——宿主照菜谱
-                # 走一遍就会用；f/s 两格是已知最便宜的"假簇过滤器"。
+                # S3: the four-field contract. Written into rules rather than
+                # new parameter docs -- the host learns it by walking the
+                # recipe once; the f/s slots are the cheapest known "fake-cluster filter".
                 "Optional four fields (recommended): add \"fras\":{\"f\":\"category (used as title)\","
                 "\"r\":[\"related entities/topics\"],\"a\":\"the citable conclusion\",\"s\":\"constraints not derivable "
                 "but costly if wrong\"} to the item. All four keys are required; if s truly has none, write \"none\". "
@@ -638,22 +680,28 @@ class _PureMixin:
 
 
     # ------------------------------------------------------------------
-    # L0 与 L1 的"冲突即合并"语义对齐
+    # Aligning L0 and L1 on the "merge on conflict" semantics
     # ------------------------------------------------------------------
     @staticmethod
     def _merge_raw_log(disk: list[dict], mine: list[dict]) -> list[dict]:
-        """两条 L0 流水按 id 取并集（**只做加法，不覆盖、不删除**）。
+        """Union of two L0 logs by id (**addition only: no overwrite, no deletion**).
 
-        为什么 L0 需要这条：L1（``memories.json``）早就有「冲突即合并」的加法
-        语义（``manager.retry_save``：取磁盘最新版本 + 补上磁盘没有的 id），
-        而 L0（``brain_raw.json``）此前是**直接覆写 / 直接替换**——两个进程各
-        自写同一个库时，就会出现「L1 是并集、L0 是较短的那一份」，于是 L1 的
-        ``source_ids`` 指不到 L0 原文。中文小说库实测 21 个 id / 36 条 L1 悬空
-        （追加五「L0 簿记漂移」），根因就在这层语义不对齐。
+        Why L0 needs this: L1 (``memories.json``) has long had the additive
+        "merge on conflict" semantics (``manager.retry_save``: take the
+        disk's newest version + add back ids the disk lacks), while L0
+        (``brain_raw.json``) was previously **direct overwrite / direct
+        replacement** -- when two processes each write the same library, you
+        get "L1 is the union, L0 is the shorter copy", so L1's
+        ``source_ids`` cannot point at the L0 originals. Measured on the
+        Chinese novel library: 21 ids / 36 dangling L1 entries (addendum
+        five, "L0 bookkeeping drift"); the root cause is exactly this
+        semantic misalignment.
 
-        只做加法是刻意的：L0 是 append-only 流水，删除也是软删除（打
-        ``forgotten`` 标记，条目仍在），所以并集不会复活任何被删的东西。
-        同 id 两条内容不同时**以磁盘为准**（与 retry_save 对 L1 的取舍一致）。
+        Addition-only is deliberate: L0 is an append-only log, and deletion
+        is soft too (a ``forgotten`` marker, the entry remains), so the
+        union never resurrects anything deleted. When two entries share an
+        id but differ in content, **the disk copy wins** (consistent with
+        retry_save's choice for L1).
         """
         if not disk:
             return list(mine)
@@ -671,7 +719,7 @@ class _PureMixin:
 
     @staticmethod
     def _layer_key(item: dict) -> str:
-        """list 层的合并键：有 id 用 id，没有就用内容指纹（避免无 id 层整份被盖）。"""
+        """Merge key for list layers: id if present, else a content fingerprint (so an id-less layer is not wholesale clobbered)."""
         rid = item.get("id")
         if rid:
             return "id:" + str(rid)
@@ -684,10 +732,12 @@ class _PureMixin:
 
     @classmethod
     def _merge_list_layer(cls, disk, mine, cap: int = 0):
-        """list 层并集：磁盘打底，本进程没见过的补进来；同键以**本进程**为准。
+        """Union of list layers: disk as the base, entries this process has
+        not seen get added in; on the same key **this process** wins.
 
-        只做加法是刻意的 —— 这些层都是流水/账本语义，并集不会复活任何被删的
-        东西（删除走墓碑或软标记）。
+        Addition-only is deliberate -- these layers all have log/ledger
+        semantics; the union never resurrects anything deleted (deletion
+        goes through tombstones or soft markers).
         """
         if not isinstance(disk, list):
             return list(mine) if isinstance(mine, list) else disk
@@ -711,7 +761,7 @@ class _PureMixin:
 
     @staticmethod
     def _merge_dict_layer(disk, mine):
-        """dict 层并集：磁盘打底，本进程的键覆盖（本地优先）。"""
+        """Union of dict layers: disk as the base, this process's keys overwrite (local wins)."""
         if not isinstance(disk, dict):
             return mine
         if not isinstance(mine, dict):
@@ -724,11 +774,14 @@ class _PureMixin:
 
     @staticmethod
     def _merge_entity_layer(disk, mine):
-        """实体层：键并集，``memory_ids`` 取**并集**、``mention_count`` 取 max。
+        """Entity layer: union of keys, ``memory_ids`` takes the **union**,
+        ``mention_count`` takes the max.
 
-        直接取本地那份会把对方挂上来的记忆 id 抹掉（实测现象）。
-        mention_count 反正 load 时会按存活记忆重算（``_recompute_entity_stats``），
-        取 max 只是让合并期间不虚降。
+        Taking the local copy directly would wipe out the memory ids the
+        other side attached (measured phenomenon). mention_count is
+        recomputed from live memories at load time anyway
+        (``_recompute_entity_stats``); taking the max just prevents a
+        spurious dip during the merge.
         """
         if not isinstance(disk, dict):
             return mine
@@ -762,15 +815,18 @@ class _PureMixin:
 
     @classmethod
     def _merge_intent_layer(cls, disk, mine):
-        """待办层：键并集 + **状态只进不退**。
+        """Open-intent layer: union of keys + **status only moves forward**.
 
-        为什么要单独一条规则：通用 list 合并是「磁盘打底、本地覆盖」，
-        对 append-only 的账本没问题（先来后到无所谓的条目），但有终态的层
-        不行 —— A 标记了 done，B 手里那份还是 open，B 一落盘就把 done 抹回
-        open，两边全程无报错（两个实例反复复现过）。
+        Why a separate rule: generic list merging is "disk as base, local
+        wins", fine for append-only ledgers (entries where order does not
+        matter), but not for layers with terminal states -- A marks done,
+        B still holds open, and the moment B persists, done is wiped back
+        to open with no error on either side (reproduced repeatedly across
+        two instances).
 
-        所以这里的取舍是：**status 取 rank 更大的**，其余字段仍以本地为准。
-        「完成」是这类语义里唯一不可逆的部分。
+        So the trade-off here: **status takes the higher rank**, all other
+        fields still follow the local copy. "Done" is the only irreversible
+        part of this semantics.
         """
         merged = cls._merge_list_layer(disk, mine)
         if not isinstance(disk, list) or not isinstance(merged, list):
@@ -792,7 +848,7 @@ class _PureMixin:
                 if disk_rank > mine_rank:
                     fixed = dict(it)
                     fixed["status"] = other["status"]
-                    # 完成时的留痕字段也一并取过来，别留下「完成了但没时间」
+                    # Carry over the completion-trace fields too; don't leave "done but with no timestamp"
                     for extra in ("done_at", "resolved_at", "completed_at"):
                         if other.get(extra) and not fixed.get(extra):
                             fixed[extra] = other[extra]
@@ -804,10 +860,12 @@ class _PureMixin:
 
     @classmethod
     def _merge_session_layer(cls, disk, mine):
-        """会话层：键并集 + **终态优先**。
+        """Session layer: union of keys + **terminal state wins**.
 
-        对方已经 ended（写了 ended_at）而本地这路还没收尾时，若按"本地优先"
-        会把 ended_at 抹掉 —— 已结束的会话在 ``active_sessions`` 里复活。
+        When the other side has already ended (wrote ended_at) while this
+        local route has not wrapped up yet, "local wins" would wipe
+        ended_at -- the finished session resurrects inside
+        ``active_sessions``.
         """
         out = cls._merge_dict_layer(disk, mine)
         if not isinstance(disk, dict) or not isinstance(out, dict):
@@ -828,10 +886,12 @@ class _PureMixin:
 
     @staticmethod
     def _merge_counter_layer(disk, mine):
-        """按日计数：同键取 **max**，刻意不求和。
+        """Per-day counters: take the **max** on the same key, deliberately not the sum.
 
-        同一个键两侧可能都带着同一份基线（各自 load 时读到的），求和会把
-        「该想起率」的分母吹大；取 max 顶多少计，不会虚增。
+        Both sides may carry the same baseline for one key (each read it at
+        its own load); summing would inflate the denominator of the
+        "should-have-recalled rate". Taking the max at worst under-counts;
+        it never inflates.
         """
         if not isinstance(disk, dict):
             return mine
@@ -857,20 +917,24 @@ class _PureMixin:
 
 
     # ------------------------------------------------------------------
-    # 派生层「真删除」账本
+    # "Real deletion" ledger for derived layers
     #
-    # 并集只会做加法。原来的解法是「合并完按当前存活记忆重裁」，
-    # 那只救得了**派生副本**（实体 / 画像，源头在 L1 可重算）。miss_log /
-    # sessions / intents 这些**独立账本**没有可重裁的源头，删了就是删了。
+    # A union only adds. The original fix was "after merging, re-derive
+    # from the currently-live memories", which only saves **derived
+    # copies** (entities / profile, re-computable from their L1 source).
+    # miss_log / sessions / intents are **independent ledgers** with no
+    # re-derivable source; once deleted, they are deleted.
     #
-    # 实测（_probe_out/_f92_delete_gap_20260929.py）：A 清空 miss_log 并落盘，
-    # B（旧快照）一次 save 就把 3 条完整并回来，两边全程无报错。
-    # 所以要有一份"哪些键被删过、什么时候删的"账本，合并时据此拦截。
+    # Measured (_probe_out/_f92_delete_gap_20260929.py): A clears miss_log
+    # and persists to disk; B (an older snapshot) merges all 3 entries
+    # right back with a single save, no error on either side. Hence we
+    # need a ledger of "which keys were deleted, and when", and merging
+    # intercepts by it.
     # ------------------------------------------------------------------
 
     @staticmethod
     def _del_ledger_key(layer: str, key: str) -> str:
-        """账本键：``层文件名::条目键``（与 :meth:`_layer_key` 的取值对齐）。"""
+        """Ledger key: ``<layer filename>::<entry key>`` (aligned with the value produced by :meth:`_layer_key`)."""
         return f"{layer}::{key}"
 
 
@@ -878,10 +942,12 @@ class _PureMixin:
 
     @staticmethod
     def _merge_del_ledger_layer(disk, mine):
-        """删除账本：键并集，同键取**更晚**的删除时刻。
+        """Deletion ledger: union of keys; on the same key take the **later** deletion time.
 
-        刻意不走 dict 规则的「本地优先」—— 两侧都是删除记录，取更晚的那次
-        才不会把对方的删除**记弱**（记弱 = 拦不住旧版本，等于没记）。
+        Deliberately not the dict rule's "local wins" -- both sides are
+        deletion records; only the later one avoids **under-recording** the
+        other side's deletion (under-recorded = cannot block the old
+        version, i.e. as good as not recorded).
         """
         if not isinstance(disk, dict):
             return dict(mine) if isinstance(mine, dict) else {}
@@ -899,9 +965,10 @@ class _PureMixin:
 
     @staticmethod
     def _entry_ts(item: dict) -> float:
-        """条目自己的时间戳（用于判断"是不是删完之后又重新产生的"）。
+        """The entry's own timestamp (used to judge "was it re-created after the deletion").
 
-        取不到就返回 0.0 —— 保守地当作"很老"，于是只要立过碑就拦住。
+        Returns 0.0 when unavailable -- conservatively treated as "very
+        old", so once a tombstone exists the merge is always blocked.
         """
         for k in ("ts", "timestamp", "created_at", "started_at", "done_at"):
             v = item.get(k)
@@ -914,19 +981,24 @@ class _PureMixin:
 
     @staticmethod
     def _merge_topic_layer(disk, mine):
-        """主题层：键并集；``member_ids`` 取**并集**，标量取较新的一侧。
+        """Topic layer: union of keys; ``member_ids`` takes the **union**,
+        scalars take the newer side.
 
-        为什么不直接走 dict 规则的「本地优先」：``member_ids`` 是这一层的
-        本体——取本地那份会把对方挂上来的成员抹掉（同款事故）。而
-        ``summary`` 的取法是**host 优先于时间戳**（见方法体注释）；都不是
-        host 时才按 ``updated_at`` 取较新的一侧。
+        Why not the dict rule's "local wins" directly: ``member_ids`` is
+        the body of this layer -- taking the local copy would wipe the
+        members the other side attached (same class of incident).
+        ``summary`` is chosen with **host taking priority over timestamps**
+        (see the in-method comment); only when neither side is host does
+        ``updated_at`` pick the newer side.
         """
         def _span_pair(raw):
-            """把任意形态的 span 收敛成 [lo, hi] 两个 float。
+            """Collapse a span of any shape into two floats [lo, hi].
 
-            ``[]`` / ``None`` / 只有一个元素 / 元素是字符串——都挡得住。
-            派生层合并是保存链的最后一道工序，它不该因为一条脏数据把整次
-            保存带塌（原实现 ``float(span)[0]`` 对 list 直接 TypeError）。
+            ``[]`` / ``None`` / a single element / string elements -- all
+            are defended against. Derived-layer merging is the last step of
+            the save chain; it must not take down the whole save over one
+            dirty entry (the original ``float(span)[0]`` raised TypeError
+            outright on a list).
             """
             try:
                 s = list(raw or [])
@@ -940,11 +1012,13 @@ class _PureMixin:
             return mine
         if not isinstance(mine, dict):
             return disk
-        # 世代：重建 ⇒ +1，**高的整代覆盖**。
-        # 键并集只在同一代之间做——跨代做并集正是「旧簇复活」的成因：
-        # 磁盘 652 个新簇 ∪ 对面内存 698 个旧簇 = 1050 个。而旧写者
-        # 的层世代更低，它下次保存时会**主动让位**给磁盘这份，
-        # 不会再并一次——这才是「清得掉」。
+        # Generations: rebuild ⇒ +1, **the higher generation replaces the whole layer**.
+        # Key union happens only within the same generation -- a cross-generation
+        # union is exactly what resurrects old clusters: 652 new clusters on
+        # disk ∪ 698 old clusters in the other side's memory = 1050. The older
+        # writer's layer epoch is lower, so on its next save it **yields
+        # voluntarily** to the disk copy and does not merge again -- that is
+        # what makes clusters "actually clearable".
         e_disk = topic_mod.layer_epoch(disk)
         e_mine = topic_mod.layer_epoch(mine)
         if e_mine > e_disk:
@@ -968,12 +1042,17 @@ class _PureMixin:
             ids = list(a.get("member_ids") or []) + list(b.get("member_ids") or [])
             merged["member_ids"] = sorted({str(x) for x in ids})
             merged["size"] = len(merged["member_ids"])
-            # 归纳合并：**host 优先于时间戳**。
-            # 抽取式代表句下一次 refresh 就能重算（丢了不心疼），宿主归纳是
-            # 花力气写的、且本系统永远不会自动重新生成它——丢了就真没了。
-            # 因此两侧只要有一侧是 host，就取那一侧；都不是（或都是）才按
-            # updated_at 取新。初版只按时间取，现在让 host 归纳变常态
-            # 后，巩固刷新会静默把归纳冲成摘录——这正是"最伤信任的静默改写"。
+            # Summary merging: **host takes priority over timestamps**.
+            # Extracted representative sentences can be recomputed at the
+            # next refresh (losing them costs nothing); a host summary is
+            # written with real effort and this system will never
+            # auto-regenerate it -- once lost, it is gone for good. So if
+            # either side is host, take that side; only when neither (or
+            # both) is host does updated_at pick the newer. The first
+            # version took by time alone; once host summaries became the
+            # norm, consolidation refreshes would silently flush summaries
+            # back into extracts -- precisely "the silent rewrite that
+            # hurts trust the most".
             ka = str(a.get("summary_kind") or "")
             kb = str(b.get("summary_kind") or "")
             if ka == topic_mod.SUMMARY_KIND_HOST and kb != topic_mod.SUMMARY_KIND_HOST:
@@ -987,13 +1066,17 @@ class _PureMixin:
             merged["summary"] = newer.get("summary", "")
             merged["summary_kind"] = newer.get("summary_kind", "")
             merged["summary_evidence"] = list(newer.get("summary_evidence") or [])
-            # 写回元信息跟着选中那一侧走（签名/时间/规模必须与 summary 同源，
-            # 否则 stale 判断会拿 A 的归纳配 B 的成员，报出假过期）。
+            # Write-back metadata follows the selected side (signature/time/size
+            # must share the same origin as summary; otherwise the stale check
+            # pairs A's summary with B's members and reports a false expiry).
             for f in ("summary_at", "summary_signature", "summary_member_count"):
                 merged[f] = newer.get(f, a.get(f))
-            # S3：四字段与宿主标题同样跟着选中侧——它们与 summary 是一套
-            # （fras.a 往往就是 summary 本体）。跟错侧的后果：地图上显示
-            # A 的结论、点进去是 B 的约束，宿主按错的那份做决策。
+            # S3: the four fields and the host title likewise follow the
+            # selected side -- they are one package with summary (fras.a is
+            # often the summary body itself). Following the wrong side
+            # means: the map shows A's conclusion while clicking through
+            # reveals B's constraints, and the host decides based on the
+            # wrong one.
             if newer.get("summary_fras"):
                 merged["summary_fras"] = newer.get("summary_fras")
             else:
@@ -1002,17 +1085,21 @@ class _PureMixin:
                 merged["title"] = newer.get("title", merged.get("title"))
                 merged["title_kind"] = topic_mod.TITLE_KIND_HOST
             else:
-                # 选中侧没有宿主命名 ⇒ 清掉另一侧残留的宿主标题。标题与
-                # summary 是一套：留着 B 起的名字配 A 的结论，就是"地图显示
-                # A 的结论、顶着一个 B 谁也对不上的名字"。与上面 fras 的
-                # pop 是同一条纪律（负对照实测过这个残留路径）。
+                # The selected side has no host title ⇒ clear the other side's
+                # residual host title. Title and summary are one package:
+                # keeping B's name attached to A's conclusion means "the map
+                # shows A's conclusion topped by a name from B that matches
+                # nothing". Same discipline as the fras pop above (this
+                # residual path was verified by a negative control).
                 merged.pop("title_kind", None)
                 merged["title"] = newer.get("title", "")
             merged["recall_hits"] = max(int(a.get("recall_hits") or 0),
                                         int(b.get("recall_hits") or 0))
-            # span 取并集（最早, 最晚）。**别写成 float(span)[0]**：span 本身
-            # 就是 list，对 list 做 float 直接 TypeError —— 那不是"算错"，
-            # 是整次保存在这里炸掉（多进程共库撞上同一个主题才触发）。
+            # span takes the union (earliest, latest). **Never write float(span)[0]**:
+            # span is itself a list, and float() on a list raises TypeError
+            # outright -- not a "wrong value" but the whole save exploding
+            # here (triggered only when multi-process shared-library writers
+            # collide on the same topic).
             sa, sb = _span_pair(a.get("span")), _span_pair(b.get("span"))
             merged["span"] = [min(sa[0], sb[0]), max(sa[1], sb[1])]
             out[k] = merged
@@ -1022,11 +1109,14 @@ class _PureMixin:
 
     @staticmethod
     def _merge_sourcesig_layer(disk, mine):
-        """C1a：源签名层合并——同键取 ``sig_at`` 较新者。
+        """C1a: source-signature layer merge -- on the same key take the newer ``sig_at``.
 
-        两个进程 ingest 同一个文件时都会记签名：后校验的那份更接近磁盘
-        现状。sha1 相同时事实无差别，取谁都对；不同时若误取旧的，drift
-        会把一个没变过的文件报成 stale（狼来了两次就没人看审计了）。
+        When two processes ingest the same file, both record a signature:
+        the later-validated one is closer to the disk's current state. With
+        the same sha1 the facts are identical, so either choice is right;
+        with different sha1s, mistakenly taking the older one makes drift
+        report an unchanged file as stale (cry wolf twice and nobody reads
+        the audit anymore).
         """
         if not isinstance(disk, dict) or not isinstance(mine, dict):
             return mine if isinstance(mine, dict) else disk
@@ -1054,23 +1144,27 @@ class _PureMixin:
 
 
 
-    # -- F14-1 层版本号 / G0 派生层脏集 ---------------------------------
+    # -- F14-1 layer version numbers / G0 derived-layer dirty set ---------------------------------
     @staticmethod
     def _layer_fingerprint(value: Any) -> str:
-        """层内容指纹（＝层版本号）。
+        """Layer content fingerprint (= layer version number).
 
-        为什么用**内容哈希**而不是逐条脏标记：10 个层形态各异（list / dict /
-        counter），逐条标脏要在几十处修改点插桩，漏一处就是静默漏写；而内容
-        哈希只有一个语义——「和我上次写下去的那份相比变没变」，不存在漏插。
+        Why a **content hash** instead of per-entry dirty flags: the 10
+        layers have different shapes (list / dict / counter); per-entry
+        dirty marking would require instrumenting dozens of modification
+        points, and one miss is a silent lost write. A content hash has
+        exactly one semantic -- "has it changed compared to what I last
+        wrote down" -- leaving no room for missed instrumentation.
 
-        ``sort_keys=True`` 是必须的：dict 的插入顺序在不同进程里可能不同，
-        不排序会让"内容其实一样"被判成变了（白白重写）。
+        ``sort_keys=True`` is mandatory: dict insertion order may differ
+        across processes; without sorting, "the content is actually
+        identical" gets judged as changed (a wasted rewrite).
         """
         try:
             blob = json.dumps(
                 value, ensure_ascii=False, sort_keys=True,
                 separators=(",", ":"), default=str,
             )
-        except (TypeError, ValueError):  # pragma: no cover - 兜底
+        except (TypeError, ValueError):  # pragma: no cover - fallback
             blob = repr(value)
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]

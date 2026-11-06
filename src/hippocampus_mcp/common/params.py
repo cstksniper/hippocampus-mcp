@@ -1,26 +1,36 @@
 # -*- coding: utf-8 -*-
-"""MCP 工具参数的纯解析助手（L0：纯标准库、零 I/O，谁都能 import）。
+"""Pure parsing helpers for MCP tool parameters (L0: pure stdlib, zero
+I/O; anyone may import).
 
-从 server.py 抽出（工具层/用例层共享的解析件）：这几个函数工具层（L4）
-与用例层（L3）都要用，而 L3 按架构纪律不准 import L4——放 L0 共享底座
-是唯一不制造环的位置。三个函数**逐字搬迁**（含 docstring），行为零变化；
-server.py 改为别名 import，原有调用点一处不动。
+Extracted from server.py (parsing pieces shared by the tool layer and
+the use-case layer): these functions are needed by both the tool layer
+(L4) and the use-case layer (L3), and L3 is forbidden by architecture
+discipline from importing L4 -- putting them on the L0 shared base is
+the only position that creates no cycle. The three functions were
+**moved verbatim** (docstrings included); behavior unchanged;
+server.py switched to alias imports, with no call site touched.
 
-两个 ``parse_str_list`` 是**刻意并存的两档严格度**（各自有主，别再合并）：
+The two ``parse_str_list`` functions are **deliberately coexisting
+strictness tiers** (each has its own owner; do not merge them again):
 
-* :func:`parse_str_list`（严格版）——坏 JSON **显式报错**
-  （``(None, err)`` 元组）。update_tags 的 clear_keys / missing_keys /
-  memory_ids 用它：静默回退会让调用方以为"没有要删的键"，整次操作
-  变成一次安静的空跑。
-* :func:`parse_str_list_lenient`（lenient 版）——JSON/逗号都收，解析
-  失败**回退逗号切分**。knowledge_topic 的 evidence/topics、词库三
-  工具（lexicon_add / lexicon_suggest / lexicon_alias_suggest）用它：
-  那些参数的语义是"顺手传几个词"，静默会表现成"参数传了没生效"，
-  比直接报错难查得多。
+* :func:`parse_str_list` (strict) -- bad JSON **raises explicitly**
+  (``(None, err)`` tuple). update_tags' clear_keys / missing_keys /
+  memory_ids use it: a silent fallback would make the caller believe
+  "there are no keys to delete", turning the whole operation into one
+  quiet no-op.
+* :func:`parse_str_list_lenient` (lenient) -- accepts JSON or commas;
+  on parse failure **falls back to comma splitting**. knowledge_topic's
+  evidence/topics and the three lexicon tools (lexicon_add /
+  lexicon_suggest / lexicon_alias_suggest) use it: those parameters
+  mean "casually pass a few words", and silence would present as "the
+  parameter was passed but did nothing", far harder to debug than an
+  outright error.
 
-与 server.py 版的一处刻意差异：``check_tag_keys`` **不在这里**——它要调
-``domain.tagging.validate_filter_keys``（L2），common 不准依赖 domain
-（依赖矩阵），故放 ``application/tags.py``。
+One deliberate difference from the server.py version: ``check_tag_keys``
+**is not here** -- it must call
+``domain.tagging.validate_filter_keys`` (L2), and common may not depend
+on domain (dependency matrix), so it lives in
+``application/tags.py``.
 """
 from __future__ import annotations
 
@@ -29,10 +39,13 @@ from typing import Any
 
 
 def parse_tags_json(raw: str) -> tuple[dict[str, Any] | None, str | None]:
-    """把 MCP 传进来的 JSON 对象字符串解析成 dict。
+    """Parse the JSON-object string passed in by MCP into a dict.
 
-    MCP 工具参数走简单类型，标签以 JSON 字符串传入。解析失败必须**显式报错**，
-    不能静默当空——否则宿主以为挂了标签，实际一条都没挂，过滤时才发现查不到。
+    MCP tool parameters use simple types; tags are passed as a JSON
+    string. A parse failure must **raise explicitly**, never silently
+    become empty -- otherwise the host believes tags were attached while
+    in fact none were, only to discover at filter time that nothing is
+    found.
     """
     text = (raw or "").strip()
     if not text:
@@ -47,10 +60,13 @@ def parse_tags_json(raw: str) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def parse_str_list(raw: str) -> tuple[list[str] | None, str | None]:
-    """把 MCP 传进来的 JSON 数组字符串解析成字符串列表（严格版）。
+    """Parse the JSON-array string passed in by MCP into a list of
+    strings (strict version).
 
-    与 :func:`parse_tags_json` 同一条纪律：解析失败**显式报错**，不能静默当空
-    ——空列表会让调用方以为"没有要删的键"，于是整次操作变成一次安静的空跑。
+    Same discipline as :func:`parse_tags_json`: a parse failure **raises
+    explicitly**, never silently becomes empty -- an empty list would
+    make the caller believe "there are no keys to delete", turning the
+    whole operation into one quiet no-op.
     """
     text = (raw or "").strip()
     if not text:
@@ -65,14 +81,17 @@ def parse_str_list(raw: str) -> tuple[list[str] | None, str | None]:
 
 
 def parse_str_list_lenient(value: Any) -> list[str]:
-    """把"列表类参数"解析成字符串列表（JSON 数组或逗号分隔都收）。
+    """Parse a "list-like parameter" into a list of strings (JSON array
+    or comma-separated, both accepted).
 
-    协议上这类参数一律是字符串：``["同安","顾父"]`` 与 ``"同安, 顾父"`` 等价。
-    解析失败**回退到逗号切分**而不是静默当空——静默会表现成"参数传了没生效"，
-    比直接报错难查得多。
+    On the wire such parameters are always strings: ``["同安","顾父"]``
+    and ``"同安, 顾父"`` are equivalent.
+    A parse failure **falls back to comma splitting** instead of silently
+    becoming empty -- silence presents as "the parameter was passed but
+    did nothing", far harder to debug than an outright error.
     """
     if not isinstance(value, str):
-        # 直接以 Python 调用（测试/脚本）时也接受序列
+        # direct Python calls (tests/scripts) also accept sequences
         if isinstance(value, (list, tuple, set)):
             return [str(x).strip() for x in value if str(x).strip()]
         return []
@@ -90,20 +109,29 @@ def parse_str_list_lenient(value: Any) -> list[str]:
 
 def parse_tagops_args(tags: str, clear_keys: str, missing_keys: str,
                       memory_ids: str) -> tuple[dict[str, Any] | None, str | None]:
-    """update_tags 四段 JSON 协议解析（行为逐位不变）。
+    """update_tags' four-segment JSON protocol parsing (behavior
+    bit-identical).
 
-    四段解析（tags / clear_keys /
-    missing_keys / memory_ids）逐段严格解析，**第一处错误即停**——错误消息
-    带字段名前缀（``"tags 解析失败：..."``），与抽助手前的工具体逐字一致。
+    The four segments (tags / clear_keys /
+    missing_keys / memory_ids) are parsed strictly one by one, **stopping
+    at the first error** -- error messages carry a field-name prefix
+    (``"tags 解析失败：..."``), verbatim identical to the tool body
+    before the helper extraction.
 
-    为什么四段必须留在适配层而不是下沉服务：
-    这些解析现行排在库解析（``_brain_for``）**之前**，「坏库名 + 坏 JSON」
-    必须先报语法错；且错误体**不带** library 首键（库还没解析）。下沉服务
-    （工厂调用即库解析）会同时翻转错误次序与信封形态——那是产品决策，
-    不是重构副产物。
+    Why the four segments must stay in the adapter layer rather than
+    sinking into a service:
+    these parses currently run **before** library resolution
+    (``_brain_for``); 「bad library name + bad JSON」 must report the
+    syntax error first; and the error body carries **no** library first
+    key (the library is not yet resolved). Sinking into a service (where
+    the factory call itself resolves the library) would flip both the
+    error order and the envelope shape -- that is a product decision,
+    not a refactor by-product.
 
-    两档严格度分工见模块 docstring：本函数四段全部走严格版
-    （:func:`parse_str_list`），坏 JSON 显式报错，不与 lenient 版混名。
+    For the strictness-tier division see the module docstring: all four
+    segments here go through the strict version
+    (:func:`parse_str_list`), bad JSON raises explicitly, and names are
+    not mixed with the lenient version.
     """
     parsed, err = parse_tags_json(tags)
     if err:
@@ -124,22 +152,31 @@ def parse_tagops_args(tags: str, clear_keys: str, missing_keys: str,
 def filter_applied(parsed_tags: dict[str, Any] | None,
                    matched: int | None,
                    degraded: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``filter_applied`` 回显：本次用的标签域 + 过滤后候选条数。
+    """``filter_applied`` self-report: the tag domain used this time +
+    the candidate count after filtering.
 
-    存在的理由：``filter_tags`` 键名写错 / 值不匹配时，检索会**静默**返回空
-    ——不报错也不提示，调用方只能当成"库里真没有"。把候选条数显式回显：
+    Reason to exist: when a ``filter_tags`` key is misspelled / its value
+    mismatches, retrieval **silently** returns empty -- no error, no
+    hint; the caller can only conclude "the library really has nothing".
+    Explicitly self-reporting the candidate count:
 
-        ``tags=None``    没设过滤（全库检索）
-        ``matched=None`` 同上（无过滤时没有"候选数"这个概念）
-        ``matched=0``    过滤**没命中任何条目**（键名/值对不上，静默失败）
-        ``matched=N``    收窄到 N 条后再检索
+        ``tags=None``    no filter set (whole-library retrieval)
+        ``matched=None`` same as above (with no filter there is no
+                         "candidate count" concept)
+        ``matched=0``    the filter **matched no entries** (key/value
+                         mismatch, silent failure)
+        ``matched=N``    narrowed to N entries before retrieval
 
-    ``matched=0`` 与"检索后为空但库里确有内容"由此可区分。候选数由调用方提供
-    （各自路径上已算过白名单，避免重复遍历）。
+    ``matched=0`` is thereby distinguishable from "retrieval came back
+    empty while the library does have content". The candidate count is
+    supplied by the caller (each path has already computed the
+    whitelist, avoiding a duplicate traversal).
 
-    ``degraded`` 信息由 :func:`hippocampus_mcp.application.tags.check_tag_keys`
-    在软降级时提供——只有 schema 显式开了 ``filter_degrade`` 才会有；缺省不开，
-    见 ``tagging.validate_filter_keys``。
+    The ``degraded`` info is provided by
+    :func:`hippocampus_mcp.application.tags.check_tag_keys` on soft
+    degradation -- present only when the schema explicitly enabled
+    ``filter_degrade``; off by default; see
+    ``tagging.validate_filter_keys``.
     """
     out: dict[str, Any] = {
         "tags": dict(parsed_tags) if parsed_tags else None,

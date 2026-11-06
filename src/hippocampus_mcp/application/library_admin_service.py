@@ -1,25 +1,33 @@
 # -*- coding: utf-8 -*-
-"""LibraryAdminService：跨库管理用例（5 工具）。
+"""LibraryAdminService: cross-library management use cases (5 tools).
 
-工具面（原「Maintain 11」的另一半）：library_list / library_info /
-library_whoami / library_use / library_create。
+Tool surface (the other half of the original "Maintain 11"): library_list /
+library_info / library_whoami / library_use / library_create.
 
-**为什么不并进 MaintainService / 为什么不继承 ``BaseService``**：这 5
-个工具的共同点是**不绑定单一 brain**——
+**Why not fold into MaintainService / why not inherit ``BaseService``**: the
+common trait of these 5 tools is that they are **not bound to a single
+brain**--
 
-* ``library_info`` 刻意不构造 HippoBrain（只读目录元信息，不必等嵌入模型
-  25–33 秒），而 ``BaseService`` 的构造契约是「一个已解析的目标库 + 它的
-  brain」。若让它们走同一个工厂，服务一构造就把 brain 造出来，这恰恰是其
-  设计意图要避开的东西；
-* ``library_use`` / ``library_create`` / ``library_list`` 操作的对象是**库集
-  合与会话绑定**，不是某一个库的内容。
+* ``library_info`` deliberately does not construct a HippoBrain (it only
+  reads catalog metadata, no need to wait 25-33 seconds for the embedding
+  model), while the ``BaseService`` construction contract is "one resolved
+  target library + its brain". If they went through the same factory,
+  constructing the service would immediately construct the brain -- exactly
+  what this design intent wants to avoid;
+* ``library_use`` / ``library_create`` / ``library_list`` operate on the
+  **library collection and session binding**, not on the contents of one
+  library.
 
-故本类自己一个，依赖全部经 :class:`LibraryPorts` **构造注入**：storage
-（注册表/绑定表/连接级默认库）留在适配层（server.py），用例只声明要什么。
-这与 base.py 已写的那条边界同向——「服务不碰库发现/会话粘性那套连接态
-状态」，这里把它落到接口上而不是只写在 docstring 里。
+Hence its own class, with all dependencies **constructor-injected** via
+:class:`LibraryPorts`: storage (registry / binding table / connection-level
+default library) stays in the adapter layer (server.py); use cases only
+declare what they need. This aligns with the boundary already written in
+base.py -- "services do not touch library discovery / session stickiness,
+that connection-state stuff"; here it is made concrete in an interface
+rather than only written in a docstring.
 
-编排逻辑与 server.py 工具体逐字对应（去 ``json.dumps``），只挪位置不改行为。
+The orchestration logic corresponds line for line with the server.py tool
+bodies (minus ``json.dumps``); only relocated, behavior unchanged.
 """
 from __future__ import annotations
 
@@ -31,12 +39,17 @@ from typing import Any, Callable
 from ..library import (LibraryInfo, LibraryResolutionError, default_roots,
                        library_id_for, normpath, resolve_library,
                        write_manifest)
-# 私有借用说明：库名回退推断在 library 包里只有这一个实现（server.py 当初
-# 也是以 ``_library._guess_name`` 用它）。与其在服务侧重抄一份命名逻辑（两份
-# 迟早漂移），不如显式留这行借用，将来升为公开 API 时一处改完。
+# Borrowed-private note: the library-name fallback inference has only this one
+# implementation in the library package (server.py originally used it as
+# ``_library._guess_name`` too). Rather than duplicating the naming logic in
+# the service layer (two copies would drift sooner or later), keep this
+# explicit borrow; when it is promoted to a public API there is exactly one
+# place to change.
 from ..library import _guess_name
-#: ``whoami`` 的 ``permission`` 键与写类守卫同一判定
-#: 函数——自曝口径必须与拦截口径同源，否则又是「报白的和拦的不是一回事」。
+#: The ``permission`` key of ``whoami`` uses the same decision
+#: function as the write guard -- the self-reported criterion must share a
+#: source with the enforcement criterion, otherwise "what reports itself and
+#: what blocks are not the same thing" all over again.
 from ..domain.write_boundary import classify_write_permission
 
 logger = logging.getLogger("hippocampus_mcp")
@@ -44,55 +57,62 @@ logger = logging.getLogger("hippocampus_mcp")
 
 @dataclass(frozen=True)
 class LibraryPorts:
-    """跨库用例的外部能力清单（组合根用 server.py 的连接态函数填空）。
+    """Inventory of external capabilities for cross-library use cases (the
+    composition root fills it with server.py's connection-state functions).
 
-    每一条都是**活在适配层的状态或 I/O**：库清单 TTL 缓存、连接级默认库、
-    会话绑定表、brain 注册表、``os.makedirs`` / ``os.listdir``。用例拿到的是
-    「能力」不是「状态本身」——试举反例：直接把 ``_library_binding`` 字典传
-    进来，就等于让用例层持有连接态。
+    Every entry is **state or I/O living in the adapter layer**: the
+    library-list TTL cache, connection-level default library, session
+    binding table, brain registry, ``os.makedirs`` / ``os.listdir``. What
+    the use case receives is a "capability", not "the state itself" -- a
+    counterexample: passing the ``_library_binding`` dict straight in would
+    amount to letting the use-case layer hold connection state.
     """
 
-    #: ``libraries(force)``：带 TTL 缓存的只读扫描（零库不建任何东西）
+    #: ``libraries(force)``: read-only scan with a TTL cache (zero libraries builds nothing)
     libraries: Callable[[bool], list[Any]]
-    #: 本次调用语境下的默认库路径（连接级 > 进程级）
+    #: Default library path in the current call context (connection level > process level)
     default_path: Callable[[], str]
-    #: ``resolve_library_path(name_or_none)``：显式 > 粘性 > 默认，解析不明抛错
+    #: ``resolve_library_path(name_or_none)``: explicit > sticky > default; raises when ambiguous
     resolve_path: Callable[[str | None], str]
-    #: 当前会话绑定的库路径（未绑定返回默认库）
+    #: Library path bound to the current session (returns the default library when unbound)
     binding_get: Callable[[], str]
-    #: ``set_library_binding(path, client)``：返回生效的 session key
+    #: ``set_library_binding(path, client)``: returns the effective session key
     binding_set: Callable[[str, str | None], str]
-    #: ``_brain_for(path)``：**只**给 ``create`` 用（建库后初始化存储）
+    #: ``_brain_for(path)``: **only** for ``create`` (initializes storage after creation)
     brain_for: Callable[[str], Any]
-    #: 常驻 brain 注册表统计（``whoami`` 的 ``resident`` 一节）
+    #: Resident brain registry stats (the ``resident`` section of ``whoami``)
     registry_stats: Callable[[], dict[str, Any]]
-    #: ``os.makedirs(path, exist_ok=True)`` 的布尔版：失败时适配层已出声
+    #: Boolean version of ``os.makedirs(path, exist_ok=True)``: the adapter layer already speaks up on failure
     ensure_dir: Callable[[str], bool]
-    #: 目录里的层文件名 → 字节数（不可读时返回 ``{"_error": ...}``）
+    #: Layer file names in the directory -> byte sizes (returns ``{"_error": ...}`` when unreadable)
     layer_files: Callable[[str], dict[str, Any]]
-    #: 后台线程预取某库的 brain（失败不影响绑定）
+    #: Background-thread prefetch of a library's brain (failure does not affect binding)
     prefetch: Callable[[str], None]
-    #: 把新建的库登记进用户级任务目录
-    #: （``<user 库>/directory.json``，建库流程的**唯一自动挂点**）。
-    #: 入参是条目 dict（task/name/library_id/path/note），返回
-    #: ``{"registered": bool, "reason"?: str, ...}``；失败由调用方自曝，
-    #: 不抛给建库流程。
+    #: Register the newly created library into the user-level task directory
+    #: (``<user library>/directory.json``, the **only automatic hook** of the
+    #: creation flow).
+    #: Input is an entry dict (task/name/library_id/path/note); returns
+    #: ``{"registered": bool, "reason"?: str, ...}``; failures are
+    #: self-reported by the caller and are not raised into the creation flow.
     task_directory_register: Callable[[dict[str, Any]], dict[str, Any]]
 
 
 class LibraryAdminService:
-    """库管理用例：列 / 查 / 自曝 / 切换 / 新建（发现与 manifest 写入在 library 包）。"""
+    """Library management use cases: list / inspect / self-report / switch /
+    create (discovery and manifest writing live in the library package)."""
 
     def __init__(self, ports: LibraryPorts) -> None:
         self.ports = ports
 
-    # ---------------------------------------------------------------- 内部
+    # ---------------------------------------------------------------- Internal
 
     def _default_info(self) -> Any:
-        """默认库的 LibraryInfo——**即便它不在任何扫描根下也要能自曝**。
+        """LibraryInfo of the default library -- **it must be able to
+        self-report even when it is not under any scan root**.
 
-        等价于 server 的 ``default_library_info()``（走同一个 default_path
-        端口，故 daemon 下按连接算，行为不变）。
+        Equivalent to server's ``default_library_info()`` (goes through the
+        same default_path port, so under the daemon it is counted per
+        connection; behavior unchanged).
         """
         path = self.ports.default_path()
         for i in self.ports.libraries(False):
@@ -101,14 +121,18 @@ class LibraryAdminService:
         return LibraryInfo(path=path, library_id=library_id_for(path),
                            name=_guess_name(path), explicit=False)
 
-    # ---------------------------------------------------------------- 列
+    # ---------------------------------------------------------------- List
 
     def list_libraries(self, *, include_backups: bool) -> dict[str, Any]:
-        """列出已发现的库。**只读**——唯一例外是零库首启建出默认目录。
+        """List discovered libraries. **Read-only** -- the only exception is
+        the zero-library first start creating the default directory.
 
-        备份目录默认不列（它们是只读快照，不能当写入目标，盘点磁盘占用才
-        开 ``include_backups``）；``auto_created`` 是「这次真的建了目录」的
-        自曝——此前零库时 list 返回空，用户看不出下一步该干什么。
+        Backup directories are not listed by default (they are read-only
+        snapshots and must not become write targets; enable
+        ``include_backups`` only for disk-usage inventories);
+        ``auto_created`` is the self-report of "a directory was really
+        created this time" -- previously, with zero libraries, list returned
+        empty and the user could not see what to do next.
         """
         ports = self.ports
         infos = ports.libraries(True)
@@ -125,7 +149,7 @@ class LibraryAdminService:
 
         _collect(infos)
 
-        # 零库首启自动建 default。
+        # Zero-library first start auto-creates default.
         auto_created = None
         _cur_default = ports.default_path()
         if not rows and _cur_default:
@@ -143,13 +167,16 @@ class LibraryAdminService:
             "auto_created": auto_created,
         }
 
-    # ---------------------------------------------------------------- 查
+    # ---------------------------------------------------------------- Inspect
 
     def describe(self, *, library: str) -> dict[str, Any]:
-        """某个库的详情（路径/id/名字/别名/层文件）。**刻意不构造 brain**。
+        """Details of one library (path/id/name/aliases/layer files).
+        **Deliberately does not construct a brain**.
 
-        ``resolve_path`` 抛错（库名不明 / 指定到备份目录）时不吞——「不确定
-        你说的是哪个库」必须让调用方看见，**绝不静默回落到默认库**。
+        When ``resolve_path`` raises (unknown library name / pointed at a
+        backup directory) it is not swallowed -- "unsure which library you
+        mean" must be visible to the caller, **never silently falling back
+        to the default library**.
         """
         ports = self.ports
         path = ports.resolve_path(library or None)
@@ -169,25 +196,35 @@ class LibraryAdminService:
         out["layer_files"] = ports.layer_files(path)
         return out
 
-    # ---------------------------------------------------------------- 自曝
+    # ---------------------------------------------------------------- Self-report
 
     def whoami(self) -> dict[str, Any]:
-        """本次调用会落到哪个库 + 能写谁——防串库的第一道自曝（含 ``source`` 依据）。
+        """Which library this call lands in + who can be written -- the
+        first anti-cross-library self-report (including the ``source``
+        basis).
 
-        三键：
+        Three keys:
 
-        * ``home``——本次连接的**可写家库**（连接级默认库，写永远钉在这）；
-        * ``current``——**寻址落点**（``library_use`` 后可以是他库，读落这）；
-        * ``permission``——现在往 ``current`` 写会怎样：``read-write``（家库）/
-          ``managed-write``（user 受管通道）/ ``read-only``（会被守卫拦下）。
+        * ``home`` -- the **writable home library** of this connection (the
+          connection-level default library; writes are always pinned here);
+        * ``current`` -- the **addressing target** (after ``library_use`` it
+          may be another library; reads land here);
+        * ``permission`` -- what a write to ``current`` would do now:
+          ``read-write`` (home library) / ``managed-write`` (the user
+          managed channel) / ``read-only`` (blocked by the guard).
 
-        口径纪律：``permission`` 直接调**守卫同款**纯函数
-        （``domain.write_boundary.classify_write_permission``），不在这里
-        另写一套判断——自曝与拦截必须同源，否则 agent 看到的和实际执行的是
-        两回事。逃生门 env 是**进程级运维开关**，不在自曝里体现：开着时
-        自曝仍报 ``read-only``（偏保守，不会误导 agent 去跨库写）。
+        Criterion discipline: ``permission`` calls the **guard's own** pure
+        function directly (``domain.write_boundary.classify_write_permission``)
+        and does not re-implement a judgment here -- self-report and
+        enforcement must share a source, otherwise what the agent sees and
+        what actually executes are two different things. The escape-hatch
+        env is a **process-level ops switch** and is not reflected in the
+        self-report: when it is on, the self-report still says
+        ``read-only`` (conservative; it will not mislead the agent into
+        cross-library writes).
 
-        ``library`` 是历史旧键，与 ``current`` 同值保留（工具面兼容）。
+        ``library`` is a legacy key kept with the same value as ``current``
+        (tool surface compatibility).
         """
         ports = self.ports
         bound = ports.binding_get()
@@ -215,13 +252,17 @@ class LibraryAdminService:
             "resident": ports.registry_stats(),
         }
 
-    # ---------------------------------------------------------------- 切换
+    # ---------------------------------------------------------------- Switch
 
     def use(self, *, library: str, client: str) -> dict[str, Any]:
-        """会话级切换：此后本会话工具自动落到该库。**不自动建库**（拼错即失败）。
+        """Session-level switch: tools in this session now target that
+        library automatically. **Does not auto-create** (a typo simply
+        fails).
 
-        绑完再后台预取（首次调用不然要自付 25–33 秒加载）——顺序勿改：绑定先
-        落，预取失败也不影响绑定本身。
+        After binding, prefetch in the background (otherwise the first call
+        pays the 25-33 second load itself) -- do not change the order: the
+        binding lands first, and a prefetch failure does not affect the
+        binding itself.
         """
         ports = self.ports
         info = resolve_library(library, libs=ports.libraries(True),
@@ -242,20 +283,27 @@ class LibraryAdminService:
                     "(see library_whoami home). Pass library= for a one-call override.",
         }
 
-    # ---------------------------------------------------------------- 新建
+    # ---------------------------------------------------------------- Create
 
     def create(self, *, name: str, path: str, aliases: str, use: bool,
                client: str, workspace_root: str = "") -> dict[str, Any]:
-        """新建一个记忆库（写 manifest + 初始化存储，可选立即切过去）。
+        """Create a new memory library (writes the manifest + initializes
+        storage, optionally switching over immediately).
 
-        建库是**显式动作**：只有这里写清单，日常扫描绝不写盘。重名与「同名
-        目录已存在且不是目录」都直接报错——歧义寻址的代价是写错库。
+        Creation is an **explicit action**: only this path writes the
+        manifest; the routine scan never writes to disk. Duplicate names and
+        "a same-named path exists but is not a directory" both raise
+        immediately -- the price of ambiguous addressing is writing to the
+        wrong library.
 
-        建库成功后**顺手登记进用户级任务目录**（该 sidecar
-        的唯一自动挂点，属受管通道）。登记失败**不阻断建库**，但必须
-        出声——``directory_registered: false`` + ``directory_reason`` + 一条
-        warning：静默漏登记会让新库「建成即隐身」（此后所有跨库寻址都找不到
-        它，而用户以为登记过了）。
+        After a successful creation the library is **also registered into
+        the user-level task directory** (the only automatic hook of that
+        sidecar; part of the managed channel). A registration failure **does
+        not block creation**, but it must speak up --
+        ``directory_registered: false`` + ``directory_reason`` + one
+        warning: a silently missed registration makes the new library
+        "invisible from birth" (all later cross-library addressing cannot
+        find it, while the user believes it was registered).
         """
         ports = self.ports
         nm = (name or "").strip()
@@ -273,7 +321,7 @@ class LibraryAdminService:
             raise LibraryResolutionError(f"{target} already exists and is not a directory")
         alias_list = [a.strip() for a in aliases.split(",") if a.strip()]
         info = write_manifest(target, nm, alias_list)
-        # 建完先把存储初始化出来：空目录不会在下次扫描前自动成为「已就绪的库」。
+        # Initialize storage right after creation: an empty directory does not automatically become a "ready library" before the next scan.
         ports.brain_for(target).save()
         out: dict[str, Any] = {
             "status": "created",
@@ -281,19 +329,22 @@ class LibraryAdminService:
                         "path": info.path},
             "aliases": alias_list,
         }
-        # 建库即登记进用户级任务目录。登记是赠品，绝不阻断
-        # 建库；但失败必须自曝——「建成即隐身」比建库失败更难查。
+        # Creation registers into the user-level task directory. Registration
+        # is a giveaway and never blocks creation; but a failure must
+        # self-report -- "invisible from birth" is harder to debug than a
+        # failed creation.
         reg: dict[str, Any] = {"registered": False, "reason": "register_error"}
         try:
             entry = {"task": info.name, "name": info.name,
                      "library_id": info.library_id, "path": info.path,
                      "note": ""}
             if (workspace_root or "").strip():
-                # C2 受管绑定（Q-B/Q-6 重审落地）：建库即绑定工作区——
-                # onboarding「问一次、建一次、绑一次」的第三步由此一步到位。
+                # C2 managed binding (Q-B/Q-6 re-review landed): creating a
+                # library binds the workspace -- the third step of onboarding
+                # "ask once, create once, bind once" becomes one step here.
                 entry["workspace_root"] = workspace_root.strip()
             reg = ports.task_directory_register(entry)
-        except Exception as exc:  # noqa: BLE001 —— 登记失败不许炸建库
+        except Exception as exc:  # noqa: BLE001 -- a registration failure must not blow up creation
             reg = {"registered": False, "reason": f"register_error: {exc}"}
         out["directory_registered"] = bool(reg.get("registered"))
         if not out["directory_registered"]:
@@ -304,17 +355,21 @@ class LibraryAdminService:
                 info.name, out["directory_reason"])
         if use:
             out["session_key"] = ports.binding_set(info.path, client or None)
-        # 实测反馈 2026-10-31：写边界钉在**连接级**家库上，建库当连接
-        # ingest 写不进新库——没人提示的话 agent 要靠写入报错才知道，
-        # 多付一轮试错。「建库 + 落首条」天然拆两次会话，这里把这件事
-        # 在建库成功时就说清楚。提示是赠品：拿不到 home 名也不炸建库。
+        # Field feedback 2026-10-31: the write boundary is pinned to the
+        # **connection-level** home library, so on the creation connection
+        # ingest cannot write into the new library -- without a hint the
+        # agent only finds out from a write error, paying an extra round of
+        # trial and error. "Create library + write the first memory"
+        # naturally splits across two sessions; this spells that out at
+        # creation time. The note is a giveaway: failing to get the home
+        # name never blows up creation.
         try:
             out["note"] = (
                 f"Write boundary note: writes on this connection remain pinned to the original home library"
                 f" ({self._default_info().name}). To write the first memory into "
                 f"{info.name}, start a new session (the new connection HELLO will bind by "
                 "workspace_root to the new library). Read side can use library_use to switch immediately.")
-        except Exception:  # noqa: BLE001 —— 提示是赠品，绝不炸建库
+        except Exception:  # noqa: BLE001 -- the note is a giveaway, never blows up creation
             out["note"] = (
                 f"Write boundary note: writes on this connection remain pinned to the original home library; to write the first memory into "
                 f"{info.name}, start a new session (the new connection HELLO will bind by "

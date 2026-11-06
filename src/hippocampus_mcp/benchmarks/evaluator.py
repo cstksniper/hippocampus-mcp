@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
-"""评估框架主模块.
+"""Main evaluation-framework module.
 
-将基线方法与评估指标编排为统一的评估流程, 支持多种数据格式:
+Orchestrates baseline methods and evaluation metrics into a unified
+evaluation pipeline; supports several data formats:
 
-1. 内置合成数据集 (用于快速验证)
-2. LoCoMo 格式 (snap-research/LoCoMo)
-3. LongMemEval 格式 (xiaowu0162/LongMemEval)
+1. Built-in synthetic dataset (for quick validation)
+2. LoCoMo format (snap-research/LoCoMo)
+3. LongMemEval format (xiaowu0162/LongMemEval)
 
-评估流程:
-    对每个方法:
-        1. 重置方法状态
-        2. 逐条摄入对话历史 (store)
-        3. 对每个评估问题执行检索 (retrieve)
-        4. 计算检索指标 (MRR, Hit@k, Recall@k, NDCG@k)
-        5. (可选) 计算 QA 指标 (F1, EM) — 需要答案生成模块
+Evaluation pipeline:
+    for each method:
+        1. reset the method's state
+        2. ingest the conversation history item by item (store)
+        3. retrieve for each evaluation question (retrieve)
+        4. compute retrieval metrics (MRR, Hit@k, Recall@k, NDCG@k)
+        5. (optional) compute QA metrics (F1, EM) -- requires an answer
+           generation module
 """
 
 from __future__ import annotations
@@ -48,11 +50,11 @@ from .metrics import (
 
 
 # ==================================================================
-# 数据格式适配器
+# Data-format adapters
 # ==================================================================
 
 class EvalSample:
-    """单个评估样本."""
+    """A single evaluation sample."""
 
     def __init__(
         self,
@@ -66,9 +68,9 @@ class EvalSample:
 
 
 def load_locomo(data_path: str) -> list[EvalSample]:
-    """加载 LoCoMo 格式数据集.
+    """Load a LoCoMo-format dataset.
 
-    LoCoMo JSON 结构:
+    LoCoMo JSON structure:
         [{
             "sample_id": "...",
             "conversation": {
@@ -117,9 +119,9 @@ def load_locomo(data_path: str) -> list[EvalSample]:
 
 
 def load_longmemeval(data_path: str) -> list[EvalSample]:
-    """加载 LongMemEval 格式数据集.
+    """Load a LongMemEval-format dataset.
 
-    LongMemEval JSON 结构:
+    LongMemEval JSON structure:
         [{
             "question_id": "...",
             "question_type": "...",
@@ -129,7 +131,7 @@ def load_longmemeval(data_path: str) -> list[EvalSample]:
             "answer_session_ids": [...]
         }]
 
-    每个 instance 转换为一个 EvalSample (一个 question).
+    Each instance is converted into one EvalSample (one question).
     """
     with open(data_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
@@ -148,7 +150,7 @@ def load_longmemeval(data_path: str) -> list[EvalSample]:
                 })
             session_idx += 1
 
-        # LongMemEval 每个 instance 只有一个 question
+        # LongMemEval has only one question per instance
         samples.append(EvalSample(
             sample_id=item.get("question_id", ""),
             messages=messages,
@@ -169,9 +171,11 @@ def generate_synthetic_dataset(
     n_questions_per_conv: int = 5,
     seed: int = 42,
 ) -> list[EvalSample]:
-    """生成合成对话数据集 (用于快速验证评估框架).
+    """Generate a synthetic conversation dataset (for quickly validating
+    the evaluation framework).
 
-    每段对话围绕若干话题展开, 问题需要从对话历史中检索答案.
+    Each conversation revolves around a few topics; questions require
+    retrieving answers from the conversation history.
     """
     rng = random.Random(seed)
 
@@ -188,7 +192,7 @@ def generate_synthetic_dataset(
 
     samples = []
     for conv_idx in range(n_conversations):
-        # 随机选 2-3 个话题
+        # randomly pick 2-3 topics
         n_topics = rng.randint(2, 3)
         chosen = rng.sample(topics, n_topics)
 
@@ -219,7 +223,7 @@ def generate_synthetic_dataset(
                 "turn_id": f"turn_{turn_idx}",
             })
 
-        # 生成问题
+        # generate questions
         questions = []
         fact_items = list(facts.items())
         rng.shuffle(fact_items)
@@ -252,16 +256,17 @@ def generate_synthetic_dataset(
 
 
 # ==================================================================
-# 评估器
+# Evaluator
 # ==================================================================
 
 class Evaluator:
-    """记忆系统评估器.
+    """Memory-system evaluator.
 
     Args:
-        dim: 嵌入维度 (仅对 hash 后端有效).
-        top_k_values: 评估的 k 值列表.
-        embedder_backend: 嵌入后端, "sentence_transformer" (默认) 或 "hash".
+        dim: embedding dimension (only effective for the hash backend).
+        top_k_values: list of k values to evaluate.
+        embedder_backend: embedding backend, "sentence_transformer"
+            (default) or "hash".
     """
 
     def __init__(
@@ -275,7 +280,7 @@ class Evaluator:
         self.top_k_values = top_k_values or [1, 3, 5, 10]
 
     def get_methods(self) -> dict[str, BaseRetriever]:
-        """返回所有待评估的方法."""
+        """Return all methods under evaluation."""
         backend = self.embedder_backend
         return {
             "Random": RandomBaseline(dim=self.dim, embedder_backend=backend),
@@ -291,47 +296,47 @@ class Evaluator:
         method: BaseRetriever,
         sample: EvalSample,
     ) -> dict[str, Any]:
-        """评估单个样本.
+        """Evaluate a single sample.
 
-        流程:
-            1. 摄入所有对话消息
-            2. 对每个问题执行检索
-            3. 计算指标
+        Pipeline:
+            1. ingest all conversation messages
+            2. retrieve for each question
+            3. compute metrics
 
         Returns:
-            包含检索结果的字典.
+            A dict containing the retrieval results.
         """
-        # 摄入对话历史
+        # ingest the conversation history
         method.reset()
         doc_id_to_content = {}
         for msg in sample.messages:
             doc_id = method.store(msg["content"])
             doc_id_to_content[doc_id] = msg["content"]
 
-        # 对每个问题检索
+        # retrieve for each question
         rankings = []
         ground_truths = []
         qa_results = []
 
         for q in sample.questions:
-            # 检索
+            # retrieve
             results = method.retrieve(q["question"], top_k=max(self.top_k_values))
             ranked_ids = [doc_id for doc_id, _ in results]
             rankings.append(ranked_ids)
 
-            # 正确文档 = 包含答案关键词的文档
+            # correct documents = documents containing the answer keywords
             answer_keywords = q["answer"]
             gt_ids = []
             for doc_id, content in doc_id_to_content.items():
-                # 简单匹配: 答案中的关键词出现在文档中
+                # simple match: a keyword from the answer appears in the document
                 if any(kw in content for kw in answer_keywords.split() if len(kw) > 1):
                     gt_ids.append(doc_id)
             if not gt_ids:
-                # 退化: 随机选一个作为 ground truth
+                # degenerate case: pick one at random as ground truth
                 gt_ids = list(doc_id_to_content.keys())[:1]
             ground_truths.append(gt_ids)
 
-            # QA 指标 (用 top-1 检索结果作为答案)
+            # QA metrics (use the top-1 retrieval result as the answer)
             if results:
                 top_content = doc_id_to_content.get(results[0][0], "")
                 qa_results.append({
@@ -341,7 +346,7 @@ class Evaluator:
             else:
                 qa_results.append({"f1": 0.0, "em": 0.0})
 
-        # 计算指标
+        # compute metrics
         metrics: dict[str, float] = {}
         for k in self.top_k_values:
             metrics[f"MRR@{k}"] = mrr(
@@ -352,7 +357,7 @@ class Evaluator:
             metrics[f"Recall_all@{k}"] = recall_all_at_k(rankings, ground_truths, k)
             metrics[f"NDCG@{k}"] = ndcg_at_k(rankings, ground_truths, k)
 
-        # QA 指标
+        # QA metrics
         if qa_results:
             metrics["F1"] = np.mean([r["f1"] for r in qa_results])
             metrics["EM"] = np.mean([r["em"] for r in qa_results])
@@ -364,14 +369,15 @@ class Evaluator:
         samples: list[EvalSample],
         methods: dict[str, BaseRetriever] | None = None,
     ) -> list[EvalReport]:
-        """评估所有方法在给定数据集上的表现.
+        """Evaluate all methods on the given dataset.
 
         Args:
-            samples: 评估样本列表.
-            methods: 待评估的方法字典. None 则使用 get_methods().
+            samples: list of evaluation samples.
+            methods: dict of methods to evaluate. None means use
+                get_methods().
 
         Returns:
-            每个方法的评估报告列表.
+            A list of evaluation reports, one per method.
         """
         if methods is None:
             methods = self.get_methods()
@@ -389,14 +395,14 @@ class Evaluator:
                 for k, v in metrics.items():
                     all_metrics.setdefault(k, []).append(v)
 
-                # 按问题类别统计
+                # aggregate by question category
                 for q in sample.questions:
                     cat = str(q.get("category", "unknown"))
                     per_category.setdefault(cat, {})
                     for k, v in metrics.items():
                         per_category[cat].setdefault(k, []).append(v)
 
-            # 聚合
+            # aggregate
             report = EvalReport(method_name)
             for k, values in all_metrics.items():
                 report.retrieval_metrics[k] = float(np.mean(values))
@@ -415,23 +421,23 @@ class Evaluator:
 
     @staticmethod
     def generate_comparison_table(reports: list[EvalReport]) -> str:
-        """生成 Markdown 格式的对比表."""
+        """Generate a Markdown comparison table."""
         if not reports:
             return "无评估结果"
 
-        # 收集所有指标名
+        # collect all metric names
         all_metrics = set()
         for r in reports:
             all_metrics.update(r.retrieval_metrics.keys())
         all_metrics = sorted(all_metrics)
 
-        # 表头
+        # header
         lines = [
             "| 方法 | " + " | ".join(all_metrics) + " |",
             "|------|" + "|".join(["------"] * len(all_metrics)) + "|",
         ]
 
-        # 数据行
+        # data rows
         for r in reports:
             row = [r.method_name]
             for m in all_metrics:

@@ -1,28 +1,34 @@
-"""写入侧纯检测：近邻重复检索（``brain.core._near_duplicates`` 的判定核）。
+"""Write-side pure checks: near-duplicate retrieval (the decision core of
+``brain.core._near_duplicates``).
 
-本模块的定位是「判据/检测类纯逻辑」的落点之一。同族其余判据已在更早
-各有归属，**不要**往这里搬（防撞车）：
+This module's position is one of the landing spots for "criterion/check-class
+pure logic". The remaining criteria of the same family already have their own
+homes from earlier -- do **not** move them here (to avoid collisions):
 
-  * ``is_restatement`` 判定核 → ``domain/policies.py``；
-  * 写侧取代检测 → ``store/supersede.py``；
-  * 读侧冲突标注 → ``domain/conflict_annotate.py``；
-  * 矛盾候选筛选 → ``store/contradictions.py``。
+  * the ``is_restatement`` decision core -> ``domain/policies.py``;
+  * write-side supersede detection -> ``store/supersede.py``;
+  * read-side conflict annotation -> ``domain/conflict_annotate.py``;
+  * contradiction candidate filtering -> ``store/contradictions.py``.
 
-零 import（需要的一切由壳注入）。``store`` / ``vector_of`` 按鸭子
-类型使用：前者要有 ``get(mid)`` 与 ``search(q, top_k=...)``（后者产出
-``(record, sim)`` 对），后者把记录映成查询向量（可为 ``None`` 表示
-"没有向量"）。
+Zero imports (everything needed is injected by the shell). ``store`` /
+``vector_of`` are used duck-typed: the former needs ``get(mid)`` and
+``search(q, top_k=...)`` (the latter yields ``(record, sim)`` pairs), the
+latter maps a record to a query vector (may be ``None`` meaning "no vector").
 
-逐字保留的怪癖（动一个就是行为变化，parity 会抓）：
-  * 候选池请求宽度是 ``top_k + len(own) + 2``——多要一点，抵消
-    "自己的这批" 占掉的席位，保证既有记忆还能凑满 ``top_k``；
-  * 相似度过滤是严格小于（``sim < min_sim`` 才跳过，恰好等于门槛
-    **算**命中）；
-  * 同一条既有记忆被多条新记忆命中时，**保留相似度最高的那次**
-    （先到先得、更高才替换）；
-  * ``similarity`` 四舍五入到 3 位小数、``content`` 截前 200 字、
-    ``source`` 缺省兜底空串；
-  * ``top_k > 0`` 才截断；``top_k <= 0`` 返回全部（负数=不限制）。
+Verbatim-preserved quirks (changing any one is a behavior change; the parity
+probe will catch it):
+  * the candidate pool request width is ``top_k + len(own) + 2`` -- ask for a
+    bit more to offset the seats taken by "this batch of our own", so existing
+    memories can still fill up ``top_k``;
+  * the similarity filter is strict less-than (skip only when ``sim <
+    min_sim``; exactly equal to the threshold **counts** as a hit);
+  * when one existing memory is hit by several new memories, **keep the hit
+    with the highest similarity** (first come first served, replaced only by a
+    higher one);
+  * ``similarity`` rounds to 3 decimal places, ``content`` is cut to the
+    first 200 characters, ``source`` defaults to an empty string;
+  * truncate only when ``top_k > 0``; ``top_k <= 0`` returns everything
+    (negative = unlimited).
 """
 from __future__ import annotations
 
@@ -37,11 +43,13 @@ def near_duplicates(
     top_k: int,
     min_sim: float,
 ) -> list[dict[str, Any]]:
-    """找出与"刚写入的这批记忆"最像的**既有**记忆。
+    """Find the **existing** memories most similar to "the memories just
+    written in this batch".
 
-    只看向量相似度（不再做矛盾判定——那是 consolidate 的活），但会把
-    ``state`` / ``superseded_by`` / ``source`` 一并给出：已作废的旧版本、
-    来自别的文件的同义表述，都是宿主当场该看到的。
+    Only vector similarity is considered (no contradiction judgment anymore --
+    that is consolidate's job), but ``state`` / ``superseded_by`` / ``source``
+    are handed over too: already-superseded old versions and synonymous
+    phrasings from other files are things the host should see on the spot.
     """
     own = set(memory_ids)
     found: dict[str, dict[str, Any]] = {}

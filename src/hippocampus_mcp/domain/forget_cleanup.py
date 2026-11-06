@@ -1,14 +1,16 @@
-"""forget 级联清理中的两段纯逻辑：画像层摘除 + L0 孤儿来源标记。
+"""Two pieces of pure logic inside the forget cascade cleanup: profile-layer removal + L0 orphan-source marking.
 
-零 import：只做 dict/list 操作，画像条目与 L0 原始记录都按鸭子类型
-（``.get("text")`` / ``.get("id")``）使用。forget 的大脑级编排（墓碑、
-物理删除、实体重算、主题层、被取代者恢复）留在 brain 壳里，这里只承载
-「给定状态算出清理结果」的可单测部分。
+Zero imports: only dict/list operations; profile entries and L0 raw records are used
+duck-typed (``.get("text")`` / ``.get("id")``). The brain-level orchestration of forget
+(tombstones, physical deletion, entity recomputation, the topic layer, restoring the
+superseded) stays in the brain shell; this module only carries the unit-testable part
+of "given the state, compute the cleanup result".
 
-两段均与原实现逐字同构，包括两处刻意保留的怪癖：
-  * ``clean_profile``：整槽被摘空时删除该 slot（空 items 的 slot 也会被删）；
-  * ``mark_orphan_raws``：raw_log 内同一 id 出现多次、或 source_ids 内同一
-    rid 出现多次时，marked 会重复 append（for-if 结构无 break/skip）。
+Both pieces are verbatim isomorphic to the original implementation, including two quirks kept on purpose:
+  * ``clean_profile``: a slot emptied entirely gets deleted (a slot with empty items gets deleted too);
+  * ``mark_orphan_raws``: when the same id appears multiple times in raw_log, or the same
+    rid appears multiple times in source_ids, marked gets repeated appends (the for-if structure
+    has no break/skip).
 """
 from __future__ import annotations
 
@@ -21,18 +23,19 @@ def clean_profile(
     memory_id: str,
     content: str,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
-    """摘除画像中由该记忆派生的条目，返回 ``(new_profile, dropped)``。
+    """Remove the profile entries derived from this memory, returning ``(new_profile, dropped)``.
 
-    命中条件（二者居其一）：
-      * 文本副本：画像 ``text`` 等于记忆全文或其前 120 字截断
-        （画像 text 本就是记忆内容的截断副本）；
-      * 单条证据：``evidence`` 有且仅有一条且精确指向该记忆。
-        旧库的 evidence 是整实体的 id 列表（粒度过粗），多证据时只认
-        文本匹配，避免误删同实体的其他条目。
+    Hit conditions (either one suffices):
+      * text copy: the profile ``text`` equals the memory's full text or its first-120-char truncation
+        (profile text is itself a truncated copy of the memory content);
+      * single evidence: ``evidence`` has exactly one entry and it points precisely at this memory.
+        In old libraries evidence is the id list of the whole entity (too coarse a granularity);
+        when there are multiple evidence entries only the text match is honored, to avoid
+        accidentally removing other entries of the same entity.
 
-    整槽摘空的 slot 从 new_profile 中消失（复刻原实现的 ``del``）。
-    dropped 每项记 ``{"slot": ..., "text": ...}``，text 取**未 strip**
-    的原始值。
+    A slot emptied entirely disappears from new_profile (replicating the original ``del``).
+    Each dropped entry records ``{"slot": ..., "text": ...}``, with text taken as the
+    **un-stripped** original value.
     """
     new_profile: dict[str, list[dict[str, Any]]] = {}
     dropped: list[dict[str, Any]] = []
@@ -61,14 +64,14 @@ def mark_orphan_raws(
     alive_refs: set[str],
     reason: str,
 ) -> list[str]:
-    """把不再被任何存活记忆引用的 L0 来源标记 forgotten，返回 marked 列表。
+    """Mark L0 sources no longer referenced by any alive memory as forgotten, returning the marked list.
 
-    ``alive_refs`` 是全部存活记忆 source_ids 的并集（调用方构建）。
-    标记**就地**写进 raw dict（``forgotten`` / ``forgotten_reason``），
-    与原实现一致——壳不需要重赋值 raw_log。
+    ``alive_refs`` is the union of all alive memories' source_ids (built by the caller).
+    The marking is written **in place** into the raw dict (``forgotten`` / ``forgotten_reason``),
+    same as the original implementation — the shell does not need to reassign raw_log.
 
-    怪癖复刻：同一 id 在 raw_log 中多次出现、或 source_ids 中重复时，
-    marked 会为每次匹配 append 一次。
+    Quirk replication: when the same id appears multiple times in raw_log, or is duplicated
+    in source_ids, marked gets one append per match.
     """
     marked: list[str] = []
     for rid in source_ids or []:

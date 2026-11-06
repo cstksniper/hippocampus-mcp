@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""层保存的账本编排与写盘编排（core 两个方法的落点）。
+"""Ledger orchestration and disk-write orchestration for layer saving (the landing spot for two core methods).
 
-原 ``brain.core._save_layers`` / ``_save_layers_core`` 是上帝类里最后一块
-大编排：前者给本次保存建账（begin / end / fail 三段），后者做派生层的
-「读-合并-写」。搬来 store 的理由：它们全程只与**层文件 I/O + 账本 +
-层状态**打交道，是持久化设施，不是认知逻辑；且底层本来就在本包
-（``ledger.py`` 的账本行 I/O、``backend`` 的层读写、``vector_store``
-的多写开关）。
+The original ``brain.core._save_layers`` / ``_save_layers_core`` were the last
+big orchestrations inside the god class: the former books the current save
+(begin / end / fail phases), the latter does the "read-merge-write" for derived
+layers. Why they moved to store: throughout, they only deal with **layer file
+I/O + ledger + layer state** — persistence infrastructure, not cognitive logic;
+and the underlying facilities were already in this package (``ledger.py``'s
+ledger-row I/O, ``backend``'s layer read/write, ``vector_store``'s multi-writer
+switch).
 
-**注入面纪律**：brain 侧能力一律以可调用对象/值经 ports
-注入，store 不 import brain；开关类（``load_config().layer_fp``、
-``multi_writer_enabled``）在**调用时**求值，保住测试对
-``core.load_config`` 等命名空间的 monkeypatch 面。core 侧只留两个薄壳
-（``_save_layers`` / ``_save_layers_core``），壳负责 brain 记账状态的
-写回——原实现在写盘成功后才更新指纹戳/序号，失败不记账，这条纪律由
-壳的"store 返回后才写回"天然保证。
+**Injection-surface discipline**: brain-side capabilities are injected via
+ports as callables/values; store never imports brain. Switch-like inputs
+(``load_config().layer_fp``, ``multi_writer_enabled``) are evaluated **at call
+time**, preserving the test monkeypatch surface over the ``core.load_config``
+namespace. The core side keeps only two thin shells (``_save_layers`` /
+``_save_layers_core``); the shells write back brain's bookkeeping state — the
+original implementation updated fingerprints/sequence numbers only after the
+disk write succeeded and booked nothing on failure; the shell's "write back
+only after store returns" preserves that discipline by construction.
 """
 from __future__ import annotations
 
@@ -29,23 +33,24 @@ from .vector_store import multi_writer_enabled
 
 
 # ----------------------------------------------------------------------
-# 写盘段（原 _save_layers_core）
+# Disk-write phase (original _save_layers_core)
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class LayerSavePorts:
-    """brain 侧层 I/O 能力与层状态句柄。
+    """Brain-side layer I/O capabilities and layer state handles.
 
-    全部字段要么是值（``layer_attrs`` / ``begin_layer_fps`` /
-    ``written_fp`` / ``backend``），要么是**可调用对象**（调用时才取值，
-    不是调用结果——这样测试 monkeypatch brain 实例/类属性后仍生效）。
+    Every field is either a value (``layer_attrs`` / ``begin_layer_fps`` /
+    ``written_fp`` / ``backend``) or a **callable** (evaluated at call time,
+    not the call's result — so tests that monkeypatch brain instances/class
+    attributes still take effect).
     """
 
     persist_dir: str | None
     layer_attrs: dict[str, str]
-    # ---- 层值读写（attr 名口径，与 _LAYER_ATTRS 的值一致）----
+    # ---- Layer value read/write (attr-name convention; values match _LAYER_ATTRS) ----
     get_layer: Callable[[str], Any]
     set_layer: Callable[[str, Any], None]
-    # ---- 合并族（本体在 brain，纯函数在 brain/pure.py）----
+    # ---- Merge family (implementations live in brain; pure functions in brain/pure.py) ----
     layer_fingerprint: Callable[[Any], str]
     layer_changed_by_other: Callable[[str, str], bool]
     read_layer_from_disk: Callable[[str], Any]
@@ -57,22 +62,23 @@ class LayerSavePorts:
     reclip_derived_layers: Callable[[], None]
     gc_layer_del: Callable[[], int]
     reset_del_blocked: Callable[[], None]
-    # ---- 后端 ----
+    # ---- Backend ----
     backend: Any | None
-    # ---- 账本指纹（只读引用：core 段只用不写）----
+    # ---- Ledger fingerprints (read-only references: the core phase only reads them) ----
     begin_layer_fps: dict[str, str]
     written_fp: dict[str, str]
-    # ---- 开关（调用时现取）----
+    # ---- Switches (fetched at call time) ----
     layer_fp_on: Callable[[], bool]
 
 
 @dataclass
 class LayerSaveResult:
-    """写盘段的产出。壳按此写回 brain 记账状态。
+    """Output of the disk-write phase. The shell writes back brain's bookkeeping state from it.
 
-    ``persisted=False`` 表示纯内存 brain（无 persist_dir）——原实现在这种
-    情况下**一个状态都不碰**（不清 ``last_layer_merge``、不推进序号），
-    壳据此跳过全部写回。
+    ``persisted=False`` means a pure in-memory brain (no persist_dir) — the
+    original implementation **touches no state at all** in that case (does not
+    clear ``last_layer_merge``, does not advance sequence numbers), and the
+    shell accordingly skips all write-backs.
     """
 
     persisted: bool = False
@@ -85,18 +91,24 @@ class LayerSaveResult:
 
 
 def save_layers_core(ports: LayerSavePorts) -> LayerSaveResult:
-    """只写 L0 / L2 / L3 等 brain 负责的层（不碰 manager 的 L1 + 向量）。
+    """Write only the layers brain owns, such as L0 / L2 / L3 (does not touch manager's L1 + vectors).
 
-    **多进程下所有派生层都必须与 L1 同语义**：L1（``memories.json``）走
-    「冲突即合并」（加法），而 brain 负责的层此前是**整份覆写** ——
-    两个进程共用一个库时，谁最后落盘谁的版本就是全库版本，对方写的实体
-    挂载 / 会话登记 / 墓碑会被静默写没（实测事故）。无异常、无日志。
+    **Under multiple processes every derived layer must share L1's semantics**:
+    L1 (``memories.json``) uses "merge on conflict" (additive), while brain's
+    layers were previously **overwritten wholesale** — with two processes
+    sharing one library, whoever persists last defines the whole library's
+    version, and the other side's entity mounts / session registrations /
+    tombstones get silently wiped (measured incident). No exceptions, no logs.
 
-    所以这里做**读-合并-写**：落盘前先读磁盘版本，按层口径取并集再写。
-    单进程（``multi_writer_enabled()`` 为假）行为与改动前完全一致。
+    So this does **read-merge-write**: before persisting, read the disk version,
+    take the union per the layer's convention, then write. In single-process
+    mode (``multi_writer_enabled()`` false) behavior is exactly as before the
+    change.
 
-    合并进来的条数记在返回值的 ``last_layer_merge``，``stats()`` 里自曝 ——
-    "别人的东西被我救回来几条"必须是看得见的数字，不能靠考古。
+    The number of merged-in entries is recorded in the return value's
+    ``last_layer_merge`` and self-reported in ``stats()`` — "how many of the
+    other side's entries my merge rescued" must be a visible number, not
+    something dug up by archaeology.
     """
     if not ports.persist_dir:
         return LayerSaveResult(persisted=False)
@@ -107,9 +119,11 @@ def save_layers_core(ports: LayerSavePorts) -> LayerSaveResult:
                                             ports.get_layer(
                                                 ports.layer_attrs[
                                                     "brain_raw.json"])))
-        # 删除账本必须**最先**并。它是别的层做拦截的依据，
-        # 放在最后并 = 本次 save 里 miss_log 先按旧账本合并完才拿到新墓碑，
-        # 恰好漏掉"对方刚才删的"这一批（顺序错了就白做）。
+        # The deletion ledger must be merged **first**. It is the basis other
+        # layers use for interception; merging it last would mean that in this
+        # save miss_log finishes merging against the old ledger before the new
+        # tombstones arrive, exactly missing the "just deleted by the other
+        # side" batch (wrong order makes the whole thing pointless).
         ports.reset_del_blocked()
         _del_path = os.path.join(ports.persist_dir, LAYER_DEL_FILE)
         if ports.layer_changed_by_other(LAYER_DEL_FILE, _del_path):
@@ -122,40 +136,49 @@ def save_layers_core(ports: LayerSavePorts) -> LayerSaveResult:
                                         ports.layer_attrs[LAYER_DEL_FILE])))
         for name, attr in ports.layer_attrs.items():
             if name == LAYER_DEL_FILE:
-                continue      # 已在上面单独并过
+                continue      # already merged separately above
             if name == "brain_raw.json":
                 continue
             _path = os.path.join(ports.persist_dir, name)
             if not ports.layer_changed_by_other(name, _path):
-                continue      # 没人动过：内存这份就是最新的
+                continue      # nobody touched it: the in-memory copy is the latest
             disk = ports.read_layer_from_disk(name)
             if disk is None:
-                continue          # 磁盘没这层：老库首次升级，按本地写
+                continue          # layer absent on disk: first upgrade of an old library, write per local state
             mine = ports.get_layer(attr)
             merged = ports.merge_layer(name, disk, mine)
-            # 报的是「磁盘里有、我内存里没有、被这次合并救回来几条」。
-            # 不是 len(merged) - len(disk)：本地为空时那等于 0，
-            # 恰恰是**最该报警**的情形（整份覆写就发生在这一刻）。
+            # What gets reported is "entries that exist on disk, not in my
+            # memory, and were rescued by this merge".
+            # Not len(merged) - len(disk): when the local copy is empty that is 0,
+            # which is precisely the case that **most deserves an alarm** (the
+            # wholesale overwrite happens at exactly this moment).
             rescued = ports.disk_only_count(name, disk, mine)
             if rescued > 0:
                 result.last_layer_merge[name] = rescued
-            # 内存也并进来：否则本进程后续操作仍按"自己的那一份"判断，
-            # 下一次 save 之前看到的还是残缺视图。
+            # Merge into memory too: otherwise this process's subsequent
+            # operations keep judging by "my own copy" and still see the
+            # incomplete view until the next save.
             ports.set_layer(attr, merged)
-        # 并集只会做加法：合并完按当前存活记忆重新裁一遍，
-        # 否则磁盘上的旧版本会把本进程已删的东西复活。
+        # The union is purely additive: after merging, reclip against currently
+        # alive memories, otherwise the stale disk version resurrects what this
+        # process already deleted.
         ports.reclip_derived_layers()
-        # 账本瘦身。放在合并之后 —— 刚并进来的墓碑当次就要生效，
-        # 不能还没用就被 GC 掉。
+        # Ledger slimming. Placed after merging — tombstones just merged in must
+        # take effect this very save; they must not be GC'd before ever being used.
         result.del_gc_last = ports.gc_layer_del()
-    # G0 / F14-1：只写**内容变了**的层（派生层脏集）。
-    # 判据 = 内容指纹没变 **且** 磁盘没被别人改过。两个条件缺一不可：
-    # 只看指纹 → 别人删了磁盘文件我们却跳过，层就丢了；只看磁盘戳 →
-    # 本进程改了但指纹相同（改回原值）时白写一次。
+    # G0 / F14-1: write only layers whose **content changed** (the derived-layer
+    # dirty set).
+    # Criterion = content fingerprint unchanged **and** disk untouched by others.
+    # Both conditions are required: fingerprint alone → if someone else deleted
+    # the disk file we would still skip and the layer is lost; disk stamp alone →
+    # when this process changed content back to the same fingerprint we would
+    # waste a write.
     files: dict[str, Any] = {}
     new_fp: dict[str, str] = {}
-    # begin 指纹能否复用：begin 在 core 之前算，中间若无多进程合并
-    # （合并会在下面 set_layer 改层内容）则层值未变，可省一次指纹计算。
+    # Whether begin fingerprints can be reused: begin is computed before core;
+    # if no multi-process merging happened in between (merging changes layer
+    # content via set_layer below), the layer values are unchanged and one
+    # fingerprint computation can be saved.
     reuse_begin_fps = not multi_writer_enabled() and bool(ports.begin_layer_fps)
     for name, attr in ports.layer_attrs.items():
         value = ports.get_layer(attr)
@@ -168,39 +191,48 @@ def save_layers_core(ports: LayerSavePorts) -> LayerSaveResult:
                 name, os.path.join(ports.persist_dir, name)
             ):
                 result.layers_skipped.append(name)
-                # 跳过层此刻的指纹就是磁盘实况（指纹未变且没人动过）
+                # For a skipped layer, the fingerprint at this moment is the disk reality (unchanged fingerprint and untouched)
                 result.end_layer_fps[name] = fp
                 continue
             new_fp[name] = fp
         files[name] = value
-    # 实写层的指纹并入 end 指纹集（跳过层已在循环里落定）
+    # Merge the actually-written layers' fingerprints into the end fingerprint
+    # set (skipped layers were settled inside the loop)
     result.end_layer_fps.update(new_fp)
-    # 层在**一个事务**里落盘。json 后端仍是逐文件 replace（行为
-    # 不变）；sqlite 后端一次 BEGIN IMMEDIATE 提交，中途失败整批回滚 ——
-    # 这正是 JSON 方案在文件系统层补不了的原语（当初选 SQLite 的第一理由）。
+    # Layers persist within **one transaction**. The json backend still does
+    # per-file replace (behavior unchanged); the sqlite backend commits with a
+    # single BEGIN IMMEDIATE and rolls the whole batch back on mid-way failure —
+    # exactly the primitive the JSON scheme cannot patch in at the filesystem
+    # layer (the first reason SQLite was chosen).
     backend = ports.backend or get_backend(ports.persist_dir)
     if files:
         backend.write_layers(files)
     for name in files:
         result.layer_stamp[name] = backend.layer_stamp(name)
-    # 指纹只在**真正写成功了**之后才更新：写失败却记账"已写"会让下次
-    # 跳过一个其实没落盘的层（与脏集只在写成功后清空同一条纪律）。
+    # Fingerprints are updated only after the write **actually succeeded**:
+    # booking "written" on a failed write would make the next save skip a layer
+    # that never made it to disk (same discipline as clearing the dirty set only
+    # after a successful write).
     result.written_fp = new_fp
-    # F14-5：end 行的层指纹已在循环里逐层落定（跳过层=写前现值、
-    # 实写层=new_fp），写失败时 end_layer_fps 保持空 ⇒ end 行不带指纹，
-    # 启动对账不会拿半成品指纹当真相。
+    # F14-5: the end row's layer fingerprints were settled layer by layer inside
+    # the loop (skipped layers = pre-write current value; written layers =
+    # new_fp). On write failure end_layer_fps stays empty ⇒ the end row carries
+    # no fingerprints, so startup reconciliation never mistakes a half-finished
+    # fingerprint for the truth.
     return result
 
 
 # ----------------------------------------------------------------------
-# 账本段（原 _save_layers）
+# Ledger phase (original _save_layers)
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class LayerLedgerPorts:
-    """账本三段编排的注入面。
+    """Injection surface for the ledger's three-phase orchestration.
 
-    ``core_fn`` 是 brain 的 ``_save_layers_core``（可被测试整体替换为
-    故障函数——原实现 ``self._save_layers_core()`` 经实例查找的语义不变）。
+    ``core_fn`` is brain's ``_save_layers_core`` (tests may replace it wholesale
+    with a faulting function — the original implementation's
+    ``self._save_layers_core()`` looked it up through the instance; semantics
+    unchanged).
     """
 
     persist_dir: str | None
@@ -217,18 +249,21 @@ class LayerLedgerPorts:
 
 
 def run_layer_save(ports: LayerLedgerPorts) -> None:
-    """给本次保存建账，真正的写盘交给 :func:`save_layers_core`。
+    """Book the ledger for this save; the actual disk write is delegated to :func:`save_layers_core`.
 
-    三段各有理由：``begin`` 必须在写盘**之前**（崩溃时至少留下「想写什么」），
-    ``end`` 记实际结果，``fail`` 记失败原因 —— 不记就等于「曾经想写但没写成」
-    这件事从未发生过（设计 §8 风险 8）。
+    Each phase has its reason: ``begin`` must run **before** the disk write (on
+    crash, at least "what we intended to write" survives), ``end`` records the
+    actual result, ``fail`` records the failure reason — without recording, the
+    event "once intended to write but never succeeded" would never have happened
+    (design §8 risk 8).
     """
     path = ledger_path(ports.persist_dir)
     seq = ports.save_seq + 1
     now_wall = ports.now_wall()
-    # F14-5：begin 带层指纹（"我声明要写的样子"）。算一次暂存，core 里
-    # 复用（仅当本次没走多进程合并——合并会在指纹循环前改层内容，
-    # 那时必须重算）。
+    # F14-5: begin carries layer fingerprints ("what I declare I am about to
+    # write"). Compute once and stash for reuse in core (only when this save did
+    # not go through multi-process merging — merging changes layer content
+    # before the fingerprint loop, in which case they must be recomputed).
     ports.set_begin_fps({})
     if path:
         fps_all = ports.compute_all_fps()
@@ -248,7 +283,7 @@ def run_layer_save(ports: LayerLedgerPorts) -> None:
     t0 = ports.now_mono()
     try:
         result = ports.core_fn()
-    except BaseException as e:  # noqa: BLE001 —— 失败也要入账，然后照常抛
+    except BaseException as e:  # noqa: BLE001 — failures get booked too, then re-raised as usual
         if path:
             ports.ledger_append({
                 "seq": seq,
@@ -271,15 +306,20 @@ def run_layer_save(ports: LayerLedgerPorts) -> None:
             "duration_ms": int((ports.now_mono() - t0) * 1000),
             "layers": {n: ports.layer_count(a)
                        for n, a in ports.layer_attrs.items()},
-            # 从磁盘并回来的层 = 这段时间里有外部写者（四象限右下角）。
-            # 切片 1 只记事实，不做判定（判定要等 F14-1 的层版本号）。
+            # Layers merged back from disk = an external writer existed during
+            # this window (bottom-right of the four quadrants).
+            # Slice 1 only records the fact, no judgment (judgment waits for
+            # F14-1's layer version numbers).
             "merged_from_disk": dict(result.last_layer_merge or {}),
-            # 本次因"内容没变"跳过的层（派生层脏集的实际效果）。
-            # 看得见"省了几次无谓重写"，也防"该写却跳过"没人发现。
+            # Layers skipped this time because "content unchanged" (the actual
+            # effect of the derived-layer dirty set).
+            # Makes "how many needless rewrites were saved" visible, and guards
+            # against a "should have written but was skipped" going unnoticed.
             "layers_skipped": list(result.layers_skipped or []),
         }
-        # F14-5：end 带层指纹（写完后的样子；core 里已补齐——实写层取
-        # new_fp，跳过层继承 begin 值）。
+        # F14-5: end carries layer fingerprints (the post-write look; core has
+        # already filled them in — written layers take new_fp, skipped layers
+        # inherit their begin values).
         if result.end_layer_fps:
             end_entry["layer_fps"] = dict(result.end_layer_fps)
         ports.ledger_append(end_entry)

@@ -1,42 +1,55 @@
 # -*- coding: utf-8 -*-
-"""主题层（L2T）：把平铺的 L1 事实收敛成主题，产出可回指的上层表述。
+"""Topic layer (L2T): converge flat L1 facts into topics, producing
+higher-level statements that can be referred back to.
 
-为什么要有这个模块
-==================
-
-L1 是检索主战场，但它的组织方式只有「平铺 + 实体倒排」——没有任何工具能
-回答「这个库有哪些知识点」。L2 只有会话级一条摘要且**不入检索路径**（写完
-即沉睡），L3 画像是热点条目不是知识；``ARCHITECTURE.md`` 里那句「RAPTOR
-递归上卷未实现」说的就是这一层。
-
-本模块只做**确定性**的部分：聚类、成员维护、抽取式代表句、统计。真正的
-「归纳」（把 N 条事实写成一句上层结论）需要智能，而生产路径不内嵌 LLM 是
-本项目的边界——那部分由宿主完成、经写回通道落库，本模块为它预留
-``summary`` / ``summary_kind`` / ``summary_evidence`` 三个字段。
-
-硬约束（改动前务必读）
+Why this module exists
 ======================
 
-* **不进检索主路径**。L2 的 ``RELEVANCE_HARD_FLOOR`` 就是防「摘要层和什么都
-  相似而霸榜」；V9f 实体图扩散把 F1 从 .311 打到 .200。主题层的出口是
-  ``knowledge_map`` 与 session_start，**不是** ``recall``。
-* **它是 L1 的派生层**。成员失效（删除 / 作废 / 归档）必须重裁；落盘走
-  ``_LAYER_ATTRS`` 的读-合并-写，删除立碑走删除账本。只改 L1 不改主题层
-  等于假删除。
-* **确定性优先**。遍历顺序固定、不引入随机源（``hash()`` 受 PYTHONHASHSEED
-  影响，一律用 sha1）、**不存质心**——质心可由成员向量重算，存下来会随换
-  模型失效，且让层文件随维度膨胀。
-* **不在写路径上跑**。聚类只在显式调用与 consolidate 时触发，``ingest``
-  不因此变慢——写路径延迟是硬约束。
-* **宁缺勿滥**。没算过向量的记录不进主题（进 ``unassigned`` 自曝），不猜。
+L1 is the main retrieval battlefield, but it is organized only as "flat +
+entity inverted index" -- no tool can answer "what knowledge points does
+this library have". L2 has only one session-level summary and **stays out
+of the retrieval path** (it goes dormant once written), and the L3 profile
+is hot entries, not knowledge; the "RAPTOR recursive aggregation not
+implemented" line in ``ARCHITECTURE.md`` refers to exactly this layer.
 
-用法::
+This module does only the **deterministic** part: clustering, membership
+maintenance, extractive representative sentences, statistics. Real
+"summarization" (writing N facts into one higher-level conclusion) needs
+intelligence, and the production path not embedding an LLM is this
+project's boundary -- that part is done by the host and persisted through
+the write-back channel; this module reserves the ``summary`` /
+``summary_kind`` / ``summary_evidence`` fields for it.
+
+Hard constraints (read before changing anything)
+================================================
+
+* **Never enters the main retrieval path**. L2's ``RELEVANCE_HARD_FLOOR``
+  exists precisely to prevent "a summary layer similar to everything
+  dominating the rankings"; V9f entity-graph diffusion dropped F1 from .311
+  to .200. The topic layer's exits are ``knowledge_map`` and session_start,
+  **not** ``recall``.
+* **It is a derived layer of L1**. Member invalidation (delete / supersede /
+  archive) must be re-adjudicated; persistence goes through the
+  read-merge-write of ``_LAYER_ATTRS``, deletions lay tombstones via the
+  deletion ledger. Changing L1 without changing the topic layer equals a
+  fake deletion.
+* **Determinism first**. Traversal order is fixed, no random sources
+  (``hash()`` is affected by PYTHONHASHSEED; always use sha1), **no stored
+  centroids** -- a centroid can be recomputed from member vectors; storing
+  it breaks on a model change and bloats the layer file with dimensions.
+* **Never runs on the write path**. Clustering triggers only on explicit
+  calls and consolidate; ``ingest`` does not slow down because of it --
+  write-path latency is a hard constraint.
+* **Better missing than wrong**. Records without a computed vector do not
+  enter topics (they self-report into ``unassigned``); no guessing.
+
+Usage::
 
     items = [{"id": ..., "vec": ndarray, "content": ..., "timestamp": ...,
               "entities": [...], "tags": {...}, "importance": ...}]
-    topics = build(items)                       # 全量/增量（传入 topics 即增量）
-    reclip(topics, alive_ids)                   # 成员失效后重裁
-    refresh(topics, items_by_id, topn=3)        # 重算 span/标题/代表句
+    topics = build(items)                       # full/incremental (passing topics = incremental)
+    reclip(topics, alive_ids)                   # re-adjudicate after member invalidation
+    refresh(topics, items_by_id, topn=3)        # recompute span/title/representative sentences
 """
 
 from __future__ import annotations
@@ -49,7 +62,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 # ----------------------------------------------------------------------
-# 常量（env 可覆盖，便于不动代码调参）
+# Constants (env-overridable, for tuning without touching code)
 # ----------------------------------------------------------------------
 
 ENV_TOPIC_LAYER = "HIPPOCAMPUS_TOPIC_LAYER"
@@ -57,57 +70,85 @@ ENV_TOPIC_JOIN_SIM = "HIPPOCAMPUS_TOPIC_JOIN_SIM"
 ENV_TOPIC_MAX = "HIPPOCAMPUS_TOPIC_MAX"
 ENV_TOPIC_SUMMARY_TOPN = "HIPPOCAMPUS_TOPIC_SUMMARY_TOPN"
 
-# 归入已有主题的余弦门槛。0.55 是中文句级嵌入的经验起点——太低会把全库并成
-# 一个筐，太高会让每条记录各成一簇（负对照：调到 0.95 时主题数应逼近
-# 记录数，否则说明相似度根本没参与判定）。
+# The cosine gate for joining an existing topic. 0.55 is the empirical
+# starting point for Chinese sentence-level embeddings -- too low merges the
+# whole library into one basket, too high gives every record its own cluster
+# (negative control: at 0.95 the topic count should approach the record
+# count; otherwise similarity is not really participating in the decision).
 TOPIC_JOIN_SIM_DEFAULT = 0.55
-# 主题数上限。超过后**强制归入最相近的主题**而不是继续新建——触顶次数
-# 在 stats 里自曝。**内部**主题数≠地图显示条数（那个由 `knowledge_map(limit=)`
-# 控制），所以这里可以给得比「能一眼看完」多。
-# 取值依据（两个独立真库的网格扫描）：cap=200/400 都撞顶；600 对一个
-# 9 千条级中文语料真库够用（550 簇不撞顶），但另一个 3.6 千条级真库的
-# 自然簇数就有 652，取 600 会让那个库重新撞顶——两个真库都不撞顶的
-# 最小整档是 **1000**（550 / 652 都留有余量），故定 1000。
-# 成本侧：1000/60 全量重建 2.6–2.9s（质心归一化缓存落地前 8.6s，见 build()）。
+# Upper bound on topic count. Beyond it, **force-join the nearest topic**
+# instead of creating new ones -- the cap-hit count is self-reported in
+# stats. The **internal** topic count ≠ the map's displayed entry count
+# (that is controlled by `knowledge_map(limit=)`), so this can be set higher
+# than "readable at a glance".
+# Basis for the value (grid scans on two independent real libraries):
+# cap=200/400 both hit the cap; 600 suffices for one real library at the
+# 9k-record Chinese-corpus scale (550 clusters, no cap hit), but the other
+# 3.6k-record real library has 652 natural clusters, so 600 would push that
+# library back into the cap -- the smallest whole step where neither real
+# library hits the cap is **1000** (550 / 652 both leave headroom), hence
+# 1000.
+# Cost side: full rebuild at 1000/60 takes 2.6-2.9s (8.6s before the
+# centroid normalization cache landed; see build()).
 TOPIC_MAX_DEFAULT = 1000
-# 单个主题的成员上限。**巨型筐的直接克星**：真库实测不加这个限制时，
-# 第一个簇会一路吸附到 **2647 条（占全库 27%）**——中文句向量有各向异性
-# （任意两句余弦普遍偏高），绝对阈值挡不住质心漂移，唯一的解是硬上限。
-# 取值依据（同轮网格扫描）：mem=300 时最大簇贴着 300 长、top5 集中度 16%；
-# mem=60 把最大簇压到 60、top5 压到 3.3%，中位簇 3–5 条。代价是单例占比
-# 多约 1 个点——换掉"300 条的筐里啥都有"是划算的。两个独立真库都指向
-# 60，不是单库巧合。
+# Per-topic member cap. **The direct nemesis of the giant basket**: measured
+# on a real library without this limit, the first cluster keeps absorbing up
+# to **2647 records (27% of the whole library)** -- Chinese sentence vectors
+# are anisotropic (cosines between arbitrary sentences run universally
+# high), absolute thresholds cannot stop centroid drift, and the only fix is
+# a hard cap.
+# Basis for the value (same-round grid scan): at mem=300 the largest cluster
+# hugs 300 and top-5 concentration is 16%; mem=60 presses the largest
+# cluster to 60 and top-5 to 3.3%, with median clusters of 3-5 records. The
+# cost is roughly 1 more point of singleton share -- trading away "a
+# 300-record basket with everything in it" is worth it. Both independent
+# real libraries point to 60; not a single-library coincidence.
 TOPIC_MAX_MEMBERS_DEFAULT = 60
-# 分批矩阵乘的批大小：批内交给 BLAS，批间保持顺序（顺序是确定性的来源）。
+# Batch size for the batched matrix multiply: within a batch it goes to
+# BLAS, order is preserved across batches (the order is the source of
+# determinism).
 TOPIC_CHUNK = 512
-# 抽取式代表句条数。
+# Number of extractive representative sentences.
 TOPIC_SUMMARY_TOPN_DEFAULT = 3
-# 代表句每条截断长度（字符）。
+# Per-sentence clip length for representative sentences (chars).
 TOPIC_SUMMARY_CLIP = 60
-# 少于这么多成员的主题**不值得归纳**（1-2 条事实本身就说清楚了，
-# 再写一句结论只是把原文换个说法）。归纳成本是宿主出的，别浪费在碎渣上。
+# Topics with fewer members than this are **not worth summarizing** (1-2
+# facts say it by themselves; another concluding sentence is just the
+# original rephrased). Summarization costs the host effort -- do not waste
+# it on crumbs.
 TOPIC_MIN_SIZE_FOR_SUMMARY = 3
-# 失效成员占比超过它 → 标 stale（提示"这个知识点的内容已经变过了"）。
+# Invalidated-member ratio above this → mark stale (a hint that "this
+# knowledge point's content has changed").
 TOPIC_STALE_RATIO = 0.5
-# 主题标题里实体的最大个数。
+# Maximum number of entities in a topic title.
 TOPIC_TITLE_ENTITIES = 2
-# 标题兜底：无实体无标签时取最早成员正文的前多少字。
+# Title fallback: with no entities and no tags, take this many leading chars
+# of the earliest member's content.
 TOPIC_TITLE_CLIP = 12
-# 主题「世代」字段名。重建（force）时 +1；层合并时**世代高的一方整代覆盖**。
-# 没有它，「重建」只是键并集意义上的叠加：磁盘旧簇会被并回来（实测
-# 652 + 698 → 1050 个簇），而且对面旧写者下次保存还会再并一次——永远清不掉。
+# Field name for the topic "generation". +1 on rebuild (force); on layer
+# merge, **the higher generation overwrites the whole generation**.
+# Without it, "rebuild" is only an additive key-union: old clusters on disk
+# get merged back (measured: 652 + 698 → 1050 clusters), and the other
+# side's old writer merges them in again on its next save -- never gets
+# cleaned up.
 TOPIC_EPOCH_FIELD = "_epoch"
-# 假簇过滤：**有信息量的成员占比**低于此值 ⇒ 判为
-# 假簇。格式相似≠一件事——一堆"好的/收到/嗯"在句向量上彼此很近（都短、都
-# 是应答），会被聚成一簇，但那不是知识点，让宿主归纳它是纯浪费。
-# 取 0.5 而不是更高的理由：判得越严越容易把真主题误判掉，而误判是**静默**
-# 的（主题从 pending 里消失，没人知道）；宁可漏筛，不可误杀。
+# Fake-cluster filter: when the **share of informative members** falls below
+# this ⇒ judged a fake cluster. Similar formatting ≠ the same subject -- a
+# pile of "好的/收到/嗯" sits close together in sentence-vector space (all
+# short, all acknowledgments) and gets clustered together, but that is not a
+# knowledge point; having the host summarize it is pure waste.
+# Why 0.5 and not higher: the stricter the judgment, the easier to misjudge
+# real topics, and a misjudgment is **silent** (the topic disappears from
+# pending and nobody knows); better to miss a filter than to kill a real
+# one.
 TOPIC_LOW_INFO_RATIO = 0.5
-# 正文信息量的及格线（>=1 才算"有信息量"）。见 :func:`info_score`。
+# Passing line for content informativeness (>=1 counts as "informative").
+# See :func:`info_score`.
 TOPIC_LOW_INFO_MIN_SCORE = 1
-# 开关（默认开）：0/off/false/no 关闭假簇过滤。
+# Switch (default on): 0/off/false/no disables the fake-cluster filter.
 ENV_TOPIC_LOW_INFO = "HIPPOCAMPUS_TOPIC_LOW_INFO_FILTER"
-# 正文被判为"套话"的最长长度：超过这个长度还全是套话的，本身也算是内容。
+# The longest a body may be and still be judged "filler": beyond this
+# length, all-filler text itself counts as content.
 TOPIC_FILLER_MAX_LEN = 6
 
 STATUS_ACTIVE = "active"
@@ -120,19 +161,23 @@ SUMMARY_KIND_HOST = "host"
 
 @dataclass(frozen=True)
 class TopicDefaults:
-    """域默认值容器——注入接缝。
+    """Domain defaults container -- the injection seam.
 
-    为什么需要它：``domain`` 不许 import ``config``（依赖图
-    ``_ALLOWED["domain"] == {"common"}``），所以这一层**不能自己去读 env**；
-    而主题层的默认值又确实是可配的。解法是依赖倒置——把默认值做成一份纯
-    数据，谁调用谁提供：
+    Why it is needed: ``domain`` must not import ``config`` (dependency
+    graph ``_ALLOWED["domain"] == {"common"}``), so this layer **cannot read
+    env by itself**; yet the topic layer's defaults are genuinely
+    configurable. The solution is dependency inversion -- make the defaults
+    a piece of pure data; whoever calls, provides:
 
-      * 不传 ⇒ 用 :class:`TopicDefaults` 的字段默认（等于「清空 env」的情形），
-        domain 单独可测，不依赖任何环境；
-      * brain 组合根从 :class:`hippocampus_mcp.config.Config` 装配一份传进来，
-        env 旋钮才接上。
+      * Not passed ⇒ use :class:`TopicDefaults`' field defaults (equivalent
+        to "env cleared"); domain is testable standalone, depending on no
+        environment;
+      * The brain composition root assembles one from
+        :class:`hippocampus_mcp.config.Config` and passes it in; only then
+        do the env knobs connect.
 
-    字段名与 Config 的 ``topic_*`` 一一对应，由 ``test_config_parity`` P7 钉住。
+    Field names correspond one-to-one with Config's ``topic_*``, pinned by
+    ``test_config_parity`` P7.
     """
     join_sim: float = TOPIC_JOIN_SIM_DEFAULT
     max_topics: int = TOPIC_MAX_DEFAULT
@@ -147,11 +192,12 @@ def _def(d: TopicDefaults | None) -> TopicDefaults:
 
 
 # ----------------------------------------------------------------------
-# 工具
+# Utilities
 # ----------------------------------------------------------------------
 
 def _unit(vec: Any) -> np.ndarray | None:
-    """归一化；零向量返回 None（零向量没有方向，进聚类只会制造噪声簇）。"""
+    """Normalize; returns None for the zero vector (a zero vector has no
+    direction and would only create noise clusters in clustering)."""
     if vec is None:
         return None
     arr = np.asarray(vec, dtype=np.float64).ravel()
@@ -164,12 +210,14 @@ def _unit(vec: Any) -> np.ndarray | None:
 
 
 def _topic_id(seed: str) -> str:
-    """确定性主题 id（**不用** uuid4/hash()：那会让测试与落盘不可复现）。"""
+    """Deterministic topic id (**no** uuid4/hash(): those make tests and
+    persistence unreproducible)."""
     return "tpc_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
 
 
 def _centroid(member_ids: Sequence[str], norms: dict[str, np.ndarray]) -> np.ndarray | None:
-    """成员单位向量的均值（再归一化）。空/全缺失返回 None。"""
+    """Mean of the members' unit vectors (re-normalized). Returns None when
+    empty or all missing."""
     acc: np.ndarray | None = None
     cnt = 0
     for mid in member_ids:
@@ -184,10 +232,13 @@ def _centroid(member_ids: Sequence[str], norms: dict[str, np.ndarray]) -> np.nda
 
 
 def new_topic(member_id: str, epoch: int = 0) -> dict[str, Any]:
-    """新主题的骨架（其余字段由 :func:`refresh` 填）。
+    """The skeleton of a new topic (the remaining fields are filled by
+    :func:`refresh`).
 
-    ``epoch`` 是这一簇出生的世代：日常增量为 0（与既有簇同代，合并走
-    键并集）；重建时整层统一 +1（合并时整代覆盖，见 :func:`layer_epoch`）。
+    ``epoch`` is the generation this cluster was born into: 0 for daily
+    increments (same generation as existing clusters; merges go through key
+    union); on rebuild the whole layer increments uniformly (+1; merges then
+    overwrite by whole generation, see :func:`layer_epoch`).
     """
     return {
         "id": _topic_id(member_id),
@@ -209,7 +260,7 @@ def new_topic(member_id: str, epoch: int = 0) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# 聚类
+# Clustering
 # ----------------------------------------------------------------------
 
 def build(
@@ -222,37 +273,50 @@ def build(
     epoch: int | None = None,
     defaults: TopicDefaults | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """把记录归入主题（传入 ``topics`` 即**增量**：只处理还没归进去的）。
+    """Assign records to topics (passing ``topics`` makes it **incremental**:
+    only records not yet assigned are processed).
 
-    算法是 **leader 型贪心扫描**，不是层次聚类：按 ``(timestamp, id)`` 固定
-    顺序逐条决定「归到最像的那个主题 / 自己开一个」。选它而不是凝聚式的三个
-    理由：
+    The algorithm is a **leader-style greedy scan**, not hierarchical
+    clustering: in the fixed ``(timestamp, id)`` order, each record decides
+    "join the most similar topic / start its own". Three reasons to pick it
+    over agglomerative:
 
-      1. 凝聚式要 O(n²) 相似度矩阵（万条库 8900 万对）；这里是 O(n·k)，
-         k ≤ ``max_topics``，万条库约 47 万次点积，秒级。
-      2. **天然支持增量**——新记录只需和 k 个质心比一次，不必重算全库，
-         所以它能挂进 ``consolidate`` 而不碰写路径。
-      3. 结果对顺序敏感（先到的决定中心），但**顺序是确定的**（按时间戳+id
-         排序），所以同一份输入两次跑出来的结果逐字节相同——可测、可复现。
+      1. Agglomerative needs an O(n²) similarity matrix (an 89-million-pair
+         library at 10k records); this is O(n·k) with k ≤ ``max_topics`` --
+         about 470k dot products for a 10k library, seconds.
+      2. **Naturally incremental** -- a new record only needs one comparison
+         against k centroids, no full-library recompute, so it can hang off
+         ``consolidate`` without touching the write path.
+      3. The result is order-sensitive (earliest arrivals decide centers),
+         but **the order is deterministic** (sorted by timestamp+id), so the
+         same input run twice is byte-identical -- testable, reproducible.
 
-    质心在过程中**增量维护**（``sum_vec / count``），不对每条记录重算全部
-    主题的质心（那样是 O(n·k·m)，实测会慢两个量级）。
+    Centroids are **maintained incrementally** along the way
+    (``sum_vec / count``); centroids of all topics are not recomputed per
+    record (that would be O(n·k·m) -- measured two orders of magnitude
+    slower).
 
     Args:
         items: ``{"id", "vec", "content", "timestamp", "entities", "tags",
-            "importance"}``；``vec`` 缺失/零向量的记录**不进主题**（进
-            ``unassigned``）。
-        topics: 已有主题（增量模式）。会被**原地修改**并返回。
-        join_sim: 归入门槛，默认取 env / 0.55。
-        max_topics: 主题数上限，默认取 env / :data:`TOPIC_MAX_DEFAULT`。
-        d: :class:`TopicDefaults` 注入包（domain 不许读 env ⇒ 由调用方给）。
-            省略则用纯数值默认，等价于清空 env。
-        alive_ids: 当前**存活**（active）的记录 id。与「有向量」是两件事：
-            存活但还没算向量的记录必须留在成员里（见下方「存活≠有向量」
-            注释）。省略则退回旧口径（只认有向量的），仅为兼容既有调用。
+            "importance"}``; records with a missing/zero ``vec`` **do not
+            enter topics** (they go to ``unassigned``).
+        topics: Existing topics (incremental mode). Modified **in place** and
+            returned.
+        join_sim: Join gate; defaults to env / 0.55.
+        max_topics: Topic count cap; defaults to env /
+            :data:`TOPIC_MAX_DEFAULT`.
+        d: The :class:`TopicDefaults` injection pack (domain must not read
+            env ⇒ the caller provides it). Omitted, pure numeric defaults
+            apply, equivalent to clearing env.
+        alive_ids: Ids of records currently **alive** (active). Different
+            from "has a vector": records that are alive but have no vector
+            yet must stay in the membership (see the "alive ≠ has vector"
+            comment below). Omitted, the old wording applies (only records
+            with vectors count), purely for compatibility with existing
+            callers.
 
     Returns:
-        ``{topic_id: topic}``。
+        ``{topic_id: topic}``.
     """
     thr = _def(defaults).join_sim if join_sim is None else float(join_sim)
     ep = 0 if epoch is None else int(epoch)
@@ -261,9 +325,12 @@ def build(
     out: dict[str, dict[str, Any]] = dict(topics or {})
 
     by_id = {str(it.get("id")): it for it in items}
-    # 维度必须一致才比得了余弦。生产里同一 model_key 下必然同维，这里防御
-    # 是为了**不崩**：混维时按首个有效向量的维度为准，其余不进主题——
-    # 宁缺勿滥，它们会落到 coverage 的 unassigned 里自曝，而不是被猜进某个簇。
+    # Cosine comparison needs consistent dimensions. In production, one
+    # model_key implies one dimension; this defense is for **not crashing**:
+    # with mixed dimensions, the first valid vector's dimension wins and the
+    # rest do not enter topics -- better missing than wrong, they land in
+    # coverage's unassigned and self-report instead of being guessed into a
+    # cluster.
     dim: int | None = None
     norms: dict[str, np.ndarray] = {}
     for it in items:
@@ -276,13 +343,17 @@ def build(
             continue
         norms[str(it.get("id"))] = u
 
-    # 已有主题：先把**失效**成员摘掉（调用方可能刚删过记忆），再算初始质心。
+    # Existing topics: strip **invalidated** members first (the caller may
+    # have just deleted memories), then compute initial centroids.
     #
-    # 「存活」不等于「有向量」。active 但还没算向量的记录必须留在成员里
-    # ——否则每刷新一次就把它摘掉、向量补齐后又重新归入，成员集合反复抖动。
-    # 抖动的代价不只是数字难看：宿主归纳记的是**成员签名**，成员一变签名就
-    # 对不上，于是每次刷新都报"归纳已过期"（假 stale），宿主会把它当噪声，
-    # 真的过期那天反而不看了。
+    # "Alive" is not the same as "has a vector". Records that are active but
+    # have no vector yet must stay in the membership -- otherwise every
+    # refresh strips them out and re-adds them once vectors are back, and
+    # the member set flaps forever. The cost of flapping is not just ugly
+    # numbers: host summaries record a **member signature**, and once
+    # members change the signature stops matching, so every refresh reports
+    # "summary is stale" (a false stale); the host learns to treat it as
+    # noise, and stops looking on the day it is genuinely stale.
     alive: set[str] | None = None if alive_ids is None else {str(x) for x in alive_ids}
     assigned: set[str] = set()
     for t in out.values():
@@ -291,9 +362,11 @@ def build(
         t["member_ids"] = kept
         assigned.update(kept)
 
-    # 质心的增量维护状态：tid -> [sum_vec, count]。**归档主题不建质心**——
-    # 它们是被摘空才归档的，建了也不会选中；更怕的是反过来被新成员吸附，
-    # 让「已归档」变成假象。
+    # Incremental centroid state: tid -> [sum_vec, count]. **Archived topics
+    # get no centroid** -- they were archived precisely for being emptied
+    # out; a centroid would never win selection, and what is really feared
+    # is the opposite: new members getting absorbed into it, making
+    # "archived" a facade.
     cent: dict[str, list[Any]] = {}
     for tid, t in out.items():
         if t.get("status") == STATUS_ARCHIVED:
@@ -308,8 +381,10 @@ def build(
             cnt += 1
         if acc is not None and cnt:
             cent[tid] = [acc, cnt]
-    # 主题数上限只算**未归档**的。归档主题永久占名额时，删过内容的库
-    # 会一直卡在 cap 上再也建不出新簇，而没有任何地方报这件事（静默）。
+    # The topic cap counts only **non-archived** topics. If archived topics
+    # occupied slots permanently, a library that has had deletions would
+    # stay stuck at the cap, never forming a new cluster, with nothing
+    # reporting it (silent).
     live_n = sum(1 for t in out.values()
                  if t.get("status") != STATUS_ARCHIVED)
 
@@ -318,18 +393,26 @@ def build(
         key=lambda x: (float(x.get("timestamp") or 0.0), str(x.get("id"))),
     )
 
-    # 分批矩阵乘：把「每条 × 每个质心」的点积整批交给 BLAS，而不是逐条
-    # Python 循环。真实大库实测（50 簇）逐条版能慢到秒级，
-    # 挂在 consolidate 里随时会踩宿主超时（session_end 曾因
-    # _find_contradictions 慢到 206s 踩过一次，同一招降到 0.34s）；
-    # 改成 (b×d) @ (d×k) 后降到秒级。批内并行、批间保持顺序——顺序是
-    # 结果确定性的来源，不能整批一次性算完（那样质心就不随归入更新了）。
+    # Batched matrix multiply: hand the "every record × every centroid" dot
+    # products to BLAS in bulk instead of a per-record Python loop. Measured
+    # on a real large library (50 clusters), the per-record version slows to
+    # the order of seconds; hung inside consolidate it would trip the host
+    # timeout at any moment (session_end once hit 206s because of
+    # _find_contradictions; the same trick brought it to 0.34s);
+    # switching to (b×d) @ (d×k) brought it back down. Within a batch it is
+    # parallel; order is preserved across batches -- the order is the source
+    # of result determinism, and it cannot be computed in one shot (then
+    # centroids would stop updating as records get assigned).
     #
-    # 质心单位向量按 tid **缓存**，``cent[tid]`` 一变即失效。缓存前实测
-    # 大库里 ``_unit`` 会被重复调用大量次数，其中很大一部分来自
-    # 下方「批内新建簇补算」的 O(批大小×pending) 循环——每个新建簇的质心
-    # 对批内**每一条**后续记录重算一遍。缓存后同一质心只在真的变了才算。
-    # 缓存不改数值：取的还是同一个 ``_unit(cent[tid][0]/cent[tid][1])``。
+    # Centroid unit vectors are **cached** by tid and invalidated the moment
+    # ``cent[tid]`` changes. Before the cache, measurements on a large
+    # library showed ``_unit`` being called a huge number of times, a large
+    # share of it from the "supplementary scoring of clusters created within
+    # the batch" O(batch size×pending) loop below -- each new cluster's
+    # centroid was recomputed for **every** subsequent record in the batch.
+    # With the cache, the same centroid is computed only when it really
+    # changed. The cache does not change values: it still fetches the same
+    # ``_unit(cent[tid][0]/cent[tid][1])``.
     _UNSET = object()
     unit_cache: dict[str, Any] = {}
 
@@ -342,13 +425,13 @@ def build(
         unit_cache[tid] = u
         return u
 
-    pending: list[str] = []          # 本批内新建、还没进快照矩阵的簇
+    pending: list[str] = []          # clusters created within this batch, not yet in the snapshot matrix
     for start in range(0, len(order), TOPIC_CHUNK):
         batch = order[start:start + TOPIC_CHUNK]
         snap = [t for t in cent if t not in pending]
         if snap:
             cent_mat = np.vstack([_cent_unit(t) for t in snap])
-            # 已满的簇不再吸附：巨型筐的克星（见 TOPIC_MAX_MEMBERS 的注释）
+            # Full clusters stop absorbing: the giant-basket nemesis (see the TOPIC_MAX_MEMBERS comment)
             full = np.array(
                 [len(out[t].get("member_ids") or []) >= mm for t in snap],
                 dtype=bool)
@@ -371,7 +454,7 @@ def build(
                 v = float(sims[row][j])
                 if np.isfinite(v):
                     best_tid, best_sim = snap[j], v
-            for tid in pending:          # 批内新建的簇：补算（数量很少）
+            for tid in pending:          # clusters created within this batch: score them too (few)
                 c = _cent_unit(tid)
                 if c is None:
                     continue
@@ -379,46 +462,50 @@ def build(
                 if (s > best_sim
                         and len(out[tid].get("member_ids") or []) < mm):
                     best_tid, best_sim = tid, s
-            # 再查一次上限：``full`` 掩码只在**批开始**算过一次，同一批内
-            # 一个簇能从 mm 一路长到 mm+批大小（实测 300 → 563）。
+            # Re-check the cap: the ``full`` mask was computed only once at
+            # **batch start**; within one batch a cluster can grow from mm
+            # all the way to mm+batch size (measured 300 → 563).
             if (best_tid and best_sim >= thr
                     and len(out[best_tid].get("member_ids") or []) < mm):
                 out[best_tid]["member_ids"].append(mid)
                 cent[best_tid] = [cent[best_tid][0] + nv, cent[best_tid][1] + 1]
-                unit_cache.pop(best_tid, None)   # 质心变了，缓存作废
+                unit_cache.pop(best_tid, None)   # centroid changed; cache invalidated
                 assigned.add(mid)
             elif live_n < cap:
                 t = new_topic(mid, ep)
                 out[t["id"]] = t
                 cent[t["id"]] = [nv.copy(), 1]
-                unit_cache[t["id"]] = _unit(nv.copy())   # 已知值，省一次重算
+                unit_cache[t["id"]] = _unit(nv.copy())   # known value; saves a recompute
                 pending.append(t["id"])
                 assigned.add(mid)
                 live_n += 1
             elif best_tid:
-                # 触顶：不新建，强制归入最相近的（触顶次数由 stats 自曝）
+                # Cap hit: no new topic; force-join the nearest (cap hits self-reported by stats)
                 out[best_tid]["member_ids"].append(mid)
                 cent[best_tid] = [cent[best_tid][0] + nv, cent[best_tid][1] + 1]
-                unit_cache.pop(best_tid, None)   # 质心变了，缓存作废
+                unit_cache.pop(best_tid, None)   # centroid changed; cache invalidated
                 assigned.add(mid)
-            # cap <= 0 且无簇可归 → 留在 unassigned，不静默新建
+            # cap <= 0 and no cluster to join → stays in unassigned; never silently creates
         pending = []
     return out
 
 
 def reclip(topics: dict[str, dict[str, Any]], alive_ids: Iterable[str]) -> int:
-    """按**当前存活**的记录重裁成员（派生层纪律：并集只会做加法）。
+    """Re-adjudicate membership against the **currently alive** records
+    (derived-layer discipline: union only ever adds).
 
-    L1 里被删除 / 作废 / 归档的记录必须从主题里摘掉，否则"知识点"会继续
-    引用一条已经不算数的记忆——而它又不进检索路径，用户根本看不见这个
-    不一致（静默是最坏的结果）。
+    Records deleted / superseded / archived in L1 must be stripped from
+    topics, otherwise a "knowledge point" keeps citing a memory that no
+    longer counts -- and since it never enters the retrieval path, the user
+    can never see the inconsistency (silence is the worst outcome).
 
     Args:
-        topics: 主题表（原地修改）。
-        alive_ids: 当前仍应计入的成员 id（由调用方按 active 状态筛出）。
+        topics: The topic table (modified in place).
+        alive_ids: Member ids that should still count (filtered by the
+            caller on the active state).
 
     Returns:
-        摘掉的成员引用条数。
+        Number of member references removed.
     """
     alive = set(alive_ids)
     dropped = 0
@@ -434,7 +521,7 @@ def reclip(topics: dict[str, dict[str, Any]], alive_ids: Iterable[str]) -> int:
 
 
 # ----------------------------------------------------------------------
-# 刷新：标题 / 跨度 / 代表句 / 状态
+# Refresh: title / span / representative sentences / status
 # ----------------------------------------------------------------------
 
 def _top_entities(members: Sequence[dict[str, Any]], limit: int) -> list[str]:
@@ -464,10 +551,13 @@ def _top_tags(members: Sequence[dict[str, Any]], limit: int) -> list[str]:
 
 
 def _title_of(members: Sequence[dict[str, Any]]) -> str:
-    """确定性标题：受信任实体 > 结构化标签 > 最早成员正文片段。
+    """Deterministic title: trusted entities > structured tags > earliest
+    member content fragment.
 
-    刻意**不做**"取最长的句子当标题"那类启发式：它会让标题随成员增删抖动，
-    而标题是地图里唯一被人眼反复读的字段，抖动比朴素更伤。
+    Deliberately **no** "take the longest sentence as title" style
+    heuristics: they make the title flap as members come and go, and the
+    title is the one field in the map read over and over by human eyes --
+    flapping hurts more than being plain.
     """
     ents = _top_entities(members, TOPIC_TITLE_ENTITIES)
     if ents:
@@ -485,18 +575,25 @@ def _title_of(members: Sequence[dict[str, Any]]) -> str:
 
 def _collision_suffix(topic: dict[str, Any],
                       members: Sequence[dict[str, Any]]) -> str:
-    """撞名时给标题补的区分后缀。
+    """The disambiguating suffix appended to a title on name collision.
 
-    真库实测痛点：多个簇标题逐字相同（实测库里有两条同名簇），
-    宿主在地图上**分不清指的是哪个**，也没法点名让它整理。
+    Pain point measured on a real library: several clusters with
+    character-identical titles (the measured library had two same-named
+    clusters); the host **cannot tell which one the map means**, and cannot
+    name one to have it tidied up.
 
-    后缀优先级（都取确定性来源，不引入随机/模型）：
-      1. 原标题没用到的**下一个受信任实体** ⇒ 「sv·fitness·P-43」
-      2. 结构标签里排第一且原标题里没有的 ⇒ 「sv·fitness·类型=实验」
-      3. 都没有 ⇒ 序号「#2」（至少可指名，不至于两个同名条目）
+    Suffix priority (all deterministic sources, no randomness/models):
+      1. The **next trusted entity** unused by the original title ⇒
+         「sv·fitness·P-43」
+      2. The first structured tag absent from the original title ⇒
+         「sv·fitness·类型=实验」
+      3. Neither exists ⇒ a sequence number 「#2」 (at least nameable, not
+         two indistinguishable same-named entries)
 
-    刻意**不改**宿主命名过的标题（``title_kind=host``）：那是人起的名字，
-    擅自加后缀是"最伤信任的静默改写"那一类——它只拿 ``title_collision`` 提示。
+    Deliberately **does not touch** host-named titles (``title_kind=host``):
+    those are names given by a person, and appending a suffix without asking
+    belongs to the "most trust-damaging silent rewrite" class -- it only
+    gets the ``title_collision`` hint.
     """
     base = str(topic.get("title") or "")
     for ent in _top_entities(members, TOPIC_TITLE_ENTITIES + 3):
@@ -510,14 +607,21 @@ def _collision_suffix(topic: dict[str, Any],
 
 def disambiguate_titles(topics: dict[str, dict[str, Any]],
                         items_by_id: dict[str, dict[str, Any]] | None = None) -> int:
-    """给同名主题补区分后缀，返回**被改过标题**的条数。
+    """Append disambiguating suffixes to same-named topics; returns the
+    number of **titles that were changed**.
 
-    - 分组键＝逐字标题；只有组内 >1 条才处理（单条不加后缀，避免无谓抖动）。
-    - 组内顺序按 ``(size 降序, topic id 升序)`` ⇒ 确定性，**第一条保留原标题**
-      （大簇不动，小簇改名，成员增删时改动面最小）。
-    - 宿主命名的标题**不改**，只标 ``title_collision``（见 :func:`_collision_suffix`）。
-    - 同名数写进 ``title_collision`` 自曝：宿主看到 ``=3`` 就知道"还有两个同名的"，
-      即便它手头这条是被改名后的那个。
+    - Grouping key = character-identical title; only groups with >1 entry
+      are processed (a single entry gets no suffix, avoiding needless
+      flapping).
+    - Within a group, order by ``(size descending, topic id ascending)`` ⇒
+      deterministic; the **first keeps its original title** (big clusters
+      stay put, small ones rename -- the smallest change surface as members
+      come and go).
+    - Host-named titles are **not changed**; only ``title_collision`` is set
+      (see :func:`_collision_suffix`).
+    - The same-name count goes into ``title_collision`` as a self-report:
+      seeing ``=3`` the host knows "two more share this name", even when the
+      one at hand is the renamed entry.
     """
     groups: dict[str, list[str]] = {}
     for tid, t in topics.items():
@@ -554,11 +658,14 @@ def _extractive_summary(
     norms: dict[str, np.ndarray],
     topn: int,
 ) -> tuple[str, list[str]]:
-    """抽取式"代表句"：取离质心最近的 N 条原文，不是归纳。
+    """Extractive "representative sentences": the N originals closest to the
+    centroid, not a summary.
 
-    命名与实现都刻意保守——它回答的是"这个主题大概在说什么"，**不是**
-    "这几条能推出什么结论"。后者要等宿主写回（``summary_kind=host``）。
-    把摘录当成归纳展示出去，是这一层最容易发生的过度承诺。
+    Both the name and the implementation are deliberately conservative -- it
+    answers "what is this topic roughly about", **not** "what conclusion do
+    these records support". The latter waits for the host to write back
+    (``summary_kind=host``). Presenting excerpts as if they were summaries
+    is the over-promise this layer is most prone to.
     """
     ids = [m for m in (topic.get("member_ids") or []) if m in norms]
     if not ids or topn <= 0:
@@ -583,11 +690,13 @@ def _extractive_summary(
 
 
 # ----------------------------------------------------------------------
-# 假簇过滤：正文信息量判据
+# Fake-cluster filter: the content-informativeness criterion
 # ----------------------------------------------------------------------
 
-# 应答/套话。它们聚在一起是因为**都短且都是应答**，不是因为讲同一件事。
-# 全是 ASCII 小写的归一形（去标点、去空白后比较）。
+# Acknowledgments/filler phrases. They cluster together because **they are
+# all short and all acknowledgments**, not because they discuss the same
+# thing. Normalized forms, all ASCII lowercase (compared after stripping
+# punctuation and whitespace).
 _FILLER_PHRASES = frozenset({
     "好的", "好", "收到", "收到收到", "明白", "了解", "知道了", "嗯", "嗯嗯",
     "哦", "行", "可以", "是的", "对", "对对", "不错", "谢谢", "多谢", "感谢",
@@ -600,9 +709,10 @@ _DIGIT_RE = re.compile(r"\d")
 
 
 def _fold_repeat(s: str) -> str:
-    """折叠整串重复：「好的好的」→「好的」、「okok」→「ok」。
+    """Fold whole-string repetition: 「好的好的」→「好的」, 「okok」→「ok」.
 
-    套话最常见的形态就是重复（附和时会连打两遍），不折叠就漏判。
+    The most common filler shape is repetition (people type it twice when
+    agreeing); without folding, detection misses it.
     """
     for n in (2, 3, 4):
         if len(s) > n and len(s) % n == 0:
@@ -613,25 +723,33 @@ def _fold_repeat(s: str) -> str:
 
 
 def info_score(content: Any, entities: Any = None, tags: Any = None) -> int:
-    """一条正文的**信息量分**（0 = 没有可归纳的东西）。
+    """The **informativeness score** of one content body (0 = nothing worth
+    summarizing).
 
-    判据全确定性、不引模型——这一层是给宿主挑"值得归纳什么"的，判据本身
-    要是黑箱，就没法解释为什么某个主题没被挑上。
+    The criteria are fully deterministic, no models -- this layer exists so
+    the host can pick "what is worth summarizing"; if the criteria
+    themselves were a black box, there would be no explaining why some topic
+    was not picked.
 
-    加分项（可累加）：
-      * **保底 1 分**：只要不是套话、不是空的，就算"有内容"；
-      * 归一化后 ≥20 字 +1；
-      * 含阿拉伯数字 +1（硬信息；中文数字刻意不算——中文库里太常见，
-        算进来就没有区分度了）；
-      * 带实体或标签 +1（讲到了具体对象）。
+    Scoring additions (cumulative):
+      * **A floor of 1 point**: as long as it is not filler and not empty,
+        it counts as "has content";
+      * ≥20 chars after normalization +1;
+      * contains Arabic numerals +1 (hard information; Chinese numerals are
+        deliberately not counted -- too common in Chinese libraries, counting
+        them would destroy discriminability);
+      * has entities or tags +1 (it touches concrete objects).
 
-    直接判 0 的：空、套话表命中（含重复折叠后命中）。
+    Scored 0 outright: empty, or a filler-table hit (including after
+    repetition folding).
 
-    🔴 **为什么给保底分（实测踩出来的，不能改回去）**：第一版按"≥8 字才
-    +1"判，结果 `test_knowledge_tool_face` 的样本文本「青蒿 工艺 要点」
-    （6 字）被判 0 分 ⇒ 所有真主题被判成假簇 ⇒ **pending 直接归零**。
-    **短 ≠ 没有信息量**——知识点标题天生就短。判"有没有信息量"和判
-    "是不是套话"是两件事，只有后者该判 0。
+    🔴 **Why the floor point exists (learned the hard way; must not be
+    reverted)**: the first version gave +1 only at "≥8 chars", and the
+    `test_knowledge_tool_face` sample text 「青蒿 工艺 要点」 (6 chars) scored
+    0 ⇒ every real topic was judged a fake cluster ⇒ **pending dropped
+    straight to zero**. **Short ≠ uninformative** -- knowledge-point titles
+    are short by nature. "Has information?" and "is filler?" are two
+    different judgments; only the latter deserves a 0.
     """
     text = " ".join(str(content or "").split())
     if not text:
@@ -644,7 +762,7 @@ def info_score(content: Any, entities: Any = None, tags: Any = None) -> int:
         return 0
     if len(norm) <= 1:
         return 0
-    # 保底 1 分：不是套话就算有内容（见 docstring 那条实测教训）
+    # Floor of 1 point: not filler means it has content (see the hard-won lesson in the docstring)
     score = 1
     if len(norm) >= 20:
         score += 1
@@ -656,7 +774,8 @@ def info_score(content: Any, entities: Any = None, tags: Any = None) -> int:
 
 
 def info_ratio_of(members: Sequence[dict[str, Any]]) -> float:
-    """簇内**有信息量成员的占比**（0.0–1.0）。空簇返回 0.0。"""
+    """The **share of informative members** in the cluster (0.0-1.0).
+    Returns 0.0 for an empty cluster."""
     if not members:
         return 0.0
     ok = 0
@@ -668,22 +787,28 @@ def info_ratio_of(members: Sequence[dict[str, Any]]) -> float:
 
 
 def low_info_topic_ids(topics: dict[str, dict[str, Any]]) -> list[str]:
-    """被判为假簇（低信息量）的主题 id，按地图顺序。
+    """Ids of topics judged fake clusters (low informativeness), in map
+    order.
 
-    给 stats 自曝用。🔴 **必须自曝**：这些簇被排除出 pending 了，不说就是
-    静默消失——宿主会以为"都归纳完了"。
+    For stats self-reporting. 🔴 **Must be self-reported**: these clusters
+    are excluded from pending; not saying so means they vanish silently --
+    the host would believe "everything is summarized".
     """
     return [str(t.get("id")) for t in ordered(topics)
             if t.get("low_info")]
 
 
 def layer_epoch(topics: dict[str, Any] | None) -> int:
-    """这一层属于第几代 = 层内所有簇的最大 ``_epoch``（没有则 0）。
+    """Which generation this layer belongs to = the maximum ``_epoch`` over
+    all clusters in the layer (0 if absent).
 
-    合并时用它判「谁更新鲜」：**高的整代覆盖，同代才走键并集**。
-    取 max 而不是取「层顶字段」，是因为层本身是 ``{topic_id: topic}``，
-    往层里塞一个非簇的顶层键会被当成一簇（``len(topics)``、地图、
-    ``host_summary_stats`` 全都遍历 values）——污染面太大。
+    Merges use it to decide "who is fresher": **the higher generation
+    overwrites wholesale; only the same generation merges by key union**.
+    Taking the max instead of a "top-of-layer field" is because the layer
+    itself is ``{topic_id: topic}`` -- stuffing a non-cluster top-level key
+    into the layer would be counted as a cluster (``len(topics)``, the map,
+    and ``host_summary_stats`` all iterate values) -- far too much pollution
+    surface.
     """
     if not isinstance(topics, dict) or not topics:
         return 0
@@ -705,17 +830,22 @@ def migrate_host_summaries(
     new: dict[str, dict[str, Any]],
     min_overlap: float = 0.5,
 ) -> list[dict[str, Any]]:
-    """重建时把旧的**宿主归纳**按成员重叠搬到新簇上。
+    """On rebuild, carry old **host summaries** onto new clusters by member
+    overlap.
 
-    归纳是宿主花力气写的、本系统永远不会自动生成——重建把簇边界重画
-    一遍就把它们全丢了，是最伤的一类沉默。所以哪怕边界变了也要搬，
-    搬过去之后**故意不重算签名**：成员数与签名对不上 ⇒ 地图把它标成
-    stale（⚠️）⇒ 提醒宿主「这条的依据变过，需要复核」。这比假装它
-    还是原来那条要诚实。
+    Summaries are written with real host effort and this system will never
+    generate them automatically -- a rebuild redraws cluster boundaries and
+    would drop every one of them, the most damaging kind of silence. So they
+    are carried even across changed boundaries, and after carrying, the
+    signature is **deliberately not recomputed**: member count vs signature
+    mismatch ⇒ the map marks it stale (⚠️) ⇒ reminding the host that "the
+    basis for this one has changed; re-verify". That is more honest than
+    pretending it is still the original entry.
 
     Returns:
-        ``[{"from", "to", "overlap"}]``，没搬成的**不在列表里**——
-        调用方要用它自曝"丢了几条"，不能静默。
+        ``[{"from", "to", "overlap"}]``; failed carries are **not in the
+        list** -- the caller must use it to self-report "how many were
+        lost", never silently.
     """
     if not isinstance(old, dict) or not isinstance(new, dict):
         return []
@@ -735,7 +865,7 @@ def migrate_host_summaries(
         for nid, nt in new.items():
             if nid in taken or not isinstance(nt, dict):
                 continue
-            # 新簇自己已有归纳就不抢：旧归纳的边界更可疑
+            # If the new cluster already has a summary, do not seize it: the old summary's boundaries are more suspect
             if str(nt.get("summary_kind") or "") == SUMMARY_KIND_HOST:
                 continue
             nm = {str(x) for x in (nt.get("member_ids") or [])}
@@ -751,7 +881,7 @@ def migrate_host_summaries(
         nt["summary_kind"] = SUMMARY_KIND_HOST
         nt["summary_at"] = ot.get("summary_at", 0.0)
         nt["summary_evidence"] = list(ot.get("summary_evidence") or [])
-        # 签名/规模**照抄旧的**：与新簇成员对不上 ⇒ 判 stale ⇒ 提示复核。
+        # Signature/scale **copied verbatim from the old**: mismatch with the new cluster's members ⇒ judged stale ⇒ prompts re-verification.
         nt["summary_signature"] = ot.get("summary_signature", "")
         nt["summary_member_count"] = ot.get("summary_member_count", 0)
         taken.add(best_id)
@@ -767,16 +897,19 @@ def refresh(
     now: float | None = None,
     defaults: TopicDefaults | None = None,
 ) -> None:
-    """重算派生字段：标题 / 跨度 / 实体 / 标签 / 代表句 / 状态。
+    """Recompute derived fields: title / span / entities / tags /
+    representative sentences / status.
 
-    **只覆盖抽取式摘要**：宿主写回的（``summary_kind=host``）不动，否则
-    一次巩固就把人花力气写的归纳冲掉了——那是最伤信任的一类静默改写。
+    **Only overwrites extractive summaries**: host-written ones
+    (``summary_kind=host``) are untouched, otherwise a single consolidation
+    would wash away the summary a person put effort into -- the most
+    trust-damaging class of silent rewrite.
 
     Args:
-        topics: 主题表（原地修改）。
-        items_by_id: ``id -> item``（只要存活的成员）。
-        topn: 代表句条数，默认取 env / 3。
-        now: 时间戳基准（测试可注入固定值）。
+        topics: The topic table (modified in place).
+        items_by_id: ``id -> item`` (only the surviving members).
+        topn: Number of representative sentences; defaults to env / 3.
+        now: Timestamp basis (tests may inject a fixed value).
     """
     n = _def(defaults).summary_topn if topn is None else int(topn)
     stamp = now if now is not None else 0.0
@@ -789,9 +922,11 @@ def refresh(
         before = list(t.get("member_ids") or [])
         ids = [m for m in before if m in items_by_id]
         members = [items_by_id[m] for m in ids]
-        # 成员表随真相**收缩**：这是 reclip/build 之外的第三条路径（调用方
-        # 可能直接传了只含存活项的 items_by_id）。不收缩的话，失效 id 会永久
-        # 留在成员里——覆盖率算高、签名算歪、地图上的 size 也偏大。
+        # The member list **shrinks** with the truth: this is a third path
+        # besides reclip/build (the caller may pass an items_by_id that
+        # contains only surviving items). Without shrinking, invalidated ids
+        # stay in the membership forever -- coverage computes high,
+        # signatures compute crooked, and the map's size runs large.
         t["member_ids"] = ids
         t["size"] = len(ids)
         lost = len(before) - len(ids)
@@ -803,53 +938,63 @@ def refresh(
             t["summary_signature"] = ""
             t["summary_member_count"] = 0
             continue
-        # stale 描述的是「刚发现成员变了」，不是终身标签。每次刷新都从
-        # active 重判——否则一次抖动会让这个主题**永久** stale，而地图上
-        # stale 是要提醒人去看的，狼来了两次就没人看了。
+        # stale describes "just discovered the members changed", not a
+        # lifelong label. Every refresh re-judges from active -- otherwise
+        # one flap would make this topic **permanently** stale, and on the
+        # map stale exists to make people look; cry wolf twice and nobody
+        # looks.
         t["status"] = STATUS_ACTIVE
-        # 宿主命名过的标题不重算。兜底标题（最早成员前 12 字）是实测
-        # 痛点——多簇同名宿主分不清；而宿主在 fras.f 里起过名字的话，一次
-        # 巩固就把它抹回兜底，正是"最伤信任的静默改写"那一类。
+        # Host-named titles are not recomputed. The fallback title (first 12
+        # chars of the earliest member) is a measured pain point -- multiple
+        # clusters with the same name the host cannot tell apart; and if the
+        # host named it in fras.f, one consolidation would wipe it back to
+        # the fallback -- exactly the "most trust-damaging silent rewrite"
+        # class.
         if str(t.get("title_kind") or "") != TITLE_KIND_HOST:
             t["title"] = _title_of(members)
         ts = [float(m.get("timestamp") or 0.0) for m in members]
         t["span"] = [min(ts), max(ts)]
         t["entities"] = _top_entities(members, 3)
         t["tags"] = _top_tags(members, 3)
-        # 假簇判据：**正文信息量**。只标不删——删了会让成员重组成
-        # 新簇（宿主已写归纳的签名随之对不上），且删是真删除、没有墓碑。
-        # 标了之后由 :func:`pending_summary_ids` 决定要不要挑它去归纳。
+        # Fake-cluster criterion: **content informativeness**. Mark only,
+        # never delete -- deleting would let members re-form into new
+        # clusters (host-written summary signatures would stop matching),
+        # and deletion is a real deletion with no tombstone.
+        # After marking, :func:`pending_summary_ids` decides whether to pick
+        # it for summarization.
         ir = info_ratio_of(members)
         t["info_ratio"] = ir
         t["low_info"] = bool(ir < TOPIC_LOW_INFO_RATIO)
         if not t.get("created_at"):
             t["created_at"] = min(ts)
         t["updated_at"] = stamp or max(ts)
-        # 只填抽取式：宿主写回的归纳不覆盖（见 docstring）
+        # Fill extractive only: host-written summaries are not overwritten (see the docstring)
         if t.get("summary_kind") != SUMMARY_KIND_HOST:
             text, ev = _extractive_summary(t, members, norms, n)
             t["summary"] = text
             t["summary_evidence"] = ev
             t["summary_kind"] = SUMMARY_KIND_EXTRACTIVE if text else ""
-        # 失效占比：这次刷新发现有多少成员已经不算数了（before 与 ids 的差）
+        # Invalidated share: how many members this refresh found no longer count (the before-vs-ids difference)
         total = lost + len(ids)
         if lost and total and (lost / total) > TOPIC_STALE_RATIO:
             t["status"] = STATUS_STALE
 
-    # 撞名消歧放在**所有标题都算完之后**——逐条处理时看不到别的簇
-    # 用了什么名字，边算边改会让结果依赖遍历顺序。
+    # Name-collision disambiguation runs **after all titles are computed** --
+    # processing one by one cannot see what names other clusters took, and
+    # renaming while computing would make results depend on traversal order.
     disambiguate_titles(topics, items_by_id)
 
 
 # ----------------------------------------------------------------------
-# 统计（给 brain_stats / knowledge_map 用）
+# Stats (for brain_stats / knowledge_map)
 # ----------------------------------------------------------------------
 
 def coverage_of(topics: dict[str, dict[str, Any]], active_total: int) -> dict[str, Any]:
-    """覆盖率自曝。
+    """Coverage self-report.
 
-    空库报 ``None`` + ``unknown``，**不报 0**——"0 条"和"无从判断"是两件事，
-    报 0 会让宿主以为"这个库真的什么都没归进去"。
+    An empty library reports ``None`` + ``unknown``, **not 0** -- "0
+    records" and "cannot tell" are two different things; reporting 0 would
+    make the host believe "this library really has nothing assigned".
     """
     assigned = len({m for t in topics.values() for m in (t.get("member_ids") or [])})
     if not active_total:
@@ -865,8 +1010,10 @@ def coverage_of(topics: dict[str, dict[str, Any]], active_total: int) -> dict[st
     cov = assigned / active_total
     note = ""
     if cov > 1.0:
-        # 分子超过分母 ⇒ 有主题仍引用非 active 记录（重裁没跑 / 跑晚了）。
-        # 报 >100% 把人当傻子，静默截断又藏住真问题 ⇒ 截断 + 自曝。
+        # Numerator exceeds denominator ⇒ some topic still cites non-active
+        # records (re-adjudication not run / run late). Reporting >100%
+        # insults the reader, silently truncating hides the real problem ⇒
+        # truncate + self-report.
         note = ("assigned 超过 active 总数：有主题仍引用非 active 记录"
                 "（重裁未跑或跑晚了）")
         cov = 1.0
@@ -891,7 +1038,8 @@ def by_status(topics: dict[str, dict[str, Any]]) -> dict[str, int]:
 
 
 def ordered(topics: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """地图排序：规模 × 新近 × 被召回次数（确定性，同分时按 id 兜底）。"""
+    """Map ordering: size × recency × recall hits (deterministic; id as the
+    tiebreaker)."""
     return sorted(
         topics.values(),
         key=lambda t: (-int(t.get("size") or 0),
@@ -901,58 +1049,83 @@ def ordered(topics: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 # ----------------------------------------------------------------------
-# 宿主归纳写回
+# Host summary write-back
 # ----------------------------------------------------------------------
 #
-# 本模块自身只给得出「代表句」——离质心最近的几条原文摘录，它回答的是「这个主题
-# 大概在说什么」。用户要的「上层知识」是**归纳**：把 N 条事实写成一句结论。
-# 那一步需要智能，而生产路径不内嵌 LLM 是本项目的边界，
-# 所以做法是一个**写回通道**：hippo 出素材 → 宿主归纳 → 写回落库。
+# This module by itself can only produce "representative sentences" -- a few
+# original excerpts closest to the centroid, answering "what is this topic
+# roughly about". The "higher-level knowledge" the user wants is a
+# **summary**: writing N facts into one conclusion. That step needs
+# intelligence, and the production path not embedding an LLM is this
+# project's boundary, so the approach is a **write-back channel**: hippo
+# produces the material → the host summarizes → write back and persist.
 #
-# 这一层因此有两种 summary，必须分得清、且不能被互相覆盖：
-#   * extractive —— 本模块随时可重算，丢了不心疼；
-#   * host       —— 宿主花力气写的，**任何自动流程都不许覆盖它**。
-# 所以这里只提供「写 / 撤 / 查状态」，不提供「自动改写」。
+# This layer therefore has two kinds of summary that must be kept distinct
+# and must never overwrite each other:
+#   * extractive -- this module can recompute it any time; losing it costs
+#     nothing;
+#   * host       -- written with real host effort; **no automatic flow may
+#     ever overwrite it**.
+# So this module offers only "write / revert / query state", never
+# "automatic rewriting".
 
-# 归纳文本长度上限。层文件随它膨胀，且过长的"归纳"通常说明宿主把素材
-# 原样粘回来了——那还不如不写（直接读代表句即可）。
+# Length cap for summary text. The layer file grows with it, and an
+# over-long "summary" usually means the host pasted the material back
+# verbatim -- which is worse than not writing one (just read the
+# representative sentences).
 SUMMARY_MAX_LEN = 2000
-# 出处条数上限。这一层的价值在于**能回指 L1**，所以出处必须精简到"够验证"。
+# Cap on evidence entries. This layer's value is **being able to point back
+# to L1**, so evidence must stay trimmed to "enough to verify".
 SUMMARY_EVIDENCE_MAX = 20
-# 素材（brief）每条正文截断长度。
+# Per-entry content clip length for the brief material.
 TOPIC_EVIDENCE_CLIP = 200
 
 # ----------------------------------------------------------------------
-# 宿主归纳的轻量 FRAS 四字段契约
+# The lightweight FRAS four-field contract for host summaries
 # ----------------------------------------------------------------------
-# 借鉴前作创作契约的 FRAS 四字段（F 职责 / R 强关系 / A 契约 /
-# S 不可推断约束），按主题层形态裁剪为四键：
+# Borrowed from the previous work's creation contract: the FRAS four fields
+# (F role / R strong relations / A contract / S non-inferable constraints),
+# trimmed to four keys for the topic layer's shape:
 #
-#   f —— 范畴：这个主题是什么（一句话，直接当标题用）
-#   r —— 关联：必须一起看的实体 / 相关主题（list）
-#   a —— 可引用的结论：这一条的本体（maps/开场包显示的那句话）
-#   s —— 不可推断的约束：a 推不出来、但搞错就出事的例外与边界
+#   f -- category: what this topic is (one sentence, used directly as the
+#        title)
+#   r -- relations: entities / related topics that must be read together
+#        (list)
+#   a -- citable conclusion: the substance of this entry (the sentence shown
+#        on maps / the opening package)
+#   s -- non-inferable constraints: exceptions and boundaries that cannot be
+#        derived from a, but getting them wrong causes damage
 #
-# 两个设计纪律：
-#   ① **S 的准入标准是"推不出来 + 防错"**，不许复述 a——确实没有也要显式
-#      写"无"，空着会被当成没填而整条拒绝；
-#   ② **结构不过就整条拒绝**（一个字段都不改）——改一半比不改更难查。
-# 为什么值得加：实测的两个痛点——标题兜底取"最早成员前 12 字"导致
-# 多簇同名宿主分不清；簇的"纯度"会被写法相似骗过。逼宿主写出 f/s 是已知
-# 最便宜的过滤器：**写不出 s 的簇大概率不是真主题**。
+# Two design disciplines:
+#   ① **S's admission bar is "not derivable + prevents errors"**; repeating
+#      a is not allowed -- if there genuinely is none, write "无" (none)
+#      explicitly; leaving it empty is treated as unfilled and the whole
+#      entry is refused;
+#   ② **Structure failure refuses the whole entry** (not one field changed)
+#      -- half a change is harder to audit than no change.
+# Why it is worth adding: two measured pain points -- the title fallback
+# taking "the earliest member's first 12 chars" left multiple same-named
+# clusters the host could not tell apart; a cluster's "purity" could be
+# fooled by similar writing style. Forcing the host to write f/s is the
+# cheapest known filter: **a cluster that cannot produce an s is probably
+# not a real topic**.
 FRAS_KEYS = ("f", "r", "a", "s")
-FRAS_F_MAX = 80       # 范畴是标题级：一行放得下
-FRAS_R_MAX = 10       # 关联条目数上限
-FRAS_S_MAX = 400      # 约束字段上限（a 复用 SUMMARY_MAX_LEN）
-#: 标题被宿主命名过的标记。没有它，refresh 每次都会用 _title_of 重算标题，
-#: 宿主起的名字（以及撞名区分）会被一次巩固静默抹掉。
+FRAS_F_MAX = 80       # the category is title-grade: fits on one line
+FRAS_R_MAX = 10       # cap on relation entries
+FRAS_S_MAX = 400      # cap on the constraints field (a reuses SUMMARY_MAX_LEN)
+#: Marker that a title was named by the host. Without it, refresh would
+#: recompute the title with _title_of every time, and the host's chosen name
+#: (plus collision disambiguation) would be silently wiped by one
+#: consolidation.
 TITLE_KIND_HOST = "host"
 
 
 def validate_fras(fras: Any) -> tuple[dict[str, Any] | None, str]:
-    """校验四字段结构。返回 ``(parsed, error)``；error 非空即整条拒绝。
+    """Validate the four-field structure. Returns ``(parsed, error)``; a
+    non-empty error means the whole entry is refused.
 
-    ``fras=None`` 是合法输入（老宿主只写自由文本），返回 ``(None, "")``。
+    ``fras=None`` is a legal input (older hosts write only free text) and
+    returns ``(None, "")``.
     """
     if fras is None:
         return None, ""
@@ -991,12 +1164,16 @@ def validate_fras(fras: Any) -> tuple[dict[str, Any] | None, str]:
 
 
 def signature_of(member_ids: Any) -> str:
-    """成员集合指纹：记录「这条归纳是在哪一批成员上做的」。
+    """Member-set fingerprint: records "which batch of members this summary
+    was made on".
 
-    为什么需要它：宿主写的归纳是对**当时**那批成员的判断。成员后来变了
-    （新增 / 删除 / 作废），归纳可能已经不再成立。但它不能因此被自动改写
-    ——refresh 不覆盖 host 是同一条纪律。所以做法是**只标注不覆盖**：签名
-    对不上就在读取时报 ``stale=True``，由宿主自己决定要不要重写。
+    Why it is needed: a host summary is a judgment about the members **as
+    they were**. Members later change (additions / deletions / supersedes)
+    and the summary may no longer hold. But it must not be automatically
+    rewritten for that -- refresh not overwriting host is the same
+    discipline. So the approach is **annotate only, never overwrite**: on a
+    signature mismatch, reads report ``stale=True`` and the host decides
+    whether to rewrite.
     """
     ids = sorted({str(m) for m in (member_ids or [])})
     return hashlib.sha1("\n".join(ids).encode("utf-8")).hexdigest()[:12]
@@ -1010,38 +1187,48 @@ def apply_host_summary(
     now: float = 0.0,
     fras: Any = None,
 ) -> tuple[bool, str]:
-    """把宿主的归纳写回主题。**校验失败一律拒绝写**，不静默降级。
+    """Write the host's summary back onto the topic. **Validation failure
+    always refuses the write**; no silent degradation.
 
-    四条硬校验（任一条不满足就整条退回并给出原因）：
+    Four hard validations (failing any one returns the whole entry with a
+    reason):
 
-      1. 文本非空且不超过 ``SUMMARY_MAX_LEN`` —— 空写回会把「没归纳」伪装成
-         「归纳过了」，超长则会把层文件撑爆（它每次 save 都要读-合并-写）；
-      2. ``evidence`` 里的 id 必须是本主题的**成员** —— 凭空引用等于伪造出
-         处，而这一层相对 L2 的全部优势就是能回指到 L1；
-      3. 出处条数不超过 ``SUMMARY_EVIDENCE_MAX``；
-      4. （FRAS）``fras`` 给了就四键齐全（见 :func:`validate_fras`）——
-         结构不过整条拒绝，一个字段都不改。
+      1. Text non-empty and not over ``SUMMARY_MAX_LEN`` -- an empty write
+         back disguises "not summarized" as "summarized"; over-long text
+         bloats the layer file (every save re-reads and re-merges it);
+      2. Ids in ``evidence`` must be **members** of this topic -- citing out
+         of thin air equals forging provenance, and this layer's entire
+         advantage over L2 is being able to point back into L1;
+      3. Evidence count not over ``SUMMARY_EVIDENCE_MAX``;
+      4. (FRAS) when ``fras`` is given, all four keys must be present (see
+         :func:`validate_fras`) -- structure failure refuses the whole
+         entry, not one field changed.
 
     Args:
-        topic: 主题（原地修改）。
-        text: 归纳文本。**只传 fras 时可留空**——那时用 ``fras.a``
-            （可引用的结论）作为一句话，少让宿主写一遍。
-        evidence: 出处（L1 记忆 id）。留空表示"这条结论不单挂某几条"。
-        member_ids: 当前成员集合（省略则用 topic 自己的）。
-        now: 写回时间戳。
-        fras: 可选的 FRAS 四字段结构。给了就把标题交给 ``fras.f``
-            （``title_kind=host``，refresh 不再重算标题），并整体存进
-            ``summary_fras``。
+        topic: The topic (modified in place).
+        text: Summary text. **May be left empty when only fras is passed** --
+            ``fras.a`` (the citable conclusion) then serves as the sentence,
+            sparing the host from writing it twice.
+        evidence: Provenance (L1 memory ids). Empty means "this conclusion
+            is not pinned to specific records".
+        member_ids: The current member set (omitted, the topic's own is
+            used).
+        now: Write-back timestamp.
+        fras: The optional FRAS four-field structure. When given, the title
+            is handed to ``fras.f`` (``title_kind=host``; refresh stops
+            recomputing the title) and the whole structure is stored in
+            ``summary_fras``.
 
     Returns:
-        ``(ok, error)``。ok 为 False 时 topic **一个字段都没改**。
+        ``(ok, error)``. When ok is False, **not one field** of topic was
+        changed.
     """
     parsed, fras_err = validate_fras(fras)
     if fras_err:
         return False, fras_err
     txt = " ".join(str(text or "").split())
     if not txt and parsed:
-        # 只给四字段：一句话结论就是 a（friction 降到最低，且口径唯一）
+        # Four fields only: the one-sentence conclusion is a (minimal friction, and a single canonical wording)
         txt = parsed["a"]
     if not txt:
         return False, "summary 为空：空写回会把「没归纳」伪装成「归纳过了」"
@@ -1067,8 +1254,10 @@ def apply_host_summary(
     topic["summary_member_count"] = len(members)
     if parsed:
         topic["summary_fras"] = parsed
-        # 标题交给宿主：兜底标题（最早成员前 12 字）是实测踩过的痛点
-        # （多簇同名、宿主分不清）。title_kind 让 refresh 不再重算它。
+        # Hand the title to the host: the fallback title (the earliest
+        # member's first 12 chars) is a measured pain point (multiple
+        # same-named clusters, host cannot tell them apart). title_kind
+        # stops refresh from recomputing it.
         topic["title"] = parsed["f"]
         topic["title_kind"] = TITLE_KIND_HOST
     if now:
@@ -1077,14 +1266,19 @@ def apply_host_summary(
 
 
 def revert_host_summary(topic: dict[str, Any]) -> tuple[bool, str]:
-    """撤销宿主归纳（回退到抽取式代表句）。
+    """Revert the host summary (fall back to extractive representative
+    sentences).
 
-    写错了要能撤——不然一个坏归纳会永久占着这个主题，而自动流程又不敢动它。
-    清空字段后**立即生效**，下次 refresh 会填回抽取式。
+    A mistake must be revertible -- otherwise one bad summary occupies the
+    topic forever while automatic flows dare not touch it. Clearing the
+    fields takes effect **immediately**; the next refresh refills the
+    extractive form.
 
-    宿主命名过的标题（``title_kind=host``）跟着归零——标题是归纳的
-    一部分，撤了归纳却留着宿主起的名字，下次 refresh 又不会重算它，
-    主题就顶着一个谁也对应不上的标题。自动标题不动。
+    A host-named title (``title_kind=host``) is zeroed along with it -- the
+    title is part of the summary; reverting the summary while keeping the
+    host's chosen name, which the next refresh will not recompute, leaves
+    the topic wearing a title nothing corresponds to. Automatic titles are
+    untouched.
     """
     if str(topic.get("summary_kind") or "") != SUMMARY_KIND_HOST:
         return False, "这个主题没有宿主归纳可撤销（当前不是 host 归纳）"
@@ -1097,7 +1291,7 @@ def revert_host_summary(topic: dict[str, Any]) -> tuple[bool, str]:
     topic.pop("summary_fras", None)
     if str(topic.get("title_kind") or "") == TITLE_KIND_HOST:
         topic.pop("title_kind", None)
-        topic["title"] = ""   # 下次 refresh 用 _title_of 重填
+        topic["title"] = ""   # refilled by _title_of on the next refresh
     return True, ""
 
 
@@ -1105,10 +1299,11 @@ def summary_state(
     topic: dict[str, Any],
     current_member_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """这条归纳现在是什么状态（供宿主判断要不要重写）。
+    """The current state of this summary (for the host to decide whether to
+    rewrite).
 
-    ``stale=True`` 的含义是**成员集合变了**，不是"内容错了"。本模块判断不了
-    内容，只负责把这个事实摆出来。
+    ``stale=True`` means **the member set changed**, not "the content is
+    wrong". This module cannot judge content; it only surfaces that fact.
     """
     kind = str(topic.get("summary_kind") or "")
     now_ids = list(current_member_ids if current_member_ids is not None
@@ -1124,8 +1319,10 @@ def summary_state(
         "member_count_at_write": int(topic.get("summary_member_count") or 0),
         "member_count_now": len(set(str(m) for m in now_ids)),
         "signature": sig_now,
-        # 四字段契约（FRAS）的回显（没写就是 None）——宿主据此确认结构落库了，
-        # 也知道这条归纳有没有把"范畴/关联/结论/约束"分开记。
+        # Echo of the four-field contract (FRAS) (None if not written) -- the
+        # host uses it to confirm the structure persisted, and to know
+        # whether this summary recorded "category/relations/conclusion/
+        # constraints" separately.
         "has_fras": bool(topic.get("summary_fras")),
         "fras": topic.get("summary_fras") or None,
         "title_kind": str(topic.get("title_kind") or ""),
@@ -1137,13 +1334,17 @@ def representative_ids(
     items_by_id: dict[str, dict[str, Any]],
     limit: int,
 ) -> list[str]:
-    """归纳素材的顺序：**离质心最近**优先。
+    """Ordering of summary material: **closest to the centroid** first.
 
-    为什么不是按时间：素材服务的是"这个主题在说什么"，代表性问题用代表性
-    排序直接回答；时间序会把最早一批（可能已被后续推翻）顶在最前面，而它们
-    恰恰最占 token。需要看演进时宿主可以自己按 span 去 recall。
+    Why not by time: the material serves "what is this topic about"; a
+    representativeness question is answered directly by a representativeness
+    ordering. Time order would push the earliest batch (possibly already
+    overturned by later records) to the front, and they are exactly the most
+    token-hungry. When evolution matters, the host can recall by span
+    itself.
 
-    只返回**当前还活着**的成员（传进来的 items_by_id 就是 active 的）。
+    Only members **currently alive** are returned (the items_by_id passed in
+    is already active-only).
     """
     ids = [m for m in (topic.get("member_ids") or []) if m in items_by_id]
     if not ids or limit <= 0:
@@ -1171,26 +1372,34 @@ def pending_summary_ids(
     exclude_low_info: bool | None = None,
     defaults: TopicDefaults | None = None,
 ) -> list[str]:
-    """「还值得归纳」的主题 id（按地图顺序，确定性）。
+    """Ids of topics that are "still worth summarizing" (map order,
+    deterministic).
 
-    判定四连，全部为真才算 pending：
-      1) 未归档（成员被删空的主题不算）；
-      2) ``size >= min_size``（默认 :data:`TOPIC_MIN_SIZE_FOR_SUMMARY`）；
-      3) 还没有 host 归纳，**或者**已有归纳但成员集合变了（``stale``）；
-      4) **不是假簇**（``low_info`` 为真则跳过，见 :func:`info_score`）。
+    A four-part test; all must hold to count as pending:
+      1) not archived (topics whose members were all deleted do not count);
+      2) ``size >= min_size`` (default :data:`TOPIC_MIN_SIZE_FOR_SUMMARY`);
+      3) no host summary yet, **or** a summary exists but the member set
+         changed (``stale``);
+      4) **not a fake cluster** (skip when ``low_info`` is true; see
+         :func:`info_score`).
 
-    第 3 条是「续跑」的关键：归纳是稀缺资产，已经写好且依据没变的**不该重做**
-    ——重做只会把一条确认过的好结论换成一次模型抽风。
+    Part 3 is the key to "resuming": summaries are a scarce asset; one
+    already written on an unchanged basis **must not be redone** -- redoing
+    only trades a confirmed good conclusion for one bout of model noise.
 
-    🔴 **第 4 条必须配自曝**：被它挡掉的主题从待归纳列表里**消失**了，宿主
-    看不见就不知道有这一批 ⇒ 调用方要把
-    :func:`low_info_topic_ids` 的数报出去（``pending_excluded_low_info``）。
-    ``low_info`` 字段缺失的旧层**一律放行**（没判过就不判，不误杀）。
+    🔴 **Part 4 must come with self-reporting**: the topics it blocks
+    **disappear** from the to-summarize list; what the host cannot see, it
+    does not know exists ⇒ the caller must report
+    :func:`low_info_topic_ids`'s count (``pending_excluded_low_info``).
+    Old layers missing the ``low_info`` field are **always allowed through**
+    (never judged, never misjudged).
 
     Args:
-        exclude_low_info: 是否排除假簇。None = 按 :data:`ENV_TOPIC_LOW_INFO`
-            （默认开），可由 ``defaults`` 的 :attr:`TopicDefaults.low_info` 覆盖。
-        d: :class:`TopicDefaults` 注入包（brain 组合根装配）。
+        exclude_low_info: Whether to exclude fake clusters. None = per
+            :data:`ENV_TOPIC_LOW_INFO` (default on), overridable by
+            ``defaults``'s :attr:`TopicDefaults.low_info`.
+        d: The :class:`TopicDefaults` injection pack (assembled by the brain
+            composition root).
     """
     lo = TOPIC_MIN_SIZE_FOR_SUMMARY if min_size is None else int(min_size)
     flag = _def(defaults).low_info if exclude_low_info is None \
@@ -1214,11 +1423,13 @@ def pending_summary_ids(
 
 
 def host_summary_stats(topics: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """归纳进度自曝：宿主归纳了几个主题、几个的依据成员已经变了。
+    """Summarization progress self-report: how many topics the host
+    summarized, how many have a changed member basis.
 
-    这两个数是「梳理进度」的验收口径——没有它们，只能靠感觉。
-    ``host_stale`` 尤其重要：它数的是"写过归纳、但成员后来变了"的主题，
-    这些是最该拿回宿主重写的一批。
+    These two numbers are the acceptance wording of "curation progress" --
+    without them it is all gut feeling. ``host_stale`` matters most: it
+    counts the topics "summarized, but members changed later" -- the batch
+    that most needs to go back to the host for a rewrite.
     """
     kinds: dict[str, int] = {"host": 0, "extractive": 0, "none": 0}
     stale = 0
@@ -1237,10 +1448,13 @@ def host_summary_stats(topics: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 != signature_of(t.get("member_ids") or [])):
             stale += 1
     kinds["host_stale"] = stale
-    # 假簇数。它进 stats 是**硬需求**不是装饰：这些簇被挡在
-    # pending 之外，不报出来宿主会以为"全部归纳完了"。
+    # Fake-cluster count. It is in stats as a **hard requirement**, not
+    # decoration: these clusters are kept out of pending; unreported, the
+    # host would believe "everything is summarized".
     kinds["low_info"] = low_info
-    # 带四字段结构的 host 归纳数。自由文本仍然合法，这一格只是让
-    # "结构覆盖率"看得见——将来要按域机器处理归纳时，没有结构就没法处理。
+    # Count of host summaries carrying the four-field structure. Free text
+    # remains legal; this cell only makes the "structure coverage" visible --
+    # when summaries need machine processing per domain someday, no structure
+    # means no processing.
     kinds["with_fras"] = with_fras
     return kinds

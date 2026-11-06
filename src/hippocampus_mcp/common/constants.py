@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-"""全包最底层的支撑模块：阈值常量表 + 无 ``self`` 的纯函数。
+"""The lowest-level support module in the package: threshold constants + pure functions with no ``self``.
 
-本模块**只 import 标准库**，不 import 包内任何模块 —— 这是它能被 ``brain`` /
-``map`` / ``file_registry`` 等各层同时依赖的前提；一旦反向依赖，就会出现
-层级倒挂或循环导入。本模块从包根层拆入 ``common/``（分层重构的产物）。
+**Imports only the standard library**, nothing else from the package -- the precondition for being depended on at the
+same time by ``brain`` / ``map`` / ``file_registry`` etc.; any reverse dependency produces an inverted hierarchy or a
+circular import. Split out of the package root into ``common/`` (a product of the layering refactor).
 
-这些符号与 HippoBrain 的实例状态**完全无关**：它们在类出现之前就已求值
-完毕，所以搬动不引入任何新的依赖方向。
+Symbols are **completely independent** of HippoBrain instance state: fully evaluated before the class exists, so moving
+them introduces no new dependency direction.
 
-``brain`` 侧 ``from ..common.constants import *`` 保持对外导入兼容 ——
-包外有 20+ 个脚本直接 ``from hippocampus_mcp.brain import NAV_TAG_KEY``
-这类常量，一行都不能断。
+``brain`` keeps ``from ..common.constants import *`` for external import compatibility -- 20+ scripts outside the
+package do ``from hippocampus_mcp.brain import NAV_TAG_KEY`` and the like; not a single line of that may break.
 
-⚠️ ``__all__`` 必须显式列出**下划线开头**的符号（``_now`` / ``_nid`` /
-``_STOPWORDS`` / ``_env_int`` …）：``import *`` 默认不导出它们，漏了就是
-运行期 NameError，而且只在某些代码路径上炸。
+⚠️ ``__all__`` must explicitly list the **underscore-prefixed** symbols (``_now`` / ``_nid`` / ``_STOPWORDS`` /
+``_env_int`` ...): ``import *`` does not export them by default; a missing one is a runtime NameError, exploding only
+on certain code paths.
 """
 
 from __future__ import annotations
@@ -27,251 +26,248 @@ import time
 import uuid
 from typing import Any
 
-# 与拆分前 **同名**：拆分前这些函数里的 logger 就是 brain 模块的 logger，
-# 硬编码名字才能让搬走后的日志行为逐位等价（不改 logger 名、不改 handler）。
+# **Same name** as before the split: the logger inside these functions was the brain module's logger; hardcoding the
+# name keeps the log behavior bit-for-bit equivalent after the move (no logger rename, no handler change).
 logger = logging.getLogger("hippocampus_mcp.brain")
 
-# ── 阈值常量（可直接调参，出处多为真库实测）──────────────────
-RELEVANCE_HARD_FLOOR = 0.30   # 相似度硬门槛：低于此值直接淘汰
-MMR_LAMBDA = 0.7              # MMR 相关性-多样性权衡
-# MMR「字面强命中豁免」：BM25 单路排名前 N 的候选豁免多样性惩罚。
-#
-# 由来（中文小说库 9359 条实测）：
-#   "顾父知情三拍是哪几章" 在 BM25 单路 top1 / 裸向量 top5 / 关掉 MMR 的完整路
-#   都能命中含 ch43 的正解，唯独**开 MMR** 的完整路漏掉它——
-#   MMR 把"与已选项近义、但带具体章号/数字的那条"当成冗余折叠了。
-#   而这类"同一事实的多个表述版本"恰恰是强约束写作项目最需要看到的：
-#   被折叠掉的往往就是带锚点/章号/数额的那一条。
-#
-# 只豁免 BM25 单路前 N 名（默认 3），不是全面关掉 MMR：
-#   豁免面越大越接近"无多样性"，top_k 会被同一话题的近似表述占满。
+# ── Threshold constants (directly tunable; most values measured on real libraries) ──────────────────
+RELEVANCE_HARD_FLOOR = 0.30   # hard similarity gate: below this, candidates are dropped outright
+MMR_LAMBDA = 0.7              # MMR relevance-diversity tradeoff
+# MMR "literal strong-hit exemption": candidates ranked in the BM25 single-channel top N are exempt from the diversity
+# penalty. Origin (measured on a Chinese novel library, 9359 entries): "顾父知情三拍是哪几章" hits the ch43-bearing
+# correct answer via BM25 top1 / raw-vector top5 / full pipeline with MMR off, but the **full pipeline with MMR on**
+# misses it -- MMR folded the entry near-synonymous with the already-selected ones but carrying a concrete chapter
+# number / figure as redundant; yet multiple phrasings of one fact are exactly what a strongly-constrained writing
+# project most needs (what gets folded away is usually the entry with the anchor / chapter number / amount). Only the
+# BM25 top N (default 3) are exempt -- MMR is not switched off wholesale: the wider the exemption, the closer to
+# "no diversity", and top_k fills up with near-identical phrasings of one topic.
 MMR_LITERAL_EXEMPT_TOPN = 3
-# ingest 回显"疑似相关"的相似度下限。
-# 上界不用设——>= dedup 阈值（0.85）的已经**并入**同一条，由 ``merged_into`` 回显；
-# 但已作废/已归档的记忆不参与合并，它们恰恰是"旧口径"的主要藏身处，
-# 所以这里不设上界，让 superseded 的老版本也能被看见。
+# Similarity floor for ingest's "possibly related" echo. No ceiling needed -- entries at or above the dedup threshold
+# (0.85) have already been **merged into** the same entry and echoed via ``merged_into``; superseded/archived memories
+# do not merge, and they are precisely where "old framings" hide -- so no ceiling: older superseded versions stay visible.
 INGEST_NEIGHBOR_MIN_SIM = 0.60
-# 未命中留痕阈值。**不要拍脑袋往上调**：
-# 实测（中文小说库 9359 条）真命中的 top1 相似度只有 0.32~0.53
-# （"ch43 的知情线锚点"命中时 sim=0.356），定 0.50 会把真命中记成未命中。
-# 这里取召回自身的硬门槛——低于它意味着连硬门槛都没过，才算真的没找到。
+# Miss-log threshold. **Do not raise it on a hunch**: measured on the Chinese novel library (9359 entries), true hits'
+# top1 similarity is only 0.32~0.53 ("ch43 的知情线锚点" hit at sim=0.356); setting 0.50 would record true hits as misses.
+# This takes recall's own hard gate -- below it means even the hard gate was not passed; only that truly counts as "not found".
 MISS_LOG_THRESHOLD = RELEVANCE_HARD_FLOOR
-# 留痕最多保留多少条（超出丢最旧的）。留痕是给归因分析用的，不是审计日志，
-# 没有上限会在长期运行的库里无声膨胀。
+# How many miss-log entries to keep at most (oldest dropped beyond that). The miss log is for attribution analysis,
+# not an audit log; without a cap it bloats silently in a long-running library.
 MISS_LOG_MAX = 500
 
-# 全局待办（open_topics）最多保留多少条（超出裁最旧的）。与 miss_log 同理：
-# 纯追加 + 无上限会在长期运行的库里无声膨胀（实测反馈 2026-10-31）。
+# How many global open intents (open_topics) to keep at most (oldest trimmed beyond that). Same reasoning as miss_log:
+# append-only + uncapped bloats silently in a long-running library (field feedback 2026-10-31).
 OPEN_TOPICS_MAX = 50
 
-# --- 删除账本：派生层「真删除」的立碑日志 ---
-# 并集表达不了减法。实体 / 画像这类**派生副本**靠「合并后按当前存活记忆重裁」
-# 就够了，但 miss_log 这类**独立账本**被删了就是真删了，没有可重裁的源头。
-# 实测复现：A 进程调 miss_log(clear=True)
-# 清空并落盘 → B（手里还是旧快照）一次 save，3 条被完整并回来，全程无报错。
-# 所以要有一份删除账本：谁删了哪一层的哪个键、什么时候删的，合并时据此拦。
+# --- Deletion ledger: a tombstone log for "true deletions" in the derived layer ---
+# Union cannot express subtraction. Derived copies (entities / profiles) can rely on "re-deriving from currently-alive
+# memories after merge", but an **independent ledger** such as miss_log, once deleted, is truly deleted -- no source
+# to re-derive from. Reproduced: process A calls miss_log(clear=True), empties it and persists to disk -> process B
+# (still holding an old snapshot) does one save, and the 3 entries come back in full, with no error anywhere along the way.
+# Hence a deletion ledger: who deleted which key in which layer and when, so merges can block on it.
 LAYER_DEL_FILE = "brain_layerdel.json"
-# 账本最多记多少个「层::键」。**不是**想删就能无限记：越界丢最旧的，
-# 丢掉的墓碑理论上可能让更老的快照复活对应条目 —— 这是个**已知且接受**的
-# 折中（30 天前的快照若此刻才落盘，它复活的不止 miss_log 一条）。
+# How many "layer::key" tombstones the ledger keeps at most. **Not** unlimited: beyond the cap the oldest are dropped,
+# and a dropped tombstone can in theory let an even older snapshot resurrect the corresponding entry -- a **known and
+# accepted** tradeoff (a 30-day-old snapshot persisted only now would resurrect more than just miss_log).
 LAYER_DEL_MAX_KEYS = 5000
-# 墓碑保留多久（秒）。留痕类条目本身有上限（miss_log 500 条），30 天
-# 远超任何一份内存快照的合理寿命。
+# How long tombstones are kept (seconds). Trace-like entries are capped anyway
+# (miss_log: 500 entries); 30 days far exceeds the reasonable lifetime of any in-memory snapshot.
 LAYER_DEL_TTL = 30 * 86400.0
 ENV_LAYER_DEL = "HIPPOCAMPUS_LAYER_DEL_LEDGER"
-# 按日活动计数保留多少天。这是个只增的计数器，不裁剪会无声膨胀；
-# 趋势观察一般看最近一两周，60 天足够做趋势。
+# How many days of per-day activity counts to keep. Append-only counter, bloats silently if never trimmed; trend
+# watching generally looks at the last week or two, so 60 days is enough for trends.
 DAILY_COUNT_KEEP_DAYS = 60
-# brain_stats 的 daily_activity 回显最近多少天。
-# **存储上限（DAILY_COUNT_KEEP_DAYS=60）与回显窗口是两件事**：
-# 报告里说"kept_days=1 太短"是误读——那是**存量只有 1 天**（功能刚上线），
-# 不是上限设成 1。真正够不着「近 14 天活动曲线」的是回显窗口写死 7 天。
-# 默认 14；用 env HIPPOCAMPUS_DAILY_ACTIVITY_DAYS 或 stats(daily_days=) 覆盖。
+# How many days of daily_activity brain_stats echoes back. **The storage cap (DAILY_COUNT_KEEP_DAYS=60) and the echo window
+# are two different things**: the "kept_days=1 is too short" report was a misreading -- that was **only 1 day of data in
+# stock** (the feature had just shipped), not a cap of 1; what made the "last 14 days activity curve" unreachable was the
+# echo window being hardcoded to 7 days. Default 14; override via env HIPPOCAMPUS_DAILY_ACTIVITY_DAYS or stats(daily_days=).
 DAILY_ACTIVITY_DEFAULT_DAYS = 14
 ENV_DAILY_ACTIVITY_DAYS = "HIPPOCAMPUS_DAILY_ACTIVITY_DAYS"
-# 导航类内容的标签键：INDEX / 目录 / 表头这类"导航性"内容与任何
-# 查询都沾点边（实测里首命中常被 INDEX 行占掉）。导入端给它们打上
-# 这个标签，检索端按 :attr:`HippoBrain.nav_penalty` 打折。
-# **只标记不删内容**——目录本身也是要能查到的，只是不该压过正文。
+# Tag key for navigation-like content: INDEX / tables of contents / header rows relate only tangentially to any query
+# (in measurements the first hit was often taken by an INDEX row). The import side tags such content with this key;
+# the retrieval side discounts it via :attr:`HippoBrain.nav_penalty`. **Tagging only, never deleting content** -- the
+# table of contents itself must stay findable, it just must not outrank the body text.
 NAV_TAG_KEY = "_nav"
-# 并行会话登记的默认存活时长：超过这个时间没结束的会话
-# 不再出现在 active_sessions 里。**必须有过期**——本项目撞车教训累累，但
-# 一个崩溃/强制关闭的会话若永久占位，登记就变成新的障碍而不是帮助。
-# 只做"看得见"，不做锁：登记不阻止任何人写，只让人**写之前能看一眼**。
+# Default time-to-live for parallel-session registrations: sessions not ended within this window no longer appear in
+# active_sessions. **An expiry is mandatory** -- this project has plenty of collision scars, but a crashed /
+# force-closed session holding its slot forever would make the registry a new obstacle instead of a help. Visibility
+# only, no locking: registering stops no one from writing; it only lets people **take a look before writing**.
 SESSION_TTL_SECONDS = 7200
-# PIN_IMPORTANCE 从 store.memory 导入（唯一真相源，勿在此重定义）
-SUPERSEDE_SIM = 0.72          # 疑似"同一事实被更新"的相似度下限（需同时满足实词重叠）
-# 矛盾候选的相似度**上界**：≥ 此值的对通常是同一条事实的两个副本，交给
-# 写入侧去重处理，不在这里当"矛盾"重复报给宿主。
+# PIN_IMPORTANCE is imported from store.memory (single source of truth; do not redefine here)
+SUPERSEDE_SIM = 0.72          # similarity floor for "same fact probably updated" (must also satisfy content-word overlap)
+# Similarity **ceiling** for contradiction candidates: pairs at or above this are usually two copies of the same fact,
+# left to write-side dedup rather than re-reported to the host as "contradictions" here.
 CONTRADICTION_SIM_CEIL = 0.85
-# 单个实体桶保留的矛盾候选数 / 最终回报给宿主的条数。
-# 桶内两两比对是 O(k²)：候选数必须**独立于桶大小**，否则大库上光是攒候选
-# 就能把内存和时间吃光（旧实现就是这么把 12,812 条全建 dict 再丢掉的）。
+# Contradiction candidates kept per entity bucket / entries finally reported to the host. Pairwise comparison within a
+# bucket is O(k²): the candidate count must be **independent of bucket size**, else on a large library merely accumulating
+# candidates eats memory and time (the old implementation built dicts for all 12,812 entries, then threw them away).
 CONTRADICTION_BUCKET_MAX = 12
 CONTRADICTION_REPORT_MAX = 5
-# 实词重叠门槛。原为 0.3 —— 中文 bigram 口径下"同一份文档里的两段话"轻易超过，
-# 导致 supersede 在批量导入场景大面积误杀（实测 28 对疑似取代，绝大多数是错的）。
-SUPERSEDE_OVERLAP = 0.6       # 无共同实体时，需达到的实词重叠率
-ENTITY_BONUS = 0.12           # 查询实体命中记忆实体的加成（跨越语义鸿沟）
-DORMANT_DAYS = 180            # 多久未被调用 → 归档
+# Content-word overlap gate. Originally 0.3 -- under the Chinese bigram metric "two passages
+# from the same document" easily exceeds it, making supersede misfire massively during bulk
+# imports (28 suspected supersede pairs measured, the overwhelming majority wrong).
+SUPERSEDE_OVERLAP = 0.6       # content-word overlap rate required when there is no shared entity
+ENTITY_BONUS = 0.12           # boost when a query entity hits a memory entity (bridges the semantic gap)
+DORMANT_DAYS = 180            # days uncalled -> archive
 
-# 批量改标签：一次可能动到上千条，且**改错了没有自动撤销**（标签是扁平
-# dict，服务端不知道"改之前是什么"）。所以写操作默认关闭，且超过这个条数必须
-# 显式 confirm —— 这两道闸门是刻意的：真实库里有大量完全无标签的条目，
-# 「一行命令把全库补上域」听起来很诱人，一旦过滤条件写错就是上千条垃圾标签，
-# 而 recall 按标签过滤时会**静默返回空**，宿主只会以为"这个域没内容"。
+# Bulk tag updates: one call can touch thousands of entries, and **a wrong change has no automatic undo** (tags are a
+# flat dict; the server does not know "what it was before"). So write operations are disabled by default, and above
+# this entry count an explicit confirm is required -- both gates are deliberate: real libraries hold many entries with
+# no tags at all, and "one command to stamp a domain onto the whole library" sounds tempting, but one wrong filter
+# condition means thousands of junk tags, and recall filtering by tag then **silently returns empty**, so the host
+# concludes "this domain has no content".
 UPDATE_TAGS_CONFIRM_ABOVE = 100
 UPDATE_TAGS_SAMPLE_MAX = 10
 
-# update_tags 变更账本（借鉴前作"前后影像 + 账本"内核，**不引其审批状态机**）：
-# 此前留的明确缺口是"改错了没有自动撤销"——
-# 标签是扁平 dict、服务端不留改前快照，撤回只能靠 sample 里前 10 条的
-# before 人工倒推。现在补上：每次**执行**记一条全量前后影像的 jsonl 条目，
-# undo 按"当前值 == 记录的 after"才回滚（fail-closed：期间被第三方改过的
-# 条目一律跳过并自曝，绝不盖掉后来的修改）。
-# 为什么不做成层文件：它是 append-only 流水（同 save_ledger.jsonl 的定位），
-# 不参与层合并；ring buffer 防无限增长。
+# update_tags change ledger (borrows the prior work's "before/after images + ledger" core, **without adopting its
+# approval state machine**): the explicitly acknowledged gap was "a wrong change has no automatic undo" -- tags are
+# a flat dict, the server keeps no pre-change snapshot, so undoing meant manually reverse-engineering from the before
+# images of the first 10 sample entries. Now closed: every **execution** records one jsonl entry with full
+# before/after images, and undo rolls back only when "current value == recorded after" (fail-closed: entries modified
+# by a third party in between are skipped and self-reported, never clobbering later edits). Why not a layer file: it
+# is an append-only stream (same positioning as save_ledger.jsonl), takes no part in layer merging; a ring buffer
+# prevents unbounded growth.
 TAG_OPS_FILE = "tag_ops.jsonl"
-# 改写历史账本：L1 文本/重要度改写与合并丢弃文本的
-# before 流水（sidecar，append-only，同 tag_ops 定位；形态逐字镜像
-# store/tag_ops.py）。ring 大小的收编形态同上：config.mem_history_ring，
-# 构造注入 manager（无 monkeypatch 面，不需要 core 快照）。
+# Rewrite-history ledger: a before-image stream for L1 text/importance rewrites and text dropped by merges (sidecar,
+# append-only, same positioning as tag_ops; the shape mirrors store/tag_ops.py verbatim). Ring size is wired up the
+# same way as above: config.mem_history_ring, injected into the manager at construction (no monkeypatch surface, no
+# core snapshot needed).
 MEM_HISTORY_FILE = "mem_history.jsonl"
-# ring 大小。这里只留**纯默认值**：env 读取收归 config.tag_ops_ring，
-# 由 brain/core.py 在 import 时快照（``core.TAG_OPS_RING``）。为什么收货地
-# 是 core 而不是本文件：本文件是 L0 纯叶，不许依赖 config；而 core 又必须
-# 保住 ``TAG_OPS_RING`` 这个被测试 monkeypatch 的名字。这个值（连同 trim
-# 阈值）唯一的定义处是 ``config.tag_ops_ring``，这里不留副本——两处同名
-# 常量迟早漂移，而它已经没有潜在使用者。
+# Ring size. Only the **pure default** lives here: env reading is consolidated into config.tag_ops_ring, snapshotted
+# by brain/core.py at import time (``core.TAG_OPS_RING``). Why the consumer is core and not this file: this file is
+# an L0 pure leaf and must not depend on config, while core must preserve the name ``TAG_OPS_RING`` that tests
+# monkeypatch. The single definition site of this value (together with the trim threshold) is ``config.tag_ops_ring``;
+# no copy is kept here -- same-named constants in two places will drift sooner or later, and it no longer has any
+# potential consumer.
 
-# 检索时的**并存口径标注**：只增不删的库必然留下"同一事实的新旧两版"
-# （supersede 关着 / 老数据早于该机制 / 当时没配对上的），命中时两条并列返回，
-# 宿主看不出哪条更近就有取错值的风险。这里对结果集内的近邻**打标**——
-# **绝不折叠、绝不改排序**：旧口径本身可能是被引用的历史事实，哪条对要由
-# 权威来源决定，不由检索器替用户裁定——折叠是错的做法。
-# 判据复用 _is_restatement（与写侧取代检测同一套语义）。
-CONFLICT_ANNOTATE_MAX = 12    # 结果集大于此值不做两两检测（O(n²) 保护，非正确性开关）
+# **Coexisting-framing annotation** at retrieval time: an append-only, never-delete library inevitably retains "an old
+# and a new version of the same fact" (supersede off / older data predating that mechanism / pairs that never matched
+# back then); on a hit both are returned side by side, and if the host cannot tell which is more recent it risks
+# picking the wrong value. Near neighbors inside the result set get **annotated** -- **never folded, never
+# re-ordered**: an old framing may itself be a historical fact being cited; which one is correct must be decided by
+# the authoritative source, not adjudicated on the user's behalf by the retriever -- folding is simply the wrong
+# approach. The criterion reuses _is_restatement (the same semantics as write-side supersede detection).
+CONFLICT_ANNOTATE_MAX = 12    # skip pairwise detection above this result-set size (O(n²) protection, not a correctness switch)
 
-# 删除操作的**相关性下限** = 召回自身的相似度硬门槛。
-# 它的作用只有一个：把 recall 放行的 **BM25 单独召回**条目剔除掉
-# ——这些条目根本没进向量路的 top_k，similarity 恰好是 0.0。
-# 实测（中文小说库 9359 条）：
-#   短查询下非首位候选里 sim=0 的占 44%，长句查询下占 58%。它们是"词面沾边"的主力。
-#
-# **不要调高这个值来过滤语义噪声——那套做法不成立**：真命中的相似度随查询长度整体漂移，
-#   长句查询 band：0.632–0.781   同期噪声（有向量支撑）：0.453–0.542
-#   短查询   band：0.461–0.580   同期噪声（有向量支撑）：0.276–0.387
-# 两边的"真命中 vs 噪声"间隔不同（长句 ~0.09，短句 ~0.07），
-# 定值门槛注定一边误杀、一边漏拦。真正稳定的是**相对优势**：靶子恒为 #1 且甩开第二名。
-# 因此防误删的主力是下面的单条规则，而不是阈值。
+# **Relevance floor** for deletion = recall's own similarity hard gate. It serves exactly one purpose: filtering out
+# the entries recall admitted via **BM25-only recall** -- those never entered the vector channel's top_k and their
+# similarity is exactly 0.0. Measured (Chinese novel library, 9359 entries): with short queries, 44% of non-first
+# candidates have sim=0; with long-sentence queries, 58%. They are the main force of "surface-word overlap only".
+# **Do not raise this value to filter semantic noise -- that approach does not hold**: true-hit similarity drifts
+# wholesale with query length.
+#   long-sentence query band: 0.632–0.781   contemporaneous noise (vector-backed): 0.453–0.542
+#   short query        band: 0.461–0.580   contemporaneous noise (vector-backed): 0.276–0.387
+# The "true hit vs noise" gap differs on the two sides (~0.09 long, ~0.07 short); a fixed threshold is doomed to
+# over-kill one side and under-block the other. What is actually stable is **relative dominance**: the target is
+# always #1 and well clear of #2. So the main defense against wrong deletion is the single-entry rule below, not the
+# threshold.
 FORGET_MIN_SIMILARITY = RELEVANCE_HARD_FLOOR
-# 非显式授权时，一次 forget_by_query 最多删 1 条。
-# "删掉那条记错的"在语义上几乎总是单数；top_k 里多出来的槽位正是误删的来源
-# （实测复现：top_k=3 里混入 2 条几乎无关的真记忆并被全部物理删除）。
+# Without explicit authorization, one forget_by_query deletes at most 1 entry. "Delete the entry that was recorded
+# wrong" is almost always semantically singular; the extra slots in top_k are exactly where wrong deletions come
+# from (reproduced: top_k=3 mixed in 2 nearly-unrelated real memories and all were physically deleted).
 FORGET_SINGLE_BY_DEFAULT = True
 
-# L3 画像容量上限：防止"钉住记忆上千条"把 stable_facts 灌成噪声。
-# 钉住的记忆大多来自批量导入的误判，无上限时 consolidate 会把它们全塞进画像。
-PROFILE_SLOT_MAX = 40         # 单个画像槽位（含 stable_facts）最多保留的条目数
-PROFILE_ENTITY_MAX = 30       # 实体画像槽位数量上限（按 mention_count 取前 N）
+# L3 profile capacity caps: prevent "thousands of pinned memories" from flooding stable_facts into noise. Pinned
+# memories mostly come from bulk-import misjudgments; uncapped, consolidate would stuff them all into the profile.
+PROFILE_SLOT_MAX = 40         # max entries kept in a single profile slot (including stable_facts)
+PROFILE_ENTITY_MAX = 30       # max number of entity profile slots (top N by mention_count)
 
-# ── block_4（相关实体状态）的独立预算 ──────
-# 老实现是"从**命中记忆**的实体出发"：top_k 越大，命中的实体越多，block_4 越吵。
-# 实测（中文小说库，top_k=10）该块会把 10 条命中牵出的十几个实体全部铺开，
-# 挤掉真正贴题的实体状态 —— 它拼进 system prompt 就是纯干扰。
-# 收窄规则：
-#   1) **查询词实体优先**（最贴题）；命中的实体只取前 BLOCK4_HIT_ENTITY_TOPN 条
-#      命中作补充（查询里没提实体时的兜底）；
-#   2) 整块有自己的上限（实体数 / 每实体事实数 / 总字符），
-#      **不与全局 token_budget 混用** —— 否则它照样按"先到先占"吃满预算。
-BLOCK4_MAX_ENTITIES = 3        # block_4 最多展示几个实体
-BLOCK4_MAX_FACTS_PER_ENTITY = 3  # 每个实体最多带几条事实
-BLOCK4_MAX_CHARS = 400         # block_4 全块字符上限（粗粒度闸门）
-BLOCK4_HIT_ENTITY_TOPN = 3     # 只从命中的前 N 条里补实体
+# ── Independent budget for block_4 (related entity states) ──────
+# The old implementation started "from the entities of **hit memories**": the larger the top_k, the more entities get
+# hit, the noisier block_4. Measured (Chinese novel library, top_k=10): this block spread out the dozen-plus entities
+# dragged in by 10 hits, crowding out the entity states that actually mattered -- spliced into the system prompt it
+# was pure noise. Narrowing rules: 1) **Query-text entities first** (most on-topic); hit entities are taken only from
+# the top BLOCK4_HIT_ENTITY_TOPN hits as a supplement (the fallback when the query names no entity); 2) the block has
+# its own caps (entity count / facts per entity / total chars), **not mixed with the global token_budget** --
+# otherwise it still eats the whole budget on a first-come-first-served basis.
+BLOCK4_MAX_ENTITIES = 3        # how many entities block_4 shows at most
+BLOCK4_MAX_FACTS_PER_ENTITY = 3  # how many facts each entity carries at most
+BLOCK4_MAX_CHARS = 400         # character cap for the whole block_4 (coarse gate)
+BLOCK4_HIT_ENTITY_TOPN = 3     # supplement entities only from the top N hits
 
-# ── 钉住槽 block_pinned_memories ──────────
-# 两处毛病，实测都咬过人：
-#   1) 条数写死 3。铁律/门禁/章节级事实同时被钉住时，后来提权的章节级卡
-#      （importance 0.8）会把书级铁律挤出前三条——"钉住"等于没钉。
-#   2) 排序纯按 importance。钉住条目的 importance 本就集中在高位且彼此接近，
-#      这个排序实际排的是"谁先被提权"，不是"谁跟手头这件事有关"。
-# 于是条数可配置（session_start(pin_limit=) > env > 默认），排序改为
-# **任务相关优先**、同档内再看 importance——区分度只来自"对不对得上这次 task"。
+# ── Pinned slot block_pinned_memories ──────────
+# Two defects, both of which bit in practice: 1) count hardcoded to 3 -- when iron rules / gates / chapter-level
+# facts are all pinned, a chapter-level card elevated later (importance 0.8) squeezes book-level iron rules out of
+# the top three -- "pinned" ends up meaning not pinned; 2) ordering purely by importance -- pinned entries'
+# importance is already concentrated at the high end and close together, so that ordering actually ranks "who got
+# elevated first", not "who relates to the task at hand". Hence the count is configurable
+# (session_start(pin_limit=) > env > default) and ordering became **task-relevance first**, importance as tiebreaker
+# within a tier -- the only discrimination comes from "does it match this task".
 PIN_BLOCK_LIMIT_DEFAULT = 3
 ENV_PIN_BLOCK_LIMIT = "HIPPOCAMPUS_PIN_BLOCK_LIMIT"
 
-# ── 知识地图槽 block_knowledge ──────────────────
-# 开场包里唯一能回答「这个库到底装了些什么」的槽：L1 是平铺事实、L2 只有会话级
-# 摘要且写完即沉睡、L3 是热点条目不是知识。
-# 条数写死会两头不讨好：小库 8 条就全看见了，大库 8 条只看见最大的 8 个筐。
-# 所以同样走 env 可配（与 PIN_BLOCK_LIMIT 同款语义，不新增 MCP 工具参数——
-# 工具面每会话随 tools/list 注入宿主上下文，加一个参数就是长期 token 成本）。
+# ── Knowledge map slot block_knowledge ──────────────────
+# The only slot in the preactivation package that can answer "what does this library actually contain": L1 is flat
+# facts, L2 only holds session-level summaries that go dormant right after being written, and L3 is hot entries, not
+# knowledge. A hardcoded count fails both ways: a small library is fully visible in 8 entries, while in a large
+# library 8 entries show only the 8 biggest baskets. So this is also env-configurable (same semantics as
+# PIN_BLOCK_LIMIT; no new MCP tool parameter -- the tool surface is injected into host context with tools/list each
+# session, and one more parameter is a permanent token cost).
 KNOWLEDGE_BLOCK_LIMIT_DEFAULT = 8
 ENV_KNOWLEDGE_BLOCK_LIMIT = "HIPPOCAMPUS_KNOWLEDGE_BLOCK_LIMIT"
-KNOWLEDGE_BLOCK_CLIP = 70      # 单行字符上限（标题 + 规模 + 一句话）
-# L3 画像里"钉住记忆"落在哪个槽（prune_stale_profile 按槽名分辨校验规则）
+KNOWLEDGE_BLOCK_CLIP = 70      # per-line character cap (title + scale + one-liner)
+# Which slot "pinned memories" land in within the L3 profile (prune_stale_profile tells
+# the validation rules apart by slot name)
 PROFILE_SLOT_STABLE = "stable_facts"
-# 画像毕业条目的置信度校准（domain 只准 import common，故两系数留在这里；
-# 槽名与三阈值是毕业校验专属，住 domain/constants.py）
-PROFILE_STRENGTH_BASE = 0.3   # 置信度 = min(0.9, BASE + STEP·强度)：
-PROFILE_STRENGTH_STEP = 0.06  #   强度3→0.48、5→0.60、10→0.90（槽内自洽排序）
+# Confidence calibration for profile graduation entries (domain may only import common, so the two coefficients live
+# here; the slot name and the three thresholds are graduation-validation specific and reside in domain/constants.py)
+PROFILE_STRENGTH_BASE = 0.3   # confidence = min(0.9, BASE + STEP·strength):
+PROFILE_STRENGTH_STEP = 0.06  #   strength 3→0.48, 5→0.60, 10→0.90 (self-consistent ordering within the slot)
 
-# ingest_batch 单次上限：批量入口的意义是"一次调用省掉 N 次往返"，
-# 但一次性塞几万条会把内存与单次落盘体积顶爆（落盘是整体覆写）。超限直接报错
-# 让调用方分批，比"默默吃下然后 OOM"好。
+# ingest_batch per-call cap: the point of a bulk entry point is "one call saves N round trips", but stuffing tens
+# of thousands of entries in at once blows up memory and the size of a single persist (persisting is a full
+# overwrite). Erroring out beyond the cap so the caller splits into batches is better than "swallow it quietly, then OOM".
 INGEST_BATCH_MAX = 2000
 
-# ── 项目概况与状态卡 ──────────────────────────────
-# session_start 预激活包的两个槽：库级全貌 + 当前状态的紧凑投影。
-# 立场：agent 每次开工时不只要「查询点的信息」，还要「这个库整体是什么、
-# 现在什么状况」。两条硬纪律（对标前作）：
-#   1. 纯派生、不检索、不聚类——热路径（每次开场）不付首次梳理那 2-3 秒；
-#   2. 信号只放「推不出但错了会出事」的（FRAS 的 S 字段纪律），
-#      可推断的量（总条数等）只作定位锚点，不展开。
-OVERVIEW_TOP_ENTITIES = 3        # 全貌卡带几个热点实体
-OVERVIEW_TOP_TAG_KEYS = 3        # 全貌卡带几个主标签键
-OVERVIEW_RECENT_DAYS = 30        # 全貌卡「近 N 天增量」窗口
-STATUS_SPARKLINE_DAYS = 14       # 状态卡 sparkline 窗口（天）
-STATUS_MISS_DAYS = 7             # 状态卡「近 N 天未命中」窗口
-STATUS_CONTRADICTION_CAP = 20    # 矛盾扫描预算上限（对）；达上限报「≥N」
-SPARKLINE_MIN_BUCKETS = 4        # 少于此桶数不渲染 sparkline（避免假精度）
-ENV_OVERVIEW_BLOCK = "HIPPOCAMPUS_OVERVIEW_BLOCK"          # 默认开；0/false/no/off 关
+# ── Project overview and status card ──────────────────────────────
+# The two slots of the session_start preactivation package: a library-level overview + a compact projection of the
+# current state. Position: when starting work, an agent needs not only "information at the query point" but also
+# "what this library is as a whole and what state it is in now". Two hard disciplines (mirroring the prior work):
+# 1. pure derivation, no retrieval, no clustering -- the hot path (every session start) does not pay the 2-3 seconds
+# of first-time combing; 2. only signals that "cannot be derived but hurt when wrong" go in (FRAS's S-field
+# discipline); derivable quantities (total entry counts etc.) serve only as anchoring landmarks, not expanded.
+OVERVIEW_TOP_ENTITIES = 3        # how many hot entities the overview card carries
+OVERVIEW_TOP_TAG_KEYS = 3        # how many main tag keys the overview card carries
+OVERVIEW_RECENT_DAYS = 30        # overview card "last N days delta" window
+STATUS_SPARKLINE_DAYS = 14       # status card sparkline window (days)
+STATUS_MISS_DAYS = 7             # status card "last N days misses" window
+STATUS_CONTRADICTION_CAP = 20    # contradiction scan budget cap (pairs); at the cap, report "≥N"
+SPARKLINE_MIN_BUCKETS = 4        # no sparkline below this bucket count (avoids false precision)
+ENV_OVERVIEW_BLOCK = "HIPPOCAMPUS_OVERVIEW_BLOCK"          # on by default; 0/false/no/off disables
 ENV_STATUS_BLOCK = "HIPPOCAMPUS_STATUS_BLOCK"
-ENV_STATUS_CONTRADICTIONS = "HIPPOCAMPUS_STATUS_CONTRADICTIONS"  # 矛盾信号开关（默认开）
+ENV_STATUS_CONTRADICTIONS = "HIPPOCAMPUS_STATUS_CONTRADICTIONS"  # contradiction signal switch (on by default)
 
-# ── 任务级「问题概况」──────────────────
-# task_hits 是「点命中」，问题概况是「这个任务触及的结构」：
-# 相关知识点 / 相关实体 / 匹配的未决待办 / 该领域近期 miss 缺口。
-# 匹配纪律（全部确定性，不引模型——热路径不付推理代价）：
-#   知识点/实体 —— task_hits 的 memory_id 与主题 member_ids / 实体
-#     memory_ids **求交**（同一个 id 空间，精确，无阈值可调）；
-#   待办/miss —— 文本 **token 相交**（任务词 + 锚点标签值 + 锚点实体名），
-#     与 resolve_intent 的 keyword-in-text 同族语义。
-TASK_TOPIC_MAX = 3           # 概况卡带几个相关知识点
-TASK_ENTITY_MAX = 5          # 带几个相关实体
-TASK_INTENT_MAX = 3          # 带几条匹配的未决待办
-TASK_MISS_MAX = 3            # 带几条相关未命中
-TASK_MISS_DAYS = 14          # miss 缺口的时间窗（比状态卡的 7 天长：
-                            # 任务级要看「这个领域最近反复缺什么」）
-TASK_TOKEN_MIN_LEN = 2       # 任务词最短长度（中文单字没有判别力）
-TASK_PROFILE_CLIP = 28       # 概况卡单行标题截断（与知识地图槽同纪律：
-                            # 绝不截规模数字，只截标题）
-ENV_TASK_PROFILE_BLOCK = "HIPPOCAMPUS_TASK_PROFILE_BLOCK"  # 默认开；0/false/no/off 关
+# ── Task-level "issue profile" ──────────────────
+# task_hits are point hits; the issue profile is "the structure this task touches": related knowledge points /
+# related entities / matching open intents / recent miss gaps in that area. Matching discipline (all deterministic,
+# no model -- the hot path pays no inference cost): knowledge points / entities -- **intersect** task_hits'
+# memory_id with topic member_ids / entity memory_ids (same id space; exact; no tunable threshold); open intents /
+# misses -- text **token intersection** (task words + anchor tag values + anchor entity names), same family of
+# semantics as resolve_intent's keyword-in-text.
+TASK_TOPIC_MAX = 3           # how many related knowledge points the profile card carries
+TASK_ENTITY_MAX = 5          # how many related entities it carries
+TASK_INTENT_MAX = 3          # how many matching open intents it carries
+TASK_MISS_MAX = 3            # how many related misses it carries
+TASK_MISS_DAYS = 14          # time window for miss gaps (longer than the status card's 7 days:
+                            # at task level you want "what this area keeps lacking lately")
+TASK_TOKEN_MIN_LEN = 2       # minimum task-word length (single Chinese characters carry no discriminative power)
+TASK_PROFILE_CLIP = 28       # per-line title truncation for the profile card (same discipline as the
+                            # knowledge map slot: never clip scale numbers, only titles)
+ENV_TASK_PROFILE_BLOCK = "HIPPOCAMPUS_TASK_PROFILE_BLOCK"  # on by default; 0/false/no/off disables
 
-# sparkline 字符梯度（低→高）。块高递进，不用颜色——文本槽里没有颜色可用，
-# 且「形状」才是要传达的信息（哪天活跃），不是精确值。
+# Sparkline character gradient (low→high). Block heights progress; no color is used -- a text slot has no color
+# available, and it is the "shape" that carries the message (which days were active), not exact values.
 _SPARK_CHARS = "▁▃▅▇"
 
 
 def sparkline(values: list[int]) -> str:
-    """把一串计数映射成 ▁▃▅▇ 文本图（状态卡「活动」行）。
+    """Map a series of counts onto a ▁▃▅▇ text chart (status card "activity" row).
 
-    空序列 / 全零 / 桶数 < :data:`SPARKLINE_MIN_BUCKETS` → 空串：
-    调用方据此降级为纯数字。两三个点画不出形状，画了就是假精度
-    （「全绿不等于每句话都对」的同型纪律）。
+    Empty sequence / all zeros / fewer than :data:`SPARKLINE_MIN_BUCKETS` buckets -> empty string: callers degrade to
+    plain numbers on that. Two or three points cannot draw a shape, and drawing one anyway is false precision (same
+    discipline as "all green does not mean every sentence is right").
 
-    归一化是**相对**的（min→▁, max→▇）：要传达的是「哪天相对更活跃」的
-    形状；全同值时给中档 ▅，不假装有波动。
+    Normalization is **relative** (min→▁, max→▇): what it conveys is the shape of "which days were relatively more
+    active"; with all-equal values it gives the mid-level ▅ rather than pretending there was fluctuation.
     """
     vals = [max(0, int(v)) for v in (values or [])]
     if len(vals) < SPARKLINE_MIN_BUCKETS or not any(vals):
@@ -289,8 +285,8 @@ def sparkline(values: list[int]) -> str:
 def format_age(days: int | None) -> str:
     """Render days-since-update as card-facing text (today/yesterday/Nd ago/Nmo ago).
 
-    ``None`` (no usable timestamp) becomes ``"unknown"``; the card must not guess.
-    Months use a 30-day approximation: this is a freshness signal, not a calendar.
+    ``None`` (no usable timestamp) becomes ``"unknown"``; the card must not guess. Months use a 30-day approximation:
+    this is a freshness signal, not a calendar.
     """
     if days is None:
         return "unknown"
@@ -303,16 +299,17 @@ def format_age(days: int | None) -> str:
     return "%dmo ago" % (days // 30)
 
 
-# 任务 token 切分：拉丁数字串为整词；CJK 连续串切**二元组**——中文没有空格，
-# 把「查朱由检煤山的事」当一个词去做 substring 匹配等于永远匹配不上，
-# 而二元组（煤山/由检）是确定性切分里判别力与成本的最佳平衡点。
-# 不引分词模型——匹配必须确定性可复现（同一任务两次开场得到同一张卡），
-# 且热路径不付推理代价。
+# Task token splitting: Latin/digit runs are whole words; CJK runs are split into **bigrams** -- Chinese has no
+# spaces, and treating "查朱由检煤山的事" as one word for substring matching means it never matches anything, while
+# bigrams (煤山/由检) are the best tradeoff between discriminative power and cost within deterministic splitting.
+# No segmentation model is introduced -- matching must be deterministic and reproducible (the same task yields the
+# same card on two session starts), and the hot path pays no inference cost.
 _TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 
-# 高频泛化二元组停用表：不拦的话「的一」「什么」这类词会把半个库的待办
-# 都判成"相关"——卡片噪声比少看几个字糟得多（与知识地图槽的截断纪律同源）。
+# Stoplist of high-frequency generic bigrams: without blocking, bigrams like 「的一」「什么」
+# would mark half the library's open intents as "related" -- card noise is far worse than
+# seeing a few characters fewer (same root as the knowledge map slot's truncation discipline).
 _TOKEN_STOP_BIGRAMS = frozenset({
     "的一", "了的", "是我", "是不", "我们", "你们", "他们", "这个", "那个",
     "什么", "怎么", "为什", "可以", "需要", "进行", "相关", "如下", "上述",
@@ -327,25 +324,25 @@ def _add_token(tokens: list[str], w: str) -> None:
 
 
 def task_tokens(task: str, extra: list[str] | None = None) -> list[str]:
-    """任务匹配用的 token 集合（确定性，不引模型）。
+    """Token set for task matching (deterministic, no model).
 
-    两个来源：任务正文 + ``extra``（锚点记忆的标签值、锚点实体名）。
-    全部 lower、去重、保序（保序让卡片输出稳定，同一任务两次开场逐字相同）。
-    中文连续串额外产出全部二元组；单字（长度 < ``TASK_TOKEN_MIN_LEN``）
-    丢弃——中文单字没有判别力。
+    Two sources: the task text + ``extra`` (anchor memories' tag values, anchor entity names). Everything is
+    lowercased, deduplicated, and order-preserving (stable order keeps card output stable: the same task yields a
+    character-identical card on two session starts). CJK runs additionally produce all bigrams; single characters
+    (length < ``TASK_TOKEN_MIN_LEN``) are dropped -- single Chinese characters carry no discriminative power.
     """
     tokens: list[str] = []
 
     def expand(chunk: str) -> None:
         cjk = _CJK_RUN_RE.findall(chunk)
         if cjk and "".join(cjk) == chunk:
-            # 纯中文串：只出二元组（整串已无判别力，见模块注释）
+            # Pure CJK run: bigrams only (the whole run has no discriminative power; see module comment)
             for run in cjk:
                 for i in range(len(run) - 1):
                     _add_token(tokens, run[i:i + 2])
             return
         _add_token(tokens, chunk)
-        for run in cjk:  # 中英混串：整词 + 中文部分的二元组都要
+        for run in cjk:  # mixed Latin/CJK run: need both the whole words and bigrams of the CJK part
             for i in range(len(run) - 1):
                 _add_token(tokens, run[i:i + 2])
 
@@ -356,35 +353,36 @@ def task_tokens(task: str, extra: list[str] | None = None) -> list[str]:
         if w is None:
             continue
         _add_token(tokens, w)
-        expand(str(w))  # 长实体名（如「煤山自缢事件」）同样补二元组
+        expand(str(w))  # long entity names (e.g. 「煤山自缢事件」) also get bigram supplementation
     return tokens
 
 
-# ── 实体来源分级（origin）──────────────────────────────────────
-# 实测（中文小说文档库）：中文启发式抽取的精度约 16%——
-# 832 个候选里只有 112 个是真书名号命名，其余是"这笔账没法记"这类短语，
-# 而其中 67% 由 ASCII 双引号模式（`"..."`）产生。中文里引号表示强调/引用/台词，
-# 不表示专名；`《》` 才是中文唯一的"作品名"标记。故：
-#   1) 中文文本下停用引号类模式，只保留《》（见 `_heuristic_entities`）；
-#   2) 给每个实体记 origin，只有受信任来源参与「检索加成 / 画像 / 矛盾检测」，
-#      启发式产物降级为"候选"，仍入库可查，但不污染决策链路。
-ENTITY_ORIGIN_MANUAL = "manual"        # 宿主显式传入 entities=[...]（最可信）
-ENTITY_ORIGIN_LEXICON = "lexicon"      # 命中项目专名词库
-ENTITY_ORIGIN_TITLE = "title"          # 《书名号》内专名（中文唯一的作品名标记）
-ENTITY_ORIGIN_SPACY = "spacy"          # spaCy NER（英文路径，质量尚可）
-ENTITY_ORIGIN_HEURISTIC = "heuristic"  # 中文句式/引号启发式（噪声主要来源）
+# ── Entity origin tiers ──────────────────────────────────────
+# Measured (Chinese novel document library): the precision of Chinese heuristic extraction is about 16% -- of 832
+# candidates only 112 were genuine 《》 title-bracket names; the rest were phrases like "这笔账没法记", and 67% of
+# those came from the ASCII double-quote pattern (`"..."`). In Chinese, quotation marks express emphasis / quotation
+# / dialogue, not proper names; `《》` is Chinese's only "work title" marker. Therefore: 1) for Chinese text,
+# quote-based patterns are disabled and only 《》 is kept (see `_heuristic_entities`); 2) every entity records an
+# origin; only trusted origins participate in "retrieval boost / profile / contradiction detection", while heuristic
+# output is demoted to "candidates" -- still stored and queryable, but kept out of decision chains.
+ENTITY_ORIGIN_MANUAL = "manual"        # host explicitly passed entities=[...] (most trusted)
+ENTITY_ORIGIN_LEXICON = "lexicon"      # hit the project's proper-noun lexicon
+ENTITY_ORIGIN_TITLE = "title"          # proper name inside 《title brackets》 (Chinese's only work-title marker)
+ENTITY_ORIGIN_SPACY = "spacy"          # spaCy NER (English path, decent quality)
+ENTITY_ORIGIN_HEURISTIC = "heuristic"  # Chinese syntax/quote heuristics (the main noise source)
 
-# 受信任来源：参与检索加成 / 画像 / 矛盾检测。
-#   - 《》 单列一档：它是中文里明确的"作品名"分隔符，与"句式猜专名"不是一个可信度；
-#     实测小说定稿范围里候选 224 个，其中 184 个来自《》（几何原本、某史料、
-#     中国货币史 这类真书名），只有 40 个是裸模式噪声。若把《》 一并降级，
-#     等于把最可靠的信号扔掉，所以单独给它受信任档。
-#   - spaCy 保留在内——它的产物质量与中文启发式不是一个量级，且仅英文路径触发。
+# Trusted origins: participate in retrieval boost / profile / contradiction detection.
+#   - 《》 gets its own tier: it is Chinese's unambiguous "work title" delimiter, not in the same trust class as
+#     "guessing proper names from sentence patterns"; measured over the novel finalization corpus, of 224 candidates
+#     184 came from 《》 (real book titles such as 几何原本、某史料、中国货币史), and only 40 were bare-pattern noise.
+#     Demoting 《》 as well would throw away the most reliable signal, so it alone gets the trusted tier.
+#   - spaCy stays trusted -- its output quality is in a different league from the Chinese heuristics, and it only
+#     triggers on the English path.
 TRUSTED_ENTITY_ORIGINS = frozenset({
     ENTITY_ORIGIN_MANUAL, ENTITY_ORIGIN_LEXICON, ENTITY_ORIGIN_TITLE,
     ENTITY_ORIGIN_SPACY,
 })
-# 可信度排序：同一实体被多种来源命中时取最高（只升级不降级）。
+# Credibility ranking: when one entity is hit by multiple origins, take the highest (upgrade only, never downgrade).
 _ORIGIN_RANK = {
     ENTITY_ORIGIN_HEURISTIC: 0,
     ENTITY_ORIGIN_SPACY: 1,
@@ -393,13 +391,13 @@ _ORIGIN_RANK = {
     ENTITY_ORIGIN_MANUAL: 4,
 }
 
-# CJK 占比超过该值就跳过 spaCy —— en_core_web_sm 是英文模型，
-# 对中文文档既抓不出实体，还白跑一趟。
+# Skip spaCy once the CJK share exceeds this -- en_core_web_sm is an English model;
+# on Chinese documents it neither finds entities nor justifies the run.
 _CJK_SKIP_SPACY_RATIO = 0.20
 
-# 更新标记词表。校准用例（见 tests/test_i5_supersede_policy.py）：一组真更新
-# 语句只含「迁移到/改到/提高到/升级为/延长为/切换到」——旧表全不认；
-# 同族紧词一并补入，刻意不加的叙事高频词也见该测试文件。
+# Update-marker vocabulary. Calibration case (see tests/test_i5_supersede_policy.py): a set of genuine update sentences
+# contained only 「迁移到/改到/提高到/升级为/延长为/切换到」 -- none of which the old table recognized; closely related terms
+# were added along with them; narrative high-frequency words deliberately left out are documented in that test file too.
 UPDATE_MARKERS = (
     "now ", "no longer", "used to", "changed", "moved to", "switched",
     "recently", "these days", "nowadays", "现在", "不再", "改成", "换了",
@@ -410,10 +408,11 @@ UPDATE_MARKERS = (
     "extended to",
 )
 
-# markdown 结构字符：文档里海量表格行 / 树形目录会被启发式规则当成专名
-# （实测 Top15 实体里 11 个是「├」「│  ├─ 伏笔表.md」这类碎片）。
-_MD_TABLE_LINE = re.compile(r"^[ \t]*\|.*$", re.M)          # 表格行
-_MD_CODE_FENCE = re.compile(r"```.*?```", re.S)              # 围栏代码块
+# Markdown structure characters: masses of table rows / tree-directory lines in documents
+# get mistaken for proper names by the heuristic rules
+# (measured: 11 of the Top15 entities were fragments like 「├」「│  ├─ 伏笔表.md」).
+_MD_TABLE_LINE = re.compile(r"^[ \t]*\|.*$", re.M)          # table rows
+_MD_CODE_FENCE = re.compile(r"```.*?```", re.S)              # fenced code blocks
 _MD_TREE_CHARS = "│├└─┌┐┘┌┬┴┼═║╔╗╚╝■□●○◆◇→←↑↓"
 _ENTITY_BAD_CHARS = set(
     "|`\\/*#<>[]{}()（）【】〈〉「」“”\"'=+~^$%&@:;,.!?，。！？、…—　"
@@ -426,38 +425,40 @@ _STOPWORDS = {
     "for", "and", "or", "we", "he", "she", "they", "his", "her", "their",
 }
 
-# ── lexicon_suggest 的内置停用词 ────────────────
-# 只放**跨项目通用**的文档行话 / 协作套话——它们是"高频 + 跨文件"的完美候选，
-# 却永远不是专名，会稳定霸占 lexicon_suggest 的头部。项目专名（人名/地名/商号）
-# 一律不进来，那些写 `<词库同目录>/entity_lexicon_stop.txt`。
-#
-# 匹配语义：某候选 gram 只要**是**这里任一条的（含自身的）子串就丢弃。
-# 所以只需写完整短语——"用户定案" 一条同时压掉 "用户定" / "案" 这些切片，
-# 不必像外部停用词文件那样手工枚举前缀碎片。
+# ── lexicon_suggest's built-in stopwords ────────────────
+# Only **cross-project generic** document jargon / collaboration boilerplate goes here -- they are perfect
+# "high-frequency + cross-file" candidates yet never proper names, and they stably occupy the top of
+# lexicon_suggest. Project proper names (person / place / brand names) never go in; those belong in
+# `<lexicon directory>/entity_lexicon_stop.txt`.
+# Matching semantics: a candidate gram is dropped if it **is a substring of** any entry here (including itself). So
+# only complete phrases need to be written -- one entry "用户定案" simultaneously suppresses slices like "用户定" /
+# "案", without having to hand-enumerate prefix fragments the way the external stopword file does.
 _DEFAULT_LEXICON_STOP = (
-    # 章节/文档自指
+    # chapter/document self-reference
     "本章", "本节", "本卷", "上一章", "下一章", "前文", "后文", "全文",
     "正文", "原稿", "开篇", "结尾", "文末", "文中",
-    # 元信息标签（标题/状态类）
+    # metadata tags (title/status kind)
     "备注", "说明", "摘要", "概要", "结论", "总述", "详见", "参见", "同上",
     "时间线", "待核清单", "核清单", "合订本", "要点版", "快照", "记录格式",
     "第一次", "第二次", "第三次", "第四次", "最后一次",
-    # 人机协作流程套话
+    # human-AI collaboration boilerplate
     "用户定案", "用户确认", "用户拍板", "用户批阅", "用户令", "已落正文",
     "已确认", "待确认", "已定案", "待定", "已完成",
-    # 通用虚词/指代短语（跨项目高频，且绝不是专名）
+    # generic function words / deictic phrases (cross-project high frequency, never proper names)
     "为什么", "什么", "怎么", "这样", "那样", "一句话", "一件事", "本文件",
     "长出来", "一下子", "一会儿", "一样",
 )
 
-# 纯"中文数字(+第/量词)"的 gram（第五节 / 十二年 / 第一次 / 三段 / 一部分）：
-# 天然高频、跨项目通用、永远不是专名。做成**规则而非枚举**，省得把量词逐个列进去。
-# 只匹配"整串就是数字(+一个量词)"——"三宝""万历年"这类真专名不受影响。
+# Grams that are purely "Chinese numerals (+ optional 第/measure word)" (第五节 / 十二年 / 第一次 / 三段 / 一部分):
+# naturally high-frequency, cross-project generic, never proper names. Implemented as a **rule, not an enumeration**,
+# sparing the listing of every measure word. Only matches "the whole string is numerals (+ one measure word)" --
+# real proper names like "三宝" / "万历年" are unaffected.
 _ORDINAL_RE = re.compile(
     r"^第?[一二三四五六七八九十百千万零两]{1,4}"
     r"(?:章|节|卷|次|年|月|日|版|轮|条|项|篇|段|部分|阶段|批|步)?$"
 )
-# 首字预筛：只有以数字或"第"开头的 gram 才值得跑正则（省掉绝大多数调用）。
+# First-character pre-filter: only grams starting with a digit or "第" are worth running
+# through the regex (skips the vast majority of calls).
 _ORDINAL_HEADS = frozenset("第一二三四五六七八九十百千万零两")
 
 
@@ -470,16 +471,15 @@ def _nid(prefix: str) -> str:
 
 
 def strip_internal_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """剔除候选条目的**内部字段**（下划线开头），原地修改并返回该条。
+    """Strip the candidate entry's **internal fields** (underscore-prefixed), modifying it in place and returning it.
 
-    这些键是检索管道自己用的：``_emb``（当前模型向量，MMR 算多样性用）、
-    ``_literal``（BM25 字面强命中，MMR 豁免惩罚用）、``_sel_sim``（MMR 复用
-    的相似度缓存）。它们不该出现在工具返回里——既浪费体积，也暴露实现细节。
+    These keys are for the retrieval pipeline's own use: ``_emb`` (current model vector, used for MMR diversity),
+    ``_literal`` (BM25 literal strong hit, used for the MMR penalty exemption), ``_sel_sim`` (similarity cache
+    reused by MMR). They must not appear in tool returns -- they waste payload and leak implementation detail.
 
-    早先这里是两个手写的 ``pop``，于是 ``_sel_sim`` 漏了出去
-    （只有当次 MMR 选中过多条才触发，平时看不见）。改成**按前缀统一清理**，
-    以后再加内部键也不会漏。公共输出字段（如 ``matched_by``）不带下划线，
-    不受影响。
+    This used to be two hand-written ``pop`` calls, and ``_sel_sim`` leaked out (only triggered when that MMR run
+    over-selected; invisible otherwise). Now it is a **unified prefix-based cleanup**, so any internal key added
+    later is covered too. Public output fields (such as ``matched_by``) carry no underscore and are unaffected.
     """
     for k in [k for k in item if k.startswith("_")]:
         item.pop(k, None)
@@ -487,34 +487,35 @@ def strip_internal_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 # ==================================================================
-# 会话身份分路
+# Session identity routing
 # ==================================================================
 
-# 没有 client 信息时的兜底路。所有未署名调用共享它 —— 与改造前等价。
+# Fallback route when no client info is present; all unsigned calls share it -- equivalent to before the rework.
 DEFAULT_SESSION_KEY = "__default__"
 
 
 def _session_key(client: str | None) -> str:
-    """会话路 key。空 / 空白 -> 默认路；否则按 client 字符串。"""
+    """Session-route key. Empty / blank -> default route; otherwise keyed by the client string."""
     c = (client or "").strip()
     return c or DEFAULT_SESSION_KEY
 
 
 # ==================================================================
-# 写者可见化
+# Writer visibility
 # ==================================================================
 
 WRITER_DIRNAME = "writers"
-# 登记多久没心跳就算过期（秒）。崩溃/强退不会来注销，只能靠过期。
+# How long a registration may go without a heartbeat before expiring (seconds). Crashes /
+# force-kills never deregister, so expiry is the only cleanup.
 WRITER_TTL_DEFAULT = 3600.0
 
 
 def pid_alive(pid) -> bool:
-    """进程是否还在。**只读探测**，绝不给对方发信号。
+    """Whether the process is still alive. **Read-only probe**; never signals the other process.
 
-    Windows 上不能用 ``os.kill(pid, 0)``——CPython 在 Windows 的 ``os.kill``
-    是 TerminateProcess 的包装，传 0 等于用退出码 0 结束对方进程。
-    这里改用 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) 只开句柄看一眼。
+    ``os.kill(pid, 0)`` cannot be used on Windows -- CPython's Windows ``os.kill`` wraps
+    TerminateProcess, so passing 0 means ending the other process with exit code 0.
+    Instead this opens a handle with OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) to peek.
     """
     try:
         pid = int(pid)
@@ -534,7 +535,7 @@ def pid_alive(pid) -> bool:
                 k32.CloseHandle(h)
                 return True
             return False
-        except Exception:  # noqa: BLE001 —— ctypes 不可用时退回"当活着"
+        except Exception:  # noqa: BLE001 -- fall back to "assume alive" when ctypes is unavailable
             return True
     try:
         os.kill(pid, 0)
@@ -544,7 +545,7 @@ def pid_alive(pid) -> bool:
 
 
 def scan_writers(wdir: str, ttl: float) -> tuple[list[dict], int]:
-    """扫写者登记目录，返回 (活跃登记, 清掉的过期登记数)。"""
+    """Scan the writer-registration directory; return (active registrations, stale ones removed)."""
     now = time.time()
     active: list[dict] = []
     stale = 0
@@ -559,7 +560,7 @@ def scan_writers(wdir: str, ttl: float) -> tuple[list[dict], int]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 info = json.load(f)
-        except Exception:  # noqa: BLE001 —— 读不出的登记一律当过期清掉
+        except Exception:  # noqa: BLE001 -- unreadable registrations are always treated as stale and removed
             stale += 1
             try:
                 os.remove(path)
@@ -588,58 +589,58 @@ def scan_writers(wdir: str, ttl: float) -> tuple[list[dict], int]:
 
 
 # ---------------------------------------------------------------------------
-# 保存账本（Save Ledger）
+# Save ledger
 # ---------------------------------------------------------------------------
-# 给「保存」本身建账：把事后靠 l0_dangling 反推丢了什么，换成当场看得见的
-# 保存时间轴。口径：层文件白名单 / 四象限 /
-# 双钟（at_mono 算间隔、at_wall 走 _reference_time）。
-# 追加式 jsonl + ring buffer：绝不做成第二个写放大源（一次 save 账本 < 4KB）。
+# Keep a ledger of "saving" itself: instead of reverse-engineering afterwards via l0_dangling what got lost, provide
+# a save timeline visible on the spot. Coverage: the layer-file whitelist / four quadrants / dual clocks
+# (at_mono for intervals, at_wall via _reference_time).
+# Append-only jsonl + ring buffer: never a second write-amplification source (one save's ledger < 4KB).
 LEDGER_FILENAME = "save_ledger.jsonl"
-# 这个值（连同 trim 阈值）唯一的定义处是 ``config.save_ledger_ring``，
-#  运行时由 ``core.LEDGER_RING`` 暴露；本文件不再留副本。
-# 启动对账在账本尾部回看的行数上限（fail 行找同 seq 的 begin 用）。
+# The single definition site of this value (together with the trim threshold) is ``config.save_ledger_ring``; exposed
+# at runtime as ``core.LEDGER_RING``; this file keeps no copy. Cap on lines re-examined from the ledger tail during
+# startup reconciliation (used by fail lines to find the begin with the same seq).
 _LEDGER_TAIL_KEEP = 16
 
-# 层内容指纹开关（＝派生层脏集）。默认开。
-# 逃逸舱：万一某层的 json.dumps 成本压垮写路径（超大库），设 0 即回到
-# "每次全量重写 10 层"的旧行为，语义不变、只是写放大回来。
-# 开关实体在 ``config.layer_fp``：本文件不读 env（L0 纯叶，env 收归 config）。
+# Layer content fingerprint switch (= the derived layer's dirty set). On by default. Escape hatch: if some layer's
+# json.dumps cost crushes the write path (very large library), setting 0 returns to the old behavior of "rewriting
+# all 10 layers in full every time" -- same semantics, just the write amplification comes back. The switch itself
+# lives in ``config.layer_fp``: this file reads no env (L0 pure leaf; env reading is consolidated into config).
 
 # ---------------------------------------------------------------------------
-# 源文件签名层 —— 漂移审计的事实源
+# Source-file signature layer -- the fact source for drift auditing
 # ---------------------------------------------------------------------------
-# 借鉴前作「条目绑定源 SHA-256 + verify 四分类」，落到本项目的形态：
-# 写入侧（ingest）给能解析到磁盘的 source 记一份 {mtime_ns, size, sha1}，
-# drift_audit 拿它与磁盘现状比，回答"文件改了但记忆没更新"。
-# 设计取舍（相对前作）：
-#   * **按 source 标签记，不按记忆条目记** —— 一条 md 导入出几百条 L1，
-#     逐条记签名是纯浪费；且 source 会消失（forget），按标签记才谈得上
-#     "这个源整体过期了"；
-#   * **内容事实没变就不动层** —— 签名条目带 sig_at 时间戳会让每次 ingest
-#     都改层内容 ⇒ 每次 save 都写盘（写放大）。没变时保持旧条目不动，
-#     "最近校验过"只留在内存缓存里；
-#   * **sha1 流式读**（1MB 一块）—— 大文件不该整份进内存；
-#   * 解不出路径的 source（会话 id / 自由文本）**不记** —— 硬记一份
-#     "sha1=?" 的假签名只会把 unbaselined 池搅浑。
+# Borrows the prior work's "entry-bound source SHA-256 + four-way verify classification", adapted to this project's
+# shape: the write side (ingest) records {mtime_ns, size, sha1} for any source that resolves to disk, and
+# drift_audit compares it against the disk's current state, answering "the file changed but the memory was not
+# updated". Design tradeoffs (relative to the prior work):
+#   * **Keyed by source label, not by memory entry** -- one md import yields hundreds of L1 entries; recording a
+#     signature per entry is pure waste; and sources disappear (forget), so only keying by label makes "this source
+#     as a whole went stale" expressible;
+#   * **If the content facts did not change, do not touch the layer** -- a sig_at timestamp on the signature entry
+#     would make every ingest change layer content => every save writes to disk (write amplification). When
+#     unchanged, the old entry stays put, and "verified recently" lives only in the in-memory cache;
+#   * **sha1 streamed** (1MB chunks) -- large files must not be read whole into memory;
+#   * sources that do not resolve to a path (session ids / free text) are **not recorded** -- forcing a fake
+#     "sha1=?" signature would only muddy the unbaselined pool.
 SOURCE_SIG_FILE = "brain_sourcesig.json"
-# 签名计算缓存上限：(路径, mtime_ns, size) → sha1。批量导入 500 条同源文件
-# 时只算一次哈希。纯性能缓存，不是事实源（事实源是层文件），超限 FIFO 丢。
+# Signature-computation cache cap: (path, mtime_ns, size) -> sha1. Bulk-importing 500 entries from the same source file
+# hashes it only once. Pure performance cache, not a fact source (the fact source is the layer file); FIFO eviction beyond the cap.
 SOURCE_SIG_CACHE_MAX = 256
 
 
-# 开关实体在 ``config.source_sig``（同上：本文件不读 env）。
+# The switch itself lives in ``config.source_sig`` (same as above: this file reads no env).
 
-# L0 自动落盘的触发粒度 —— 累积多少条**新 raw** 落一次盘。
-# 0 = 每条都落（最安全，写放大最大）；负数 = 关闭自动落盘，只自曝欠账。
-# 取值在 ``config.l0_autosave_every``，实际常量见 core.py。
-# ``_guess_importance`` 的上限。当前所有分支最高只到 0.75，
-# 所以这行**实际是 no-op**（旧代码里写成字面量 min(score, 0.95)，被误读成
-# "自动判定能给到 0.95"）。抽成常量并写明，是为了将来加更高档位时天花板
-# 一眼可见 —— 0.95 以上属于"用户反复确认过"，词面规则不该给到。
+# L0 auto-persist trigger granularity -- how many **new raw** entries accumulate before a write to disk. 0 = persist
+# every entry (safest, most write amplification); negative = auto persist off, only self-reporting the backlog. The
+# value lives in ``config.l0_autosave_every``; the actual constant is in core.py.
+# Cap for ``_guess_importance``. Every current branch tops out at 0.75, so this line is **effectively a no-op** (old
+# code wrote the literal min(score, 0.95), which was misread as "auto-judgment can reach 0.95"). Extracting it as a
+# named constant with this note makes the ceiling obvious when a higher tier is added later -- anything above 0.95
+# belongs to "repeatedly confirmed by the user", which surface-word rules must not award.
 _GUESS_IMPORTANCE_CAP = 0.95
-# 只认下面这些层文件（**别写死数量**，加层就来改这里，写死的数一加层就变谎话）。
-# 库目录里还有 .bak-* / writers/ / lexicon.json / 账本自己，
-# 把它们算进来会把备份与外部工具的 touch 误报成「我漏写了」。
+# Only the layer files below count (**never hardcode the count** -- when a layer is added, edit here; a hardcoded
+# number becomes a lie the moment a layer is added). The library directory also holds .bak-* / writers/ / lexicon.json
+# / the ledgers themselves; counting those would misreport backups and external tools' touches as "I failed to write".
 LEDGER_LAYER_FILES = (
     "brain_raw.json", "brain_entities.json", "brain_summaries.json",
     "brain_profile.json", "brain_sessions.json", "brain_intents.json",
@@ -647,8 +648,8 @@ LEDGER_LAYER_FILES = (
     "brain_counters.json", "brain_knowledge.json", LAYER_DEL_FILE,
     SOURCE_SIG_FILE,
     "memories.json", "memories.vectors.npz",
-    # LNN 状态主格式是 npz；旧库的 .pt 保留在白名单里（兼容读期间两者
-    # 都可能存在于库目录，漏掉哪个都会把"别人的状态文件"误报成漏写）。
+    # LNN state's primary format is npz; old libraries' .pt stays on the whitelist (during the compatibility-read window
+    # both may exist in the library directory; missing either would misreport "someone else's state file" as an unwritten layer).
     "lnn_state.npz", "lnn_state.npz.meta.json", "lnn_state.npz.bak",
     "lnn_state.pt", "lnn_state.pt.meta.json",
 )

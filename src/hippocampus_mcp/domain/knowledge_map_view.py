@@ -1,37 +1,46 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.knowledge_map`` 的三块逻辑（从 core 抽取）。
+"""Three pieces of logic from ``brain.core.knowledge_map`` (extracted from core).
 
-**为什么值得搬**：``knowledge_map`` 是知识地图入口，75 行里行投影循环
-（22 行）、pending/excluded 双口径、回显体组装三块全是纯逻辑。搬走后壳
-只剩「门禁 → 自动建 → 注入 → 编排」一条直线。
+**Why worth moving**: ``knowledge_map`` is the knowledge-map entry point; of
+its 75 lines, the row-projection loop (22 lines), the pending/excluded dual
+standards, and the echo-body assembly are all pure logic. After the move the
+shell is just one straight line: "gate → auto-build → inject → orchestrate".
 
-**依赖方向**：本模块零 import——``ordered`` / ``STATUS_ARCHIVED`` /
-``SUMMARY_KIND_HOST`` / ``signature_of`` / ``pending_summary_ids`` 五个
-topic 包符号全由壳调用时现取后注入（domain 同层禁互引，topic 住在
-domain 但只准依赖 common；沿用 knowledge_batch 先例）。
-``stats`` / ``open_topics`` / ``open_intents`` / ``playbook`` 是 brain
-侧能力，按值或按惰性回调注入。
+**Dependency direction**: this module has zero imports — the five
+topic-package symbols ``ordered`` / ``STATUS_ARCHIVED`` /
+``SUMMARY_KIND_HOST`` / ``signature_of`` / ``pending_summary_ids`` are all
+fetched by the shell at call time and injected (same-layer imports are banned
+inside domain; topic lives in domain but may only depend on common; following
+the knowledge_batch precedent). ``stats`` / ``open_topics`` / ``open_intents``
+/ ``playbook`` are brain-side capabilities, injected by value or as lazy
+callbacks.
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (changing any one is a behavior change; parity will catch it)**:
 
-1. ``project_rows`` 的 ``limit`` 用真值判定：``limit=0`` = 不限（全部
-   行）；``limit`` 计数的是**已入行的条数**（archived 被 continue 掉的不占
-   额度），且 break 检查在 append **之后**（第 limit 行会入行再断）。
-2. ``summary_stale`` 是三段 and 的 bool：``kind==HOST and signature and
-   signature != signature_of(member_ids)``——host 归纳但签名为空 ⇒ 不标
-   stale（宁可漏标也不误标，改写权在宿主）。
-3. ``entities`` / ``tags`` 各截前 3；``span`` 拷贝一份（不与主题层同对象）；
-   ``size`` / ``recall_hits`` 走 ``int(x or 0)``；``title`` 空则
-   ``(untitled)``。
-4. ``pending_counts`` 的 excluded 口径是同一函数 ``exclude_low_info=False``
-   （假簇自曝差集）；``excluded_n = max(0, 差)``——正常 excluded ≥ pending，
-   max(0) 是防御性的（文案钉）。
-5. ``assemble_report`` 的 13 键固定序（键序即信号）；``playbook`` 只在
-   ``pending`` 非空时经回调现取（空 pending 不调——惰性注入，调用次数
-   与原实现逐次对齐）；``note`` 是操作说明书文案（刻意在返回体不在
-   docstring，省 tools/list 的 token 税）。
-6. 本方法**不检查 layer_enabled**——门禁在壳里；自动建（空层 + 有记录）
-   也在壳里，注入的 knowledge 永远是**当前层快照**。
+1. ``project_rows``'s ``limit`` uses truthiness: ``limit=0`` = unlimited (all
+   rows); ``limit`` counts **rows already added** (archived ones skipped by
+   continue don't take quota), and the break check is **after** the append
+   (the limit-th row enters the list, then it breaks).
+2. ``summary_stale`` is a three-clause and: ``kind==HOST and signature and
+   signature != signature_of(member_ids)`` — host-summarized but empty
+   signature ⇒ not marked stale (better to miss a mark than mis-mark; the
+   rewrite right belongs to the host).
+3. ``entities`` / ``tags`` each truncated to the first 3; ``span`` copied (not
+   the same object as the topic layer); ``size`` / ``recall_hits`` via
+   ``int(x or 0)``; empty ``title`` becomes ``(untitled)``.
+4. ``pending_counts``' excluded standard is the same function with
+   ``exclude_low_info=False`` (false-cluster self-report difference set);
+   ``excluded_n = max(0, diff)`` — normally excluded >= pending, so max(0) is
+   defensive (文案钉, pinned for display).
+5. ``assemble_report``'s fixed 13-key order (key order is signal);
+   ``playbook`` is fetched via callback only when ``pending`` is non-empty
+   (empty pending ⇒ no call — lazy injection, call counts aligned with the
+   original implementation one by one); ``note`` is the operating-manual text
+   (deliberately in the response body, not the docstring, saving the
+   tools/list token tax).
+6. This method **does not check layer_enabled** — the gate is in the shell;
+   auto-build (empty layer + records present) is also in the shell; the
+   injected knowledge is always the **current-layer snapshot**.
 """
 from __future__ import annotations
 
@@ -39,7 +48,7 @@ from typing import Any, Callable
 
 
 # ======================================================================
-# 块 1：主题行投影（旧壳 3021-3049）
+# Block 1: topic row projection (old shell 3021-3049)
 # ======================================================================
 def project_rows(
     knowledge: dict[str, Any],
@@ -51,19 +60,20 @@ def project_rows(
     summary_kind_host: str,
     signature_of: Callable[[list[str]], str],
 ) -> list[dict[str, Any]]:
-    """把主题层投影成地图行（14 键固定序，含 stale 自曝）。
+    """Project the topic layer into map rows (14 keys in fixed order, including stale self-report).
 
     Args:
-        knowledge: 主题层字典（壳直传当前层快照）。
-        include_archived: 是否含已归档主题。
-        limit: 行数上限；**0 = 不限**（真值判定，见怪癖 1）。
-        ordered: ``topic_mod.ordered``（层序枚举）。
-        status_archived: ``topic_mod.STATUS_ARCHIVED`` 常量。
-        summary_kind_host: ``topic_mod.SUMMARY_KIND_HOST`` 常量。
-        signature_of: ``topic_mod.signature_of``（成员签名函数）。
+        knowledge: The topic-layer dict (the shell passes the current-layer
+            snapshot straight through).
+        include_archived: Whether to include archived topics.
+        limit: Row cap; **0 = unlimited** (truthiness check; see quirk 1).
+        ordered: ``topic_mod.ordered`` (layer-order enumeration).
+        status_archived: The ``topic_mod.STATUS_ARCHIVED`` constant.
+        summary_kind_host: The ``topic_mod.SUMMARY_KIND_HOST`` constant.
+        signature_of: ``topic_mod.signature_of`` (member signature function).
 
     Returns:
-        地图行列表（层序，最多 limit 行）。
+        Map row list (layer order, at most limit rows).
     """
     rows: list[dict[str, Any]] = []
     for t in ordered(knowledge):
@@ -76,8 +86,10 @@ def project_rows(
             "size": int(t.get("size") or 0),
             "summary": t.get("summary") or "",
             "summary_kind": t.get("summary_kind") or "",
-            # 归纳所依据的成员集合已经变了 ⇒ 这条上层结论可能不再成立。
-            # 不改写、只标注（改写权在宿主），但必须看得见。
+            # The member set this summary was based on has changed ⇒ this
+            # higher-level conclusion may no longer hold. No rewriting, only
+            # annotating (the rewrite right belongs to the host), but it must
+            # be visible.
             "summary_stale": bool(
                 t.get("summary_kind") == summary_kind_host
                 and t.get("summary_signature")
@@ -88,8 +100,10 @@ def project_rows(
             "span": list(t.get("span") or []),
             "updated_at": t.get("updated_at"),
             "recall_hits": int(t.get("recall_hits") or 0),
-            # S3：这条归纳带没带四字段结构（fras）。机器要按域处理归纳
-            # （矛盾检测 / 域卡）时，没有结构就没有抓手——先让覆盖率可见。
+            # S3: whether this summary carries the four-field structure
+            # (fras). When machines need to process summaries by domain
+            # (contradiction detection / domain cards), no structure means no
+            # handle — make coverage visible first.
             "has_fras": bool(t.get("summary_fras")),
         })
         if limit and len(rows) >= limit:
@@ -98,7 +112,7 @@ def project_rows(
 
 
 # ======================================================================
-# 块 2：pending / excluded 双口径（旧壳 3050-3056）
+# Block 2: pending / excluded dual standards (old shell 3050-3056)
 # ======================================================================
 def pending_counts(
     knowledge: dict[str, Any],
@@ -106,19 +120,21 @@ def pending_counts(
     defaults: Any,
     pending_summary_ids: Callable[..., list[str]],
 ) -> tuple[list[str], int]:
-    """待归纳清单 + 假簇自曝差集（同一函数两个口径算出来的差）。
+    """Pending list + false-cluster self-report difference set (the difference from the same function under two standards).
 
     Args:
-        knowledge: 主题层字典。
-        defaults: ``_topic_defaults()`` 现取快照。
-        pending_summary_ids: ``topic_mod.pending_summary_ids``。
+        knowledge: The topic-layer dict.
+        defaults: A fresh snapshot of ``_topic_defaults()``.
+        pending_summary_ids: ``topic_mod.pending_summary_ids``.
 
     Returns:
-        ``(pending, excluded_low_info_n)``。
+        ``(pending, excluded_low_info_n)``.
     """
     pending = pending_summary_ids(knowledge, defaults=defaults)
-    # 假簇自曝：pending 里被低信息量判据挡掉的那批，不报出来
-    # 宿主会以为"都归纳完了"。与 pending 同一口径算出来的差集。
+    # False-cluster self-report: the batch within pending blocked by the
+    # low-information criterion; without reporting it the host would believe
+    # "everything is summarized". A difference set computed under the same
+    # standard as pending.
     excluded = pending_summary_ids(knowledge, exclude_low_info=False,
                                    defaults=defaults)
     excluded_n = max(0, len(excluded) - len(pending))
@@ -126,7 +142,7 @@ def pending_counts(
 
 
 # ======================================================================
-# 块 3：回显体组装（旧壳 3057-3078）
+# Block 3: echo-body assembly (old shell 3057-3078)
 # ======================================================================
 def assemble_report(
     *,
@@ -140,10 +156,11 @@ def assemble_report(
     excluded_low_info_n: int,
     playbook: Callable[[int, int], Any],
 ) -> dict[str, Any]:
-    """组装知识地图回显体（13 键固定序，键序即信号）。
+    """Assemble the knowledge-map echo body (13 keys in fixed order; key order is signal).
 
-    怪癖复刻：``playbook`` 经回调现取且**只在 pending 非空时调一次**
-    （空 pending ⇒ None 且不调——惰性注入，调用次数对齐）。
+    Quirk replicated: ``playbook`` is fetched via callback and **called only
+    once, only when pending is non-empty** (empty pending ⇒ None and no call —
+    lazy injection, call counts aligned).
     """
     return {
         "enabled": True,
@@ -157,10 +174,13 @@ def assemble_report(
         "note": ("代表句是抽取式摘录（离质心最近的几条原文），不是归纳；"
                  "真正的上层结论要宿主总结后写回"),
         "pending_excluded_low_info": excluded_low_info_n,
-        # ── 「整理这个库」的操作说明书 ────────────────────────────
-        # 刻意放在**返回体**而不是 docstring：docstring 每会话随 tools/list
-        # 注入一次，写进去就是长期 token 税；返回体只有真要整理时才付，
-        # 而且能按当前库的实际状态动态生成（几条待归纳、撞没撞顶）。
+        # ── The "tidy this library" operating manual ─────────────────────
+        # Deliberately in the **response body**, not the docstring: a
+        # docstring is injected once per session with tools/list, so writing
+        # it there is a long-term token tax; the response body only pays when
+        # tidying is actually wanted, and can be generated dynamically from
+        # the current library's actual state (how many pending, whether the
+        # cap was hit).
         "pending": pending,
         "pending_count": len(pending),
         "playbook": (playbook(len(pending), len(rows)) if pending else None),
@@ -168,7 +188,7 @@ def assemble_report(
 
 
 # ======================================================================
-# 编排入口（壳的唯一调用点）
+# Orchestration entry (the shell's only call site)
 # ======================================================================
 def collect(
     knowledge: dict[str, Any],
@@ -187,11 +207,12 @@ def collect(
     playbook: Callable[[int, int], Any],
     auto_built: bool,
 ) -> dict[str, Any]:
-    """knowledge_map 全流程：投影 → 双口径 pending → 回显（顺序有语义）。
+    """The full knowledge_map flow: projection → dual-standard pending → echo (the order carries semantics).
 
-    与原实现的调用次序逐行对齐：行循环在最前；pending/excluded 两份
-    清单随后（excluded 在 pending 之后）；stats / open_* / playbook 在
-    回显组装时按值/按回调现取。
+    Call order aligned line by line with the original implementation: the row
+    loop first; the two pending/excluded lists after it (excluded after
+    pending); stats / open_* / playbook fetched by value/callback during echo
+    assembly.
     """
     rows = project_rows(knowledge, include_archived=include_archived,
                         limit=limit, ordered=ordered,

@@ -1,35 +1,49 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.file_registry_summary`` 族编排
-（从 core 抽取）。
+"""Orchestration of the ``brain.core.file_registry_summary`` family
+(extracted from core).
 
-**为什么值得搬**：建档摘要是 session_start 热路径上的一段编排——
-「config 门 → 侧车存在性 → 间隔门控（锁内重判）→ 带预算重扫 → 对账 →
-汇总回退」六步全是流程控制，值计算（扫描/汇总/索引）本来就在
-``map/file_registry.py``。搬走后壳只剩「读 config / 现取 fr_mod 入口 /
-注入对账回调」三行直线。
+**Why worth moving**: the file-archiving summary is a stretch of
+orchestration on session_start's hot path -- the six steps "config gate →
+sidecar existence → interval gating (re-checked under lock) → rescan with
+budget → reconcile → summarize with fallback" are all flow control; the
+value computation (scan / summarize / index) already lives in
+``map/file_registry.py``. After the move the shell is down to three
+straight lines: "read config / fetch the fr_mod entry points / inject the
+reconcile callback".
 
-**依赖方向**：本模块零 import——``fr_mod`` 的四个入口（load / scan /
-update / summarize）由壳在调用时从本命名空间现取注入（patch
-``core.fr_mod`` 即生效）；对账回调（读 ``self.source_sigs``，brain 态）
-裸引用注入；``now`` 时刻与 ``interval_h`` / ``limits`` 由壳算好传入；
-路径归一化经 ``path_of`` 回调注入（os 不进 domain）。
+**Dependency direction**: this module has zero imports -- the four
+``fr_mod`` entry points (load / scan / update / summarize) are fetched from
+that namespace by the shell at call time and injected (patching
+``core.fr_mod`` takes effect); the reconcile callback (reads
+``self.source_sigs``, brain state) is injected as a bare reference; the
+``now`` instant and ``interval_h`` / ``limits`` are computed by the shell
+and passed in; path normalization is injected via the ``path_of`` callback
+(os stays out of domain).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (touching any one is a behavior change; the parity
+tests will catch it)**:
 
-1. 间隔门控在**锁内重判**（``_do`` 在 ``update`` 的侧车锁内跑）——
-   两个会话同时开场不该各扫一遍；
-2. 门控真值 ``interval_h > 0``：0 = 每次都扫（关闭节流）；
-   ``now - last_checked < interval_h*3600`` 才跳过（等于间隔就重扫）；
-3. 扫描失败不炸不写：``except → (False, reg)``——报上一次的摘要，
-   ``last_checked`` 不前进（下次开场会再试）；
-4. ``update`` 本身失败（锁忙等）→ 回退 ``load`` 报旧摘要——热路径
-   绝不因建档失败而炸；
-5. 无侧车返回 ``None``（opt-in）；``update`` 的 ``(result, saved)``
-   二元解包语义保留；
-6. 对账判据 (mtime_ns, size) **双等**：size 缺省哨兵 **-1 / -2 错开**
-   ——两侧都没记录时永不相等，防「都没记录」被误判成「已同步」；
-7. ``last_synced`` **逐条现取** ``now()``（惰性回调，调用次数与
-   原实现逐次对齐——冻结钟下两侧同值）。
+1. Interval gating is **re-checked under lock** (``_do`` runs inside
+   ``update``'s sidecar lock) -- two sessions opening at once must not each
+   scan once;
+2. The gate's truth is ``interval_h > 0``: 0 = scan every time (throttling
+   off); skip only when ``now - last_checked < interval_h*3600`` (equal to
+   the interval means rescan);
+3. Scan failure neither crashes nor writes: ``except → (False, reg)`` --
+   report the previous summary; ``last_checked`` does not advance (the next
+   opening retries);
+4. ``update`` itself failing (lock busy-wait) → fall back to ``load`` and
+   report the old summary -- the hot path never crashes over a file-archiving
+   failure;
+5. No sidecar returns ``None`` (opt-in); the ``(result, saved)`` two-tuple
+   unpacking semantics of ``update`` are preserved;
+6. The reconcile criterion (mtime_ns, size) is **double equality**: the
+   size-missing sentinels are **staggered, -1 / -2** -- when neither side
+   has a record they can never compare equal, preventing "neither has a
+   record" from being misjudged as "already synced";
+7. ``last_synced`` fetches ``now()`` **per entry** (lazy callback; the call
+   count aligns with the original implementation one by one -- under a
+   frozen clock both sides get the same value).
 """
 from __future__ import annotations
 
@@ -48,26 +62,33 @@ def summary_flow(
     summarize: Callable[..., dict[str, Any] | None],
     reconcile: Callable[[dict[str, Any]], int],
 ) -> dict[str, Any] | None:
-    """建档摘要编排：存在性 → 锁内门控重扫 → 失败回退 → 汇总。
+    """File-archiving summary orchestration: existence → gated rescan under
+    lock → failure fallback → summarize.
 
     Args:
-        persist_dir: 脑持久目录（侧车 ``file_registry.json`` 所在）。
-        now: 本时刻（壳 ``_now()`` 现取，门控 / last_checked / 汇总共用）。
-        interval_h: 重扫间隔小时数（壳读 config；**0 = 关闭节流**）。
-        limits: 扫描预算 ``(max_files, budget_s)``（壳 ``scan_limits()``
-            现取）。
-        load / scan / update / summarize: ``fr_mod`` 四入口（壳现取注入）。
-        reconcile: 对账回调 ``(reg) -> 清掉条数``（brain 侧
-            ``_fr_reconcile_source_sigs``，读 ``self.source_sigs``）。
+        persist_dir: the brain's persistence directory (where the sidecar
+            ``file_registry.json`` lives).
+        now: the current instant (fetched by the shell's ``_now()``; shared
+            by gating / last_checked / summarize).
+        interval_h: rescan interval in hours (read from config by the shell;
+            **0 = throttling off**).
+        limits: scan budget ``(max_files, budget_s)`` (fetched by the
+            shell's ``scan_limits()``).
+        load / scan / update / summarize: the four ``fr_mod`` entry points
+            (fetched and injected by the shell).
+        reconcile: reconcile callback ``(reg) -> number of entries cleared``
+            (brain-side ``_fr_reconcile_source_sigs``, reads
+            ``self.source_sigs``).
 
     Returns:
-        汇总 dict；未启用 / 无侧车 / 无 reg 时 ``None``。
+        Summary dict; ``None`` when not enabled / no sidecar / no reg.
     """
     if load(persist_dir) is None:
         return None
 
     def _do(reg):
-        # 间隔门控在锁内重判：两个会话同时开场不该各扫一遍
+        # Interval gating re-checked under lock: two sessions opening at once
+        # must not each scan once
         if interval_h > 0 and now - float(
                 reg.get("last_checked") or 0.0) < interval_h * 3600:
             return False, reg
@@ -75,13 +96,13 @@ def summary_flow(
             scan(reg, limits[0], limits[1])
             reg["last_checked"] = now
             reconcile(reg)
-        except Exception:  # noqa: BLE001 —— 扫描失败：不写，报旧摘要
+        except Exception:  # noqa: BLE001 -- scan failed: do not write, report the old summary
             return False, reg
         return True, reg
 
     try:
         reg, saved = update(persist_dir, _do, wait=0.0)
-    except Exception:  # noqa: BLE001 —— 热路径不因建档扫描失败而炸
+    except Exception:  # noqa: BLE001 -- the hot path never crashes over a failed archiving scan
         reg = load(persist_dir)
     if reg is None:
         return None
@@ -95,19 +116,25 @@ def reconcile_stale_entries(
     path_of: Callable[[str], str],
     now: Callable[[], float],
 ) -> int:
-    """stale 条目 × 源签名层对账：hippo 吃过当前内容版本 ⇒ 清 stale。
+    """Reconcile stale entries against the source-signature layer: hippo has
+    consumed the current content version ⇒ clear stale.
 
-    判据是 (mtime_ns, size) 双等——与建档层同 threat model（墙钟比对
-    的对抗性场景本来就不在防御范围内）。**原地改 reg**（与原实现同
-    对象语义），返回清掉的条数（0 = 没得可清，常态）。
+    The criterion is (mtime_ns, size) double equality -- the same threat
+    model as the archiving layer (adversarial wall-clock comparison was
+    never within the defense scope). **Mutates reg in place** (same object
+    semantics as the original implementation); returns the number of entries
+    cleared (0 = nothing to clear, the common case).
 
     Args:
-        reg: 建档注册表（``files`` 为 ``{rel: entry}``）。
-        sig_by_path: ``fr_mod.source_sig_index`` 产出的绝对路径索引
-            （壳构造，两边同口径——归一化/取最新只此一份）。
-        path_of: ``rel → 索引键`` 归一化回调（``normcase(join(root,
-            str(rel)))``，os 不进 domain）。
-        now: ``last_synced`` 时间源（**逐条现取**，惰性回调）。
+        reg: the archiving registry (``files`` is ``{rel: entry}``).
+        sig_by_path: absolute-path index produced by
+            ``fr_mod.source_sig_index`` (built by the shell; both sides share
+            one criterion -- normalization / taking the newest exists only
+            here).
+        path_of: ``rel → index key`` normalization callback (``normcase(
+            join(root, str(rel)))``; os stays out of domain).
+        now: time source for ``last_synced`` (**fetched per entry**, lazy
+            callback).
     """
     n = 0
     for rel, ent in (reg.get("files") or {}).items():

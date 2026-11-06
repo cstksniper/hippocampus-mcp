@@ -1,20 +1,27 @@
-"""矛盾检测：库存记录上的查询组合。
+"""Contradiction detection: query compositions over inventory records.
 
-从 ``brain/core.py`` 提取。四个入口一一对应 core 的四个薄包装：
+Extracted from ``brain/core.py``. The four entry points map one-to-one to
+core's four thin wrappers:
 
-- :func:`ids_matching_tags`  ← ``_ids_matching_tags``（标签白名单）
-- :func:`contradiction_buckets` ← ``_contradiction_buckets``（受信任实体分桶）
-- :func:`find_contradictions` ← ``_find_contradictions``（候选对主查询）
-- :func:`pool_size` ← ``_contradiction_pool_size``（候选分母）
+- :func:`ids_matching_tags`  ← ``_ids_matching_tags`` (tag whitelist)
+- :func:`contradiction_buckets` ← ``_contradiction_buckets`` (trusted-entity
+  bucketing)
+- :func:`find_contradictions` ← ``_find_contradictions`` (candidate-pair main
+  query)
+- :func:`pool_size` ← ``_contradiction_pool_size`` (candidate denominator)
 
-落点理由：这些是**库存记录上的查询组合**——复用 store 的
-``pairwise_similarities`` 能力与 ``MemoryState`` 状态机。domain 受依赖
-矩阵约束（只准依赖 common）碰不到 ``store.memory.MemoryState``，故与
-``tag_ops`` / ``ledger`` 两个 I/O 提取同落 store 侧。
+Why they landed here: these are **query compositions over inventory
+records** -- they reuse store's ``pairwise_similarities`` capability and the
+``MemoryState`` state machine. domain is constrained by the dependency
+matrix (may depend only on common) and cannot reach
+``store.memory.MemoryState``, so they landed on the store side together with
+the two I/O extractions ``tag_ops`` / ``ledger``.
 
-纪律同族：本模块**不 import vector_store**——store 实例由调用方
-（brain 包装层传 ``self.manager.store``）注入；可信实体 id  likewise
-由包装层现取 ``self._trusted_entity_ids()`` 后传入，本模块不碰 brain。
+Same-family discipline: this module does **not import vector_store** -- the
+store instance is injected by the caller (the brain wrapper passes
+``self.manager.store``); trusted entity ids  likewise
+are fetched live by the wrapper via ``self._trusted_entity_ids()`` and
+passed in; this module never touches brain.
 """
 
 from __future__ import annotations
@@ -40,18 +47,21 @@ __all__ = [
 def ids_matching_tags(
     records: Any, filter_tags: dict[str, Any] | None,
 ) -> set[str] | None:
-    """按结构化标签筛出记忆 id 白名单。
+    """Filter a whitelist of memory ids by structured tags.
 
-    语义：**所有**键都必须匹配（AND）；单个键的值可以是标量或列表
-    （列表内取 OR）。比较前统一 ``str()`` 归一——标签经 JSON 往返后
-    可能是 ``43`` 也可能是 ``"43"``，不做归一会让过滤静默失效。
+    Semantics: **all** keys must match (AND); a single key's value may be a
+    scalar or a list (OR within the list). Values are normalized with
+    ``str()`` before comparison -- after a JSON round-trip a tag may be
+    ``43`` or ``"43"``; without normalization the filter silently stops
+    working.
 
     Args:
-        records: 候选记录可迭代对象（调用方传 ``store.iter_records()``）。
-        filter_tags: 过滤条件。
+        records: Iterable of candidate records (the caller passes
+            ``store.iter_records()``).
+        filter_tags: Filter conditions.
 
     Returns:
-        None 表示"无过滤"（调用方不要把它当成空集）。
+        None means "no filtering" (callers must not read it as an empty set).
     """
     if not filter_tags:
         return None
@@ -78,15 +88,19 @@ def ids_matching_tags(
 def contradiction_buckets(
     records: Any, trusted_ids: Any,
 ) -> dict[str, list[str]]:
-    """按受信任实体把活跃记忆分桶（矛盾检测的输入）。
+    """Bucket active memories by trusted entity (input to contradiction
+    detection).
 
-    只认受信任来源的实体：不可信实体（尤其中文高频短语）会把大量互不相关
-    的记忆塞进同一个桶，既产生成片的假"矛盾"，又因桶内两两比对是 O(k²)
-    而拖慢巩固。抽成独立函数是为了让这条过滤可被单测直接验证。
+    Only entities from trusted sources count: untrusted entities (especially
+    high-frequency Chinese phrases) cram large numbers of unrelated memories
+    into one bucket, producing swathes of false "contradictions" while the
+    O(k²) pairwise comparison inside a bucket slows down consolidation. This
+    filter is its own function so unit tests can verify it directly.
 
     Args:
-        records: 候选记录可迭代对象。
-        trusted_ids: 受信任实体 id 集合（调用方现取，本模块不碰 brain）。
+        records: Iterable of candidate records.
+        trusted_ids: Set of trusted entity ids (fetched live by the caller;
+            this module never touches brain).
     """
     by_ent: dict[str, list[str]] = {}
     for rec in records:
@@ -106,27 +120,36 @@ def find_contradictions(
     filter_tags: dict[str, Any] | None = None,
     trusted_ids: Any = None,
 ) -> list[dict[str, Any]]:
-    """筛出"同实体 + 高相似 + 内容不同"的活跃记忆对。
+    """Screen out active memory pairs that are "same entity + high
+    similarity + different content".
 
-    **只读**：不修改任何记录状态。它只是"提示宿主这里可能有两套口径"，
-    裁决权在宿主（只增不删的库里，新旧两版本来就该并存，见 D8）。
+    **Read-only**: no record state is modified. It only "hints to the host
+    that two versions of a position may coexist here"; the verdict belongs
+    to the host (in an append-only library, an old and a new version are
+    supposed to coexist; see D8).
 
     Args:
-        store: 存储实例（``pairwise_similarities`` / ``get`` /
-            ``iter_records`` 由调用方注入）。
-        limit: 最多返回多少对。
-        source: 只查某个来源（文件名 / 会话标识）下的记忆。
-        records: 候选集，默认全库存活记录。
-        filter_tags: 结构化标签过滤，与 ``recall`` 的
-            ``filter_tags`` **同一套语义**（全键 AND、单键多值 OR、
-            ``str()`` 归一），复用 :func:`ids_matching_tags`。
-            作用＝把"整库口径矛盾"收窄成"**某个域内的**口径矛盾"——
-            六代口径混在一个库里时，全局 top-N 会被无关域占满。
-        trusted_ids: 受信任实体 id 集合（调用方现取）。
+        store: Storage instance (``pairwise_similarities`` / ``get`` /
+            ``iter_records`` injected by the caller).
+        limit: Maximum number of pairs returned.
+        source: Only look at memories from one source (file name / session
+            identifier).
+        records: Candidate set; defaults to all active records in the
+            library.
+        filter_tags: Structured tag filter, **the same semantics** as
+            ``recall``'s ``filter_tags`` (all keys AND, multi-value OR within
+            one key, ``str()`` normalization); reuses
+            :func:`ids_matching_tags`.
+            Purpose = narrow "whole-library position conflicts" down to
+            "conflicts **within one domain**" -- when six generations of
+            positions are mixed in one library, the global top-N gets filled
+            by unrelated domains.
+        trusted_ids: Set of trusted entity ids (fetched live by the caller).
 
     Returns:
-        按相似度降序的候选对，每对带 ``a_id``/``b_id``（可直接交给
-        :meth:`update_memory` 作废）与 ``newer``（谁的时间戳更新）。
+        Candidate pairs sorted by similarity descending, each with
+        ``a_id``/``b_id`` (can be handed straight to :meth:`update_memory`
+        for superseding) and ``newer`` (whose timestamp is newer).
     """
     recs = list(records if records is not None else store.iter_records())
     recs = [
@@ -134,9 +157,12 @@ def find_contradictions(
         if r is not None and r.state == MemoryState.ACTIVE.value
         and (not source or (r.source or "") == source)
     ]
-    # J3：标签域过滤。与 recall 同源（ids_matching_tags），保证"按域查矛盾"
-    # 与"按域检索"看到的是同一批条目——两套实现迟早会算出不一样的白名单。
-    # None = 无过滤（**不要**当成空集，那是"什么都不查"）。
+    # J3: tag-domain filtering. Same origin as recall (ids_matching_tags), so
+    # "query contradictions by domain" and "retrieve by domain" see the same
+    # batch of entries -- two implementations would sooner or later compute
+    # different whitelists.
+    # None = no filter (**do not** read it as an empty set; that means
+    # "match nothing").
     if filter_tags:
         allow = ids_matching_tags(store.iter_records(), filter_tags)
         if allow is None:
@@ -155,7 +181,7 @@ def find_contradictions(
             b = store.get(ib)
             if a is None or b is None:
                 continue
-            if a.content == b.content:      # 内容相同 = 重复，不是矛盾
+            if a.content == b.content:      # identical content = duplicate, not a contradiction
                 continue
             out.append({
                 "a_id": ia, "b_id": ib,
@@ -172,17 +198,22 @@ def find_contradictions(
 def pool_size(
     store: Any, source: str = "", filter_tags: dict[str, Any] | None = None,
 ) -> int:
-    """矛盾候选的**分母**：过滤后还剩多少条进得了比对。
+    """The **denominator** of contradiction candidates: how many records
+    survive filtering and can enter comparison.
 
-    存在的理由：``count: 0`` 有两种截然不同的真相——
-      ① 候选池非空、但筛不出矛盾对（＝域内口径一致，好消息）
-      ② **候选池本身就是空的**（＝过滤条件没命中，和 B2 同型的静默失败）
-    不把分母报出来，调用方一律读成 ①，于是"域内没问题"这个结论是假的。
+    Reason it exists: ``count: 0`` has two completely different truths --
+      ① the candidate pool is non-empty but no contradiction pairs were
+      found (= positions agree within the domain, good news)
+      ② **the candidate pool itself is empty** (= the filter matched nothing,
+      the same silent-failure shape as B2)
+    Without reporting the denominator, callers always read it as ①, so the
+    conclusion "no problem within the domain" is false.
 
     Args:
-        store: 存储实例（``iter_records`` 由调用方注入）。
-        source: 只查某个来源（文件名 / 会话标识）下的记忆。
-        filter_tags: 结构化标签过滤。
+        store: Storage instance (``iter_records`` injected by the caller).
+        source: Only look at memories from one source (file name / session
+            identifier).
+        filter_tags: Structured tag filter.
     """
     recs = [
         r for r in store.iter_records()

@@ -1,38 +1,59 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.recall`` 的三段内联逻辑（从 core 抽取）。
+"""The three inlined blocks of ``brain.core.recall`` (extracted from core).
 
-**为什么值得搬**：``recall`` 的壳里混着三块互不相干的职责——查询实体收集
-（约 6 行）、向量/字面两路融合（约 15 行）、候选过滤与打分构建（约 68 行）。
-第三块是主体：硬门槛过滤 + 命中归因 + 四路加分 + 导航降权 + 回显体组装，
-全是纯 dict/list 运算，却因为要读 ``self.manager`` 的十几个面而无法单测。
-搬出来后，``recall`` 只剩「空库短路 / 标签白名单 / 取两路候选 / 调 manager /
-MMR 与标注编排 / 三处副作用记账」这些真正需要 brain 状态的事。
+**Why worth moving**: recall's shell mixes three unrelated
+responsibilities -- query entity collection (about 6 lines), the vector/
+literal two-channel fusion (about 15 lines), and candidate filtering plus
+score assembly (about 68 lines). The third block is the bulk: hard-gate
+filtering + hit attribution + four-way bonuses + navigation downweighting +
+response-body assembly, all pure dict/list operations, yet untestable in
+isolation because it reads a dozen facets of ``self.manager``. After the
+move, ``recall`` keeps only the things that truly need brain state:
+"empty-library short circuit / tag allowlist / fetch two channels of
+candidates / call manager / MMR and annotation orchestration / bookkeeping
+at three side-effect points".
 
-**依赖方向**：本模块只 import 标准库（domain → 仅 common 的纪律这里连
-common 都没用上——所有常量、回调、``np.exp`` 均由壳在调用时现取后注入）。
+**Dependency direction**: this module imports only the standard library
+(domain → common-only discipline; here not even common is used -- all
+constants, callbacks, and ``np.exp`` are fetched by the shell at call time
+and injected).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (touching any one is a behavior change; the parity
+tests will catch it)**:
 
-1. ``literal_ids`` 的取法与旧实现**同源**：旧壳先算
-   ``bm25_ranked = list(bm25_scores.keys())``，再取前 ``MMR_LITERAL_EXEMPT_TOPN``
-   名。本模块直接用 ``bm25_scores`` 的键序算——``use_bm25=False`` 时两侧同为
-   空，``fts5`` 分支也同为 ``dict(hits)`` 的键序，逐位等价。
-2. 回显体里 ``literal`` / ``_literal`` / ``_emb`` **三键并存**（``_literal``
-   与 ``literal`` 同值，是历史冗余）。``_emb`` 供 :meth:`_mmr_select` 算多样性
-   惩罚、``_annotate_conflicts`` 算近邻，删任一个都会改下游行为。
-3. ``_emb`` 只在候选**通过全部过滤**后才取（旧代码在 append 里调
-   ``manager.vector_of``），抽到 :meth:`RecallCandidateContext.embed` 后保持
-   同一惰性——被淘汰的候选不会碰嵌入模型。
-4. ``hit_entity`` 是 ``bool(query_ent_ids) and bool(交集)`` 的短路形态：
-   ``query_ent_ids`` 为空时**不碰** ``rec.entity_ids``。
-5. ``matched_by`` 按固定顺序收集（vector → bm25 → entity → pin）后
-   ``sorted()`` 输出；顺序本身不影响结果，但漏一路会漏归因。
-6. 钉住豁免的指数衰减**外层套 ``float()``**（``np.exp`` 返回 ``np.float64``，
-   不转会让回显体里出现 numpy 标量）。
-7. 导航降权是**乘在最终分上**且带双条件：``nav_penalty < 1.0`` 才生效、
-   且标签键有真值；默认 ``nav_penalty == 1.0`` 时整段跳过（不碰分）。
-8. 硬门槛豁免只认字面路：``sim < hard_floor`` 且 ``did not in bm25_scores``
-   才淘汰——BM25 单路命中的条目 ``similarity`` 是 0.0 也不该被杀。
+1. ``literal_ids`` is taken **from the same source** as the old
+   implementation: the old shell first computed
+   ``bm25_ranked = list(bm25_scores.keys())``, then took the top
+   ``MMR_LITERAL_EXEMPT_TOPN``. This module computes directly from the key
+   order of ``bm25_scores`` -- with ``use_bm25=False`` both sides are empty,
+   and the ``fts5`` branch likewise both follow the key order of
+   ``dict(hits)``; bit-for-bit equivalent.
+2. The response body carries ``literal`` / ``_literal`` / ``_emb`` -- **three
+   keys coexist** (``_literal`` duplicates ``literal``; historical
+   redundancy). ``_emb`` feeds :meth:`_mmr_select`'s diversity penalty and
+   ``_annotate_conflicts``'s neighbor search; deleting either key changes
+   downstream behavior.
+3. ``_emb`` is only fetched after a candidate **passes all filters** (the
+   old code called ``manager.vector_of`` inside append); extracted into
+   :meth:`RecallCandidateContext.embed`, the same laziness is preserved --
+   eliminated candidates never touch the embedding model.
+4. ``hit_entity`` is the short-circuit form of ``bool(query_ent_ids) and
+   bool(intersection)``: when ``query_ent_ids`` is empty, ``rec.entity_ids``
+   is **not touched**.
+5. ``matched_by`` is collected in a fixed order (vector → bm25 → entity →
+   pin) and then emitted via ``sorted()``; the order itself does not affect
+   the result, but missing a channel loses attribution.
+6. The pinned exemption's exponential decay is **wrapped in an outer
+   ``float()``** (``np.exp`` returns ``np.float64``; without the cast a
+   numpy scalar would leak into the response body).
+7. Navigation downweighting **multiplies the final score** and is
+   double-gated: it applies only when ``nav_penalty < 1.0`` and the tag key
+   is truthy; with the default ``nav_penalty == 1.0`` the whole block is
+   skipped (score untouched).
+8. The hard-gate exemption recognizes only the literal channel: a candidate
+   is eliminated only when ``sim < hard_floor`` and ``did not in
+   bm25_scores`` -- an entry hit by BM25 alone must not be killed even
+   though its ``similarity`` is 0.0.
 """
 from __future__ import annotations
 
@@ -41,26 +62,32 @@ from typing import Any, Callable
 
 
 # ======================================================================
-# 块 A：查询实体（旧壳 1451-1456）
+# Block A: query entities (old shell 1451-1456)
 # ======================================================================
 def query_entity_ids(
     names: list[str],
     entities: dict[str, Any],
     trusted_ids: set[str],
 ) -> set[str]:
-    """把查询里的实体名解析成**受信任**的实体 id 集合。
+    """Resolve entity names in the query into a **trusted** set of entity
+    ids.
 
     Args:
-        names: :meth:`HippoBrain.extract_entities` 的产出（四路次序的实体名）。
-        entities: 实体表（``brain.entities``，键为小写实体名）。
-        trusted_ids: 受信任来源的实体 id 白名单（启发式产出不参与加成）。
+        names: output of :meth:`HippoBrain.extract_entities` (entity names in
+            four-channel order).
+        entities: the entity table (``brain.entities``, keyed by lowercase
+            entity name).
+        trusted_ids: allowlist of entity ids from trusted sources
+            (heuristically produced entities do not participate in bonuses).
 
     Returns:
-        去重后的实体 id 集合。查询里没有任何受信任实体时为空集——
-        调用方据此短路 :meth:`collect_recall_items` 的实体加成。
+        Deduplicated set of entity ids. Empty when the query contains no
+        trusted entity -- the caller uses that to short-circuit
+        :meth:`collect_recall_items`'s entity bonus.
 
-    复刻怪癖：查表键是 ``name.lower()`` 而**不是** name 本身；实体表里
-    ``id`` 缺失的条目（``ent["id"]``）会 KeyError——既有行为，不兜底。
+    Replicated quirk: the lookup key is ``name.lower()``, **not** the name
+    itself; entries in the entity table missing ``id`` (``ent["id"]``) raise
+    KeyError -- existing behavior, no fallback added.
     """
     out: set[str] = set()
     for name in names:
@@ -71,19 +98,24 @@ def query_entity_ids(
 
 
 # ======================================================================
-# 块 B：两路融合（旧壳 1484-1500）
+# Block B: two-channel fusion (old shell 1484-1500)
 # ======================================================================
 @dataclass(frozen=True)
 class RecallFusion:
-    """向量路与字面路的融合中间态。
+    """Fusion intermediate state of the vector channel and the literal
+    channel.
 
     Attributes:
-        vec_ranked: 向量路排序结果（原始顺序，RRF 输入）。
-        vec_set: 同上的集合形态，只用于命中归因。
-        fused: RRF 融合分（含 BM25 权重），**只含参与融合的 id**。
-        candidate_ids: 向量路 ∪ 字面路的并集（向量路在前，字面路补尾）。
-        sim_by_id: 向量相似度（字面路单捞的条目取 0.0）。
-        vec_score_by_id: 向量路原始分（次级排序信号，权重 0.1）。
+        vec_ranked: vector-channel ranking (original order, RRF input).
+        vec_set: set form of the above, used only for hit attribution.
+        fused: RRF fused scores (with the BM25 weight), **only ids that
+            participated in the fusion**.
+        candidate_ids: union of vector ∪ literal channels (vector first,
+            literal appended at the tail).
+        sim_by_id: vector similarity (entries fetched by the literal channel
+            alone get 0.0).
+        vec_score_by_id: raw vector-channel scores (secondary ranking
+            signal, weight 0.1).
     """
     vec_ranked: list[str]
     vec_set: set[str]
@@ -100,23 +132,29 @@ def build_fusion(
     bm25_weight: float,
     fuse: Callable[[list[list[str]], Any], dict[str, float]],
 ) -> RecallFusion:
-    """把两路候选融合成统一的打分/并集视图（旧壳 1484-1500 整块）。
+    """Fuse the two channels of candidates into a unified scoring/union view
+    (the whole old-shell block 1484-1500).
 
     Args:
-        raw: manager.recall 的返回（鸭子类型：``memory_id`` / ``similarity``
-            / ``score`` 三个属性）。
-        bm25_ranked: 字面路排序结果；**空列表表示字面通道关闭**，此时
-            ``fuse`` 只收到单路（权重表退化为 ``[1.0]``）。
-        bm25_weight: 字面路在 RRF 里的权重（``brain.bm25_weight``）。
-        fuse: :func:`~hippocampus_mcp.retrieval.bm25.rrf_fuse` 本体
-            （retrieval 不在 domain 的可依赖范围内，按第 16 条铁律注入）。
+        raw: return value of manager.recall (duck-typed: the three
+            attributes ``memory_id`` / ``similarity`` / ``score``).
+        bm25_ranked: literal-channel ranking; **an empty list means the
+            literal channel is off**, in which case ``fuse`` receives a
+            single channel (the weight table degrades to ``[1.0]``).
+        bm25_weight: the literal channel's weight in RRF
+            (``brain.bm25_weight``).
+        fuse: :func:`~hippocampus_mcp.retrieval.bm25.rrf_fuse` itself
+            (retrieval is outside domain's allowed dependencies; injected
+            per iron rule no. 16).
 
     Returns:
-        :class:`RecallFusion`。空 ``raw`` 且空 ``bm25_ranked`` 时全空，
-        调用方循环自然不产出。
+        :class:`RecallFusion`. With empty ``raw`` and empty ``bm25_ranked``
+        everything is empty and the caller's loop naturally yields nothing.
 
-    复刻怪癖：``fuse`` 的调用形态随 ``bm25_ranked`` **真假**分岔——空列表
-    时权重表只有 ``[1.0]`` 一项，与旧壳逐字一致（不是传 ``[1.0, w]`` 的空路）。
+    Replicated quirk: the call shape of ``fuse`` branches on the **truthiness**
+    of ``bm25_ranked`` -- with an empty list the weight table has the single
+    entry ``[1.0]``, verbatim identical to the old shell (not the
+    ``[1.0, w]`` of an empty channel).
     """
     vec_ranked = [r.memory_id for r in raw]
     vec_set = set(vec_ranked)
@@ -143,36 +181,46 @@ def build_fusion(
 
 
 # ======================================================================
-# 块 C：候选过滤与打分构建（旧壳 1502-1570）
+# Block C: candidate filtering and score assembly (old shell 1502-1570)
 # ======================================================================
 @dataclass(frozen=True)
 class RecallCandidateContext:
-    """候选遍历所需的全部旋钮与回调（壳在调用时现取后一次性注入）。
+    """Every knob and callback needed to traverse candidates (fetched by the
+    shell at call time and injected in one go).
 
     Attributes:
-        allow_ids: 标签白名单；``None`` 表示不过滤（**不是空集**）。
-        include_superseded: 是否放行 superseded 记录。
-        archived_state: ``MemoryState.ARCHIVED.value``——状态是字符串，
-            按值注入（store.memory 不在 domain 依赖范围内）。
-        superseded_state: 同上，``MemoryState.SUPERSEDED.value``。
-        hard_floor: 相关性硬门槛（``RELEVANCE_HARD_FLOOR``）。
-        entity_bonus: 实体命中加成（``ENTITY_BONUS``）。
-        literal_topn: 字面强命中豁免名次（``MMR_LITERAL_EXEMPT_TOPN``）；
-            ``<= 0`` 时豁免集为空。
-        w_time: 时间衰减权重（``manager.scorer.w_time``，补钉住豁免用）。
-        lambda_decay: 衰减时间常数（``brain.lambda_decay``）。
-        nav_penalty: 导航类内容折扣（``< 1.0`` 才生效）。
-        nav_tag_key: 导航标签键（``brain.nav_tag_key``）。
-        bm25_scores: 字面路分数字典（**键序即名次**）。
-        query_ent_ids: 查询实体 id 集合（块 A 的产出）。
-        vec_set: 向量路 id 集合（归因用）。
-        fused: RRF 融合分（块 B 的产出）。
-        vec_score_by_id: 向量路原始分（次级信号）。
-        sim_by_id: 向量相似度（缺失取 0.0）。
-        get_record: ``manager.store.get`` 本体（鸭子类型返回值，可能 None）。
-        embed: ``manager.vector_of`` 本体（**惰性**：只对通过过滤的候选调）。
-        exp: ``np.exp`` 本体（numpy 不在 domain 依赖范围内）。
-        now: 时间基准（``manager._reference_time or _now()``，调用时算好）。
+        allow_ids: tag allowlist; ``None`` means no filtering (**not an
+            empty set**).
+        include_superseded: whether superseded records are admitted.
+        archived_state: ``MemoryState.ARCHIVED.value`` -- state is a string,
+            injected by value (store.memory is outside domain's dependency
+            scope).
+        superseded_state: same, ``MemoryState.SUPERSEDED.value``.
+        hard_floor: relevance hard gate (``RELEVANCE_HARD_FLOOR``).
+        entity_bonus: entity-hit bonus (``ENTITY_BONUS``).
+        literal_topn: literal strong-hit exemption rank
+            (``MMR_LITERAL_EXEMPT_TOPN``); with ``<= 0`` the exemption set is
+            empty.
+        w_time: time-decay weight (``manager.scorer.w_time``, used to
+            backfill the pinned exemption).
+        lambda_decay: decay time constant (``brain.lambda_decay``).
+        nav_penalty: navigation-content discount (effective only when
+            ``< 1.0``).
+        nav_tag_key: navigation tag key (``brain.nav_tag_key``).
+        bm25_scores: literal-channel score dict (**key order is the
+            ranking**).
+        query_ent_ids: query entity id set (Block A's output).
+        vec_set: vector-channel id set (for attribution).
+        fused: RRF fused scores (Block B's output).
+        vec_score_by_id: raw vector-channel scores (secondary signal).
+        sim_by_id: vector similarity (0.0 when missing).
+        get_record: ``manager.store.get`` itself (duck-typed return value,
+            may be None).
+        embed: ``manager.vector_of`` itself (**lazy**: called only for
+            candidates that pass the filters).
+        exp: ``np.exp`` itself (numpy is outside domain's dependency scope).
+        now: time base (``manager._reference_time or _now()``, computed at
+            call time).
     """
     allow_ids: set[str] | None
     include_superseded: bool
@@ -201,22 +249,29 @@ def collect_recall_items(
     candidate_ids: list[str],
     ctx: RecallCandidateContext,
 ) -> list[dict[str, Any]]:
-    """按旧壳 1502-1570 的次序过滤候选、打分、组装回显体。
+    """Filter candidates, score, and assemble the response body in the old
+    shell's 1502-1570 order.
 
     Returns:
-        通过全部过滤的条目（**顺序即 candidate_ids 的遍历序**；MMR 与
-        最终截断在壳里做，这里不裁 ``top_k``）。每条都带 ``_emb`` /
-        ``_literal`` 两个内部字段，供 :meth:`_mmr_select` 与
-        :meth:`_annotate_conflicts` 消费，最后由 ``strip_internal_fields``
-        统一清理——本函数**不负责清理**。
+        Entries that passed all filters (**order is the traversal order of
+        candidate_ids**; MMR and the final truncation happen in the shell;
+        this does not cut ``top_k``). Each entry carries the two internal
+        fields ``_emb`` / ``_literal`` for :meth:`_mmr_select` and
+        :meth:`_annotate_conflicts` to consume, cleaned up uniformly by
+        ``strip_internal_fields`` at the end -- this function is **not
+        responsible for the cleanup**.
 
-    复刻怪癖见模块 docstring 第 2-8 条；其中：
+    Replicated quirks: see module docstring items 2-8; among them:
 
-    - 硬门槛豁免只认字面路（``did not in ctx.bm25_scores``）；
-    - 钉住豁免与实体加成**按此顺序**叠加在融合分之后、导航降权之前；
-    - 导航降权是乘法，且 ``nav_penalty`` 为 1.0（默认）时整段跳过。
+    - the hard-gate exemption recognizes only the literal channel (``did not
+      in ctx.bm25_scores``);
+    - the pinned exemption and the entity bonus are stacked **in this
+      order** after the fused score and before navigation downweighting;
+    - navigation downweighting is multiplicative, and with ``nav_penalty``
+      at 1.0 (default) the whole block is skipped.
     """
-    # 字面强命中豁免集：键序即名次（见模块 docstring 第 1 条）
+    # Literal strong-hit exemption set: key order is the ranking (see module
+    # docstring item 1)
     if ctx.literal_topn > 0:
         literal_ids = set(list(ctx.bm25_scores.keys())[:ctx.literal_topn])
     else:
@@ -233,17 +288,22 @@ def collect_recall_items(
             continue
         if rec.state == ctx.superseded_state and not ctx.include_superseded:
             continue
-        # D2a 写侧隔离：待审卡不进召回池——这是"不进召回池"承诺的**唯一
-        # 执行点**（brain.recall 单一调用路径，scope_recall 的用户库流同穿
-        # 此处）。getattr 兜底：旧记录对象没有该字段时按未隔离处理。
+        # D2a write-side isolation: quarantined cards stay out of the recall
+        # pool -- this is the **single enforcement point** of the "kept out
+        # of the recall pool" promise (brain.recall is the one call path;
+        # the scope_recall user-library flow passes through here too).
+        # getattr fallback: old record objects lacking the field are treated
+        # as not quarantined.
         if getattr(rec, "quarantine", False):
             continue
         sim = ctx.sim_by_id.get(did, 0.0)
-        # 相关性硬门槛：向量和 BM25 都没命中 → 淘汰（防摘要层霸榜）
+        # Relevance hard gate: missed by both vector and BM25 → eliminate
+        # (prevents the summary layer from dominating the board)
         if sim < ctx.hard_floor and did not in ctx.bm25_scores:
             continue
 
-        # 命中归因：三路信号各记一笔，供返回体的 matched_by 用
+        # Hit attribution: one entry per channel of signal, for the response
+        # body's matched_by
         hit_entity = bool(ctx.query_ent_ids) and bool(
             ctx.query_ent_ids & set(rec.entity_ids or [])
         )
@@ -257,19 +317,24 @@ def collect_recall_items(
         if rec.pin:
             srcs.append("pin")
 
-        # 主排序信号 = RRF 融合分；向量分作为次级信号
+        # Primary ranking signal = RRF fused score; vector score as the
+        # secondary signal
         score = ctx.fused.get(did, 0.0) + 0.1 * ctx.vec_score_by_id.get(did, 0.0)
-        # 钉住记忆豁免时间衰减（补足 w_time 的最大可能贡献）
+        # Pinned memories are exempt from time decay (backfills w_time's
+        # maximum possible contribution)
         if rec.pin:
             age = max(ctx.now - rec.timestamp, 0.0)
             score += ctx.w_time * (
                 1.0 - float(ctx.exp(-age / ctx.lambda_decay))
             )
-        # 实体命中加成（跨越语义鸿沟：向量相似度低但实体对上）
+        # Entity-hit bonus (bridging the semantic gap: low vector similarity
+        # but the entity matches)
         if hit_entity:
             score += ctx.entity_bonus
-        # 导航类内容降权：默认 penalty=1.0 不生效，只有导入端显式标了
-        # NAV_TAG_KEY 且配了折扣才动，避免默认行为变化。
+        # Navigation-content downweighting: the default penalty=1.0 is a
+        # no-op; it only kicks in when the import side explicitly tagged
+        # NAV_TAG_KEY and configured a discount, avoiding default-behavior
+        # changes.
         if ctx.nav_penalty < 1.0 and (rec.tags or {}).get(ctx.nav_tag_key):
             score *= ctx.nav_penalty
         items.append({
@@ -286,10 +351,12 @@ def collect_recall_items(
             "pin": rec.pin,
             "source": rec.source or "",
             "tags": dict(rec.tags or {}),
-            # D7（ZCode 追加三）：这条**凭什么**被召回。多路混合检索里
-            # "分数高"不等于"检索器认为它相关"——可能只是 BM25 字面撞上了
-            # 一个虚词，也可能是实体/钉住加成顶上去的。给出归因才能解释
-            # 误召回，也是调权重的依据。
+            # D7 (ZCode addendum three): **why** this entry was recalled. In
+            # multi-channel hybrid retrieval, "high score" does not mean
+            # "the retriever considered it relevant" -- it may be BM25
+            # literally hitting a stopword, or the entity/pin bonus pushing
+            # it up. Attribution is what makes false recalls explainable,
+            # and the basis for tuning weights.
             "matched_by": sorted(srcs),
             "literal": did in literal_ids,
             "_emb": ctx.embed(rec),

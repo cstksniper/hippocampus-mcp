@@ -1,38 +1,44 @@
 # -*- coding: utf-8 -*-
-"""批量写回主题归纳（``action="summarize_batch"``）的域内实现。
+"""In-domain implementation of the batch write-back of topic summaries
+(``action="summarize_batch"``).
 
-从 ``HippoBrain._knowledge_summarize_batch`` 抽出：本模块
-只含纯逻辑与编排，零 import——``topic`` 模块函数（apply_host_summary /
-pending_summary_ids）、``_knowledge_items``、``_persist_knowledge``、
-``_topic_defaults`` 全部由壳调用时现取后注入（domain 同层禁互引）。
+Extracted from ``HippoBrain._knowledge_summarize_batch``: this module contains only pure
+logic and orchestration, zero imports -- the ``topic`` module functions
+(apply_host_summary / pending_summary_ids), ``_knowledge_items``, ``_persist_knowledge``,
+and ``_topic_defaults`` are all fetched and injected by the shell at call time
+(same-layer cross-imports banned within domain).
 
-行为怪癖（逐条钉在 tests/test_m5_batch31_summarize_batch_flow.py）：
+Behavior quirks (each pinned in tests/test_m5_batch31_summarize_batch_flow.py):
 
-  1. 双守卫有先后：``not items`` 先于 ``isinstance``——空 dict / 0 /
-     False / 空元组都报「items 是空的」，只有**非空**的非 list 才报
-     「items 必须是数组」；
-  2. 逐条独立：一条校验不过只退那一条（记进 ``failed`` 带原因），
-     同批其他条照常写——否则一次手抖写错一个 id，整批几十条归纳全丢；
-  3. 存活全集**逐条现取**（``items_of(require_vec=False)``，且只对
-     **通过主题查找**的条目取）：调用次数语义与原实现一致，防猴子
-     补丁计数面；
-  4. ``topic_id`` 经 ``str(... or "")`` + strip：0 / False / None 全
-     归一成空串，走「没有这个主题：」（拼的是 strip 后的 tid）；
-  5. ``alive`` = ``member_ids`` ∩ 存活全集，保 ``member_ids`` 序；
-  6. ``apply_host_summary`` 失败时 topic 零改动（域函数自身保证），
-     本模块不兜底、不重试；
-  7. ``written`` 条目的 ``title`` 兜底 ``(未命名)``；``has_fras`` 读
-     apply **之后**的 ``summary_fras``——旧 fras 不清 ⇒ 不传 fras
-     重写也报 True；
-  8. 落盘条件：只有 ``written`` 非空才调 ``persist``——全失败的批次
-     不写盘；
-  9. ``ok = not failed or bool(written)``：部分成功算 ok；
-  10. ``pending_summary_ids`` 调**两次**（``pending_count`` 与 note
-      各一次）；``defaults`` 由壳一次现取后注入；
-  11. note 三段式，有失败时中段插「，%d 条被退回（见 failed）」；
-  12. 回显十键固定序：ok, enabled, action, written, failed,
-      failed_count, results, saved, pending_count, note——注意
-      ``written`` 是**计数**、``results`` 才是列表。
+  1. The two guards are ordered: ``not items`` runs before ``isinstance`` -- an empty
+     dict / 0 / False / empty tuple all report "items is empty (expects
+     [{topic_id, summary, evidence}])"; only a **non-empty** non-list reports
+     "items must be an array";
+  2. Per-item independence: one item failing validation rejects only that item (recorded
+     in ``failed`` with a reason); other items in the same batch are written as usual --
+     otherwise one mistyped id would lose dozens of summaries in the batch;
+  3. The alive set is **fetched per item** (``items_of(require_vec=False)``, and only
+     for items that **passed the topic lookup**): the call-count semantics match the
+     original implementation, guarding the monkeypatch-counting surface;
+  4. ``topic_id`` goes through ``str(... or "")`` + strip: 0 / False / None all
+     normalize to the empty string and take the "no such topic: " path (concatenating
+     the stripped tid);
+  5. ``alive`` = ``member_ids`` ∩ alive set, preserving ``member_ids`` order;
+  6. When ``apply_host_summary`` fails, the topic is left unchanged (the domain function
+     guarantees that itself); this module neither patches up nor retries;
+  7. ``written`` entries' ``title`` falls back to "(untitled)"; ``has_fras`` reads
+     ``summary_fras`` **after** apply -- a stale fras not cleared ⇒ rewriting without
+     passing fras also reports True;
+  8. Persist condition: ``persist`` is called only when ``written`` is non-empty -- a
+     batch that failed entirely does not write to disk;
+  9. ``ok = not failed or bool(written)``: partial success counts as ok;
+  10. ``pending_summary_ids`` is called **twice** (once each for ``pending_count`` and
+      note); ``defaults`` is fetched once by the shell and injected;
+  11. The note has three segments; with failures the middle segment inserts
+      "; %d item(s) rejected (see failed)";
+  12. The echo has a fixed ten-key order: ok, enabled, action, written, failed,
+      failed_count, results, saved, pending_count, note -- note that ``written`` is a
+      **count** while ``results`` is the list.
 """
 from __future__ import annotations
 
@@ -42,10 +48,11 @@ ACTION = "summarize_batch"
 
 
 def guard(items: Any) -> tuple[Any, dict[str, Any] | None]:
-    """双守卫（怪癖 1）。返回 ``(items, None)`` 或 ``(None, 错误体)``。
+    """The two guards (quirk 1). Returns ``(items, None)`` or ``(None, error body)``.
 
-    错误体四键固定序：ok=False / enabled=True / action / error。两条
-    消息逐字保留——工具面测试对它们做子串断言。
+    The error body has a fixed four-key order: ok=False / enabled=True / action / error.
+    The two messages are preserved verbatim -- tool-surface tests assert substrings on
+    them.
     """
     if not items:
         return None, {"ok": False, "enabled": True, "action": ACTION,
@@ -65,12 +72,12 @@ def apply_items(
     apply_summary: Callable[..., tuple[bool, str]],
     now: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """逐条独立校验与写回（怪癖 2-7）。返回 ``(written, failed)``。
+    """Per-item independent validation and write-back (quirks 2-7). Returns ``(written, failed)``.
 
-    ``items_of`` 逐条现取（怪癖 3，固定收 ``require_vec=False``）；
-    ``apply_summary`` 签名与 ``topic.apply_host_summary`` 一致（topic,
-    text, evidence, member_ids, now=, fras=），校验不过返回
-    ``(False, 原因)`` 且**一个字段都不改**。
+    ``items_of`` is fetched per item (quirk 3, always given ``require_vec=False``);
+    ``apply_summary``'s signature matches ``topic.apply_host_summary`` (topic,
+    text, evidence, member_ids, now=, fras=); on failed validation it returns
+    ``(False, reason)`` and **changes not a single field**.
     """
     written: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -105,10 +112,11 @@ def assemble_report(
     defaults: Any,
     pending_summary_ids: Callable[..., list[str]],
 ) -> dict[str, Any]:
-    """十键回显体（怪癖 9-12）。
+    """The ten-key echo body (quirks 9-12).
 
-    ``pending_summary_ids`` 调两次——与原实现「pending_count 与 note
-    各算一次」对齐，调用次数是行为面（猴子补丁计数可观测）。
+    ``pending_summary_ids`` is called twice -- matching the original implementation's
+    "once for pending_count and once for note"; the call count is part of the behavior
+    surface (observable via monkeypatch counting).
     """
     pending = len(pending_summary_ids(knowledge, defaults=defaults))
     return {
@@ -140,9 +148,10 @@ def collect(
     pending_summary_ids: Callable[..., list[str]],
     persist: Callable[[], Any],
 ) -> dict[str, Any]:
-    """编排入口（壳注入八面）。
+    """Orchestration entry point (eight things injected by the shell).
 
-    守卫不过直接回错误体——不落盘、不算 pending（怪癖 1/8）。
+    A guard failure returns the error body directly -- nothing persisted to disk, no
+    pending counted (quirks 1/8).
     """
     items, err = guard(items)
     if err is not None:

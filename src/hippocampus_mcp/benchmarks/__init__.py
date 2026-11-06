@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""benchmarks 包: 评估框架与基线方法."""
+"""benchmarks package: evaluation framework and baseline methods."""
 
 from .metrics import (
     EvalReport,

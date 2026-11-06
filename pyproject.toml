@@ -28,11 +28,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # 上界按「实际跑通」的经验值钉死，不是拍脑袋：
+    # Upper bounds are pinned to empirically verified "actually runs" values, not guesses:
     #   mcp 2.3.0 / sentence-transformers 6.2.0 / torch 2.15.0 / transformers 5.22.1
-    #   已在干净 venv 实测：server 导入 OK、46 个工具全注册、embed_batch 出 384 维。
-    # 不加上界会让首批用户装到我没验证过的版本（2026-11-03 踩到：本机 1.29/5.6.1，
-    # 而 PyPI 最新已是 2.3/6.2）。
+    #   verified in a clean venv: server imports OK, all 46 tools register, embed_batch
+    #   yields 384 dims.
+    # Without upper bounds the first users would install versions I never validated
+    # (hit on 2026-11-03: local machine had 1.29/5.6.1, while PyPI's latest was already
+    # 2.3/6.2).
     "mcp>=1.0,<3",
     "torch>=2.0,<3",
     "ncps>=1.0,<2",
@@ -41,43 +43,46 @@ dependencies = [
 ]
 
 [project.urls]
-# GitHub 账号已落实（2026-11-05）；首发 0.1.0 未上传 PyPI，故此处可安全补齐。
+# GitHub account is in place (2026-11-05); the initial 0.1.0 release was not uploaded to PyPI, so filling these in now is safe.
 Homepage = "https://github.com/cstksniper/hippocampus-mcp"
 Source = "https://github.com/cstksniper/hippocampus-mcp"
 Issues = "https://github.com/cstksniper/hippocampus-mcp/issues"
 
-# --- 可选依赖 ---
-# 核心服务只依赖上面的必需项。
-# 以下三者在本项目内均为「惰性导入 + 明确降级」，缺失不会崩溃，
-# 只是对应能力降级（见各处 log 与 docstring）。
+# --- Optional dependencies ---
+# The core service depends only on the required items above.
+# The following three are all "lazy import + explicit degradation" in this project; missing
+# them does not crash, the corresponding capability just degrades
+# (see the various logs and docstrings).
 [project.optional-dependencies]
-# 评测 / 对照脚本调用外部 LLM API（任一 OpenAI 兼容端点，经 JUDGE_* 环境变量注入）
+# evaluation / baseline scripts call external LLM APIs (any OpenAI-compatible endpoint, injected via JUDGE_* environment variables)
 llm = ["httpx>=0.24"]
-# spaCy NER 实体抽取（英文路径；中文走启发式 + 词库，不需要它）
+# spaCy NER entity extraction (the English path; Chinese uses heuristics + the lexicon and does not need it)
 ner = ["spacy>=3.7"]
-# 跨进程写锁；缺失时降级为乐观锁，冲突仍会显式失败
+# cross-process write lock; degrades to an optimistic lock when missing, conflicts still fail explicitly
 lock = ["filelock>=3.12"]
-# ONNX 推理后端：实测启动 35.0s → 12.8s。
-# 缺失不影响功能 —— onnx_backend 默认 auto，缺依赖会静默回落 torch（已核代码路径）。
+# ONNX inference backend: measured startup 35.0s → 12.8s.
+# Missing it does not affect functionality — onnx_backend defaults to auto, and with the
+# dependency absent it silently falls back to torch (code path verified).
 onnx = ["onnxruntime>=1.17", "tokenizers>=0.15"]
-# 开发 / 测试
+# development / testing
 dev = ["pytest>=8.0"]
-# 一次装齐
+# install everything at once
 all = ["httpx>=0.24", "spacy>=3.7", "filelock>=3.12", "onnxruntime>=1.17", "tokenizers>=0.15"]
 
 [project.scripts]
-# 指向 cli：默认走 launcher（daemon 共享单份模型），
-# 并提供 setup / doctor 子命令，与生产入口口径一致。
+# points at the cli: defaults to the launcher (the daemon shares a single copy of the model),
+# and provides setup / doctor subcommands, consistent with the production entry's account.
 hippocampus-mcp = "hippocampus_mcp.cli:main"
 
-# src 布局的包发现配置
+# package discovery config for the src layout
 [tool.hatch.build.targets.wheel]
 packages = ["src/hippocampus_mcp"]
 
-# ⚠️ sdist 是**公开可下载的**：`pip download hippocampus-mcp` 拿到的就是这个包。
-#    默认行为会把整个仓库打进去。这里用**显式白名单**，只放「从 sdist 能重建出
-#    同一个 wheel」所需的最小集，其他研发过程与私人语料一律挡在包外。
-#    要加文件进来，先问一句：这东西公开了有没有问题？
+# ⚠️ the sdist is **publicly downloadable**: `pip download hippocampus-mcp` gets exactly this package.
+#    The default behavior would pack the whole repository in. This uses an **explicit whitelist**,
+#    containing only the minimal set needed to "rebuild the same wheel from the sdist";
+#    all other development artifacts and private corpora are kept out of the package.
+#    Before adding a file, ask first: is it OK for this to be public?
 [tool.hatch.build.targets.sdist]
 include = [
     "/src/hippocampus_mcp",
@@ -97,7 +102,7 @@ include = [
     "/docs/assets",
 ]
 
-# uv 配置: 使用 CPU 版本的 PyTorch，避免下载庞大的 CUDA 包
+# uv config: use the CPU build of PyTorch to avoid downloading the huge CUDA packages
 [tool.uv]
 [[tool.uv.index]]
 name = "pytorch-cpu"

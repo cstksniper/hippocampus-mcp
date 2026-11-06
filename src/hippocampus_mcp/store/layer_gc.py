@@ -1,34 +1,49 @@
-"""层 GC 族：L0 自动落盘 / 删除账本拦截与瘦身 / 层合并
-路由 / 派生层重裁 / 启动对账。
+"""Layer GC family: L0 auto-persist / deletion-ledger gating and slimming /
+layer merge routing / derived-layer reclip / boot reconciliation.
 
-从 ``brain.core`` 整搬六件（I/O 密集落 store；与 ``store/layer_save.py``
-分工——那边管"全量保存编排"，这里管"层级的增删并瘦身边角"）。
+Six pieces moved wholesale from ``brain.core`` (I/O-heavy work belongs in
+store; division of labor with ``store/layer_save.py`` -- that side owns
+"full-save orchestration", this side owns "per-layer add/delete plus slimming
+edge cases").
 
-**状态容器不搬**：``layer_del`` / ``layer_stamp`` 由壳注入本体或以
-"返回新值、壳回写"的口径处理（``_gc_layer_del`` 原实现就是**重绑新
-dict**，模块返回 ``(新 dict, 丢了几条)``、壳回写属性，语义一致）；
-``raw_log`` 同理（多写并集后壳回写 ``self.raw_log``）。
+**State containers not moved**: ``layer_del`` / ``layer_stamp`` are injected as
+the object itself by the shell or handled under the "return the new value, the
+shell writes it back" contract (``_gc_layer_del``'s original implementation
+**rebinds a new dict** anyway; the module returns ``(new dict, how many were
+dropped)`` and the shell writes the attribute back -- semantically identical);
+``raw_log`` works the same way (after the multi-writer union the shell writes
+``self.raw_log`` back).
 
-**副作用留壳**：``_save_l0_only`` 的 try/except、
-``manager.last_save_error`` 记账与 logger 自曝、``_l0_pending`` 清零
-都留在壳（"收尾落盘留壳"的同一判断——注入端口会比原代码还长）；
-本模块只做落盘核心，异常向上抛。
+**Side effects stay in the shell**: ``_save_l0_only``'s try/except,
+``manager.last_save_error`` bookkeeping and logger self-report, and the
+``_l0_pending`` reset all stay in the shell (the same judgment as "final
+persist stays in the shell" -- an injection port would be longer than the
+original code); this module only does the persist core and raises exceptions
+upward.
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (touching any one is a behavior change; parity
+will catch it):
 
-  * save_l0_only：多写进程下 L0 append-only，必须先读盘并集再写
-    （整份覆写会把别的进程写的 raw 静默写没）；写完盖层戳；
-  * apply_layer_deletions：开关关或账本空直接放行；放行条件是条目
-    时间戳**晚于**删除时刻（删后又命中=新留痕，不是复活）；list 与
-    dict 两种形态分别拦截；被拦条数由壳累加 ``_layer_del_blocked``；
-  * gc_layer_del：先按 TTL 丢超龄（非数值时间戳一并丢），仍超量按
-    时间戳降序保留最新 max_keys 条；返回丢掉几条；
-  * merge_layer：按层规则路由（未知层=dict 规则）；``del_ledger`` 层
-    不参与拦截（自己没有删除语义）；合并完统一过删除账本；
-  * reclip_derived_layers：L1 视图为空（count==0）直接返回——宁可漏裁
-    不可误裁；实体重算统计后摘空壳；画像走 prune；主题层走 reclip；
-  * reconcile_ledger_on_boot：纯解析（末条 end/begin/fail 三态判
-    lost/mismatch），日志留壳。
+  * save_l0_only: under multi-writer processes L0 is append-only; must read the
+    disk and union before writing (a whole-file overwrite would silently erase
+    raw written by other processes); stamp the layer after writing;
+  * apply_layer_deletions: switch off or empty ledger passes straight through;
+    the pass condition is an entry timestamp **newer than** the deletion moment
+    (a hit after deletion = a new trace, not resurrection); list and dict forms
+    are gated separately; the blocked count is accumulated by the shell in
+    ``_layer_del_blocked``;
+  * gc_layer_del: first drop over-age entries by TTL (non-numeric timestamps
+    dropped as well); if still over the cap, keep the newest max_keys entries
+    by timestamp descending; returns how many were dropped;
+  * merge_layer: route by layer rule (unknown layer = dict rule); the
+    ``del_ledger`` layer does not participate in gating (it has no deletion
+    semantics of its own); after merging, everything passes the deletion
+    ledger;
+  * reclip_derived_layers: an empty L1 view (count==0) returns directly --
+    rather under-clip than mis-clip; entities recomputed then empty shells
+    removed; profile goes through prune; topic layers go through reclip;
+  * reconcile_ledger_on_boot: pure parsing (last entry's end/begin/fail
+    three-state decision of lost/mismatch); logging stays in the shell.
 """
 from __future__ import annotations
 
@@ -43,13 +58,16 @@ def save_l0_only(
     backend: Any, get_backend_fn: Callable[[str], Any],
     layer_stamp: dict,
 ) -> list:
-    """L0 落盘核心：多写并集 → 后端写 → 盖层戳。返回（可能并集过的）
-    新 raw_log；异常向上抛（记账与自曝在壳）。"""
+    """L0 persist core: multi-writer union -> backend write -> layer stamp.
+    Returns the (possibly unioned) new raw_log; exceptions propagate upward
+    (bookkeeping and self-reporting live in the shell)."""
     if multi_writer_fn():
-        # 多写进程下 L0 是 append-only：必须与磁盘取并集，
-        # 整份覆写会把别的进程写的 raw 静默写没（同款事故）
+        # Under multi-writer processes L0 is append-only: must union with the
+        # disk, a whole-file overwrite would silently erase raw written by
+        # other processes (same class of incident)
         raw_log = merge_raw_fn(read_raw_fn(), raw_log)
-    # G1：走后端（json 写单文件；sqlite 只更新 layers 表里这一行）
+    # G1: go through the backend (json writes the single file; sqlite updates
+    # only this one row in the layers table)
     backend = backend or get_backend_fn(persist_dir)
     backend.write_layers({"brain_raw.json": raw_log})
     layer_stamp["brain_raw.json"] = backend.layer_stamp("brain_raw.json")
@@ -60,7 +78,8 @@ def apply_layer_deletions(
     name: str, merged: Any, *, enabled: bool, layer_del: dict,
     layer_key_fn: Callable[[dict], str], entry_ts_fn: Callable[[dict], float],
 ) -> tuple[Any, int]:
-    """合并之后：把账本里已标记删除的键挡掉。返回 ``(合并结果, 拦截数)``。"""
+    """After merging: block keys the ledger has marked deleted. Returns
+    ``(merge result, blocked count)``."""
     blocked = 0
     if not enabled or not layer_del:
         return merged, blocked
@@ -92,10 +111,13 @@ def gc_layer_del(
     layer_del: dict, *, now_fn: Callable[[], float], ttl: float,
     max_keys: int,
 ) -> tuple[dict, int]:
-    """账本瘦身：丢超龄的；仍超量就丢最旧的。返回 ``(新账本, 丢掉几条)``。
+    """Ledger slimming: drop over-age entries; if still over the cap, drop the
+    oldest. Returns ``(new ledger, how many were dropped)``.
 
-    ⚠️ 已知折中：丢掉的墓碑理论上可能让**更老**的快照复活对应条目。
-    30 天远超任何一份内存快照的合理寿命，接受这个风险并写在这里。
+    WARNING -- known trade-off: a dropped tombstone could in theory let an
+    **older** snapshot resurrect the corresponding entry. 30 days far exceeds
+    the reasonable lifetime of any in-memory snapshot; the risk is accepted and
+    documented here.
     """
     if not layer_del:
         return layer_del, 0
@@ -118,16 +140,18 @@ def merge_layer(
     apply_del_fn: Callable[[str, Any], Any], miss_log_max: int,
     list_caps: dict[str, int] | None = None,
 ) -> Any:
-    """按层口径合并（磁盘打底 + 本地补充），再按删除账本拦截。
+    """Merge by layer contract (disk as the base + local additions), then gate
+    through the deletion ledger.
 
-    ``list_caps``：list_cap 规则的 per-层上限表（缺省回落
-    ``miss_log_max``——历史行为逐位不变）。brain_topics 走这里传
-    ``OPEN_TOPICS_MAX``。
+    ``list_caps``: per-layer cap table for list_cap rules (missing entries fall
+    back to ``miss_log_max`` -- historical behavior bit-for-bit unchanged).
+    brain_topics goes through here passing ``OPEN_TOPICS_MAX``.
     """
     rule = rules.get(name, "dict")
     if rule == "del_ledger":
-        # 账本自己不参与拦截：它的键形如 "层::键"，别的层的 prefix 命中
-        # 不到它；反过来它也拦不了自己（自己没有删除语义）。
+        # The ledger itself does not participate in gating: its keys look like
+        # "layer::key", so other layers' prefixes never hit it; conversely it
+        # cannot block itself (it has no deletion semantics of its own).
         return fns["del_ledger"](disk, mine)
     if rule == "raw":
         merged = fns["raw"](disk if isinstance(disk, list) else [], mine)
@@ -150,7 +174,8 @@ def merge_layer(
         merged = fns["sourcesig"](disk, mine)
     else:
         merged = fns["dict"](disk, mine)
-    # 合并做完（并集只会做加法）之后，按删除账本把已删的键挡回去。
+    # After merging (a union only ever adds), block already-deleted keys via
+    # the deletion ledger.
     return apply_del_fn(name, merged)
 
 
@@ -159,11 +184,13 @@ def reclip_derived_layers(
     recompute_entity_stats_fn: Callable[[], Any], prune_fn: Callable[[], Any],
     reclip_knowledge_fn: Callable[[], Any],
 ) -> None:
-    """并集之后，按**当前真相**重新裁剪派生层。
+    """After the union, re-clip the derived layers against the **current
+    truth**.
 
-    实体 / 画像本来就是 L1 的派生副本，不需要额外的删除日志：合并完拿
-    当前存活记忆重新裁一遍即可。L1 视图为空（count==0）直接返回——
-    宁可漏裁，不可误裁（与 prune_stale_profile 同源）。
+    Entities / profile are derived copies of L1 in the first place and need no
+    extra deletion log: after merging, just re-clip them against the currently
+    alive memories. An empty L1 view (count==0) returns directly -- rather
+    under-clip than mis-clip (same origin as prune_stale_profile).
     """
     if count_fn() == 0:
         return
@@ -174,7 +201,8 @@ def reclip_derived_layers(
             entities.pop(k, None)
     if isinstance(profile, dict) and profile:
         prune_fn()
-    # 主题层同样是 L1 的派生副本：并集会把已删记忆的成员并回来。
+    # Topic layers are derived copies of L1 too: the union would merge back
+    # members from already-deleted memories.
     if isinstance(knowledge, dict) and knowledge:
         reclip_knowledge_fn()
 
@@ -183,11 +211,13 @@ def reconcile_ledger_on_boot(
     last: Any, tail: list, attrs: list,
     fingerprint_fn: Callable[[str], str],
 ) -> dict:
-    """启动对账的纯解析：末条 end/begin/fail 三态判 lost/mismatch。
+    """Pure parsing for boot reconciliation: the last entry's end/begin/fail
+    three-state decision of lost/mismatch.
 
-    行里没有 ``layer_fps``（旧格式/指纹关）→ ``layer_fps_absent``，不判
-    内容。双钟纪律：不新增时间字段，lost 的时间语义引用账本行的
-    at_wall/at_mono。
+    A row without ``layer_fps`` (old format / fingerprints off) ->
+    ``layer_fps_absent``, no content judgment. Dual-clock discipline: no new
+    time fields added; lost's time semantics reference the ledger row's
+    at_wall/at_mono.
     """
     return reconcile_on_boot(
         last, tail, attrs,

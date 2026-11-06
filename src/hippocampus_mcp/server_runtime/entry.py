@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
-"""MCP stdio 启动序列（server.py 的 ``main()`` 启动编排本体；server.py 只留薄壳）。
+"""MCP stdio startup sequence (the implementation body of server.py's
+``main()`` startup orchestration; server.py keeps only a thin shell).
 
-这里实现 main() 的全部启动编排——文件日志挂接、stdout 护栏安装、导入链
-预载、诊断看门狗、三档预热（sync/off/auto）、启动耗时自曝、
-``server.run()``。
+Implemented here: all of main()'s startup orchestration -- file log
+hookup, stdout guard-rail installation, import-chain preload, diagnostic
+watchdog, the three warmup tiers (sync/off/auto), startup-time
+self-report, ``server.run()``.
 
-server.py 留 ``def main(): _entry.run_main()`` 壳（cli.py / launcher.py 的
-``from .server import main`` 零改动）。
+server.py keeps the ``def main(): _entry.run_main()`` shell (cli.py /
+launcher.py's ``from .server import main`` needs zero changes).
 
-🔴 现取纪律：server 实例与全部启动依赖（``_PERSIST_DIR`` / ``logger`` /
-``_preload_import_chain`` / ``_WARMUP_DIAG`` / ``_WARMUP_MODE`` /状态常量
-/ ``start_background_warmup`` / ``_PROCESS_T0`` / ``_HANDSHAKE_WINDOW`` /
-``server``）一律经 :func:`_srv` **调用时现取**——测试替换
-``server.server``（假 FastMCP）或 patch 任一状态量，启动序列拿到的是替身。
+🔴 Fetch-live discipline: the server instance and all startup
+dependencies (``_PERSIST_DIR`` / ``logger`` / ``_preload_import_chain``
+/ ``_WARMUP_DIAG`` / ``_WARMUP_MODE`` / state constants /
+``start_background_warmup`` / ``_PROCESS_T0`` / ``_HANDSHAKE_WINDOW`` /
+``server``) are all fetched live at call time via :func:`_srv` -- test
+replacement of ``server.server`` (a fake FastMCP) or patching any state
+variable means the startup sequence receives the stub.
 """
 from __future__ import annotations
 
@@ -28,16 +32,16 @@ logger = logging.getLogger("hippocampus_mcp")
 
 
 def _srv() -> Any:
-    """server 模块本体（现取入口，见模块 docstring）。"""
+    """The server module itself (fetch-live entry; see the module docstring)."""
     from hippocampus_mcp import server as _s
 
     return _s
 
 
 def run_main() -> None:
-    """启动 MCP stdio 服务端（server.py ``main()`` 薄壳的实现本体）。"""
+    """Start the MCP stdio server (implementation body of server.py's ``main()`` thin shell)."""
     s = _srv()
-    # 调试用文件日志（stdio 模式下 stderr 可能被截断，文件日志能完整还原崩溃现场）
+    # Debug file logging (in stdio mode stderr can be truncated; a file log reproduces the crash scene in full)
     os.makedirs(s._PERSIST_DIR, exist_ok=True)
     _fh = logging.FileHandler(
         os.path.join(s._PERSIST_DIR, "mcp_server_debug.log"), encoding="utf-8"
@@ -50,26 +54,34 @@ def run_main() -> None:
         logging.getLogger(_name).addHandler(_fh)
         logging.getLogger(_name).setLevel(logging.DEBUG)
 
-    # 注意：这里**不再** import torch。torch 由 ``_prepare_torch()`` 在首次真正
-    # 需要时导入（见 ``get_brain``），否则它的 ~5.7s 会直接顶在 MCP 握手路径上。
-    # ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` 也随之下沉到那个函数里
-    # （必须赶在 ``import torch`` 之前设进环境）。
+    # Note: torch is **no longer** imported here. torch is imported by
+    # ``_prepare_torch()`` when first truly needed (see ``get_brain``);
+    # otherwise its ~5.7s would sit directly on the MCP handshake path.
+    # ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` accordingly sink into that
+    # function (they must be set in the environment before
+    # ``import torch``).
 
-    # stdout 护栏：后台线程里的第三方输出改道 stderr，避免污染 JSON-RPC
+    # stdout guard rail: third-party output in background threads is
+    # rerouted to stderr, avoiding JSON-RPC pollution
     if not isinstance(sys.stdout, _ThreadAwareStdout):
         sys.stdout = _ThreadAwareStdout(sys.stdout)
 
-    # 导入链预载：必须在 server.run() 之前，否则会卡死（见 _preload_import_chain）
+    # Import-chain preload: must happen before server.run(), otherwise it
+    # hangs (see _preload_import_chain)
     s._preload_import_chain()
 
-    # 诊断看门狗：与预热模式无关——卡死可以发生在主线程（off 模式的惰性初始化）
-    # 或后台线程（auto），只看 auto 会漏掉一半现场。
+    # Diagnostic watchdog: independent of the warmup mode -- hangs can
+    # happen in the main thread (off mode's lazy initialization) or in
+    # the background thread (auto); watching only auto misses half the
+    # scenes.
     if s._WARMUP_DIAG:
         s._start_warmup_watchdog()
 
     if s._WARMUP_MODE == "sync":
-        # 旧行为：预热完才应答握手。**不要给 MCP 宿主用**——宿主会话通常在
-        # 10-15 秒内完成工具注册，预热期间的工具会被整个漏掉。
+        # Old behavior: answer the handshake only after warmup. **Do not
+        # give this to MCP hosts** -- host sessions usually finish tool
+        # registration within 10-15 seconds, and tools during warmup
+        # would be missed entirely.
         try:
             brain = s.get_brain()
             brain._get_nlp()
@@ -78,15 +90,17 @@ def run_main() -> None:
                 "warmup done: L1=%d entities=%d",
                 brain.manager.store.count(), len(brain.entities),
             )
-        except Exception as e:  # 预热失败不阻断服务（首次调用会重试）
+        except Exception as e:  # warmup failure does not block the service (the first call retries)
             s.logger.warning("warmup failed (will retry on first call): %s", e)
     elif s._WARMUP_MODE == "off":
         s.logger.info("HIPPOCAMPUS_WARMUP=off: skipping warmup; the first tool call will initialize")
     else:
         s.start_background_warmup()
 
-    # 启动耗时自曝：只报数，不阻断。卡死与慢在宿主侧长得一模一样，
-    # 没有这一行就只能靠猜 —— 猜错方向的代价是整套接入纪律继续空转。
+    # Startup-time self-report: reports the number only, does not block.
+    # Hung and slow look identical on the host side; without this line
+    # you can only guess -- guessing wrong costs the whole onboarding
+    # discipline another round of spinning its wheels.
     _boot_s = time.time() - s._PROCESS_T0
     if _boot_s > s._HANDSHAKE_WINDOW:
         s.logger.warning(

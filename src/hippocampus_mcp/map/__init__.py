@@ -1,1 +1,1 @@
-"""map 子包。"""
+"""The map subpackage."""

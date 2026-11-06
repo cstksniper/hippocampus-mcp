@@ -1,34 +1,42 @@
 # -*- coding: utf-8 -*-
-"""源文件签名与漂移审计（从 brain/core.py 提取）。
+"""Source-file signatures and drift audit (extracted from brain/core.py).
 
-收录四个 brain 方法（``_resolve_source_path`` / ``_file_sig`` /
-``record_source_sig`` / ``source_drift``）与一个 pure 助手
-（``_PureMixin._drift_row``）的实现体，brain 侧只留薄包装。
+Houses the implementation bodies of four brain methods (``_resolve_source_path`` /
+``_file_sig`` / ``record_source_sig`` / ``source_drift``) and one pure helper
+(``_PureMixin._drift_row``); the brain side keeps only thin wrappers.
 
-为什么放 store/ 而不是 brain / domain / application：
-- 这是**库存记录上的查询组合**（``drift_audit`` 遍历 store 记录算引用
-  事实，再逐源对磁盘现状）——同 contradictions 的落点判据；
-- 要用 ``store.memory.MemoryState`` 状态机判 active，domain 受依赖
-  矩阵约束（只准依赖 common）碰不到它，application 又是 brain 的
-  下游（「用例逻辑只从 brain 单向流向 application，不回头」）；
-- 文件 I/O（os.stat / open / hashlib）在 store 层有先例（backend）。
+Why store/ rather than brain / domain / application:
+- This is a **query combination over inventory records** (``drift_audit`` walks store
+  records to compute reference facts, then checks each source against the disk's
+  current state) — the same placement criterion as contradictions;
+- It needs ``store.memory.MemoryState``'s state machine to judge active; domain is
+  constrained by the dependency matrix (may only depend on common) and cannot touch
+  it, and application is downstream of brain ("use-case logic flows one way from
+  brain to application and never turns back");
+- File I/O (os.stat / open / hashlib) has precedent in the store layer (backend).
 
-**旋钮纪律**（承 tag_ops / ledger）：``source_root`` / ``sig_enabled``
-两个 Config 旋钮由包装层在调用时从 brain 侧现取传入——本模块不 import
-config（store 受矩阵约束也不许 import config）。唯一直接 import 的常量
-是 ``SOURCE_SIG_CACHE_MAX``（``_file_sig`` 的 FIFO 缓存上限，全仓无
-monkeypatch 先例，同 tag_ops 的 TAG_OPS_FILE 例外）。
+**Knob discipline** (inherited from tag_ops / ledger): the two Config knobs
+``source_root`` / ``sig_enabled`` are fetched fresh from the brain side by the
+wrapper layer at call time — this module does not import config (store is bound by
+the matrix and may not import config either). The only directly imported constant is
+``SOURCE_SIG_CACHE_MAX`` (the FIFO cache cap of ``_file_sig``; no monkeypatch
+precedent anywhere in the repo, the same exception as tag_ops's TAG_OPS_FILE).
 
-状态语义（与 brain 侧原实现逐字一致）：
-- ``file_sig`` 的缓存键含 ``(path, mtime_ns, size)``——文件被改自然
-  重算，没改则同进程反复 ingest 只算一次哈希；OSError（文件正被删 /
-  无权限）返回 None，调用方按「解不出」处理，不炸写入路径；
-- 缓存淘汰是 FIFO（dict 保序）丢最旧，纯性能缓存不追求命中率；
-- ``record_source_sig`` 内容事实没变就不动层（连 dict 都不碰）——
-  层指纹每次 ingest 都变会让每次 save 都写盘（批量导入 500 条 =
-  500 次写盘）；``first_seen`` 从既有条目继承，只有首次见到才落 now；
-- ``drift_audit`` 只读：不改 ``source_sigs``、不写文件，磁盘事实
-  （mtime/size/sha1）当场现算。
+State semantics (verbatim identical to the original brain-side implementation):
+- ``file_sig``'s cache key includes ``(path, mtime_ns, size)`` — a changed file is
+  naturally rehashed, an unchanged one is hashed only once per process no matter how
+  many times it is ingested; on OSError (file being deleted / no permission) it
+  returns None, the caller treats it as "could not resolve", and the write path
+  does not blow up;
+- Cache eviction is FIFO (dicts preserve order), dropping the oldest; it is a pure
+  performance cache and does not chase optimal hit rate;
+- ``record_source_sig`` leaves the layer untouched when the content facts have not
+  changed (does not even touch the dict) — a layer fingerprint changing on every
+  ingest would make every save write to disk (a 500-entry bulk import = 500 disk
+  writes); ``first_seen`` is inherited from an existing entry; only a first sighting
+  records now;
+- ``drift_audit`` is read-only: it does not modify ``source_sigs``, does not write
+  files, and computes the disk facts (mtime/size/sha1) on the spot.
 """
 from __future__ import annotations
 
@@ -42,12 +50,13 @@ from .memory import MemoryState
 
 def resolve_source_path(source: str, persist_dir: str | None,
                         source_root: str) -> str | None:
-    """把 source 标签解析成磁盘上的绝对路径；解不出返回 None。
+    """Resolve a source label into an absolute path on disk; return None when unresolvable.
 
-    解析次序：绝对路径 → 记忆库目录 → ``source_root`` → 进程 CWD。
-    **解不出是常态而不是错误**：source 也承载会话 id、自由文本来源
-    （"群聊" / "口头"），它们本来就没有对应文件——对它们记一份假签名
-    只会把 unbaselined 池搅浑。
+    Resolution order: absolute path → memory-library directory → ``source_root`` →
+    process CWD. **Unresolvable is the norm, not an error**: source also carries
+    session ids and free-text origins ("group chat" / "verbal"), which have no
+    corresponding file to begin with — recording a fake signature for them would only
+    muddy the unbaselined pool.
     """
     s = str(source or "").strip()
     if not s:
@@ -68,13 +77,15 @@ def resolve_source_path(source: str, persist_dir: str | None,
 
 def file_sig(path: str, cache: dict[tuple[str, int, int], str],
              cache_max: int = SOURCE_SIG_CACHE_MAX) -> dict[str, Any] | None:
-    """算一个文件的 {mtime_ns, size, sha1}；带 (路径, mtime, size) 缓存。
+    """Compute a file's {mtime_ns, size, sha1}; cached by (path, mtime, size).
 
-    缓存键含 mtime/size：文件被改（mtime 变）自然重算，没改则同一
-    进程内反复 ingest 同一文件只算一次哈希。OSError（文件正在被删 /
-    无权限）返回 None——调用方按"解不出"处理，不炸写入路径。
+    The cache key includes mtime/size: a changed file (mtime changed) is naturally
+    recomputed; unchanged, repeated ingests of the same file within one process hash
+    it only once. On OSError (file being deleted / no permission) it returns None —
+    the caller treats it as "could not resolve", and the write path does not blow up.
 
-    淘汰是 FIFO（dict 保序）丢最旧：纯性能缓存，不追求命中率最优。
+    Eviction is FIFO (dicts preserve order), dropping the oldest: a pure performance
+    cache that does not chase optimal hit rate.
     """
     try:
         st = os.stat(path)
@@ -92,7 +103,7 @@ def file_sig(path: str, cache: dict[tuple[str, int, int], str],
             return None
         cached = h.hexdigest()
         if len(cache) >= cache_max:
-            # FIFO 丢最旧（dict 保序）：纯性能缓存，不追求命中率最优
+            # FIFO drops the oldest (dicts preserve order): a pure performance cache, not chasing optimal hit rate
             cache.pop(next(iter(cache)))
         cache[key] = cached
     return {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "sha1": cached}
@@ -102,21 +113,26 @@ def record_source_sig(source: str, source_sigs: dict[str, dict[str, Any]],
                       persist_dir: str | None, source_root: str,
                       sig_cache: dict[tuple[str, int, int], str], *,
                       sig_enabled: bool) -> dict[str, Any] | None:
-    """写入侧：给一个 source 标签记源文件签名（ingest 调用）。
+    """Write side: record a source-file signature for a source label (called by ingest).
 
-    **内容事实没变就不动层**：签名条目含 sig_at，若每次 ingest 都重盖，
-    层指纹每次都变 ⇒ 每次 save 都写盘（批量导入 500 条 = 500 次写盘）。
-    没变时连 dict 都不碰，层保持干净。
+    **Content facts unchanged means the layer is not touched**: the signature entry
+    carries sig_at; if every ingest re-stamped it, the layer fingerprint would change
+    every time ⇒ every save would write to disk (a 500-entry bulk import = 500 disk
+    writes). When nothing changed, not even the dict is touched and the layer stays
+    clean.
 
     Args:
-        source: source 标签。
-        source_sigs: brain 的签名层（本函数就地改它）。
-        persist_dir / source_root: 路径解析输入（brain 侧现取）。
-        sig_cache: ``_file_sig`` 的 sha1 缓存（brain 实例属性，就地改）。
-        sig_enabled: Config 旋钮 source_sig（关着直接返回 None）。
+        source: the source label.
+        source_sigs: the brain's signature layer (this function modifies it in place).
+        persist_dir / source_root: path-resolution inputs (fetched fresh on the brain
+            side).
+        sig_cache: ``_file_sig``'s sha1 cache (a brain instance attribute, modified
+            in place).
+        sig_enabled: the Config knob source_sig (when off, return None directly).
 
     Returns:
-        当前生效的签名条目（新记或既有），解不出路径 / 开关关着返回 None。
+        The currently effective signature entry (newly recorded or existing); returns
+        None when the path cannot be resolved / the switch is off.
     """
     if not sig_enabled:
         return None
@@ -135,7 +151,7 @@ def record_source_sig(source: str, source_sigs: dict[str, dict[str, Any]],
             and prev.get("mtime_ns") == sig["mtime_ns"]
             and prev.get("size") == sig["size"]
             and prev.get("sha1") == sig["sha1"]):
-        return prev  # 没变：不碰层
+        return prev  # unchanged: do not touch the layer
     now = _now()
     entry = dict(sig)
     entry["path"] = path
@@ -151,7 +167,7 @@ def drift_row(source: str, category: str,
               sig: dict[str, Any] | None,
               cur: dict[str, Any] | None,
               diff: list[str] | None = None) -> dict[str, Any]:
-    """漂移审计的一行：引用事实 + 记录签名 vs 磁盘现状（sha1 只给前 8 位）。"""
+    """One row of the drift audit: reference facts + recorded signature vs current disk state (sha1 shows only the first 8 hex digits)."""
     row: dict[str, Any] = {
         "source": source,
         "category": category,
@@ -183,47 +199,59 @@ def drift_audit(records: Iterable[Any],
                 sig_enabled: bool = True,
                 sig_cache: dict[tuple[str, int, int], str] | None = None,
                 ) -> dict[str, Any]:
-    """C1b：源文件漂移审计——"文件改了但记忆没更新"的服务端答案。
+    """C1b: source-file drift audit — the server-side answer to "the file changed but the memory did not".
 
-    借鉴前作的 verify 四分类，按记忆库的实际形态落地为：
+    Borrowing the predecessor's verify four-way classification, grounded in the memory
+    library's actual shape as:
 
     ============== ======================================================
-    分类           含义
+    Category       Meaning
     ============== ======================================================
-    ``stale``      记过签名、文件还在，但 mtime/size/sha1 有任一不同
-                   ⇒ 该源下的记忆可能已过期（文件是较新真相）
-    ``missing``    记过签名、文件不见了 ⇒ 记忆还在、源没了（imported_
-                   but_deleted）；回查原话的链路已断
-    ``unbaselined``能解析到文件、但**从没记过签名**（本功能上线前导入的
-                   存量、或 ``HIPPOCAMPUS_SOURCE_SIG=0`` 期间写的）⇒
-                   不是"没漂移"，是"无法判断"——单列一类，不混进 ok
-    ``orphan``     记过签名、但库里没有任何记忆引用这个 source ⇒ 签名
-                   条目本身过期了（记忆被 forget 干净 / 换标签重导）
-    ``unresolvable``source 不是文件（会话 id / 自由文本）⇒  informational，
-                   不参与漂移判定
-    ``ok``         记过签名、文件还在、内容事实一致
+    ``stale``      A signature was recorded and the file still exists, but at
+                   least one of mtime/size/sha1 differs ⇒ the memories under
+                   this source may be outdated (the file is the newer truth)
+    ``missing``    A signature was recorded but the file is gone ⇒ the memories
+                   remain but the source is lost (imported_but_deleted); the
+                   chain back to the original text is broken
+    ``unbaselined``The file resolves, but **a signature was never recorded**
+                   (stock imported before this feature shipped, or written
+                   during ``HIPPOCAMPUS_SOURCE_SIG=0``) ⇒ not "no drift" but
+                   "cannot judge" — its own category, not mixed into ok
+    ``orphan``     A signature was recorded but no memory in the library
+                   references this source ⇒ the signature entry itself is
+                   stale (memories fully forgotten / re-imported under a new
+                   label)
+    ``unresolvable``The source is not a file (session id / free text) ⇒  informational,
+                   does not participate in drift judgment
+    ``ok``         A signature was recorded, the file still exists, content facts match
     ============== ======================================================
 
-    每条带**分母**（各类计数 + 总源数 + 引用记忆数）：``count:0`` 有两种
-    真相（真没漂移 vs 压根没采集），不报分母调用方一律读成前者——
-    与 contradictions 的 ``candidate_pool`` 同一条纪律。
+    Every item carries its **denominator** (per-category counts + total sources +
+    referenced memories): ``count:0`` has two possible truths (truly no drift vs
+    never collected at all); without the denominator the caller always reads it as
+    the former — the same discipline as contradictions's ``candidate_pool``.
 
-    **不做**的事：``never_ingested``（某目录下的文件从没导入过）需要知道
-    "监视目录"是什么，那是项目侧脚本的输入（``export_memories(source=)``
-    已能算），本工具不假设监视目录。
+    What is **not** done: ``never_ingested`` (files under some directory were never
+    imported) requires knowing what the "watched directory" is; that is an input for
+    project-side scripts (``export_memories(source=)`` can already compute it), and
+    this tool assumes no watched directory.
 
     Args:
-        records: 库存记录可迭代（brain 传 ``store.iter_records()``）。
-        source_sigs: 签名层（只读）。
-        source: 只审计这一个 source（空 = 全库）。
-        limit: 每类最多回多少行（0 = 只给计数）。
-        include_ok: 是否把 ``ok`` 的源也列出来（默认只列有问题的）。
-        persist_dir / source_root: 路径解析输入（brain 侧现取）。
-        sig_enabled: Config 旋钮 source_sig（进 denominators 自曝）。
-        sig_cache: sha1 缓存（brain 实例属性，就地改；缺省用本地空缓存）。
+        records: an iterable of inventory records (brain passes
+            ``store.iter_records()``).
+        source_sigs: the signature layer (read-only).
+        source: audit only this one source (empty = whole library).
+        limit: at most how many rows to return per category (0 = counts only).
+        include_ok: whether to also list ``ok`` sources (by default only problematic
+            ones).
+        persist_dir / source_root: path-resolution inputs (fetched fresh on the brain
+            side).
+        sig_enabled: the Config knob source_sig (self-reported inside denominators).
+        sig_cache: the sha1 cache (a brain instance attribute, modified in place; a
+            local empty cache is used by default).
     """
     cache = sig_cache if sig_cache is not None else {}
-    # 1) 引用事实：source 标签 → {memories, active}（分母来自这里）
+    # 1) Reference facts: source label → {memories, active} (the denominators come from here)
     refs: dict[str, dict[str, int]] = {}
     for rec in records:
         s = str(rec.source or "").strip()
@@ -233,9 +261,10 @@ def drift_audit(records: Iterable[Any],
         row["memories"] += 1
         if rec.state != MemoryState.ARCHIVED.value:
             row["active"] += 1
-    # 2) 判定：签名层 ∪ 引用集合（任一侧独有的都要露面）；
-    #    点名了 source 就**收窄到它一个**（不是并集加一项——那会让
-    #    "只查 a" 返回全库结果，调用方以为过滤生效了）。
+    # 2) Judgment: signature layer ∪ reference set (sources unique to either side must appear);
+    #    when a source is named, **narrow to just that one** (not union-plus-one — that
+    #    would make "query only a" return whole-library results, and the caller would
+    #    believe the filter took effect).
     want = source.strip()
     labels = ([want] if want
               else sorted(set(source_sigs) | set(refs)))
@@ -247,8 +276,8 @@ def drift_audit(records: Iterable[Any],
         sig = source_sigs.get(s)
         ref = refs.get(s)
         if sig is None:
-            # 从没记过签名：能解析到文件才是 unbaselined（无法判断），
-            # 否则是"这个 source 压根不是文件"（informational）
+            # No signature ever recorded: it is unbaselined (cannot judge) only if the
+            # file resolves; otherwise "this source is not a file at all" (informational)
             if resolve_source_path(s, persist_dir, source_root):
                 buckets["unbaselined"].append(drift_row(
                     s, "unbaselined", ref, None, None))
@@ -276,7 +305,7 @@ def drift_audit(records: Iterable[Any],
                 s, "stale", ref, sig, cur, diff))
         else:
             buckets["ok"].append(drift_row(s, "ok", ref, sig, cur))
-    # 3) 计数 + 截断。orphan 按定义 ref 为 None，其"引用记忆数"是 0。
+    # 3) Counts + truncation. orphan by definition has ref None, so its "referenced memory count" is 0.
     counts = {k: len(v) for k, v in buckets.items()}
     out_rows: dict[str, list[dict[str, Any]]] = {}
     for k, rows in buckets.items():
@@ -288,8 +317,9 @@ def drift_audit(records: Iterable[Any],
         "ok": True,
         "scope": source.strip() or "(whole library)",
         "counts": counts,
-        # 可行动的（要宿主看一眼的）三类合计——"0"才是"没漂移"，
-        # 但 unbaselined>0 时它说的是"无法判断"，必须分开读。
+        # Sum of the three actionable (worth a host's glance) categories — "0" is what
+        # "no drift" means, but when unbaselined>0 it says "cannot judge" and must be
+        # read separately.
         "actionable": actionable,
         "verdict": ("clean" if actionable == 0 else
                     ("unknown" if counts["unbaselined"] and

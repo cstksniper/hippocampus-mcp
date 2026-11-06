@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
-"""CfC 记忆核的纯 numpy 实现.
+"""A pure-numpy implementation of the CfC memory core.
 
-逐算子对照 ncps 1.0.x ``WiredCfCCell(mode="default")`` 的前向：
+Operator-by-operator comparison with ncps 1.0.x ``WiredCfCCell(mode="default")``
+forward:
 
-    对每层 l（AutoNCP 多层，层 0 输入=嵌入向量，其余层输入=上层输出）：
+    For each layer l (AutoNCP multi-layer; layer 0 input = embedding vector,
+    other layers' input = previous layer's output):
         xl  = cat([inp, h_l])
-        ff1 = tanh(xl @ (W_ff1 ⊙ mask_l)ᵀ + b_ff1)      # mask 仅作用于 ff1/ff2
+        ff1 = tanh(xl @ (W_ff1 ⊙ mask_l)ᵀ + b_ff1)      # mask applies to ff1/ff2 only
         ff2 = tanh(xl @ (W_ff2 ⊙ mask_l)ᵀ + b_ff2)
-        t   = sigmoid((xl @ W_taᵀ + b_ta)·ts + (xl @ W_tbᵀ + b_tb))  # 照抄：time 头不加 mask
+        t   = sigmoid((xl @ W_taᵀ + b_ta)·ts + (xl @ W_tbᵀ + b_tb))  # copied as-is: the time head gets no mask
         new_h_l = ff1·(1−t) + t·ff2
-    输出 = 末层 new_h（motor 层）；hx_new = cat(各层 new_h)
+    output = last layer's new_h (motor layer); hx_new = cat(all layers' new_h)
 
-为什么敢做：
-    - 生产配置 ``AutoNCP(771, 768)`` build 后 3 层 ``[2, 1, 768]``，末层即 motor；
-    - 接线由 ``np.random.default_rng(1111)`` 种子确定性生成，邻接矩阵可整体导出；
-    - 生产路径的 CfC **从未被训练**（``HIPPOCAMPUS_CRL_MODEL`` 未配置、src 无
-      manual_seed，权重每次重启都在变），等价性验收 therefore 是"同权重对拍"，
-      而不是"复现某次训练结果"。
+Why we dare:
+    - The production config ``AutoNCP(771, 768)`` builds 3 layers ``[2, 1, 768]``,
+      the last of which is the motor;
+    - The wiring is generated deterministically from the
+      ``np.random.default_rng(1111)`` seed, so the adjacency matrices can be
+      exported wholesale;
+    - The production-path CfC was **never trained** (``HIPPOCAMPUS_CRL_MODEL``
+      unset, no manual_seed in src; weights change on every restart), so the
+      equivalence acceptance is therefore a "same-weights head-to-head check",
+      not "reproducing some training run".
 
-掩码预乘：torch 版每次 forward 都做 ``weight * sparsity_mask``；这里 mask 固定，
-加载时预乘一次（``W_eff = W ⊙ mask``），数学等价、省一半乘法。
+Mask pre-multiplication: the torch version does ``weight * sparsity_mask`` on
+every forward; here the mask is fixed and pre-multiplied once at load time
+(``W_eff = W ⊙ mask``) — mathematically equivalent, half the multiplications.
 """
 
 from __future__ import annotations
@@ -29,14 +36,15 @@ from typing import Any, Optional
 
 import numpy as np
 
-# 权重初始化种子（生产确定性初始化用）。与 AutoNCP 接线的默认 seed(1111) 同源，
-# 让"接线确定 + 权重确定"构成一个完全确定的核。
+# Weight initialization seed (for deterministic production initialization).
+# Same origin as AutoNCP wiring's default seed(1111), so "deterministic wiring
+# + deterministic weights" compose a fully deterministic core.
 DEFAULT_INIT_SEED = 1111
 
 _MODE = "default"
-_TS = 1.0  # timespans=None 时 ncps 的固定时间步
+_TS = 1.0  # ncps's fixed timestep when timespans=None
 
-# 4 个线性头在 npz / 状态字典里的名字（与 ncps 模块属性一一对应）
+# Names of the 4 linear heads in npz / state dicts (1:1 with ncps module attributes)
 _HEADS = ("ff1", "ff2", "time_a", "time_b")
 
 
@@ -45,10 +53,10 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 class NumpyCfcLayer:
-    """单层 CfCCell 等价物（backbone_layers=0 的形态，即 wired 模式的全部形态）。
+    """Single-layer CfCCell equivalent (the backbone_layers=0 form, i.e. the whole of wired mode).
 
-    权重布局与 torch ``nn.Linear`` 一致：weight (out, in)、bias (out,)。
-    ``w_ff1/w_ff2`` 存的是**已预乘掩码**的有效权重。
+    Weight layout matches torch ``nn.Linear``: weight (out, in), bias (out,).
+    ``w_ff1/w_ff2`` store the **already mask-pre-multiplied** effective weights.
     """
 
     __slots__ = (
@@ -67,7 +75,7 @@ class NumpyCfcLayer:
         self.b_tb = b_tb
 
     def forward(self, x: np.ndarray, ts: float = _TS) -> np.ndarray:
-        """x: (B, in) → (B, H)。"""
+        """x: (B, in) → (B, H)."""
         ff1 = np.tanh(x @ self.w_ff1.T + self.b_ff1)
         ff2 = np.tanh(x @ self.w_ff2.T + self.b_ff2)
         t = _sigmoid((x @ self.w_ta.T + self.b_ta) * ts + (x @ self.w_tb.T + self.b_tb))
@@ -75,15 +83,18 @@ class NumpyCfcLayer:
 
 
 class NumpyWiredCfc:
-    """多层（wired）CfC 核的 numpy 等价物。
+    """Numpy equivalent of the multi-layer (wired) CfC core.
 
     Args:
-        input_dim: 嵌入输入维度（层 0 的外部输入宽度）。
-        layer_sizes: 各层神经元数（如 AutoNCP(771,768) → [2, 1, 768]）。
-            末层必须是输出层（``output_dim == layer_sizes[-1]``）。
-        masks: 每层的掩码列表，形状 (H_l, in_l)，``in_l = 上层宽 + H_l``。
-            传 ``None`` 时按"全连接"生成全 1 掩码（等价无稀疏接线，测试用）。
-        seed: 确定性初始化种子。
+        input_dim: Embedding input dimension (layer 0's external input width).
+        layer_sizes: Neuron count per layer (e.g. AutoNCP(771,768) →
+            [2, 1, 768]). The last layer must be the output layer
+            (``output_dim == layer_sizes[-1]``).
+        masks: Per-layer mask list, shape (H_l, in_l),
+            ``in_l = previous layer width + H_l``. Passing ``None`` generates
+            all-ones "fully connected" masks (equivalent to no sparse wiring;
+            for tests).
+        seed: Deterministic initialization seed.
     """
 
     def __init__(
@@ -104,12 +115,13 @@ class NumpyWiredCfc:
         self.layer_sizes = [int(n) for n in layer_sizes]
         self.output_dim = int(output_dim)
         self.seed = int(seed)
-        # 掩码留档：load_weights 换权重时要重新预乘 ff1/ff2
+        # Masks kept on file: load_weights must re-pre-multiply ff1/ff2 when
+        # swapping weights
         self.masks: list[np.ndarray] = []
 
         rng = np.random.default_rng(self.seed)
         self.layers: list[NumpyCfcLayer] = []
-        prev_out = self.input_dim  # 层 0 的"外部输入"宽度；层 l>0 输入是上层输出
+        prev_out = self.input_dim  # layer 0's "external input" width; layer l>0 takes the previous layer's output
         for l, h in enumerate(self.layer_sizes):
             in_l = prev_out + h  # cat([inp, h_l])
             if masks is not None:
@@ -150,7 +162,7 @@ class NumpyWiredCfc:
             prev_out = h
 
     # ------------------------------------------------------------------
-    # 初始化（对齐 torch：2D权重 Xavier uniform，bias 走 Linear 默认）
+    # Initialization (aligned with torch: 2D weights Xavier uniform, bias per Linear default)
     # ------------------------------------------------------------------
     @staticmethod
     def _xavier_init(rng: np.random.Generator, out_f: int, in_f: int) -> np.ndarray:
@@ -163,22 +175,22 @@ class NumpyWiredCfc:
         return rng.uniform(-limit, limit, size=(out_f,)).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # 前向
+    # Forward
     # ------------------------------------------------------------------
     def forward(
         self, x: np.ndarray, hx: Optional[np.ndarray], ts: float = _TS
     ) -> tuple[np.ndarray, np.ndarray]:
-        """前向（与 torch ``CfC.forward`` 同契约）。
+        """Forward (same contract as torch ``CfC.forward``).
 
         Args:
-            x: (B, input_dim) 或 (B, S, input_dim)。
-            hx: (B, total_units) 或 None（零初始化）。
-            ts: 时间步（本服务恒为 1.0）。
+            x: (B, input_dim) or (B, S, input_dim).
+            hx: (B, total_units) or None (zero-initialized).
+            ts: Timestep (always 1.0 in this service).
 
         Returns:
-            (output, hx_new)：output (B, S, output_dim)（与 torch 的
-            ``fc=Identity`` 语义一致，即末层隐状态的完整序列）；hx_new
-            (B, total_units)。
+            (output, hx_new): output (B, S, output_dim) (consistent with
+            torch's ``fc=Identity`` semantics, i.e. the full sequence of the
+            last layer's hidden states); hx_new (B, total_units).
         """
         x = np.asarray(x, dtype=np.float32)
         if x.ndim == 2:
@@ -195,7 +207,7 @@ class NumpyWiredCfc:
                 raise ValueError(
                     f"hx shape {h.shape} != expected ({batch}, {total})"
                 )
-        # 按层切分（与 torch.split(hx, layer_sizes, dim=1) 一致）
+        # Split by layer (consistent with torch.split(hx, layer_sizes, dim=1))
         bounds = np.cumsum([0] + self.layer_sizes)
         h_layers = [h[:, bounds[i]:bounds[i + 1]] for i in range(len(self.layer_sizes))]
 
@@ -208,15 +220,16 @@ class NumpyWiredCfc:
                 nh = layer.forward(xl, ts=ts)
                 new_layers.append(nh)
                 inp = nh
-            outs[:, s, :] = inp  # 末层输出（motor）
+            outs[:, s, :] = inp  # last layer's output (motor)
             h_layers = new_layers
         hx_new = np.concatenate(h_layers, axis=1)
         return outs, hx_new
 
     def load_weights(self, arrays: dict[str, np.ndarray]) -> None:
-        """按 ``layer{i}.{head}.{weight|bias}`` 键原地换权重（ff1/ff2 重乘掩码）。
+        """Swap weights in place by ``layer{i}.{head}.{weight|bias}`` keys (ff1/ff2 re-multiplied by mask).
 
-        与 ncps ``load_state_dict(strict=False)`` 同语义：缺键不炸（保留原值）。
+        Same semantics as ncps ``load_state_dict(strict=False)``: missing keys
+        don't blow up (original values kept).
         """
         for l, layer in enumerate(self.layers):
             h = self.layer_sizes[l]
@@ -252,10 +265,10 @@ class NumpyWiredCfc:
                     )
 
     # ------------------------------------------------------------------
-    # 权重读写（npz 通道）
+    # Weight read/write (npz channel)
     # ------------------------------------------------------------------
     def state_arrays(self) -> dict[str, np.ndarray]:
-        """导出为 npz 友好的数组字典（键与 ncps state_dict 对齐后剥前缀）。"""
+        """Export as an npz-friendly array dict (keys aligned with ncps state_dict, prefix stripped)."""
         out: dict[str, np.ndarray] = {}
         for l, layer in enumerate(self.layers):
             out[f"layer{l}.ff1.weight"] = layer.w_ff1
@@ -270,7 +283,7 @@ class NumpyWiredCfc:
 
     @classmethod
     def from_npz(cls, path: str) -> "NumpyWiredCfc":
-        """从导出的 npz 构造（含掩码与元信息；权重导出脚本产出此格式）。"""
+        """Construct from an exported npz (includes masks and metadata; produced by the weight-export script)."""
         with np.load(path, allow_pickle=False) as z:
             meta = json.loads(str(z["meta_json"]))
             arrays = {k: np.asarray(z[k]) for k in z.files if k != "meta_json"}

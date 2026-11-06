@@ -1,29 +1,37 @@
 # -*- coding: utf-8 -*-
-"""写入凭据（origin）：把「谁在什么任务下写的」变成**结构化字段**。
+"""Write credentials (origin): turn "who wrote this, under which task" into **structured fields**.
 
-**要解决的具体病**：``MemoryRecord.source`` 是自由字符串（文件名 / 相对路径 /
-会话标识），由宿主自己填。多 Worker 共享一个库之后，这条通道回答不了三件事：
+**The specific problem being solved**: ``MemoryRecord.source`` is a free-form string
+(file name / relative path / session identifier), filled in by the host itself. Once
+multiple Workers share one library, this channel cannot answer three questions:
 
-1. 这条记忆是 Router 写的还是 Worker-3 写的？（``source`` 里可能只有路径）
-2. 它属于哪个工单 / 哪次任务？（现在只能靠人翻 ``raw_log`` 反推）
-3. 事后归因：某个 Worker 跑歪了，它污染了哪几条？（没有主体字段就查不出来）
+1. Was this memory written by the Router or by Worker-3? (``source`` may contain only a path)
+2. Which ticket / which task does it belong to? (currently one can only dig through ``raw_log``
+   by hand to infer it)
+3. Post-hoc attribution: a certain Worker went off the rails — which entries did it pollute?
+   (without a subject field this cannot be looked up)
 
-Super-agent（Router + 每工单一个 Worker）把一个「架构假设」变成了硬需求：
-**同一时刻多个主体在往同一个库写**。缺主体归属时，坏结果只能整体回滚，
-没法精确回收。
+The super-agent (Router + one Worker per ticket) turned an "architectural assumption" into a
+hard requirement: **multiple subjects are writing to the same library at the same time**.
+Without subject attribution, a bad result can only be rolled back as a whole and cannot
+be precisely reclaimed.
 
-三条口径（与 ``domain/write_quarantine`` / ``domain/task_directory`` 同族）：
+Three conventions (same family as ``domain/write_quarantine`` / ``domain/task_directory``):
 
-1. **只写不筛**：本模块产出的 origin **不进检索路径**（recall 不读它）。
-   先让数据落下来，等真库上验证过取值分布，再接过滤——一次只动一层，
-   写路径与检索路径同时改是 G 段吃过的教训。
-2. **稀疏**：取值为空就不落键，存量卡逐字节不变（同 ``quarantine`` /
-   ``sensitivity`` 的序列化纪律）。
-3. **不猜**：没有 ``task`` 来源就留空，不从正文里猜任务名。
-   ``task`` 的真相源应当是宿主的 ``session_start(task=...)``；本模块只搬运。
+1. **Write only, do not filter**: origin produced by this module **does not enter the retrieval
+   path** (recall does not read it). Let the data land first; wire up filtering only after the
+   value distribution has been validated on a real library — change one layer at a time;
+   changing the write path and the retrieval path simultaneously is a lesson phase G already
+   paid for.
+2. **Sparse**: empty values produce no keys; existing cards stay byte-for-byte unchanged
+   (the same serialization discipline as ``quarantine`` / ``sensitivity``).
+3. **Do not guess**: without a ``task`` source, leave it empty; do not guess the task name
+   from the body text. The source of truth for ``task`` should be the host's
+   ``session_start(task=...)``; this module only ferries it along.
 
-依赖方向：本模块是纯函数，只依赖标准库，不 import 本包其它模块
-（``common`` 是 L0，任何层都可以依赖它，它不能反过来依赖任何人）。
+Dependency direction: this module is pure functions, depends only on the standard library,
+and imports no other module of this package (``common`` is L0 — any layer may depend on it,
+but it may not depend back on anyone).
 """
 
 from __future__ import annotations
@@ -39,25 +47,27 @@ __all__ = [
     "normalize_origin",
 ]
 
-#: origin 的固定字段集合。**顺序即语义优先级**：``session`` 永远有值
-#: （daemon 下是 per-connection key），``task`` 依赖宿主显式传入，
-#: ``surface`` 是写入面（工具名 / CLI / 导入脚本）。
+#: The fixed field set of origin. **Order is semantic priority**: ``session`` always has a value
+#: (a per-connection key under the daemon), ``task`` depends on the host passing it explicitly,
+#: ``surface`` is the write surface (tool name / CLI / import script).
 ORIGIN_FIELDS: tuple[str, ...] = ("session", "task", "surface")
 
-#: 逐字段长度上限。origin 是**索引维度**不是正文，一条记忆多存 200 字
-#: 任务全文会让 5.28MB 的 memories.json 无谓膨胀（且这些字已经进了正文）。
+#: Per-field length caps. origin is an **index dimension**, not body text; storing an extra
+#: 200 chars of task full text per memory would needlessly bloat the 5.28MB memories.json
+#: (and those chars are already in the body text).
 MAX_LEN: dict[str, int] = {"session": 64, "task": 200, "surface": 32}
 
-#: 全字段总长兜底（防止宿主塞进超长 JSON 串绕过逐字段上限）。
+#: Total-length backstop across all fields (prevents the host from stuffing in an over-long
+#: JSON string to bypass the per-field caps).
 MAX_VALUE_CHARS = 320
 
 
 def normalize_origin(raw: Any) -> dict[str, str]:
-    """把任意形态的输入归一到 ``{session/task/surface}`` 三键字典。
+    """Normalize arbitrarily shaped input into the three-key ``{session/task/surface}`` dict.
 
-    只保留白名单字段（未知键丢弃——origin 是要按字段查的，多出来的键
-    既不会被读也不会被索引，留着只是噪声）；值统一 ``str().strip()``
-    并按 :data:`MAX_LEN` 截断。
+    Only whitelisted fields are kept (unknown keys are dropped — origin is meant to be
+    queried by field; extra keys are neither read nor indexed, and keeping them is just
+    noise); values are uniformly ``str().strip()``-ed and truncated per :data:`MAX_LEN`.
     """
     if not isinstance(raw, dict):
         return {}
@@ -72,7 +82,7 @@ def normalize_origin(raw: Any) -> dict[str, str]:
         out[key] = text[: MAX_LEN.get(key, 64)]
     if not out:
         return {}
-    # 总长兜底：按字段顺序截，保 session（归因的第一主键）
+    # total-length backstop: truncate in field order, preserving session (the first attribution key)
     budget = MAX_VALUE_CHARS
     trimmed: dict[str, str] = {}
     for key in ORIGIN_FIELDS:
@@ -90,11 +100,12 @@ def normalize_origin(raw: Any) -> dict[str, str]:
 def build_origin(
     session: str = "", task: str = "", surface: str = ""
 ) -> dict[str, str]:
-    """构造一条写入凭据（空值不落键，结果可能是 ``{}``）。
+    """Build one write credential (empty values produce no keys; the result may be ``{}``).
 
-    ``session`` 取宿主连接标识（``common.session_ctx.session_key()``）；
-    stdio 直连形态下它恒为 ``__default__``——那不是 bug，是**一进程一会话**
-    的正常态（与 LNN 分路同源限制，见 ``common/session_ctx`` 的 docstring）。
+    ``session`` takes the host connection identifier (``common.session_ctx.session_key()``);
+    in the stdio direct-connect form it is always ``__default__`` — that is not a bug, it is
+    the normal state of **one process, one session** (the same same-source restriction as the
+    LNN split; see the ``common/session_ctx`` docstring).
     """
     return normalize_origin(
         {"session": session, "task": task, "surface": surface}
@@ -104,12 +115,13 @@ def build_origin(
 def merge_origin(
     old: dict[str, str] | None, new: dict[str, str] | None
 ) -> dict[str, str]:
-    """合并两组 origin：**既存值优先，只补空缺键**。
+    """Merge two origin dicts: **existing values win; only missing keys are filled in**.
 
-    与 :func:`store.memory.merge_tag_dicts` 同一原则——去重合并意味着两条
-    内容近乎相同，主体通常也相同；真出现不同主体（两个 Worker 独立写到
-    同一件事实上），保留先写的那个至少是**确定性**的，且新主体已在
-    ``raw_log`` 里留痕，不会丢。
+    Same principle as :func:`store.memory.merge_tag_dicts` — a deduplicating merge means
+    the two entries are near-identical in content, and the subject is usually the same too;
+    if a genuinely different subject does appear (two Workers independently wrote to the
+    same fact), keeping the earlier writer is at least **deterministic**, and the new subject
+    has already left a trace in ``raw_log``, so it is not lost.
     """
     merged = dict(normalize_origin(new))
     merged.update(normalize_origin(old))

@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
-"""用户级记忆继承槽：纯选择与渲染。
+"""User-level memory inheritance slot: pure selection and rendering.
 
-落点：I/O 编排在
-``brain/session.py::_user_scope_brief``（轻量读取路径——不构 brain、
-不载嵌入模型），本模块只做**纯数据**的选择与文本渲染，与
-:mod:`stats_views.pinned_brief` 同口径：
+Placement: I/O orchestration lives in
+``brain/session.py::_user_scope_brief`` (a lightweight read path -- no brain
+construction, no embedding model loading); this module does only the **pure
+data** selection and text rendering, the same approach as
+:mod:`stats_views.pinned_brief`:
 
-* ``records`` 是鸭子类型（用到 ``.id / .content / .importance /
-  .timestamp / .pin / .state``）——domain 不 import store（arch G1），
-  ``active_state`` 由调用方注入（``MemoryState.ACTIVE.value``）；
-* 选择判据：**pinned 优先**（不看阈值）→ 阈值档
-  （非 pinned 且 ``importance >= importance_min``）→ 组内一律
-  ``(-importance, -timestamp)`` 降序 → 整体 cap 到 ``limit``；
-  pinned 条目即使 importance 也过阈值，只在 pinned 档出现一次。
+* ``records`` is duck-typed (uses ``.id / .content / .importance /
+  .timestamp / .pin / .state``) -- domain does not import store (arch G1);
+  ``active_state`` is injected by the caller (``MemoryState.ACTIVE.value``);
+* Selection criteria: **pinned first** (threshold not consulted) -> the
+  threshold band (non-pinned and ``importance >= importance_min``) -> within
+  each group always ``(-importance, -timestamp)`` descending -> capped
+  overall to ``limit``; a pinned entry appears only in the pinned band even
+  if its importance also passes the threshold.
 """
 
 from __future__ import annotations
@@ -29,27 +31,35 @@ def select_user_scope(
     importance_min: float,
     active_state: str = "active",
 ) -> list[dict[str, Any]]:
-    """从用户级库的库存记录里选出继承槽条目。
+    """Select inheritance-slot entries from the user-level library's stock
+    records.
 
     Args:
-        records: 库存记录（调用方已从用户库后端取好并转成记录对象）。
-        limit: 带几条。**``<= 0` 返回空列表**——这是"关闭"，不是切片：
-            ``records[:limit]`` 在 ``limit=-1`` 时是"倒数第 1 条之外全要"，
-            负值切片在这里是错的（关＝零痕迹的字面义）。
-        importance_min: 阈值档下限（``Config.user_scope_importance``，
-            默认 0.7）。边界**含等于**：``importance == importance_min`` 入档。
-        active_state: 活跃状态字符串（调用方注入）。
+        records: stock records (the caller has already fetched them from the
+            user library backend and converted them into record objects).
+        limit: how many to carry. **``<= 0`` returns an empty list** -- this
+            is "off", not slicing: ``records[:limit]`` with ``limit=-1`` means
+            "everything except the last one", and negative slicing is wrong
+            here (off = literally zero traces).
+        importance_min: the threshold band's lower bound
+            (``Config.user_scope_importance``, default 0.7). The boundary is
+            **inclusive**: ``importance == importance_min`` enters the band.
+        active_state: the active state string (injected by the caller).
 
     Returns:
-        入选条目的投影 dict 列表（``memory_id / content / importance /
-        timestamp / pin``），pinned 档在前、阈值档在后，各自
-        ``(-importance, -timestamp)`` 降序，总量 cap 到 ``limit``。
+        A list of projection dicts for the selected entries (``memory_id /
+        content / importance / timestamp / pin``), pinned band first,
+        threshold band after, each ``(-importance, -timestamp)`` descending,
+        capped overall to ``limit``.
     """
     if limit <= 0:
         return []
-    # D2a 写侧隔离：待审卡不进 user_scope 槽——伪造"用户偏好"即使写进了
-    # 用户库，也不能经继承槽注入任何会话（攻击链的最后一环，见设计稿 §4.3）。
-    # getattr 兜底同 recall_flow：旧记录对象无该字段按未隔离处理。
+    # D2a write-side isolation: quarantined cards stay out of the user_scope
+    # slot -- fabricated "user preferences" must not reach any session through
+    # the inheritance slot, even if written into the user library (the last
+    # link of the attack chain, see design doc §4.3).
+    # The getattr fallback matches recall_flow: old record objects without the
+    # field are treated as not isolated.
     active = [r for r in records
               if r.state == active_state and not getattr(r, "quarantine", False)]
     pinned = [r for r in active if r.pin]
@@ -72,10 +82,12 @@ def select_user_scope(
 
 
 def render_user_scope(entries: list[dict[str, Any]]) -> list[str]:
-    """继承槽文本行：与 ``block_task_hits`` 同款渲染（``content[:200]（id[:8]``）。
+    """Inheritance-slot text lines: the same rendering as ``block_task_hits``
+    (``content[:200]（id[:8]``).
 
-    返回体键 ``block_user_scope``：宿主直接拼 prompt 的文本槽，
-    与结构化 ``user_scope.memories`` 同源。
+    The response body key ``block_user_scope``: a text slot the host
+    concatenates into its prompt directly, same source as the structured
+    ``user_scope.memories``.
     """
     return [
         f"{e['content'][:200]}（{e['memory_id'][:8]}）" for e in entries

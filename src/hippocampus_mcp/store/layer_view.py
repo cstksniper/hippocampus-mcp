@@ -1,38 +1,49 @@
 # -*- coding: utf-8 -*-
-"""层指纹投影（从 brain/core.py 提取）。
+"""Layer fingerprint projection (extracted from brain/core.py).
 
-这批函数只**读**内存状态并投影成对外结论，不写任何东西：
+These functions only **read** in-memory state and project it into outward
+conclusions; they write nothing:
 
-- :func:`pending_layer_names` —— 此刻「内存有改动但还没写下去」的层
-  （四象限的内存侧判据）；
-- :func:`compute_all_layer_fps` —— 全部层的内容指纹（账本 begin/end
-  行的 ``layer_fps`` 字段）；
-- :func:`classify_layer_quadrants` —— F14-3 四象限逐层归属；
-- :func:`ledger_view` —— F14 账本投影（``brain_stats.save_ledger``）。
+- :func:`pending_layer_names` -- the layers that at this moment "have
+  in-memory changes not yet persisted" (the memory-side criterion of the
+  quadrant view);
+- :func:`compute_all_layer_fps` -- content fingerprints of all layers (the
+  ``layer_fps`` field of the ledger begin/end lines);
+- :func:`classify_layer_quadrants` -- F14-3 per-layer quadrant assignment;
+- :func:`ledger_view` -- F14 ledger projection (``brain_stats.save_ledger``).
 
-为什么放 store/ 而不是 brain：判据全是「层文件 / 层属性」这一对关系，
-零领域逻辑；brain 只留薄包装（把 ``_LAYER_ATTRS``、指纹函数、磁盘戳
-比较在本侧绑好当适配层）。与 :mod:`hippocampus_mcp.store.ledger` 同域。
+Why store/ rather than brain: the criteria are all the single pair
+"layer file / layer attribute", zero domain logic; brain keeps only thin
+wrappers (binding ``_LAYER_ATTRS``, the fingerprint function and the disk
+stamp comparison on its side as the adapter). Same domain as
+:mod:`hippocampus_mcp.store.ledger`.
 
-端口纪律：
+Port discipline:
 
-* **不 import 任何 Config 旋钮**。指纹开关 ``layer_fp`` 由包装层在调用
-  时从 ``core`` 命名空间现取后作参数传入（monkeypatch 面必需）；
-* 指纹计算本身以 ``fingerprint_of(attr)`` 回调注入 —— brain 侧传的是
-  ``lambda a: self._layer_fingerprint(getattr(self, a))``，运行期查找，
-  测试 patch ``_layer_fingerprint`` 仍然生效；
-* 时钟同样注入（``now`` / ``stamp_of``），账本投影的 ``interval_s`` 全靠
-  ``time.monotonic()`` 差值，wall clock 相减遇 NTP 回拨会得负数。
+* **No Config knobs are imported**. The fingerprint switch ``layer_fp`` is
+  fetched live from the ``core`` namespace by the wrapper at call time and
+  passed in as a parameter (required for the monkeypatch surface);
+* The fingerprint computation itself is injected as the
+  ``fingerprint_of(attr)`` callback -- brain passes
+  ``lambda a: self._layer_fingerprint(getattr(self, a))``, a runtime lookup,
+  so test patches of ``_layer_fingerprint`` still apply;
+* The clock is injected too (``now`` / ``stamp_of``); the ledger projection's
+  ``interval_s`` relies entirely on ``time.monotonic()`` differences --
+  subtracting wall clocks goes negative on NTP rollbacks.
 
-预存怪癖按「只挪位置不改行为」原样保留：
+Pre-existing quirks are preserved as-is under "move only, change nothing":
 
-* ``_layer_written_fp`` 为空（新库）时 :func:`pending_layer_names` 返回
-  空列表 —— 不是"没有改动"，是"无从判断"，这一点由 ``pending_note`` 说清；
-* :func:`classify_layer_quadrants` 里 ``name in stamped`` 先短路，**只有**
-  戳表里有的层才去问 ``changed_by_other``；``persist_dir`` 为 None 时
-  ``os.path.join("", name)`` 得到相对路径（因此几乎恒为 False）；
-* 账本投影在 ``last`` 不是 dict 时返回 ``level=unknown`` 的整套字段，
-  **绝不报 0** —— 0 会被读成「刚保存过」，那是比 unknown 更糟的谎话。
+* When ``_layer_written_fp`` is empty (new library), :func:`pending_layer_names`
+  returns an empty list -- not "no changes", but "cannot tell"; this is said
+  plainly by ``pending_note``;
+* In :func:`classify_layer_quadrants`, ``name in stamped`` short-circuits
+  first; **only** layers present in the stamp table ever ask
+  ``changed_by_other``; when ``persist_dir`` is None,
+  ``os.path.join("", name)`` yields a relative path (hence almost always
+  False);
+* When ``last`` is not a dict, the ledger projection returns the whole field
+  set with ``level=unknown`` and **never reports 0** -- 0 would be read as
+  "just saved", a lie worse than unknown.
 """
 from __future__ import annotations
 
@@ -45,17 +56,19 @@ def pending_layer_names(
     written_fp: Mapping[str, str],
     fingerprint_of: Callable[[str], str],
 ) -> list[str]:
-    """此刻**内存里有改动、但还没写下去**的层名。
+    """Layer names that at this moment **have in-memory changes not yet
+    persisted**.
 
-    ``written_fp`` 为空（本进程从没落过盘）时返回空 —— 不是"没有改动"，
-    是"无从判断"。从没写过的层也不算"改动"，算"还没建"。
+    Returns empty when ``written_fp`` is empty (this process has never
+    persisted) -- not "no changes", but "cannot tell". A layer never written
+    does not count as "changed" either; it counts as "not yet built".
     """
     if not written_fp:
         return []
     out: list[str] = []
     for name, attr in layer_attrs.items():
         if name not in written_fp:
-            continue      # 从没写过这层：不算"改动"，算"还没建"
+            continue      # never persisted: not "changed", but "not yet built"
         if fingerprint_of(attr) != written_fp[name]:
             out.append(name)
     return out
@@ -66,10 +79,12 @@ def compute_all_layer_fps(
     fingerprint_of: Callable[[str], str],
     enabled: bool,
 ) -> dict[str, str]:
-    """全部层的内容指纹（账本 begin/end 行的 ``layer_fps`` 字段）。
+    """Content fingerprints of all layers (the ``layer_fps`` field of the
+    ledger begin/end lines).
 
-    指纹开关关闭时返回空 dict —— 账本行里就不带 ``layer_fps``，
-    启动对账据此诚实降级（不猜）。
+    Returns an empty dict when the fingerprint switch is off -- the ledger
+    line then carries no ``layer_fps``, and boot reconciliation degrades
+    honestly on that basis (no guessing).
     """
     if not enabled:
         return {}
@@ -84,12 +99,17 @@ def classify_layer_quadrants(
     fingerprint_of: Callable[[str], str],
     changed_by_other: Callable[[str, str], bool],
 ) -> dict[str, str]:
-    """F14-3 四象限判定（口径 2）：逐层给出当前归属。
+    """F14-3 quadrant classification (wording 2): current assignment per
+    layer.
 
-    内存侧（**主判据**）＝当前内存指纹 vs 本进程上次落盘指纹；
-    磁盘侧（**仅辅证**）＝层文件戳还在不在（mtime 永不单独定罪 ——
-    touch 不改内容时指纹不变，仍算 clean，只是记一笔 external_write）。
-    本进程从没写过该层 → ``unknown``（是"还没建"，不是"改了没写"）。
+    Memory side (**primary criterion**) = current in-memory fingerprint vs
+    this process's last persisted fingerprint;
+    disk side (**corroborating evidence only**) = whether the layer file
+    stamp is still there (mtime never convicts alone -- touch without a
+    content change keeps the fingerprint unchanged and still counts as
+    clean, merely recorded as an external_write).
+    This process never wrote the layer → ``unknown`` ("not yet built", not
+    "changed but unsaved").
     """
     out: dict[str, str] = {}
     for name, attr in layer_attrs.items():
@@ -98,7 +118,8 @@ def classify_layer_quadrants(
             out[name] = "unknown"
             continue
         dirty = fingerprint_of(attr) != written
-        # ``name in stamped`` 先短路是预存行为：戳表里没有就不必去问磁盘。
+        # The ``name in stamped`` short-circuit is pre-existing behavior: no
+        # need to ask the disk about layers absent from the stamp table.
         changed = name in stamped and changed_by_other(
             name, os.path.join(persist_dir or "", name))
         if dirty:
@@ -119,10 +140,11 @@ def ledger_view(
     now: Callable[[], float],
     stamp_of: Callable[[float], str],
 ) -> dict[str, Any]:
-    """F14：账本投影（``brain_stats.save_ledger``）。
+    """F14: ledger projection (``brain_stats.save_ledger``).
 
-    范式照抄 ``recall_feedback``：数字 + level + 人话 note。
-    空库 / 从未落盘报 ``null`` + ``unknown``，**绝不报 0**。
+    Pattern copied from ``recall_feedback``: numbers + level + plain-language
+    note. Empty library / never persisted reports ``null`` + ``unknown`` --
+    **never 0**.
     """
     if not isinstance(last, dict):
         return {
@@ -143,7 +165,8 @@ def ledger_view(
         }
     at_wall = last.get("at_wall")
     at_mono = float(last.get("at_mono") or now())
-    # 间隔一律用单调钟：wall clock 相减遇到 NTP 回拨会得负数。
+    # Intervals always use the monotonic clock: subtracting wall clocks goes
+    # negative on NTP rollbacks.
     interval = max(0.0, now() - at_mono)
     phase = last.get("phase")
     merged = last.get("merged_from_disk") or {}
@@ -163,8 +186,8 @@ def ledger_view(
             level = "stale"
         note = (f"Last save {stamp}, {hh}h{mm}m ago; 0 saves since. "
                 f"In-memory changes made during this window are lost if the host reclaims the process.")
-    # F14-5：启动对账结果非空 lost ⇒ 这是最重的一级（数据确实没写下去）；
-    # 磁盘与账本不符次之。
+    # F14-5: boot reconcile with non-empty lost ⇒ the heaviest level (data
+    # really did not get written); disk/ledger mismatch ranks second.
     if isinstance(boot, dict):
         if boot.get("lost_since_last_save"):
             level = "critical"
@@ -183,8 +206,9 @@ def ledger_view(
         "last_phase": phase,
         "last_duration_ms": last.get("duration_ms"),
         "last_layers": last.get("layers"),
-        # F14-1 已落地：这里不再是 None。四象限的"内存侧"维度＝
-        # 当前内存指纹 vs 上次落盘指纹，不一致即"改了还没写下去"。
+        # F14-1 landed: no longer None here. The quadrant view's "memory
+        # side" dimension = current in-memory fingerprint vs last persisted
+        # fingerprint; a mismatch means "changed but not yet written".
         "pending_layers": list(pending) if pending else [],
         "pending_note": (
             (f"{len(pending)} layers have unsaved changes: {', '.join(pending)}. "
@@ -192,14 +216,17 @@ def ledger_view(
             if pending else
             "No layer currently holds unwritten changes (memory matches the last persisted content)."
         ),
-        # G0：上次 save 实际跳过了几个层（派生层脏集的效果，恒为空说明没生效）
+        # G0: how many layers the last save actually skipped (effect of the
+        # derived-layer dirty set; always empty means it never took effect)
         "last_layers_skipped": last.get("layers_skipped") or [],
-        # F14-3：四象限逐层归属（unsaved=改了没写 / conflict=改了且别人也动了 /
-        # clean / external_write / unknown=本进程还没写过）
+        # F14-3: per-layer quadrant assignment (unsaved=changed, not written /
+        # conflict=changed and someone else touched it too /
+        # clean / external_write / unknown=this process never wrote it)
         "layers_quadrant": dict(quadrant),
-        # L1 有自己的脏标记与合并链路，不混进层四象限，只给一行事实
+        # L1 has its own dirty flag and merge chain; kept out of the layer
+        # quadrants, reported as a one-line fact
         "l1_dirty": l1_dirty,
-        # F14-5：启动对账结果（None = 无账本可对）
+        # F14-5: boot reconcile result (None = no ledger to reconcile against)
         "boot_reconcile": boot,
         "external_touched": sorted(merged.keys()),
         "level": level,

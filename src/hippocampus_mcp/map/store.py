@@ -1,10 +1,12 @@
-"""地图层侧车存储（信息地图层）。
+"""Map-layer sidecar storage (information map layer).
 
-核心判断：**地图 ≠ 记忆**——地图答「现在是什么」，记忆答「发生过
-什么」。所以地图条目不进 recall 检索路径（不带向量、不是记忆），按键
-更新（同一键反复写，旧值被替换而不是与新值竞争），持续过期（不改就是错）。
+Core judgment: **map != memory** -- the map answers "what is the state
+now", memory answers "what happened". So map entries do not enter the
+recall retrieval path (no vectors, not memories); they are updated by key
+(the same key written repeatedly, the old value replaced rather than
+competing with the new), and continuously expire (unchanged means wrong).
 
-侧车 JSON（``<persist_dir>/maps.json``）::
+Sidecar JSON (``<persist_dir>/maps.json``)::
 
     {
       "version": 1,
@@ -28,23 +30,33 @@
       }
     }
 
-四条纪律（与文件建档同族，详见设计文档四道闸）：
-1. **闸一·写时更新**：状态只走 :func:`set_entry` 一个入口（map_set 工具
-   的底层），一经 set 即整体替换该键的旧值——「一键一条」是数据模型保证
-   的，不靠调用方自觉。
-2. **闸二·真相源验证**：条目可声明 ``truth_source``（文件路径），set 时
-   记录其（size, mtime_ns）+ blake2b 签名；:func:`verify` 重读比对——
-   签名失匹读一次内容哈希仲裁（touch / git checkout 不误报），真变了
-   标 ``drift``。与 file_registry 的哈希仲裁同一思路
-   （条目 truth_source 指向文件路径即自动继承本机制）。
-3. **opt-in**：没有侧车就没有地图层一切行为；不存在返回 None，不炸
-   调用方（与 file_registry.load 同约定）。
-4. **失败不炸热路径**：磁盘异常由调用方兜底；本模块只对「用法错误」
-   （超长键值 / 未知 map 等）抛 ValueError。
-5. **并发写在锁内**（见 :mod:`sidecar_lock`）：所有
-   读-改-写一律走 :func:`update`；直接 :func:`save` 只保证「不写坏」，
-   不防丢更新。抢不到锁抛 :class:`SidecarBusy`，由调用方决定等或跳过
-   ——**绝不静默丢写**（这是 tmp+rename 时代的真实病灶）。
+Four disciplines (same family as file registration; see the design doc's
+four gates for detail):
+1. **Gate 1 - update at write time**: status goes through
+   :func:`set_entry`, a single entry point (the bottom layer of the
+   map_set tool); once set, the key's old value is replaced wholesale --
+   "one key, one entry" is guaranteed by the data model, not by caller
+   discipline.
+2. **Gate 2 - truth-source verification**: an entry may declare
+   ``truth_source`` (a file path); on set, its (size, mtime_ns) + blake2b
+   signature is recorded; :func:`verify` re-reads and compares -- on
+   signature mismatch, read the content hash once to arbitrate (touch /
+   git checkout do not false-positive); a real change marks ``drift``.
+   Same idea as file_registry's hash arbitration (an entry whose
+   truth_source points at a file path inherits this mechanism
+   automatically).
+3. **opt-in**: no sidecar, none of the map layer's behavior; missing
+   returns None without crashing the caller (same contract as
+   file_registry.load).
+4. **Failure must not blow up the hot path**: disk exceptions are the
+   caller's to handle; this module raises ValueError only for "usage
+   errors" (overlong keys/values / unknown maps, etc.).
+5. **Concurrent writes inside the lock** (see :mod:`sidecar_lock`): all
+   read-modify-write goes through :func:`update`; calling :func:`save`
+   directly only guarantees "not writing it broken", not against lost
+   updates. Failing to get the lock raises :class:`SidecarBusy`, and the
+   caller decides to wait or skip -- **never silently drop a write** (the
+   real disease of the tmp+rename era).
 """
 
 from __future__ import annotations
@@ -59,24 +71,24 @@ from .constants import MAPS_VERSION
 from .file_registry import HASH_MAX_BYTES, _hash_file
 from ..common.sidecar_lock import SidecarBusy, SidecarUnreadable
 
-# 体量护栏（防病态 JSON：一个条目不是一段文章）
-MAX_KEY_LEN = 100        # 条目键（CN2601 / chr1 / --use-avx2）
-MAX_STATUS_LEN = 200     # 状态值
-MAX_DESC_LEN = 200       # 图描述（相关性匹配靠它，一句话）
+# Size guardrails (against pathological JSON: an entry is not an article)
+MAX_KEY_LEN = 100        # entry key (CN2601 / chr1 / --use-avx2)
+MAX_STATUS_LEN = 200     # status value
+MAX_DESC_LEN = 200       # map description (relevance matching relies on it; one sentence)
 MAX_NOTE_LEN = 500       # note
-MAX_FIELDS = 20          # 附加字段个数
-MAX_FIELD_LEN = 200      # 单个附加字段值长度
-MAX_MAPS = 200           # 一个库的地图数上限（防误用成记忆库）
+MAX_FIELDS = 20          # number of extra fields
+MAX_FIELD_LEN = 200      # length of a single extra field value
+MAX_MAPS = 200           # max maps per library (guards against misuse as a memory store)
 
 
-# ── 读写 ────────────────────────────────────────────────────────
+# ── Read/write ────────────────────────────────────────────────────────
 
 def maps_path(persist_dir: str) -> str:
     return os.path.join(persist_dir, "maps.json")
 
 
 def load(persist_dir: str) -> dict | None:
-    """读侧车；不存在/损坏都返回 None（损坏按未启用处理，不炸调用方）。"""
+    """Read the sidecar; missing/corrupt both return None (corrupt is treated as not enabled, never crashing the caller)."""
     try:
         with open(maps_path(persist_dir), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -88,10 +100,12 @@ def load(persist_dir: str) -> dict | None:
 
 
 def _write_atomic(persist_dir: str, data: dict) -> None:
-    """原子写（tmp + rename）：多会话并发改地图不能留半个 JSON。
+    """Atomic write (tmp + rename): concurrent multi-session map edits must
+    not leave half a JSON.
 
-    **不含锁**——由 :func:`update` 在已持锁的临界区里调用，或由
-    :func:`save` 自己拿锁后调用。两者都不许在未持锁时直接用它。
+    **No locking here** -- called by :func:`update` inside an already-held
+    lock critical section, or by :func:`save` after taking the lock itself.
+    Neither may use it directly without holding the lock.
     """
     p = maps_path(persist_dir)
     os.makedirs(persist_dir, exist_ok=True)
@@ -109,15 +123,18 @@ def _write_atomic(persist_dir: str, data: dict) -> None:
 
 
 def save(persist_dir: str, data: dict, wait: float = 0.0) -> None:
-    """给**已在手**的 data 落盘（原子写 + 侧车锁）。
+    """Persist **already-in-hand** data to disk (atomic write + sidecar lock).
 
-    ⚠️ 锁只保证「不写坏、两次写不交错」，**不防丢更新**：读若发生在锁
-    之外，别人这期间的改动会被这份整量快照覆盖。要防丢更新用
-    :func:`update`——那里读和写在同一个临界区里。
+    Warning: the lock only guarantees "not writing it broken, two writes not
+    interleaving"; it does **not** prevent lost updates: if the read happened
+    outside the lock, others' changes in the meantime get overwritten by
+    this whole-snapshot write. To prevent lost updates use :func:`update` --
+    there, read and write share one critical section.
 
-    这个签名留着是因为 ``data`` 常是从别处算出来的（CLI 预演、测试
-    造数据），强行要求回调反而绕。抢不到锁抛 :class:`SidecarBusy`，
-    绝不静默丢写。
+    This signature exists because ``data`` is often computed elsewhere (CLI
+    rehearsal, test fixtures); forcing a callback would be roundabout.
+    Failing to get the lock raises :class:`SidecarBusy`; a write is never
+    silently dropped.
     """
     lock = sl.lock_path(maps_path(persist_dir))
     tok = sl.acquire(lock, wait=wait)
@@ -131,25 +148,30 @@ def save(persist_dir: str, data: dict, wait: float = 0.0) -> None:
 
 def update(persist_dir: str, fn, create: bool = False,
            wait: float = 0.0, reset_unreadable: bool = False):
-    """在侧车锁内做「读 → 改 → 写」，**防丢更新的唯一正确姿势**。
+    """Do "read -> modify -> write" inside the sidecar lock, **the only
+    correct way to prevent lost updates**.
 
-    ``fn(data)`` 在锁内拿到**最新的** data（不是调用方手里的旧快照），
-    原地修改后返回 ``(save: bool, result)``：
+    ``fn(data)`` receives the **latest** data inside the lock (not the
+    caller's stale snapshot), mutates it in place, and returns
+    ``(save: bool, result)``:
 
-    - ``save=True`` ⇒ 落盘；
-    - ``save=False`` ⇒ 只算不写（例如巡检间隔未到、无配方可跑）——
-      这是常态，不是异常；
-    - ``create=True`` 且侧车不存在 ⇒ 用 :func:`empty` 起一份；
-      ``create=False`` 且侧车不存在 ⇒ **不调 fn**，直接返回 ``(None, False)``
-      （opt-in：没启用地图层就不该被写入）。
+    - ``save=True`` => persist;
+    - ``save=False`` => compute only, no write (e.g. the patrol interval has
+      not elapsed, no recipe to run) -- this is the norm, not an exception;
+    - ``create=True`` and the sidecar is absent => start one from
+      :func:`empty`; ``create=False`` and the sidecar is absent => **do not
+      call fn**, return ``(None, False)`` directly (opt-in: with the map
+      layer not enabled there should be no write).
 
-    🔴 **「读不出来」不等于「不存在」**：文件在但 ``load`` 返回 None
-    （损坏/被独占）⇒ 抛 :class:`SidecarUnreadable`，绝不起空侧车覆盖。
-    只有 ``reset_unreadable=True``（init --force 这种显式重建）才把坏
-    文件改名隔离后重建。
+    Red alert: **"unreadable" is not "nonexistent"**: the file exists but
+    ``load`` returns None (corrupt/exclusively held) => raise
+    :class:`SidecarUnreadable`; never overwrite with a fresh empty sidecar.
+    Only ``reset_unreadable=True`` (explicit rebuild like init --force)
+    renames the bad file into quarantine and rebuilds.
 
-    返回 ``(result, saved)``。抢不到锁抛 :class:`SidecarBusy`——由调用方
-    决定等（``wait``）/ 报错 / 跳过本轮，不允许当成写成功。
+    Returns ``(result, saved)``. Failing to get the lock raises
+    :class:`SidecarBusy` -- the caller decides to wait (``wait``) / raise /
+    skip this round; it must not be treated as a successful write.
     """
     lock = sl.lock_path(maps_path(persist_dir))
     tok = sl.acquire(lock, wait=wait)
@@ -163,7 +185,7 @@ def update(persist_dir: str, fn, create: bool = False,
             if exists and not reset_unreadable:
                 raise sl.SidecarUnreadable(p)
             if exists:
-                sl.quarantine(p)          # 显式重建：隔离，不删
+                sl.quarantine(p)          # explicit rebuild: quarantine, do not delete
             if not create:
                 return None, False
             data = empty()
@@ -179,7 +201,7 @@ def empty() -> dict:
     return {"version": MAPS_VERSION, "maps": {}}
 
 
-# ── 写入（闸一：唯一入口） ──────────────────────────────────────
+# ── Write (gate 1: the only entry) ──────────────────────────────────────
 
 def _clip(s: object, n: int, what: str) -> str:
     s = "" if s is None else str(s)
@@ -190,11 +212,13 @@ def _clip(s: object, n: int, what: str) -> str:
 
 
 def resolve_source(path: str, root: str | None = None) -> str:
-    """truth_source 解析：绝对路径原样；相对路径先试建档项目根
-    （file_registry.init 显式指定的 root），再试进程 cwd。
+    """truth_source resolution: absolute paths as-is; relative paths try the
+    registration project root first (the root explicitly given to
+    file_registry.init), then the process cwd.
 
-    返回**首个存在的候选**；都不存在时返回主候选（调用方记录不到签名，
-    由 verify 在文件出现后按 missing 处理）。
+    Returns the **first existing candidate**; when none exists, returns the
+    primary candidate (the caller records no signature; verify treats it as
+    missing once the file appears).
     """
     path = str(path).strip()
     if not path:
@@ -212,10 +236,11 @@ def resolve_source(path: str, root: str | None = None) -> str:
 
 
 def _record_source_sig(full: str) -> dict | None:
-    """truth_source 当前签名（size/mtime_ns + 内容哈希）。
+    """The truth_source's current signature (size/mtime_ns + content hash).
 
-    文件不存在 / 太大不哈希 ⇒ None（verify 时按 missing 或无基线处理）。
-    与 file_registry 同一套仲裁签名（自动继承本机制）。
+    File missing / too large to hash => None (treated as missing or as
+    no-baseline at verify time). Same arbitration signature as file_registry
+    (inherits this mechanism automatically).
     """
     try:
         if not os.path.isfile(full) or os.path.getsize(full) > HASH_MAX_BYTES:
@@ -231,17 +256,22 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
               fields: dict | None = None, desc: str | None = None,
               truth_source: str | None = None, note: str | None = None,
               updated_by: str = "", root: str | None = None) -> tuple[dict, dict, list[str]]:
-    """按键 upsert 一个条目（闸一唯一写入口）。返回 (map, entry, notes)。
+    """Upsert one entry by key (gate 1's sole write entry). Returns (map,
+    entry, notes).
 
-    - map 不存在则新建（desc 缺省用 name——desc 是 L1 相关性匹配的
-      唯一依据，见设计文档 §3/§6）；
-    - 同键再写**整体替换**旧值（旧状态与新状态竞争在数据模型层面被排除）；
-    - ``truth_source``：非空 ⇒ 设置并记录当前签名（set 的那一刻起算「真相
-      变没变」）；None（没传）⇒ **保留**原值与原签名基线（局部更新状态
-      不该顺手丢掉真相源声明）；空串 ⇒ 显式清除；
-    - 重新 set 自动清除该条目的 drift（重新记录了基线）；
-    - notes 是非致命警告（如 truth_source 不在磁盘上）——返回给宿主，
-      不打断写入。
+    - A missing map is created (desc defaults to name -- desc is the sole
+      basis for L1 relevance matching, see the design doc §3/§6);
+    - Writing the same key again **replaces wholesale** the old value (old
+      status vs new status competing is excluded at the data-model level);
+    - ``truth_source``: non-empty => set it and record the current signature
+      ("has the truth changed" is measured from the moment of set); None
+      (not passed) => **keep** the original value and its signature baseline
+      (a local status update must not casually drop the truth-source
+      declaration); empty string => explicit clear;
+    - Re-setting automatically clears the entry's drift (a new baseline was
+      recorded);
+    - notes are non-fatal warnings (e.g. truth_source not on disk) --
+      returned to the host; the write is not interrupted.
     """
     name = _clip(name, MAX_DESC_LEN, "map name")
     key = _clip(key, MAX_KEY_LEN, "entry key")
@@ -280,9 +310,9 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
     old_ts = str(ent.get("truth_source") or "")
     old_sig = ent.get("source_sig")
     if truth_source is None:
-        new_ent["truth_source"] = old_ts          # 没传 ⇒ 保留
-        new_ent["source_sig"] = old_sig          # 基线不动（verify 会
-    elif str(truth_source).strip():               # 如实暴露这期间的变化）
+        new_ent["truth_source"] = old_ts          # not passed => keep
+        new_ent["source_sig"] = old_sig          # baseline untouched (verify will
+    elif str(truth_source).strip():               # expose any change in between truthfully)
         new_ent["truth_source"] = _clip(str(truth_source).strip(), 400,
                                         "truth_source")
         full = resolve_source(new_ent["truth_source"], root)
@@ -291,13 +321,13 @@ def set_entry(data: dict, name: str, key: str, status: str | None = None,
             notes.append("truth_source missing from disk or too large (no recorded signature): %s"
                          % new_ent["truth_source"])
         new_ent["source_sig"] = sig
-    # truth_source == ""（显式空串）⇒ 清除：source_sig 保持 None
+    # truth_source == "" (explicit empty string) => clear: source_sig stays None
     m["entries"][key] = new_ent
     m["updated_at"] = now
     return m, new_ent, notes
 
 
-# ── 查询 ────────────────────────────────────────────────────────
+# ── Query ────────────────────────────────────────────────────────
 
 def get_entry(data: dict, name: str, key: str) -> dict | None:
     m = (data.get("maps") or {}).get(str(name)) or {}
@@ -310,16 +340,21 @@ def map_names(data: dict) -> list[str]:
 
 def ack_entry(data: dict, name: str, key: str,
               now: float | None = None) -> dict:
-    """「我核过了，状态没变」：只前移 ``updated_at``，不动 status/fields。
+    """"I re-checked it; the status is unchanged": only advances ``updated_at``,
+    leaving status/fields untouched.
 
-    闸三（提及级漂移）的**唯一显式清除手势**（``map/mention.py`` 清除
-    规则 1）：判据是「有更晚的记忆说了另一个状态」，把确认时刻写进
-    ``updated_at`` 就让它不再满足；同时清掉 ``ent["mention"]``。
+    Gate 3's (mention-level drift) **only explicit clearing gesture** (the
+    clearing rule 1 in ``map/mention.py``): the trigger is "a later memory
+    says another status"; writing the confirmation moment into
+    ``updated_at`` makes it no longer satisfied; also clears
+    ``ent["mention"]``.
 
-    为什么不复用 ``set_entry``：重写要人把 status/fields 再抄一遍，
-    抄错就是把「确认没变」写成「改成了别的」——最需要安全的地方不该有
-    抄写风险。也不动 ``updated_by``（状态不是他写的，只是确认过），
-    确认痕迹单独落 ``acked_at``。
+    Why not reuse ``set_entry``: rewriting would make a human copy
+    status/fields again, and a copying mistake turns "confirmed unchanged"
+    into "changed to something else" -- the place that most needs safety
+    should not carry transcription risk. ``updated_by`` is also untouched
+    (the status was not written by them; they only confirmed it); the
+    confirmation trace persists separately in ``acked_at``.
     """
     now = time.time() if now is None else now
     m = (data.get("maps") or {}).get(str(name))
@@ -331,25 +366,28 @@ def ack_entry(data: dict, name: str, key: str,
     ent = ents[str(key)]
     ent["updated_at"] = now
     ent["acked_at"] = now
-    ent["mention"] = None            # 闸三标记随确认一起清（新增的会重算）
+    ent["mention"] = None            # gate-3 mark cleared with the confirmation (new ones get recomputed)
     m["updated_at"] = now
     return ent
 
 
 def list_maps(data: dict, now: float | None = None) -> list[dict]:
-    """全库地图摘要（给 L0 索引行与 map_list 工具用）。"""
+    """Library-wide map summary (for the L0 index lines and the map_list tool)."""
     now = time.time() if now is None else now
     out = []
     for name, m in (data.get("maps") or {}).items():
         ents = m.get("entries") or {}
         drifted = sum(1 for e in ents.values() if e.get("drift"))
-        # 自动 verify 的三态里「说不清」也要上浮——
-        # extract_failed 不是 drift（值没变，是我们拒绝猜），但同样不能
-        # 当成 clean 藏起来（设计 §8 C1「失败不当一致」）。
+        # In auto-verify's three states, "cannot tell" must also surface --
+        # extract_failed is not drift (the value did not change; we refused
+        # to guess), but it likewise must not be hidden as clean (design §8
+        # C1 "failure is not consistency").
         failed = sum(1 for e in ents.values()
                      if (e or {}).get("auto_state", {}).get("state") == "failed")
-        # 目录对账的两个方向。drift 按原因分开数——
-        # 「值变了」与「文件没了」的处置完全不同，混成一个数等于没说。
+        # The two directions of directory reconciliation. drift is counted
+        # separately by reason -- "value changed" and "file gone" need
+        # completely different handling; merging into one number says
+        # nothing.
         dir_missing = sum(
             1 for e in ents.values()
             if ((e or {}).get("drift") or {}).get("reason") == "dir_missing")
@@ -357,9 +395,10 @@ def list_maps(data: dict, now: float | None = None) -> list[dict]:
             1 for e in ents.values()
             if ((e or {}).get("drift") or {}).get("reason") == "dir_conflict")
         auto_state = m.get("auto_state") or {}
-        # 闸三：更新后被提到「另一个状态」的条目数。它是
-        # **提示**不是事实——与 drift（真相源比对结果）分开计数，页面上
-        # 也分开写（`·疑变N` vs `·漂移N`），不合并成一个大数。
+        # Gate 3: entries mentioned with "another status" after an update.
+        # It is a **hint**, not fact -- counted separately from drift (the
+        # truth-source comparison result) and written separately on the page
+        # (`·疑变N` vs `·漂移N`), never merged into one big number.
         mentioned = sum(1 for e in ents.values() if (e or {}).get("mention"))
         newest = max([float(e.get("updated_at") or 0.0)
                       for e in ents.values()] or
@@ -372,7 +411,7 @@ def list_maps(data: dict, now: float | None = None) -> list[dict]:
             "failed": failed,
             "dir_missing": dir_missing,
             "dir_conflict": dir_conflict,
-            # 目录→地图方向（truth_source 结构上抓不到的那一路）
+            # directory -> map direction (the path structurally unreachable via truth_source)
             "unmatched": int(auto_state.get("unmatched_total") or 0),
             "unmatched_keys": list(auto_state.get("unmatched") or [])[:5],
             "unmatched_complete": auto_state.get("unmatched_complete") is not False,
@@ -388,21 +427,24 @@ def list_maps(data: dict, now: float | None = None) -> list[dict]:
     return out
 
 
-# ── 验证（闸二） ────────────────────────────────────────────────
+# ── Verify (gate 2) ────────────────────────────────────────────────
 
 def verify(data: dict, name: str | None = None,
            root: str | None = None) -> dict:
-    """重读真相源，逐条比对签名（§4 闸二的机械化版）。
+    """Re-read truth sources, comparing signatures entry by entry (the
+    mechanized version of §4 gate 2).
 
-    对每个带 ``source_sig`` 基线的条目：
-      - stat 签名没变 ⇒ clean，零读取；
-      - 失配 ⇒ 读一次内容哈希：相同 ⇒ 纯 touch，刷新签名；不同 ⇒
-        ``drift = {"reason": "changed"}``；
-      - 文件消失 ⇒ ``drift = {"reason": "missing"}``；
-      - 内容回到基线哈希（改了又改回 / 删了又恢复）⇒ 清除 drift。
+    For each entry carrying a ``source_sig`` baseline:
+      - stat signature unchanged => clean, zero reads;
+      - mismatch => read the content hash once: same => pure touch, refresh
+        the signature; different => ``drift = {"reason": "changed"}``;
+      - file gone => ``drift = {"reason": "missing"}``;
+      - content back at the baseline hash (changed and changed back /
+        deleted and restored) => clear drift.
 
-    没有 truth_source 的条目跳过（纯人工状态退到闸三/闸四，设计文档
-    §4 覆盖矩阵）。返回计数 + 漂移清单（宿主据此知道该重核哪些条目）。
+    Entries without truth_source are skipped (purely manual statuses fall
+    back to gate 3/gate 4, design doc §4 coverage matrix). Returns counts +
+    the drift list (the host learns which entries to re-check).
     """
     now = time.time()
     res = {"checked": 0, "clean": 0, "touched": 0, "skipped": 0,
@@ -441,8 +483,8 @@ def verify(data: dict, name: str | None = None,
                     ent["drift"]["since"] = now
                 continue
             if digest is None or digest == sig.get("hash"):
-                # 纯 touch（git checkout / robocopy 重置 mtime）或内容
-                # 回到了基线：刷新签名、清除 drift
+                # Pure touch (git checkout / robocopy resetting mtime) or
+                # content back at the baseline: refresh signature, clear drift
                 sig["size"], sig["mtime_ns"] = st.st_size, st.st_mtime_ns
                 if digest is not None:
                     sig["hash"] = digest
@@ -450,7 +492,8 @@ def verify(data: dict, name: str | None = None,
                 ent["drift"] = None
                 res["touched" if was_drifted or cur != base else "clean"] += 1
                 continue
-            # 内容真的变了：保留旧基线哈希（改回来要能识别），标 drift
+            # Content really changed: keep the old baseline hash (a change-back
+            # must be recognizable), mark drift
             ent["drift"] = {"reason": "changed", "since": now}
             res["drifted"].append({"map": mname, "key": key,
                                    "reason": "changed",

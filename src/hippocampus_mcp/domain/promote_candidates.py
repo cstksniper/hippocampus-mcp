@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
-"""提升候选判据：稳定期限 + 去个案化 + sensitive标注。
+"""Promotion candidate criteria: stability tenure + de-casing + sensitive
+flagging.
 
-提升流决策语义的纯函数落点（domain 只准依赖 common；本模块
-**连 sensitive 都不 import**——同层禁互引，sensitive匹配经 ``sensitive_fn``
-回调由服务层注入，词表内容与模式都在服务层装配）：
+Pure-function home for the promotion-flow decision semantics (domain may
+only depend on common; this module **does not even import sensitive** --
+same-layer cross-imports are forbidden; sensitive matching is injected
+by the service layer via the ``sensitive_fn`` callback; the lexicon
+content and patterns are assembled in the service layer):
 
-* 稳定期限：记录在 ≥ ``min_sessions`` 个**不同会话**中出现。
-  "出现"的口径：该记录 id 在某条 L2 摘要的 ``memory_ids`` 回指里
-  （ingest 落的账），**或**该记录所属实体名出现在摘要正文里
-  "记忆/摘要提到同一实体或主题"）。会话 id 以 ``summaries`` 条目的
-  ``session_id`` 为准（空 id 的摘要不计——没有会话归属就没法数"不同"）。
-* 去个案化：**只标注不硬拦**——候选带 ``project_entities``
-  （该记录命中的本项目实体名），改写由人。
-* sensitive：``sensitive_fn(content)`` 命中 → ``blocked=True`` +
-  ``sensitive_hits`` 详情（可改写后重提）；带 ``sensitive=true`` 标签的记录
-  **永不进候选**（服务层与判据层双重尊重）。
-* 写入绝不自动：本函数只产候选清单；写入走
-  ``store_memory(library="user")`` 的人工两步（改写 + 显式调用），
-  source 由人按约定填 ``promoted:<源库>:<memory_id>``。
+* Stability tenure: the record appears in >= ``min_sessions``
+  **different sessions**. The "appearance" criterion: the record id is
+  back-referenced in some L2 summary's ``memory_ids`` (the ledger
+  written at ingest), **or** a name of an entity the record belongs to
+  appears in the summary text ("memory/summary mentions the same entity
+  or topic"). Session ids follow the ``summaries`` entries'
+  ``session_id`` (summaries with an empty id do not count -- no session
+  attribution, no way to count "different").
+* De-casing: **flag only, never hard-block** -- candidates carry
+  ``project_entities`` (this project's entity names the record hit);
+  rewriting is a human's job.
+* sensitive: a ``sensitive_fn(content)`` hit → ``blocked=True`` +
+  ``sensitive_hits`` details (can be rewritten and re-submitted);
+  records tagged ``sensitive=true`` **never enter candidates**
+  (respected doubly, at the service layer and the criteria layer).
+* Writes are never automatic: this function only produces a candidate
+  list; writing goes through the manual two steps of
+  ``store_memory(library="user")`` (rewrite + explicit call), with
+  source filled by a human per convention as
+  ``promoted:<source library>:<memory_id>``.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from typing import Any, Callable, Iterable
 
 __all__ = ["collect_promote_candidates"]
 
-#: "打了这个结构化标签的记录永不进提升候选"（约定键）。
+#: "Records carrying this structured tag never enter promotion candidates" (conventional key).
 SENSITIVE_TAG_KEY = "sensitive"
 
 
@@ -39,31 +49,39 @@ def collect_promote_candidates(
     sensitive_fn: Callable[[str], list[dict[str, Any]]],
     active_state: str = "active",
 ) -> list[dict[str, Any]]:
-    """从项目库记录里收集"值得提升为用户级记忆"的候选。
+    """Collect candidates "worth promoting to user-level memory" from
+    project-library records.
 
     Args:
-        records: 库存记录（鸭子类型：``.id/.content/.state/.tags/
-            .importance/.timestamp``）。
-        summaries: L2 摘要（``{session_id, text, memory_ids}``；其它键
-            忽略）。``session_id`` 为空的条目不参与会话统计。
-        entity_members: 本项目实体倒排 ``{实体名: [memory_id, ...]}``，
-            由服务层从 brain 实体表现取组装（实体表是每库一份的
-            I/O，domain 不碰）。
-        min_sessions: 稳定期限阈值（Config 注入）。``<=1`` 时判据
-            恒真（每条 active 记录都是候选）——部署自己拍这个值。
-        sensitive_fn: ``(content) -> hits``，服务层闭包（内置
-            :func:`domain.sensitive.match_sensitive` + env 词表内容）。
-        active_state: 活跃状态字符串（调用方注入，承 U1 同款口径）。
+        records: store records (duck-typed: ``.id/.content/.state/.tags/
+            .importance/.timestamp``).
+        summaries: L2 summaries (``{session_id, text, memory_ids}``;
+            other keys ignored). Entries with an empty ``session_id`` do
+            not participate in session counting.
+        entity_members: this project's entity inverted index
+            ``{entity name: [memory_id, ...]}``, assembled by the service
+            layer from brain's entity profiles (the entity table is
+            per-library I/O; domain does not touch it).
+        min_sessions: stability-tenure threshold (injected via Config).
+            When ``<=1`` the criterion is always true (every active
+            record is a candidate) -- the deployment picks this value
+            itself.
+        sensitive_fn: ``(content) -> hits``, a service-layer closure
+            (built-in :func:`domain.sensitive.match_sensitive` + env
+            lexicon content).
+        active_state: active-state string (injected by the caller,
+            inheriting U1's same convention).
 
     Returns:
-        候选清单，``(-sessions_seen, -importance, -timestamp)`` 降序。
-        每条：``memory_id / content / importance / timestamp /
-        sessions（有序去重）/ sessions_seen / project_entities /
-        sensitive_hits / blocked``。
+        Candidate list, descending by
+        ``(-sessions_seen, -importance, -timestamp)``.
+        Each: ``memory_id / content / importance / timestamp /
+        sessions (ordered, deduplicated) / sessions_seen /
+        project_entities / sensitive_hits / blocked``.
     """
-    # 会话统计视图（一次算好，per-record 复用）：
-    #   ids_sessions[id] = {session_id, ...}  按 memory_ids 回指
-    #   text_by_session = [(session_id, text), ...]  按实体名正文匹配
+    # Session-counting views (computed once, reused per record):
+    #   ids_sessions[id] = {session_id, ...}  via memory_ids back-references
+    #   text_by_session = [(session_id, text), ...]  via entity-name text matching
     ids_sessions: dict[str, set[str]] = {}
     session_texts: list[tuple[str, str]] = []
     for s in summaries or ():
@@ -83,7 +101,7 @@ def collect_promote_candidates(
             continue
         tags = r.tags or {}
         if isinstance(tags, dict) and tags.get(SENSITIVE_TAG_KEY):
-            continue  # 打了sensitive标记的永不进候选
+            continue  # records flagged sensitive never enter candidates
         sessions = set(ids_sessions.get(r.id, ()))
         ents = [name for name, ids in members.items() if r.id in ids]
         if ents:

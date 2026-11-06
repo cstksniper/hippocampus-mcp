@@ -1,22 +1,30 @@
 # -*- coding: utf-8 -*-
-"""开场包的「知识地图」槽（从 brain/core.py 提取）。
+"""The session-start package's "knowledge map" slot (extracted from
+brain/core.py).
 
-几条一行的知识点（标题 + 规模 + 一句话）。
+A few one-line knowledge points (title + size + one sentence).
 
-🔴 **刻意不在这里自动梳理**。开场包在热路径上（每会话一次），而首次梳理是
-全库聚类——真实大库实测 2-3 秒。把这几秒塞进
-每次开场，换来的只是「万一宿主想看地图」。所以这里只读盘上已有的层，空就
-明说「调 knowledge_map 会梳理一次」，把一次性成本留给用户显式调用。
+🔴 **Deliberately no auto-sorting here**. The session-start package is on the
+hot path (once per session), and the first sorting run is a whole-library
+clustering -- measured 2-3 seconds on a real large library. Stuffing those
+seconds into every session start buys only "in case the host wants to see the
+map". So this reads only the layer already on disk; if empty, say plainly
+"calling knowledge_map will sort once", leaving the one-time cost to an
+explicit user call.
 
-一句话优先用**宿主归纳**（那才是上层知识），没有才退回抽取式代表句。
+The one sentence prefers the **host summary** (that is the upper-layer
+knowledge) and only falls back to the extractive representative sentence
+without it.
 
-为什么放 domain/：纯派生投影。🔴 但主题口径（``ordered`` / 归档状态 /
-``summary_state``）**走注入不 import** —— arch G1 的矩阵是
-``domain → 仅 common``，同层互引都不行（因此吃过亏）。同理
-``store.count()`` 也由调用方注入（只有"有料但没梳理过"这一条分支需要它，
-注入成 callable 才能保住惰性）。
+Why domain/: pure derived projection. 🔴 But the topic semantics
+(``ordered`` / archived status / ``summary_state``) **go through injection,
+not import** -- arch G1's matrix is ``domain -> common only``; same-layer
+mutual imports are not allowed at all (bitten by this before). Likewise
+``store.count()`` is injected by the caller (only the "has data but never
+sorted" branch needs it; injecting it as a callable preserves laziness).
 
-端口纪律：``limit`` / ``clip`` / 主题层开关全部显式参数，不读 Config。
+Port discipline: ``limit`` / ``clip`` / the topic-layer switch are all
+explicit parameters; no Config reads.
 """
 from __future__ import annotations
 
@@ -34,11 +42,13 @@ def knowledge_brief(
     store_count: Callable[[], int],
     clip: int,
 ) -> list[str]:
-    """开场包的知识地图槽：几条一行的知识点。"""
+    """The session-start package's knowledge map slot: a few one-line
+    knowledge points."""
     if limit <= 0 or not topic_layer_enabled:
         return []
     if not knowledge:
-        # 有料但从没梳理过 ≠ 没有知识点：把出路讲清楚，别让宿主以为库是空的
+        # Has data but never sorted != no knowledge points: state the way out
+        # clearly; do not let the host believe the library is empty
         if store_count():
             return ["(no knowledge points sorted yet; calling knowledge_map will sort them once)"]
         return []
@@ -48,17 +58,23 @@ def knowledge_brief(
             continue
         title = str(t.get("title") or "(untitled)")
         size = len(t.get("member_ids") or [])
-        # summary 这一格装的是**当前生效**的那句话：写了 host 归纳就是归纳，
-        # 没写就是 refresh 填的抽取式代表句（两者互斥，见 topic.refresh）。
+        # The summary slot holds the **currently effective** sentence: if a
+        # host summary was written, it is the summary; otherwise it is the
+        # extractive representative sentence filled by refresh (the two are
+        # mutually exclusive, see topic.refresh).
         line = str(t.get("summary") or "").strip() or "(no summary yet)"
         mark = ""
         st = summary_state(t, t.get("member_ids"))
         if st.get("is_host"):
-            # ⚠️ = 写过归纳但依据成员后来变了（最该拿回宿主重写的一批）
+            # ⚠️ = a summary was written but its underlying members changed
+            # later (the batch most deserving of being taken back to the host
+            # for a rewrite)
             mark = "" if not st.get("stale") else "⚠️"
         head = "%s (%d records) %s" % (title, size, mark)
-        # 只截句子、**绝不截标题和规模**：真库实测整行硬截会把两者一起切掉，
-        # 剩下半截标题，宿主认不出这是哪个知识点（比少看几个字糟得多）。
+        # Truncate only the sentence, **never the title and size**: measured on
+        # a real library, a hard cut of the whole line slices both together,
+        # leaving half a title the host cannot match to any knowledge point
+        # (far worse than seeing a few characters fewer).
         budget = clip - len(head)
         if budget < 8:
             head = head[:clip - 1] + "…"

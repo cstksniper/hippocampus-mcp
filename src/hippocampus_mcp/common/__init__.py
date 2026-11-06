@@ -1,1 +1,1 @@
-"""common 子包。"""
+"""The ``common`` subpackage."""

@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-"""记忆管理器 (MemoryManager).
+"""Memory manager (MemoryManager).
 
-将 LNN 动态记忆核、向量存储、打分引擎与抽样器编排为统一的记忆服务.
-对外提供 store / recall / get / update / delete / save / load / reset 等操作,
-是 MCP 工具层与底层组件之间的桥梁.
+Orchestrates the LNN dynamic memory core, vector store, scoring engine and
+sampler into a unified memory service. Exposes store / recall / get / update /
+delete / save / load / reset and related operations; it is the bridge between
+the MCP tool layer and the underlying components.
 
-架构对应关系（海马体隐喻）:
-    - MemoryCore  → CA3: 时序整合, 生成查询向量 h(t)
-    - VectorStore → CA1/皮层: 长期记忆存储
-    - ScoringEngine → 海马体回忆机制: 相似度 × 时间衰减 × 重要性
-    - Sampler     → 探索性回忆: 距离加权抽样避免局部最优
+Architecture mapping (hippocampus metaphor):
+    - MemoryCore  -> CA3: temporal integration, generates query vector h(t)
+    - VectorStore -> CA1/cortex: long-term memory storage
+    - ScoringEngine -> hippocampal recall mechanism: similarity x time decay x importance
+    - Sampler     -> exploratory recall: distance-weighted sampling avoids local optima
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from ..config import LNN_CTX_MAX_DEFAULT, load_config  # noqa: F401（LNN_CTX_MAX_DEFAULT 再导出）
+from ..config import LNN_CTX_MAX_DEFAULT, load_config  # noqa: F401 (LNN_CTX_MAX_DEFAULT re-exported)
 from ..common.recency import (
     in_time_window,
     iso_date,
@@ -38,11 +39,13 @@ from ..store.idem import IdemIndex, normalize_key
 
 
 def _stderr_print(*args, **kwargs) -> None:
-    """诊断输出一律走 stderr。
+    """Diagnostic output always goes to stderr.
 
-    **MCP stdio 模式下 stdout 是 JSON-RPC 协议通道**：写到 stdout 的内容会被客户端
-    当成协议消息解析，报 "Invalid JSON" 并可能直接断连。本模块的告警（补算向量、
-    加载训练权重失败、元数据回退等）都发生在服务启动路径上，故必须走 stderr。
+    **Under MCP stdio mode stdout is the JSON-RPC protocol channel**: anything
+    written to stdout gets parsed by the client as a protocol message, which
+    yields "Invalid JSON" errors and may drop the connection outright. This
+    module's warnings (vector backfill, training-weight load failures, metadata
+    fallback, etc.) all happen on the service startup path, hence stderr.
     """
     kwargs.setdefault("file", sys.stderr)
     print(*args, **kwargs)
@@ -58,7 +61,7 @@ from .embeddings import (
 )
 from ..lnn import MemoryCore, StateCheckpoint
 from ..retrieval import DistanceWeightedSampler, ScoringEngine
-# C5 意图路由（默认关）与 C6 检索时衰减（默认关）——见 retrieval/intent.py
+# C5 intent routing (default off) and C6 retrieval-time decay (default off) -- see retrieval/intent.py
 from ..retrieval.intent import (
     INTENT_WEIGHT_MULTIPLIERS,
     classify_intent,
@@ -67,15 +70,17 @@ from ..retrieval.intent import (
 
 
 def _recall_decay_enabled() -> bool:
-    """C6 检索时记忆衰减是否开启（默认关；每次读 env 便于测试切换）。
+    """Whether C6 retrieval-time memory decay is enabled (default off; reads env
+    every call so tests can flip it).
 
-    M1：改走 config 单一读取点（白名单语义，见 config._BOOL_SEMANTICS B）。
+    M1: now goes through the config single read point (whitelist semantics,
+    see config._BOOL_SEMANTICS B).
     """
     return load_config().recall_decay
 
 
 def _recall_decay_tau() -> float:
-    """C6 衰减时间常数 tau（秒）。默认 90 天，与 lambda_decay 同基准。"""
+    """C6 decay time constant tau (seconds). Defaults to 90 days, same basis as lambda_decay."""
     tau = load_config().recall_decay_tau
     return tau if tau > 0 else 7776000.0
 from ..store import (
@@ -90,14 +95,17 @@ from ..store import (
 
 
 def _seed_store_config() -> None:
-    """store/lnn/retrieval 旋钮的生产注入点。
+    """Production injection point for the store/lnn/retrieval knobs.
 
-    G1 依赖矩阵只许 engine/brain import config；store/lnn/retrieval 的
-    16 个已收编旋钮由**唯一生产构造方**（本模块）在 import 时把
-    ``load_config()`` 的字符串运输值灌进各自注入缝（``apply_config``）。
-    消费点的 env 直读降级为「直连回退」（env 先、注入值回退）——测试
-    直连 store/retrieval 不经本模块的面零改动；解析（float/白名单）
-    仍留消费点，零漂移。详见 common/config_bridge 模块 docstring。
+    The G1 dependency matrix only allows engine/brain to import config; the
+    16 consolidated store/lnn/retrieval knobs get the string transport values
+    from ``load_config()`` poured into their injection seams (``apply_config``)
+    at import time by the **sole production constructor** (this module).
+    Env direct reads at consumption points are demoted to a "direct-connection
+    fallback" (env first, injected value as fallback) -- tests that use
+    store/retrieval directly without going through this module keep a
+    zero-change surface; parsing (float/whitelist) stays at the consumption
+    point, zero drift. See the common/config_bridge module docstring for details.
     """
     from ..lnn import memory_core as _lnn_mod
     from ..retrieval import intent as _intent_mod
@@ -122,22 +130,27 @@ _seed_store_config()
 
 
 class EmbedderModelMismatchError(RuntimeError):
-    """显式配置的嵌入模型与库内已有向量不一致，且未允许切换。
+    """The explicitly configured embedding model does not match the vectors
+    already in the library, and switching was not allowed.
 
-    这是"**服务静默用错模型**"这类事故的硬拦截：与其用错模型
-    把整库重算一遍（几千条要几十秒到几分钟），或者更糟——悄悄用另一个模型的
-    向量去检索（命中率归零却看不出来），不如明确失败并写清处置办法。
+    This is the hard block against "**the service silently using the wrong
+    model**" class of incident: rather than recompute the whole library with
+    the wrong model (thousands of entries take tens of seconds to minutes), or
+    worse -- quietly retrieve with another model's vectors (hit rate drops to
+    zero with nothing visible) -- fail explicitly and spell out the remedies.
 
-    "库里的模型"由 :meth:`VectorStore.preferred_model_key` 判定：
-    优先落盘的 ``model_key``，其次覆盖率最高的非 ``__legacy__`` 槽位。
+    The "library's model" is decided by :meth:`VectorStore.preferred_model_key`:
+    the persisted ``model_key`` first, then the non-``__legacy__`` slot with
+    the highest coverage.
 
-    确实要在同一份数据上比对不同模型的检索效果时，设
-    ``HIPPOCAMPUS_ALLOW_MODEL_SWITCH=1`` 显式放行（等于回到旧的"补算"行为）。
+    To deliberately compare retrieval quality of different models on the same
+    data, set ``HIPPOCAMPUS_ALLOW_MODEL_SWITCH=1`` to explicitly allow it
+    (equivalent to the old "backfill" behavior).
     """
 
 
 class RecallResult:
-    """单条回忆结果的封装."""
+    """Wrapper for a single recall result."""
 
     def __init__(
         self,
@@ -166,10 +179,12 @@ class RecallResult:
             "score": round(self.score, 4),
             "similarity": round(self.similarity, 4),
             "timestamp": self.timestamp,
-            # 时间派生字段（2026-11-05）：与 brain.recall 的返回体同口径。
-            # 生产路径（MCP 工具）走的是 manager.recall，不经 recall_flow，
-            # 若不在这里补，宿主拿到的结果就**没有**日期——两条路径的
-            # 字段面会分叉，那正是"评测好看、真机没有"的典型成因。
+            # Time-derived fields (2026-11-05): same contract as brain.recall's
+            # response body. The production path (MCP tools) goes through
+            # manager.recall, not recall_flow; if these were not added here the
+            # host would get results **without** dates -- the two paths' field
+            # surfaces would diverge, which is exactly how "looks good in the
+            # benchmark, missing on the real host" bugs are born.
             "occurred_at": iso_date(self.timestamp),
             "weekday": weekday_abbr(self.timestamp),
             "importance": self.importance,
@@ -179,16 +194,19 @@ class RecallResult:
 
 
 # ==================================================================
-# 去重合并前先看"会不会丢硬信息"
+# Before dedup-merging, check "would we lose hard information"
 # ==================================================================
 
-# 阿拉伯数字（含小数、千分位）。不收百分号——"0.1—0.4%"里 % 是单位不是信息。
+# Arabic numerals (incl. decimals, thousands separators). No percent sign --
+# in "0.1—0.4%" the % is a unit, not information.
 _RE_ARABIC = re.compile(r"\d+(?:[.,]\d+)*")
-# 中文数字串：**只收长度 >= 2 的连续序列**。单字（"一""二"）在中文里绝大多数是
-# 助词/量词（"一样""再一次"），收进来会让"几乎每条都带硬信息"、
-# 去重形同虚设——那等于变相关掉去重，是本方案最大的误用风险。
+# Chinese numeral runs: **only sequences of length >= 2 are collected**. Single
+# characters ("一" "二") are overwhelmingly particles/classifiers in Chinese
+# ("一样" "再一次"); collecting them would make "almost every entry carry hard
+# info" and dedup effectively useless -- that is equivalent to turning dedup
+# off by the back door, the biggest misuse risk of this scheme.
 _RE_CN_NUM = re.compile(r"[零〇一二三四五六七八九十百千万亿两]{2,}")
-# 日期：2026-09-21 / 2026年9月21日 / 9/21 / 八月中 / 己丑年
+# Dates: 2026-09-21 / 2026年9月21日 / 9/21 / 八月中 / 己丑年
 _RE_DATE = re.compile(
     r"\d{2,4}\s*[-/年.]\s*\d{1,2}(?:\s*[-/月.]\s*\d{1,4}\s*日?)?"
     r"|[〇零一二三四五六七八九十]{1,3}\s*月(?:\s*[〇零一二三四五六七八九十]{1,3}\s*日)?"
@@ -197,15 +215,19 @@ _RE_DATE = re.compile(
 
 
 def extract_hard_info(text: str) -> set[str]:
-    """抽出文本里的**可判定硬信息**：数字与日期。
+    """Extract the **decidable hard information** in the text: numbers and dates.
 
-    为什么只取这两类：合并时 ``content`` 取**更长者**，较短的一方被整段丢弃，
-    而丢得最痛的恰恰是"旧文本里没有的那个数"——实测案例是
-    「燕行日程·约二千余里」被 0.85 阈值吞掉后彻底消失。
+    Why only these two categories: on merge ``content`` keeps the **longer**
+    one and the shorter side is dropped wholesale, and the most painful loss is
+    precisely "the number the old text did not have" -- a measured case is
+    「燕行日程·约二千余里」vanishing completely after being swallowed by the
+    0.85 threshold.
 
-    这两类是**可判定的**：有没有新数字，机器能算准；
-    而"语义上是不是一条新事实"机器判不准，那属于 supersede / neighbors 的活。
-    宁可漏判（少建几条重复）也不能让它静默丢数——丢数是不可恢复的。
+    These two categories are **decidable**: whether there is a new number is
+    something a machine can compute accurately; "whether it is semantically a
+    new fact" is not machine-decidable, that belongs to supersede / neighbors.
+    Prefer false negatives (a few fewer duplicates built) over silently losing
+    numbers -- lost numbers are unrecoverable.
     """
     if not text:
         return set()
@@ -220,30 +242,36 @@ def extract_hard_info(text: str) -> set[str]:
 
 
 # ==================================================================
-# LNN 时序隐状态分路
+# LNN temporal hidden-state partitioning
 # ==================================================================
 
-# 没有 client 信息时的兜底路。所有未署名调用共享它 —— 与改造前等价。
+# Fallback route when there is no client info. All unnamed calls share it --
+# equivalent to the pre-refactor behavior.
 DEFAULT_LNN_KEY = "__default__"
 
-# 最多同时保留几路上下文（LRU）。每份约 131 KB（hx + window），8 份 ≈ 1 MB，
-# 代价可忽略；超了淘汰**最久未用**的那路，绝不动正在用的。
-# M1：常量上移 config.py（L0 底座），此处保留再导出防包外引用断裂。
+# Max number of context routes kept at once (LRU). Each is ~131 KB
+# (hx + window), 8 of them ~= 1 MB, a negligible cost; over the limit the
+# **least recently used** route is evicted, never one in active use.
+# M1: the constant moved up to config.py (L0 base); re-exported here so
+# out-of-package references do not break.
 
 
 def lnn_ctx_max_from_env() -> int:
-    """读 LNN 分路上限（走 config 单一读取点；>0 判定保持现状）。"""
+    """Read the LNN route cap (through the config single read point; >0 keeps the
+    current semantics)."""
     v = load_config().lnn_ctx_max
     return v if v > 0 else LNN_CTX_MAX_DEFAULT
 
 
 class LnnContext:
-    """一路 LNN 时序上下文（一位 client 一份）。
+    """One LNN temporal context (one per client).
 
-    打包了四类**进程级运行时状态**：CfC 隐状态 ``hx``、上一步输出
-    ``last_output``、滑窗 ``window``、步数 ``step_count``，外加时间基准
-    ``reference_time``。这些是共享连接下会串味的全部东西 —— 记忆 / 实体 /
-    画像 / 摘要 / 待办 / 钉住槽本就该跨会话共用，不在其中。
+    Packs the four kinds of **process-level runtime state**: CfC hidden state
+    ``hx``, last step output ``last_output``, sliding window ``window``, step
+    count ``step_count``, plus the time base ``reference_time``. These are all
+    the things that get cross-contaminated under shared connections -- memories
+    / entities / profile / summary / open intents / pin slots are meant to be
+    shared across sessions and are not part of it.
     """
 
     __slots__ = ("hx", "last_output", "window", "step_count",
@@ -258,7 +286,7 @@ class LnnContext:
         self.reference_time: float | None = None
 
     def snapshot(self) -> dict:
-        """给自曝用的轻量快照（不拷张量，只报形态）。"""
+        """Lightweight snapshot for self-reporting (no tensor copies, shapes only)."""
         return {
             "step_count": self.step_count,
             "window_size": len(self.window),
@@ -267,28 +295,35 @@ class LnnContext:
         }
 
 class MemoryManager:
-    """记忆管理器: 编排 LNN + 向量库 + 打分 + 抽样.
+    """Memory manager: orchestrates LNN + vector store + scoring + sampling.
 
     Args:
-        embedding_dim: 嵌入维度, 默认 384（**仅对 hash 后端生效**；
-            走 sentence_transformer 时维度由模型决定，会被实际模型覆盖）。
-            使用 hash 后端时需手动指定为 32。
-        n_neurons: CfC 神经元数, 默认 512 (需 > output_dim + 2).
-        window_size: LNN 滑动窗口, 默认 5.
-        persist_dir: 持久化目录路径. 为 None 则不持久化.
-        lambda_decay: 时间衰减常数 (秒). 默认 7776000 (90天, LoCoMo调优).
-        mu_importance: 重要性衰减常数 (秒). 默认 15552000 (180天, LoCoMo调优).
-        embedder_backend: 嵌入后端, "sentence_transformer" (默认) 或 "hash".
-        w_sim: 加法公式相似度权重, 默认 0.95.
-        w_time: 加法公式时间衰减权重, 默认 0.03.
-        w_recall: 加法公式回忆频次权重, 默认 -0.02 (负值=多样性惩罚).
-        auto_save: 是否在每次 store 后自动持久化, 默认 False.
-        backend: 存储后端. 目前只支持 "numpy"（VectorStore）。
-            传其他值会**显式报错**而不是悄悄换一条会丢数据的路径。
-            （曾有一份基于 ChromaDB 的实验实现，实测有 6 处会静默损坏数据
-            的语义差异，已从代码库移除；原因保留在下方错误信息里，
-            供将来重新实现后端时对照。）
-        dedup_threshold: 去重合并阈值, 默认 0.85. 置 1.0 关闭去重。
+        embedding_dim: embedding dimension, default 384 (**only effective for
+            the hash backend**; with sentence_transformer the dimension is
+            decided by the model and gets overridden by the actual model).
+            With the hash backend it must be set to 32 manually.
+        n_neurons: CfC neuron count, default 512 (must be > output_dim + 2).
+        window_size: LNN sliding window, default 5.
+        persist_dir: persistence directory path. None means no persistence.
+        lambda_decay: time decay constant (seconds). Default 7776000
+            (90 days, LoCoMo-tuned).
+        mu_importance: importance decay constant (seconds). Default 15552000
+            (180 days, LoCoMo-tuned).
+        embedder_backend: embedding backend, "sentence_transformer" (default)
+            or "hash".
+        w_sim: additive-formula similarity weight, default 0.95.
+        w_time: additive-formula time-decay weight, default 0.03.
+        w_recall: additive-formula recall-frequency weight, default -0.02
+            (negative = diversity penalty).
+        auto_save: whether to persist automatically after each store, default False.
+        backend: storage backend. Currently only "numpy" (VectorStore) is
+            supported. Any other value raises **explicitly** instead of quietly
+            switching to a data-losing path.
+            (An experimental ChromaDB-based implementation once existed; testing
+            found 6 semantic differences that would silently corrupt data, and
+            it was removed from the codebase; the reasons are kept in the error
+            message below for reference when the backend is reimplemented.)
+        dedup_threshold: dedup-merge threshold, default 0.85. Set 1.0 to disable dedup.
     """
 
     def __init__(
@@ -316,45 +351,55 @@ class MemoryManager:
         self.auto_save = auto_save
         self.backend = backend
         self.dedup_threshold = dedup_threshold
-        # O8 检索端过时窗口（天）：age > 窗口且未 pin → 不进候选。**默认 0 = 关**
-        # ——归档的老记忆也必须能被相似查询查到；输出长度靠 top_k 截断，
-        # 不靠时间判死。**零状态变更**——不删、不归档、不改 state，只挡输出。MCP recall 工具经 RecallService 直连本方法（不经
-        # brain.recall），窗口必须在这一层生效才全覆盖。
+        # O8 retrieval-side staleness window (days): age > window and not pinned
+        # -> excluded from candidates. **Default 0 = off** -- archived old
+        # memories must remain reachable by similar queries; output length is
+        # controlled by top_k truncation, not by time-based death sentences.
+        # **Zero state changes** -- no deletion, no archiving, no state change,
+        # output gating only. The MCP recall tool reaches this method directly
+        # via RecallService (not through brain.recall), so the window must take
+        # effect at this layer for full coverage.
         self._recency_window_seconds = max(int(recency_window_days), 0) * 86400.0
-        # 改写历史账本（mem_history.jsonl，sidecar）：ring 构造注入
-        # （纪律：store 侧函数只认显式参数）；行数/seq 惰性扫描——
-        # 首条写入时读一次盘，纯内存 brain（persist_dir=None）整体旁路。
+        # Rewrite-history ledger (mem_history.jsonl, sidecar): ring injected at
+        # construction (discipline: store-side functions only take explicit
+        # arguments); line count/seq scanned lazily -- one disk read on first
+        # write; pure in-memory brain (persist_dir=None) bypasses it entirely.
         self.mem_history_ring = max(int(mem_history_ring), 0)
         self._mem_history_lines: int | None = None
         self._mem_history_last_seq: int = 0
 
-        # 嵌入器: 默认使用 sentence-transformers 语义嵌入
-        # 统一走 create_embedder(), 它会校验嵌入器协议（embed/embed_query/
-        # embed_batch/model_key）——缺任一方法在初始化就报错，而不是等召回时
-        # 才抛 AttributeError（覆盖报告 D5）。
+        # Embedder: default is sentence-transformers semantic embedding.
+        # Always goes through create_embedder(), which validates the embedder
+        # protocol (embed/embed_query/embed_batch/model_key) -- a missing method
+        # errors at initialization instead of raising AttributeError at recall
+        # time (coverage report D5).
         #
-        # 模型名的解析不再在这里分支：把（可能为空的）名字原样交给嵌入器，
-        # 由 resolve_embedder_model() 单点决定"参数 > env > 默认值"，并把
-        # **来源**记在 embedder.model_source 上。"某个入口忘了设 env 就静默
-        # 跑成 MiniLM"正是这么来的，集中解析后不再有第二个地方会写错。
+        # Model-name resolution no longer branches here: the (possibly empty)
+        # name is handed to the embedder as-is, resolve_embedder_model() decides
+        # in one place "argument > env > default" and records the **source** on
+        # embedder.model_source. "Some entry point forgot to set env and it
+        # silently ran as MiniLM" is exactly how it used to happen; with
+        # centralized resolution there is no second place to get it wrong.
         if embedder_backend == "sentence_transformer":
             self.embedder = create_embedder(
                 "sentence_transformer", model_name=embedder_model or ""
             )
-            # 实际维度由模型决定, 同步更新
+            # Actual dimension is decided by the model; sync it
             self.embedding_dim = self.embedder.dim
         else:
             self.embedder = create_embedder(embedder_backend, dim=embedding_dim)
 
-        # 构造参数留档：库内模型与本进程不一致且需"跟随数据"时，要按新维度
-        # 重建 LNN 核（见 _follow_store_model）。
+        # Constructor arguments kept for later: when the library's model differs
+        # from this process's and "follow the data" is needed, the LNN core must
+        # be rebuilt with the new dimension (see _follow_store_model).
         self._ctor_n_neurons = n_neurons
         self._ctor_window_size = window_size
-        # 最近一次"跟随数据换模型"的报告（None = 没发生），供上层日志/测试断言
+        # Report of the most recent "follow-the-data model switch" (None = never
+        # happened), for upper-layer logs/test assertions
         self.model_follow: dict[str, Any] | None = None
 
-        # LNN 动态记忆核
-        # AutoNCP 要求 output_dim < n_neurons - 2
+        # LNN dynamic memory core
+        # AutoNCP requires output_dim < n_neurons - 2
         actual_n_neurons = max(n_neurons, self.embedding_dim + 3)
         self.memory_core = MemoryCore(
             input_dim=self.embedding_dim,
@@ -363,8 +408,9 @@ class MemoryManager:
             window_size=window_size,
         )
 
-        # 向量存储：当前唯一受支持的后端是 numpy（VectorStore）。
-        # model_key 标识当前活跃嵌入模型: 换模型 = 换向量槽位, 无需重新导入文档
+        # Vector store: the only supported backend today is numpy (VectorStore).
+        # model_key identifies the currently active embedding model:
+        # switching model = switching vector slot, no document re-import needed
         self._model_key = self.embedder.model_key
         if backend != "numpy":
             raise ValueError(
@@ -390,7 +436,7 @@ class MemoryManager:
             model_key=self._model_key,
         )
 
-        # 打分引擎: 加法公式 (LoCoMo 评测最优配置)
+        # Scoring engine: additive formula (best LoCoMo benchmark configuration)
         self.scorer = ScoringEngine(
             lambda_decay=lambda_decay,
             mu_importance=mu_importance,
@@ -402,70 +448,85 @@ class MemoryManager:
         )
         self.sampler = DistanceWeightedSampler(beta=1.0, epsilon=0.1)
 
-        # 持久化
+        # Persistence
         self.persist_dir = persist_dir
         self._checkpoint: StateCheckpoint | None = None
         if persist_dir:
             import os
-            # H7：主格式 npz（零 torch 读写）；旧库的 lnn_state.pt 由
-            # StateCheckpoint 兼容读（惰性 torch），无需迁移即可启动。
+            # H7: primary format is npz (zero torch I/O); old libraries'
+            # lnn_state.pt is read by StateCheckpoint for compatibility
+            # (lazy torch), so startup needs no migration.
             ckpt_path = os.path.join(persist_dir, "lnn_state.npz")
             self._checkpoint = StateCheckpoint(ckpt_path)
 
-        # 当前会话已处理的步数（进程级累计，供 auto_save 与 checkpoint 用；
-        # 分路之后各路还有自己的 step_count，见 LnnContext）
+        # Steps processed in the current session (process-level total, used by
+        # auto_save and checkpoint; after partitioning each route keeps its own
+        # step_count, see LnnContext)
         self._step_count: int = 0
 
-        # 「L1 落盘前先刷 L0」钩子（R2 / L0 不变式，语义见 :meth:`save`）。
-        # 为什么挂在 manager 而不让 engine 认识 L0：auto_save / save_state /
-        # retry_save / session_end 四个入口最后都汇到 save()，钩子挂这里
-        # 一处覆盖全部路径——按路径逐个补，等于同一个 bug 补四次。
+        # "Flush L0 before persisting L1" hook (R2 / L0 invariant, semantics in
+        # :meth:`save`). Why the hook lives on manager instead of teaching
+        # engine about L0: the four entry points auto_save / save_state /
+        # retry_save / session_end all funnel into save(), so one hook here
+        # covers every path -- patching per path means patching the same bug
+        # four times.
         self._pre_persist: Callable[[], None] | None = None
 
-        # LNN 隐状态分路容器。未署名调用全部落在 DEFAULT_LNN_KEY，
-        # 因此**不接线时行为与改造前逐位一致**。
+        # LNN hidden-state partition containers. All unnamed calls land on
+        # DEFAULT_LNN_KEY, so **without wiring the behavior is bit-for-bit
+        # identical to the pre-refactor one**.
         self._lnn_contexts: dict[str, LnnContext] = {}
         self._lnn_ctx_lru: list[str] = []
         self._lnn_ctx_max = lnn_ctx_max_from_env()
 
-        # 参考时间: 使用已存储消息的最新时间戳, 而非 wall-clock
-        # (LoCoMo 评测中发现 time.time() 与数据时间戳差距巨大导致时间衰减失效)
+        # Reference time: use the newest timestamp of stored messages, not
+        # wall-clock (LoCoMo benchmark found time.time() diverges hugely from
+        # the data timestamps, which nullifies time decay)
         self._reference_time: float | None = None
 
-        # 自动保存的健康度（zcode 反馈：保存被并发拒绝时宿主毫不知情，
-        # 以为 ingest 已落盘，重启后才发现丢了一批）。
-        # 见 store_memory() 里的自动保存分支：失败不阻断写入，但必须留痕。
+        # Auto-save health (zcode feedback: when a save is rejected for
+        # concurrency the host has no idea -- it believes ingest is already
+        # persisted and only discovers the lost batch after a restart).
+        # See the auto-save branch in store_memory(): failure does not block
+        # the write, but it must leave a trace.
         self.last_save_error: str | None = None
-        # C5 自曝：最近一次 recall 的意图判定（路由关闭时恒 None）
+        # C5 self-report: intent classification of the most recent recall
+        # (always None when routing is off)
         self.last_recall_intent: str | None = None
         self.autosave_failures: int = 0
-        # 最近一次 store_memory 是否命中去重（并入了哪条既有记忆），见 store_memory
+        # Whether the last store_memory hit dedup (and merged into which existing
+        # memory), see store_memory
         self.last_store_merge_of: str | None = None
-        # C10：命中去重但**因含新硬信息而未合并**时，那条近重复的既有记忆。
-        # 与 last_store_merge_of 互斥：本字段非空 == 本次确实新建了。
+        # C10: when dedup was hit but **not merged because of new hard info**,
+        # the near-duplicate existing memory. Mutually exclusive with
+        # last_store_merge_of: this field non-empty == this call really created.
         self.last_store_near_miss: dict[str, Any] | None = None
-        # C13：本次写入内容的截断自曝（嵌入模型 token 硬上限）。
-        # truncated 为 True 时，embedded_chars 之后的原文对向量检索不可见。
+        # C13: truncation self-report for this write's content (embedding model
+        # token hard cap). When truncated is True, the original text after
+        # embedded_chars is invisible to vector retrieval.
         self.last_truncation: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
-    # 核心 API
+    # Core API
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # LNN 上下文路由
+    # LNN context routing
     # ------------------------------------------------------------------
     def lnn_key(self, client: str | None) -> str:
-        """解析本次调用走哪一路。三级：显式 client > 默认路。
+        """Resolve which route this call uses. Three levels: explicit client >
+        default route.
 
-        第二级（``ctx.session``：daemon 下每条 TCP 连接一个 ServerSession）
-        由 server 层接线时解析后作为 ``client`` 传进来，manager 只认
-        显式值 —— 协议层拿不到会话，不该在这里猜。
+        The second level (``ctx.session``: one ServerSession per TCP connection
+        under the daemon) is resolved by the server layer at wiring time and
+        passed in as ``client``; the manager only trusts explicit values --
+        the protocol layer has no access to the session, so no guessing here.
         """
         c = (client or "").strip()
         return c or DEFAULT_LNN_KEY
 
     def _lnn_ctx(self, client: str | None) -> LnnContext:
-        """取（或建）一路上下文，并把它挪到 LRU 末尾（最近使用）。"""
+        """Get (or create) one route's context and move it to the LRU tail
+        (most recently used)."""
         key = self.lnn_key(client)
         ctx = self._lnn_contexts.get(key)
         if ctx is None:
@@ -476,7 +537,8 @@ class MemoryManager:
         if key in self._lnn_ctx_lru:
             self._lnn_ctx_lru.remove(key)
         self._lnn_ctx_lru.append(key)
-        # LRU 淘汰：只淘汰**最久未用**且当前没在路上的
+        # LRU eviction: only evict the **least recently used** route, and never
+        # one currently in flight
         while len(self._lnn_contexts) > self._lnn_ctx_max and len(self._lnn_ctx_lru) > 1:
             victim = self._lnn_ctx_lru.pop(0)
             self._lnn_contexts.pop(victim, None)
@@ -484,11 +546,14 @@ class MemoryManager:
 
     @contextmanager
     def _lnn_route(self, client: str | None):
-        """把某一路的隐状态装进 memory_core，退出时原样取回。
+        """Install one route's hidden state into memory_core and restore it
+        verbatim on exit.
 
-        ``MemoryCore`` 是一个**单例**（权重只有一份，本来就该共享），
-        只有隐状态是需要分路的运行时数据 —— 所以这里做的是"换状态"，
-        不是"换模型"。用上下文管理器保证异常路径也能把状态还回去。
+        ``MemoryCore`` is a **singleton** (there is only one set of weights,
+        which is meant to be shared); only hidden state is per-route runtime
+        data -- so what happens here is "swap state", not "swap model". The
+        context manager guarantees the state is returned even on exception
+        paths.
         """
         ctx = self._lnn_ctx(client)
         core = self.memory_core
@@ -509,10 +574,12 @@ class MemoryManager:
             self._touch_global_reference_time()
 
     def _touch_global_reference_time(self) -> None:
-        """把进程级 ``_reference_time`` 对齐为各路的最大值。
+        """Align the process-level ``_reference_time`` to the max across routes.
 
-        consolidate / save / load 读的是进程级那一份；分路后它仍应是"见过的最新
-        时间戳"，否则老记忆会永久豁免归档（历史故障，见架构文档 §八 4）。
+        consolidate / save / load read the process-level copy; after
+        partitioning it must still mean "newest timestamp ever seen", otherwise
+        old memories get permanently exempt from archiving (historical incident,
+        see architecture doc section 8.4).
         """
         vals = [c.reference_time for c in self._lnn_contexts.values()
                 if c.reference_time is not None]
@@ -522,7 +589,7 @@ class MemoryManager:
                 self._reference_time = mx
 
     def lnn_context_report(self) -> dict:
-        """自曝：当前有几路上下文、各自走到第几步。"""
+        """Self-report: how many context routes exist and each one's step count."""
         return {
             "count": len(self._lnn_contexts),
             "max": self._lnn_ctx_max,
@@ -530,34 +597,41 @@ class MemoryManager:
                      for k in self._lnn_ctx_lru},
         }
 
-    # ---------------------------------------------------------------- 幂等索引
+    # ---------------------------------------------------------------- idempotency index
     def _idem_index(self) -> IdemIndex:
-        """取幂等倒排（首次用到时从内存记录重建，**不另开盘**）。
+        """Get the idempotency inverted index (rebuilt from in-memory records on
+        first use, **no extra disk**).
 
-        索引是 ``MemoryRecord.idem`` 的派生物：进程重启后第一次写带键的
-        请求会扫一遍记录。万条量级一次线性扫描 ~ms 级，且只在真用了幂等
-        键的库上发生——不用这个特性时**零成本、零内存**。
+        The index is derived from ``MemoryRecord.idem``: the first keyed write
+        after a process restart scans the records once. A linear scan over ten
+        thousand entries is ~ms-scale, and it only happens on libraries that
+        actually use idempotency keys -- without this feature it is **zero
+        cost, zero memory**.
         """
         idx = getattr(self, "_idem", None)
         if idx is None:
             idx = IdemIndex()
-            # M3 端口纪律：走 iter_records，不摸 _records
+            # M3 port discipline: use iter_records, never touch _records
             idx.rebuild(self.store.iter_records())
             self._idem = idx
         return idx
 
     def _remember_idem(self, idem_key: str, memory_id: str) -> None:
-        """写入成功后登记幂等映射（空键 / 空 id 一律不动）。"""
+        """Register the idempotency mapping after a successful write (empty key /
+        empty id are always ignored)."""
         if idem_key and memory_id:
             self._idem_index().remember(idem_key, memory_id)
 
     def idem_lookup(self, key: str) -> str | None:
-        """幂等键查询：返回既存记忆 id，未命中 / 悬空一律 ``None``。
+        """Idempotency-key lookup: returns the existing memory id; miss / dangling
+        both return ``None``.
 
-        供 ``brain.ingest`` / ``WriteService`` 在**写之前**判定（写前判定
-        才能连 L0 都不留）。悬空回执（记录已被 ``forget()`` 真删除）在这里
-        自动摘除——返回一个库里不存在的 id 比重复写入更坏：宿主会以为
-        记忆还在。
+        Used by ``brain.ingest`` / ``WriteService`` to decide **before writing**
+        (a pre-write decision avoids leaving even an L0 entry). Dangling
+        receipts (the record was truly deleted by ``forget()``) are pruned here
+        automatically -- returning an id that no longer exists in the library is
+        worse than a duplicate write: the host would believe the memory is
+        still there.
         """
         if not key:
             return None
@@ -588,58 +662,72 @@ class MemoryManager:
         origin: dict[str, str] | None = None,
         idem_key: str = "",
     ) -> str:
-        """存储一条新记忆.
+        """Store a new memory.
 
-        流程: 文本 → 嵌入 → LNN step (更新时序状态) → 写入向量库.
+        Flow: text -> embedding -> LNN step (updates temporal state) -> write
+        to the vector store.
 
         Args:
-            content: 记忆文本内容.
-            importance: 重要程度 [0, 1], 默认 0.5.
-            memory_type: 记忆类型 (episodic/semantic/procedural/general).
-            timestamp: 自定义时间戳; None 则使用当前时间.
-            cognitive_type: 认知类型 (experience/world/opinion), v0.3 新增.
-            source_ids: L0 原始层回指 id 列表, v0.3 新增.
-            entity_ids: 关联实体 id 列表, v0.3 新增.
-            state: 生命周期状态 (active/superseded/archived), v0.3 新增.
-            source: 来源标签（文件名/相对路径），透传到 recall 命中结果，
-                让"这条记忆出自哪个文档"可回查（覆盖报告·高 3）。
-            tags: 结构化标签，如 ``{"章": 43, "年": "己丑"}``，供
-                recall/get_memory_context 按条件过滤。命中去重合并时**取并集**
-                （与 source_ids/entity_ids 同一原则）：并进来的内容可能带不同
-                章的标签，丢掉就再也按章查不到这条混合记录了。
-            quarantine: D2a 写侧隔离标记（默认 False = 现状）。True = 待审：
-                不进召回池、不进 user_scope 槽，drift_audit 过目后经受管
-                通道转正。判据单一真相在 domain/write_quarantine.should_quarantine，
-                本层只存标记不做判定。
-            sensitivity: D1 隐私打标（默认空串 = 未打）。"personal" /
-                "sensitive:类别"，仅随卡存储与回显，本层不消费。
+            content: memory text content.
+            importance: importance [0, 1], default 0.5.
+            memory_type: memory type (episodic/semantic/procedural/general).
+            timestamp: custom timestamp; None uses the current time.
+            cognitive_type: cognitive type (experience/world/opinion), added in v0.3.
+            source_ids: list of ids pointing back to the L0 raw layer, added in v0.3.
+            entity_ids: list of associated entity ids, added in v0.3.
+            state: lifecycle state (active/superseded/archived), added in v0.3.
+            source: source label (file name/relative path), passed through to
+                recall hit results so "which document this memory came from" is
+                traceable (coverage report, high 3).
+            tags: structured tags, e.g. ``{"章": 43, "年": "己丑"}``, for
+                recall/get_memory_context conditional filtering. On a dedup-hit
+                merge they are **unioned** (same principle as
+                source_ids/entity_ids): the merged-in content may carry tags for
+                different chapters; dropping them would make this hybrid record
+                unfindable by chapter forever.
+            quarantine: D2a write-side quarantine flag (default False = status
+                quo). True = pending review: stays out of the recall pool and
+                the user_scope slot, and is promoted through the managed channel
+                after drift_audit review. The single source of truth for the
+                criterion is domain/write_quarantine.should_quarantine; this
+                layer only stores the flag and makes no judgment.
+            sensitivity: D1 privacy label (default empty string = unlabeled).
+                "personal" / "sensitive:<category>"; stored and echoed with the
+                card only, not consumed at this layer.
 
         Returns:
-            记忆的唯一 ID。**注意**：若命中去重（与某条 active 记忆相似度
-            >= ``dedup_threshold``），本次不会新建，而是合并进那条记忆并返回
-            它的 id——此时 ``source_ids`` / ``entity_ids`` 取并集，
-            ``content`` 取更长者、``timestamp`` 取最新、``importance`` 取最大，
-            类型字段仅当原值为默认值时才被新值替换。
+            The memory's unique ID. **Note**: on a dedup hit (similarity >=
+            ``dedup_threshold`` against some active memory) nothing new is
+            created; the write merges into that memory and its id is returned --
+            in that case ``source_ids`` / ``entity_ids`` are unioned,
+            ``content`` keeps the longer one, ``timestamp`` the newest,
+            ``importance`` the max, and type fields are replaced by the new
+            value only when the original was the default.
         """
         if timestamp is None:
             timestamp = time.time()
 
-        # 更新参考时间 (用于 recall 时的打分)
-        # 按本路记录；进程级全局仍取各路最大值（_touch_global_reference_time），
-        # 所以 consolidate / save 的口径与改造前一致。
+        # Update the reference time (used for scoring at recall)
+        # Recorded per-route; the process-level global still takes the max
+        # across routes (_touch_global_reference_time), so consolidate / save
+        # keep the same contract as before the refactor.
         _ctx = self._lnn_ctx(client)
         if _ctx.reference_time is None or timestamp > _ctx.reference_time:
             _ctx.reference_time = timestamp
             self._touch_global_reference_time()
 
-        # 本次调用是否命中去重、并入了哪条既有记忆。
-        # 返回值保持"只有 id"的旧签名不变，宿主（ingest）需要区分"新建 / 并入"
-        # 时读这个属性——双写场景下"我以为写了新条，其实并进了旧条"必须能看到。
+        # Whether this call hit dedup, and merged into which existing memory.
+        # The return value keeps the old "id only" signature; when the host
+        # (ingest) needs to distinguish "created / merged", it reads this
+        # attribute -- in dual-write scenarios "I thought I wrote a new entry
+        # but it merged into an old one" must be visible.
         self.last_store_merge_of: str | None = None
         self.last_store_near_miss = None
 
-        # P0-2 幂等：宿主声明的「同一次请求」重放 ⇒ 不嵌入、不写、不新增。
-        # 查表放在嵌入**之前**是刻意的：重放本该省掉的正是最贵的那一步。
+        # P0-2 idempotency: a host-declared replay of "the same request" =>
+        # no embedding, no write, no creation. The lookup is deliberately placed
+        # **before** embedding: what a replay should skip is precisely the most
+        # expensive step.
         self.last_idem_hit: str | None = None
         if idem_key:
             _hit = self.idem_lookup(idem_key)
@@ -647,33 +735,42 @@ class MemoryManager:
                 self.last_idem_hit = _hit
                 return _hit
 
-        # 生成嵌入
+        # Generate embedding
         emb = self.embedder.embed(content)
 
-        # C13：截断自曝。嵌入模型有 token 硬上限（BGE / MiniLM = 512），
-        # 超限部分被静默丢弃、对向量零贡献：写入成功、回读在库、stats 正常，
-        # **只有检索悄悄差一截**。这里把「实际纳入嵌入多少字」显式算出来，
-        # 由 ingest / store_memory 回显给调用方。
+        # C13: truncation self-report. Embedding models have a token hard cap
+        # (BGE / MiniLM = 512); the excess is silently dropped and contributes
+        # nothing to the vector: the write succeeds, the record reads back, stats
+        # look normal -- **only retrieval is quietly degraded**. Here the
+        # "how many characters actually entered the embedding" is computed
+        # explicitly and echoed back to the caller by ingest / store_memory.
         self.last_truncation = embedding_coverage(self.embedder, content)
 
-        # Phase 5 步骤5: 记忆去重 — 相似度 > 阈值时合并而非新建
+        # Phase 5 step 5: memory dedup -- merge instead of creating when
+        # similarity > threshold
         if self.dedup_threshold < 1.0 and self.store.count() > 0:
             candidates = self.store.search(emb, top_k=1)
             if candidates:
                 existing, sim = candidates[0]
-                # 只合并到**仍有效**的记忆。已作废 / 已归档的记录语义上不是
-                # "同一条现行事实"，把新写入吞进去会让它一进来就隐身；
-                # 那种情况应当新建，再交给上层的事实更新检测去判定取代关系。
-                # ---- 合并丢信息守卫----------------------------------------
-                # 合并只保留「更长者」——较短的新文本被**整段丢弃**。若新文本
-                # 带来旧文本没有的数字/日期，这样的丢弃是不可恢复的信息损失，
-                # 因此不合并、独立新建，并把近重复提示留在 last_store_near_miss。
+                # Merge only into **still valid** memories. Superseded /
+                # archived records are semantically not "the same current fact";
+                # swallowing the new write would make it invisible from birth.
+                # That case should create new, then let the upper layer's fact
+                # update detection decide the supersede relation.
+                # ---- merge information-loss guard--------------------------
+                # Merging keeps only the "longer" one -- the shorter new text is
+                # **dropped wholesale**. If the new text brings numbers/dates the
+                # old text lacked, that drop is unrecoverable information loss,
+                # so no merge: create separately, and leave the near-duplicate
+                # notice in last_store_near_miss.
                 _is_dup = (
                     sim >= self.dedup_threshold
                     and existing.state == MemoryState.ACTIVE.value
-                    # D2a：待审写入**绝不合并**——合并会把未经审查的内容
-                    # 并进一张可见卡（quarantine 标记随合并丢弃），等于
-                    # 绕过待审。隔离卡一律独立新建，由 drift_audit 复审。
+                    # D2a: quarantined writes are **never merged** -- merging
+                    # would fold unreviewed content into a visible card (the
+                    # quarantine flag is dropped on merge), i.e. bypassing
+                    # review. Quarantined cards are always created separately
+                    # and re-reviewed by drift_audit.
                     and not quarantine
                 )
                 _missing_hard: set[str] = (
@@ -695,9 +792,10 @@ class MemoryManager:
                         content if len(content) > len(existing.content)
                         else existing.content
                     )
-                    # 被吞文本必须在 store.update **之前**取——update
-                    # 原地改 existing，之后读 existing.content 拿到的已是
-                    # 幸存文本，"谁被吞了"就再也算不出来了。
+                    # The swallowed text must be captured **before** store.update --
+                    # update mutates existing in place, so reading
+                    # existing.content afterwards yields the surviving text and
+                    # "who was swallowed" can no longer be computed.
                     discarded_content = (
                         existing.content
                         if merged_content == content else content
@@ -706,16 +804,21 @@ class MemoryManager:
                     if merged_content != existing.content:
                         merged_emb = self.embedder.embed(merged_content)
                     else:
-                        # 内容维持**旧文本** → 必须沿用旧文本的向量。
-                        # 此前这里赋的是 emb（本次新文本的向量），于是
-                        # 「内容没变、向量却换了」：记录与它的向量脱钩，
-                        # 写入成功、回读在库、stats 正常，只有检索悄悄变差。
-                        # 实测后果：两张内容不同的卡落盘向量逐元素相同
-                        # （cos=1.000000），其中一条与自身文本只有 0.8908。
+                        # Content stays the **old text** -> must keep the old
+                        # text's vector. Previously this assigned emb (the new
+                        # text's vector), producing "content unchanged but vector
+                        # swapped": the record and its vector decoupled, the write
+                        # succeeds, the record reads back, stats look normal --
+                        # only retrieval quietly degrades. Measured consequence:
+                        # two cards with different content persisted
+                        # element-identical vectors (cos=1.000000), one of which
+                        # had only 0.8908 against its own text.
                         merged_emb = self.vector_of(existing)
                         if merged_emb is None:
-                            # 旧记录在当前模型槽位下没有向量（不该发生）；
-                            # 兜底沿用本次的，总好过把记录写成无向量。
+                            # The old record has no vector under the current
+                            # model slot (should not happen); fall back to this
+                            # call's vector -- better than persisting a
+                            # vectorless record.
                             merged_emb = emb
                     self.store.update(
                         existing.id,
@@ -723,16 +826,23 @@ class MemoryManager:
                         embedding=merged_emb,
                         timestamp=max(timestamp, existing.timestamp),
                         importance=merged_importance,
-                        # 缺陷 D3：下面四项此前**被整体丢弃**。后果是
-                        #   ① 本次的 L0 原文失去 source_ids 回指，成为永久孤儿
-                        #      （"一字不改可回指核对"的审计链静默断裂，且不会被
-                        #       forget 的级联清理覆盖到）
-                        #   ② 本次提到的实体与这条记忆失去关联，实体倒排索引断裂
-                        # 因此合并必须把来源与索引一并带过去（有序并集，非覆盖）。
+                        # Defect D3: the four fields below used to be **dropped
+                        # entirely**. Consequences:
+                        #   (1) this call's L0 raw text lost its source_ids
+                        #       back-reference and became a permanent orphan
+                        #       (the "verbatim text can be cross-checked" audit
+                        #       chain silently broke, and forget's cascade
+                        #       cleanup did not cover it)
+                        #   (2) entities mentioned in this call lost their link
+                        #       to the memory, breaking the entity inverted index
+                        # So a merge must carry sources and indexes over
+                        # (ordered union, not overwrite).
                         source_ids=merge_id_lists(existing.source_ids, source_ids),
                         entity_ids=merge_id_lists(existing.entity_ids, entity_ids),
-                        # 类型取"更具体"的一方：原值仍是默认值时才采纳新值，
-                        # 避免后续一次粗分类把已判定的具体类型冲掉。
+                        # Type takes the "more specific" side: the new value is
+                        # adopted only when the original is still the default,
+                        # so a later coarse classification cannot wash away an
+                        # already-decided specific type.
                         memory_type=(
                             existing.memory_type
                             if existing.memory_type != MemoryType.GENERAL.value
@@ -743,21 +853,29 @@ class MemoryManager:
                             if existing.cognitive_type != CognitiveType.WORLD.value
                             else cognitive_type
                         ),
-                        # 来源标签同样不能吞：合并进来的内容可能来自另一个文件，
-                        # 丢掉 source 就再也查不出这条记忆是哪些文件的混合体。
-                        # 单值字段取"先有的那个，空则用新的"。
+                        # The source label must not be swallowed either: the
+                        # merged-in content may come from another file; dropping
+                        # source would make this hybrid record's file lineage
+                        # untraceable. Single-value fields take "the pre-existing
+                        # one, or the new one if empty".
                         source=existing.source or source,
-                        # 标签同样取并集：并进来的内容可能带别的章/年标签，
-                        # 覆盖会让这条混合记录在"按章过滤"下彻底查不到。
+                        # Tags are unioned too: the merged-in content may carry
+                        # other chapter/year tags; overwriting would make this
+                        # hybrid record unfindable under "filter by chapter".
                         tags=merge_tag_dicts(existing.tags, tags),
-                        # O1：合并保留双方检索强度的 max——新轨迹恒为 0，
-                        # 等价于保留旧痕迹的巩固成果，合并不丢强度。
+                        # O1: merge keeps the max of both sides' retrieval
+                        # strength -- the new trajectory is always 0, so this is
+                        # equivalent to keeping the old trace's consolidation
+                        # gains; a merge never loses strength.
                         recall_strength=max(
                             float(existing.recall_strength or 0.0), 0.0),
                     )
-                    # 合并留前值：被吞一方的文本入账（两态都记——
-                    # "新长旧短"吞旧文本、"旧长新短"吞新文本；两文本完全
-                    # 相同不记，没有任何东西丢失）。after 取幸存文本。
+                    # Merge keeps the prior value: the swallowed side's text
+                    # enters the ledger (both directions are recorded --
+                    # "new longer" swallows the old text, "old longer" swallows
+                    # the new text; when both texts are identical nothing is
+                    # recorded since nothing was lost). after holds the
+                    # surviving text.
                     if discarded_content != merged_content:
                         self._mem_history_append({
                             "kind": "merge",
@@ -766,22 +884,27 @@ class MemoryManager:
                             "after": {"content": merged_content},
                         })
                     self.last_store_merge_of = existing.id
-                    # 幂等键照样登记：合并路径也算「这次请求有了回执」，
-                    # 否则重放会再走一遍全量匹配（结果相同但白付一次嵌入）。
+                    # Register the idempotency key as well: the merge path also
+                    # counts as "this request got a receipt", otherwise a replay
+                    # would redo the full match (same result but a wasted
+                    # embedding).
                     self._remember_idem(idem_key, existing.id)
                     return existing.id
 
-        # LNN step: 更新隐藏状态 (时序记忆)
-        # 推进的是**本路**的隐状态。共享连接下若不分路，A 的写入会
-        # 直接改写 B 的检索起点 —— 无异常、无日志，只掉时序分。
-        # H7：MemoryCore 收 numpy（后端内部负责 dtype/形状），进程零 torch。
+        # LNN step: update hidden state (temporal memory)
+        # What advances is **this route's** hidden state. Under a shared
+        # connection without partitioning, A's write would directly overwrite
+        # B's retrieval starting point -- no exception, no log, just degraded
+        # temporal scores.
+        # H7: MemoryCore takes numpy (the backend handles dtype/shape
+        # internally); the process is torch-free.
         emb_input = np.asarray(emb, dtype=np.float32).reshape(1, -1)
         with self._lnn_route(client) as _rctx:
             self.memory_core.step(emb_input)
             _rctx.step_count += 1
         self._step_count += 1
 
-        # 写入向量库（向量挂在当前模型槽位下）
+        # Write to the vector store (vector attached under the current model slot)
         record = MemoryRecord(
             id="",
             content=content,
@@ -804,16 +927,18 @@ class MemoryManager:
         memory_id = self.store.add(record)
         self._remember_idem(idem_key, memory_id)
 
-        # 自动持久化 (可选)
+        # Auto-persist (optional)
         if self.auto_save and self._step_count % 10 == 0:
             try:
                 self.save()
                 self.last_save_error = None
             except Exception as e:
-                # 不阻断主流程——但**绝不能静默**：
-                # 并发写保护拒绝保存时，这批记忆只在内存里。宿主看到 ingest 成功
-                # 就以为落盘了，进程一重启全丢，且没有任何痕迹可查（zcode 反馈）。
-                # 这里记下来，由 get_stats / save_state 显式暴露出去。
+                # Does not block the main flow -- but **must never be silent**:
+                # when the concurrent-write guard rejects the save, this batch
+                # of memories exists only in memory. The host sees ingest
+                # succeed, believes it is persisted, and loses everything on
+                # restart with no trace to inspect (zcode feedback).
+                # Record it here; get_stats / save_state expose it explicitly.
                 self.last_save_error = f"{type(e).__name__}: {e}"
                 self.autosave_failures += 1
                 logger.warning(
@@ -834,39 +959,45 @@ class MemoryManager:
         occurred_after: float = 0.0,
         occurred_before: float = 0.0,
     ) -> list[RecallResult]:
-        """回忆与查询相关的记忆.
+        """Recall memories relevant to the query.
 
-        流程:
-            1. 生成查询向量 (使用 LNN 的 h(t) 或纯文本嵌入).
-            2. 向量库检索 top_k * 3 候选.
-            3. 打分引擎综合排序.
-            4. 可选: 距离加权抽样引入探索性.
+        Flow:
+            1. Generate the query vector (LNN's h(t) or plain text embedding).
+            2. Retrieve top_k * 3 candidates from the vector store.
+            3. Rank comprehensively with the scoring engine.
+            4. Optional: distance-weighted sampling adds exploration.
 
         Args:
-            query: 查询文本. 为 None 时使用 LNN 当前状态作为隐式查询.
-            top_k: 返回的记忆数量.
-            use_lnn: 是否使用 LNN 混合查询向量 (False 则纯文本嵌入).
-            sample: 是否使用抽样 (True) 或贪心排序 (False).
-            allow_ids: 只在这个 id 白名单里检索（标签过滤在检索**前**收窄
-                候选集）。None = 不限。空集合 = 直接返回空。
+            query: query text. None uses the LNN's current state as the
+                implicit query.
+            top_k: number of memories to return.
+            use_lnn: whether to blend the LNN into the query vector (False uses
+                the plain text embedding).
+            sample: use sampling (True) or greedy ranking (False).
+            allow_ids: search only within this id whitelist (tag filtering
+                narrows the candidate set **before** retrieval). None = no
+                limit. Empty set = return empty immediately.
         """
         if self.store.count() == 0:
             return []
         if allow_ids is not None and not allow_ids:
             return []
 
-        # 本次检索读的是**本路**的时序状态（与写入侧同一 key）
+        # This retrieval reads **this route's** temporal state (same key as the
+        # write side)
         window_active = occurred_after > 0 or occurred_before > 0
         with self._lnn_route(client) as _rctx:
-            # 生成查询向量
+            # Generate the query vector
             if query is not None:
-                # 查询侧: BGE 等模型需要指令前缀 (embed_query 对非 BGE 模型等价于 embed)
+                # Query side: BGE and similar models need an instruction prefix
+                # (embed_query equals embed for non-BGE models)
                 query_emb = self.embedder.embed_query(query)
                 if use_lnn:
-                    # 混合: LNN 查询向量与文本嵌入的加权融合
+                    # Hybrid: weighted fusion of the LNN query vector and the
+                    # text embedding
                     lnn_query = self.memory_core.get_query()
                     lnn_np = np.asarray(lnn_query, dtype=np.float64)
-                    # 加权: 0.6 * 文本嵌入 + 0.4 * LNN 状态
+                    # Weighting: 0.6 * text embedding + 0.4 * LNN state
                     query_vec = 0.6 * query_emb + 0.4 * lnn_np
                     norm = np.linalg.norm(query_vec)
                     if norm > 1e-12:
@@ -874,17 +1005,20 @@ class MemoryManager:
                 else:
                     query_vec = query_emb
             else:
-                # 无显式查询, 使用 LNN 当前状态
+                # No explicit query: use the LNN's current state
                 lnn_query = self.memory_core.get_query()
                 query_vec = np.asarray(lnn_query, dtype=np.float64)
 
-            # 检索候选 (多取一些用于打分)
-            # 标签过滤时上限改用白名单规模：白名单可能只有几十条，
-            # 沿用全库条数只会白算一堆被屏蔽的行。
+            # Retrieve candidates (fetch extra for scoring)
+            # Under tag filtering the cap switches to the whitelist size: a
+            # whitelist may hold only a few dozen entries; sticking with the
+            # full-library count just wastes compute on masked rows.
             pool_size = self.store.count() if allow_ids is None else len(allow_ids)
-            # 时间窗生效时把候选池放大 10 倍：过滤发生在检索**之后**，
-            # 若池子仍是 top_k*3，窗口内可用的条目可能凑不满 top_k ——
-            # 那是"过滤太狠"，不是"库里没有"。先多捞再按时间裁。
+            # When a time window is active the candidate pool is enlarged 10x:
+            # filtering happens **after** retrieval, so with a pool of only
+            # top_k*3 the in-window entries may not fill top_k -- that would be
+            # "filtering too hard", not "the library has nothing". Fetch more
+            # first, then trim by time.
             candidate_k = min(max(top_k * (10 if window_active else 3), top_k),
                               pool_size)
             candidates = self.store.search(query_vec, top_k=candidate_k, allow_ids=allow_ids)
@@ -892,24 +1026,31 @@ class MemoryManager:
             if not candidates:
                 return []
 
-            # 准备打分输入
-            # 使用参考时间 (已存储消息的最新时间戳), 而非 wall-clock
-            # (LoCoMo 评测关键修复: time.time() 与数据时间戳差距巨大导致时间衰减失效)
+            # Prepare scoring inputs
+            # Use the reference time (newest timestamp of stored messages), not
+            # wall-clock (key LoCoMo fix: time.time() diverges hugely from the
+            # data timestamps, which nullifies time decay)
             current_time = self._reference_time if self._reference_time else time.time()
 
-        # O8 检索端过时窗口：age > 窗口且未 pin → 不进候选。放打分前——被挡
-        # 条目不计分、不进 rank、不加 recall_count（对被挡条目零状态写入）。
+        # O8 retrieval-side staleness window: age > window and not pinned ->
+        # excluded from candidates. Applied before scoring -- blocked entries
+        # are not scored, not ranked, and get no recall_count bump (zero state
+        # writes for blocked entries).
         if self._recency_window_seconds > 0 or window_active:
             candidates = [
                 (r, s) for r, s in candidates
-                # O8：系统自动挡（对 timestamp<=0 保守保留，见 recency 注释）。
-                # **用户显式给了时间窗时让位**：O8 是"默认策略"，时间窗是
-                # "显式意图"，两者冲突时显式优先——否则「查三年前那次事故」
-                # 会被 180 天窗口先挡掉，时间窗形同虚设。
+                # O8: automatic system-level blocking (timestamp<=0 conservatively
+                # kept, see the recency notes). **Yields when the user gave an
+                # explicit time window**: O8 is a "default policy", the time
+                # window is an "explicit intent"; when they conflict, explicit
+                # wins -- otherwise "find that incident from three years ago"
+                # would be blocked first by the 180-day window, rendering the
+                # time window useless.
                 if (self._recency_window_seconds <= 0 or window_active
                     or not out_of_window(r.timestamp, r.pin, current_time,
                                          self._recency_window_seconds))
-                # 用户显式时间窗（对 timestamp<=0 排除，理由见 in_time_window）
+                # User's explicit time window (timestamp<=0 excluded, see
+                # in_time_window for the rationale)
                 and (not window_active
                      or in_time_window(r.timestamp, occurred_after,
                                        occurred_before))
@@ -919,12 +1060,14 @@ class MemoryManager:
         similarities = np.array([sim for _, sim in candidates])
         timestamps = np.array([r.timestamp for r, _ in candidates])
         recall_counts = np.array([r.recall_count for r, _ in candidates])
-        # O1 检索强度（结果集语义的累积量，见 reinforce/stamp_recalled）
+        # O1 retrieval strength (a result-set-semantics accumulator, see
+        # reinforce/stamp_recalled)
         strengths = np.array([r.recall_strength for r, _ in candidates])
 
-        # 综合打分
-        # C5（默认关，HIPPOCAMPUS_INTENT_ROUTING=1 开）：按查询意图对权重乘子
-        # 路由；关闭时连分类都不调，行为逐位不变。
+        # Comprehensive scoring
+        # C5 (default off, HIPPOCAMPUS_INTENT_ROUTING=1 to enable): routes
+        # weight multipliers by query intent; when off, not even the classifier
+        # runs, bit-for-bit unchanged behavior.
         intent = None
         multipliers = None
         if intent_routing_enabled() and query:
@@ -935,25 +1078,28 @@ class MemoryManager:
             weight_multipliers=multipliers,
             strengths=strengths,
         )
-        # C6（默认关，HIPPOCAMPUS_RECALL_DECAY=1 开）：检索时记忆衰减——
-        # 对综合分做乘性 recency 重加权 exp(-age/tau)。加法公式里的时间项
-        # 权重太小（~0.03），改权重是噪声（C2 扫描已证）；乘性重加权能把
-        # 「最近发生的」整体从排序深处抬上来。关闭时不进乘法，逐位不变。
+        # C6 (default off, HIPPOCAMPUS_RECALL_DECAY=1 to enable): retrieval-time
+        # memory decay -- multiplicatively re-weights the composite score by
+        # exp(-age/tau). The additive formula's time term is too lightly
+        # weighted (~0.03); changing weights is noise (proven by the C2 scan),
+        # while multiplicative re-weighting can lift "recently happened" items
+        # out of the ranking depths as a whole. When off, no multiplication,
+        # bit-for-bit unchanged.
         if _recall_decay_enabled():
             age = np.maximum(current_time - timestamps, 0.0)
             scores = scores * np.exp(-age / _recall_decay_tau())
         self.last_recall_intent = intent
 
         if sample:
-            # 距离加权抽样
+            # Distance-weighted sampling
             chosen_idx = self.sampler.sample(similarities, k=top_k)
             ranked = [(i, scores[i]) for i in chosen_idx]
             ranked.sort(key=lambda x: -x[1])
         else:
-            # 贪心排序
+            # Greedy ranking
             ranked = self.scorer.rank(scores, top_k=top_k)
 
-        # 构建结果
+        # Build results
         results: list[RecallResult] = []
         for idx, score in ranked:
             record, sim = candidates[idx]
@@ -970,33 +1116,40 @@ class MemoryManager:
                 )
             )
 
-            # 增加回忆计数。
+            # Bump the recall count.
             #
-            # 注意**这里不写 last_recalled_at**：本方法返回的是**候选集**
-            # （brain.recall 以 fetch_k = max(top_k*4, 12) 取候选，之后还要过
-            # 硬门槛 / MMR / 标签过滤），在这里打时间戳会把"只是被取出来看过
-            # 一眼、最终没返回给宿主"的记录也算成"被召回过"——沉寂归档
-            # （consolidate 以 last_recalled_at 为时间基准）因此被稀释：
-            # 每次查询都会给十来条记录续命。真正的"被召回"时间戳由
-            # **brain.recall 在最终结果上写**（见该方法末尾）。
+            # Note **last_recalled_at is NOT written here**: this method returns
+            # the **candidate set** (brain.recall fetches candidates with
+            # fetch_k = max(top_k*4, 12), then applies hard gates / MMR / tag
+            # filtering); stamping timestamps here would also count "fetched and
+            # glanced at but never returned to the host" records as "recalled" --
+            # dormant archiving (consolidate uses last_recalled_at as its time
+            # base) gets diluted accordingly: every query would extend the life
+            # of a dozen records. The real "was recalled" timestamp is written
+            # by **brain.recall on the final results** (see the end of that
+            # method).
             self.store.update(record.id, recall_count=record.recall_count + 1)
 
         return results
 
     def stamp_recalled(self, memory_ids) -> int:
-        """给"真正返回给宿主的条目"盖上"最后一次被召回"的时间戳。
+        """Stamp "last recalled" timestamps on entries that were truly returned
+        to the host.
 
-        为什么单独开一个方法而不是写在 :meth:`search` 里：``search`` 返回的是
-        **候选集**（上层还会过硬门槛 / MMR / 标签过滤），在候选阶段打戳等于
-        "每次查询给十来条根本没露面的记忆续命"，沉寂归档（``consolidate`` 以
-        ``last_recalled_at`` 为时间基准）会被稀释。
+        Why a separate method instead of doing it in :meth:`search`:
+        ``search`` returns the **candidate set** (the upper layer still applies
+        hard gates / MMR / tag filtering); stamping at the candidate stage means
+        "every query extends the life of a dozen memories that never showed
+        up", diluting dormant archiving (``consolidate`` uses
+        ``last_recalled_at`` as its time base).
 
-        时间基准与 ``consolidate`` 的 ``now`` 必须一致（``_reference_time or
-        wall-clock``）：LoCoMo 评测的数据时间戳可能是 2023 年，若写裸
-        ``time.time()``，老记忆会被判成"刚刚被召回"→ **永久豁免沉寂归档**。
+        The time base must match ``consolidate``'s ``now`` (``_reference_time
+        or wall-clock``): LoCoMo benchmark data timestamps may be from 2023; if
+        a bare ``time.time()`` were written, old memories would be judged
+        "just recalled" -> **permanently exempt from dormant archiving**.
 
         Returns:
-            实际打戳成功的条数。
+            Number of entries actually stamped successfully.
         """
         stamp = self._reference_time if self._reference_time else time.time()
         n = 0
@@ -1006,9 +1159,10 @@ class MemoryManager:
             rec = self.store.get(mid)
             if rec is None:
                 continue
-            # O1：召回即巩固——真实召回（进结果集）在盖时间戳的同时给
-            # 检索强度 +1。与 recall_count（候选集、多样性惩罚）分工见
-            # MemoryRecord.recall_strength 注释。
+            # O1: recall is consolidation -- a true recall (entered the result
+            # set) bumps retrieval strength by +1 while stamping the timestamp.
+            # Division of labor with recall_count (candidate set, diversity
+            # penalty): see the MemoryRecord.recall_strength comment.
             new_strength = max(float(rec.recall_strength or 0.0), 0.0) + 1.0
             if self.store.update(mid, last_recalled_at=stamp,
                                  recall_strength=new_strength):
@@ -1016,12 +1170,15 @@ class MemoryManager:
         return n
 
     def reinforce(self, memory_ids, amount: float = 1.0) -> int:
-        """只累加检索强度，不碰 last_recalled_at（睡眠重放的接缝）。
+        """Only accumulates retrieval strength, never touches last_recalled_at
+        (the seam for sleep replay).
 
-        分工纪律（约束 4/5 的延伸）：``stamp_recalled`` ＝ 真实召回（进
-        结果集）——盖时间戳 + 强度 +1；本方法 ＝ **非召回的强化**（睡眠批的
-        睡眠重放共激活）——只加强度。重放不是"被宿主想起过"，若盖了
-        last_recalled_at，沉寂归档就会被重放稀释成永生。
+        Division-of-labor discipline (an extension of constraints 4/5):
+        ``stamp_recalled`` = true recall (entered the result set) -- stamps the
+        timestamp + strength +1; this method = **non-recall reinforcement**
+        (the sleep batch's replay co-activation) -- strength only. A replay is
+        not "recalled by the host"; if it stamped last_recalled_at, dormant
+        archiving would be diluted by replays into immortality.
         """
         n = 0
         for mid in memory_ids:
@@ -1036,14 +1193,16 @@ class MemoryManager:
         return n
 
     # ------------------------------------------------------------------
-    # 改写历史账本（mem_history.jsonl）
+    # Rewrite-history ledger (mem_history.jsonl)
     # ------------------------------------------------------------------
     def _mem_history_append(self, entry: dict[str, Any]) -> None:
-        """追加一条改写历史（纯旁路——任何失败都不阻断主写路径）。
+        """Append one rewrite-history entry (pure bypass -- any failure never
+        blocks the main write path).
 
-        行数/seq 惰性初始化（首条写入时扫一次盘）；纯内存 brain 直接放弃。
-        写失败由 store.mem_history 落 warning（"改之前是什么从此无处可查"
-        必须让运维看见），本方法不重复记、不抛出。
+        Line count/seq lazily initialized (one disk scan on first write); the
+        pure in-memory brain gives up immediately. Write failures log a warning
+        via store.mem_history ("what it was before the change" must be visible
+        to ops); this method neither duplicates the record nor raises.
         """
         if not self.persist_dir:
             return
@@ -1058,9 +1217,11 @@ class MemoryManager:
 
     def memory_history(self, memory_id: str | None = None,
                        limit: int = 20) -> list[dict[str, Any]]:
-        """读改写历史（最新在前）。``memory_id`` 过滤单条；纯内存
-        brain 返回空。账本是审计面：forget 级联**不**清理它（墓碑拦的
-        是复活不是历史），已删记录的历史条目自然 ring 老化。"""
+        """Read rewrite history (newest first). ``memory_id`` filters to one
+        entry; the pure in-memory brain returns empty. The ledger is the audit
+        surface: forget's cascade does **not** clean it (tombstones block
+        resurrection, not history), and deleted records' history entries age out
+        through the ring naturally."""
         entries = _mem_history.read_history(self.persist_dir)
         if memory_id:
             entries = [e for e in entries if e.get("memory_id") == memory_id]
@@ -1068,7 +1229,7 @@ class MemoryManager:
         return entries[:max(int(limit), 0)]
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
-        """根据 ID 获取单条记忆."""
+        """Get a single memory by ID."""
         record = self.store.get(memory_id)
         if record is None:
             return None
@@ -1077,24 +1238,28 @@ class MemoryManager:
     def update_memory(
         self, memory_id: str, **fields: Any
     ) -> bool:
-        """更新记忆字段 (content / importance / memory_type 等).
+        """Update memory fields (content / importance / memory_type etc.).
 
-        如果更新了 content, 会重新生成嵌入并更新 LNN 状态.
+        If content is updated, the embedding is regenerated and the LNN state
+        updated.
 
-        content/importance 变更先把旧值记进
-        ``mem_history.jsonl``（sidecar 账本，纯旁路——写失败只 warning
-        不阻断主路径）。state **单独**变更不记：supersede/归档路径的旧
-        记录本身保留（状态机已承担留痕），记了反是噪声；state 随
-        content/importance 一起变时旧值一并入账。embedding 不记（可由
-        content 重算）。
+        content/importance changes first record the old values into
+        ``mem_history.jsonl`` (sidecar ledger, pure bypass -- write failure only
+        warns and never blocks the main path). A state-**only** change is not
+        recorded: the supersede/archive path keeps the old record itself (the
+        state machine already provides the audit trail), so recording it is just
+        noise; when state changes together with content/importance the old
+        values are recorded together. embedding is not recorded (recomputable
+        from content).
         """
         record = self.store.get(memory_id)
         if record is None:
             return False
 
-        # 改写留前值：before＝三字段全量快照（审计价值——改写时的
-        # 状态也要可考），after＝被改字段的新值。见方法 docstring 的
-        # 记/不记边界。
+        # Rewrite keeps the prior value: before = full three-field snapshot
+        # (audit value -- the state at rewrite time must also be examinable),
+        # after = the new values of the changed fields. See the record/do-not-
+        # record boundary in the method docstring.
         changed = [k for k in ("content", "importance") if k in fields]
         if changed:
             self._mem_history_append({
@@ -1105,7 +1270,7 @@ class MemoryManager:
                 "after": {k: fields[k] for k in changed},
             })
 
-        # 如果更新了 content, 重新嵌入
+        # If content was updated, re-embed
         if "content" in fields:
             new_content = fields["content"]
             new_emb = self.embedder.embed(new_content)
@@ -1114,9 +1279,11 @@ class MemoryManager:
         return self.store.update(memory_id, **fields)
 
     def delete_memory(self, memory_id: str) -> bool:
-        """删除指定记忆（同时摘掉指向它的幂等回执，防悬空 id）。"""
+        """Delete the given memory (also removes idempotency receipts pointing
+        to it, preventing dangling ids)."""
         ok = self.store.delete(memory_id)
-        # 索引还没建就不用摘：重建时这条记录本就不在了（零成本旁路）
+        # No need to prune if the index was never built: on rebuild this record
+        # would not be there anyway (zero-cost bypass)
         if ok and getattr(self, "_idem", None) is not None:
             self._idem.forget_memory(memory_id)
         return ok
@@ -1128,14 +1295,16 @@ class MemoryManager:
         state: str | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """列出记忆 (不含嵌入向量).
+        """List memories (without embedding vectors).
 
         Args:
-            limit: 最多返回条数.
-            source: 只看来自该来源的条目（精确匹配；覆盖报告·高 3 要的
-                "列某文件入库了哪些条"）。传 ``""`` 可筛"没有来源"的旧记录。
-            state: 只看指定状态（active/superseded/archived）。
-            offset: 跳过前若干条（配合 limit 分页审计大库）。
+            limit: maximum number of entries to return.
+            source: only entries from this source (exact match; what coverage
+                report, high 3 asked for: "list which entries a file imported").
+                Pass ``""`` to filter for old records "without a source".
+            state: only the given state (active/superseded/archived).
+            offset: skip the first N entries (paging for auditing large
+                libraries together with limit).
         """
         results = []
         for record in self.store.iter_records():
@@ -1152,10 +1321,11 @@ class MemoryManager:
         return results
 
     def sources(self) -> dict[str, int]:
-        """统计各来源的条数：``{source: 条数}``。
+        """Count entries per source: ``{source: count}``.
 
-        导入脚本用它做"按源文件跳过已导入"的幂等判断（覆盖报告·中 9）。
-        没有来源的旧记录归到空字符串键下。
+        Import scripts use it for the "skip already-imported source files"
+        idempotency check (coverage report, medium 9). Old records without a
+        source are grouped under the empty-string key.
         """
         out: dict[str, int] = {}
         for record in self.store.iter_records():
@@ -1165,14 +1335,16 @@ class MemoryManager:
 
     def reset_context(self, client: str | None = None,
                       clear_all: bool = False) -> list[str]:
-        """重置 LNN 隐藏状态 (开始新的对话上下文).
+        """Reset the LNN hidden state (start a new conversation context).
 
-        默认只清**这一路**。共享进程里"清掉所有人"正是最典型的
-        串味事故——A 开新会话，B 的时序上下文跟着归零。要全清必须显式
-        ``clear_all=True``（并会在返回值里列出被清的路）。
+        By default only **this route** is cleared. In a shared process,
+        "clearing everyone" is the most typical cross-contamination incident --
+        A starts a new session and B's temporal context zeroes out with it.
+        Clearing everything requires explicit ``clear_all=True`` (and the return
+        value lists the cleared routes).
 
         Returns:
-            被清掉的 key 列表。
+            List of cleared keys.
         """
         if clear_all:
             keys = list(self._lnn_contexts)
@@ -1193,23 +1365,24 @@ class MemoryManager:
         ctx = self._lnn_contexts.pop(key, None)
         if key in self._lnn_ctx_lru:
             self._lnn_ctx_lru.remove(key)
-        # 若清的正是当前挂在 core 上的那一路，core 也要归零，
-        # 否则下一个读它的人会读到残留。
+        # If the cleared route is the one currently mounted on the core, the
+        # core must be zeroed too, otherwise the next reader gets residue.
         self.memory_core.reset_state()
         self._step_count = 0
         self._reference_time = None
         return [key] if ctx is not None else []
 
     # ------------------------------------------------------------------
-    # 多模型向量管理（换模型不重导入）
+    # Multi-model vector management (model switch without re-import)
     # ------------------------------------------------------------------
     @property
     def model_key(self) -> str:
-        """当前活跃嵌入模型标识."""
+        """Identifier of the currently active embedding model."""
         return self._model_key
 
     def vector_of(self, record: MemoryRecord) -> np.ndarray | None:
-        """取记录在当前活跃模型下的向量；未算过返回 None（需补算）."""
+        """Get the record's vector under the currently active model; returns None
+        if never computed (needs backfilling)."""
         vec = record.vector_for(self._model_key)
         if vec is None:
             return None
@@ -1218,22 +1391,26 @@ class MemoryManager:
     def ensure_vectors(
         self, batch_size: int = 32, verbose: bool = True
     ) -> dict[str, int]:
-        """为当前模型补算缺失向量（不重新导入文档、不调 LLM）.
+        """Backfill missing vectors for the current model (no document re-import,
+        no LLM calls).
 
-        换嵌入模型后首次加载会走这条路：文本与结构原样保留，
-        只用新模型重算向量。万条规模亦仅需分钟级。
+        The first load after switching embedding models takes this path: text
+        and structure are preserved as-is, only the vectors are recomputed with
+        the new model. Even ten-thousand-entry libraries need only minutes.
 
         Returns:
-            {"missing": 缺失条数, "filled": 实际补算条数}
+            {"missing": number missing, "filled": number actually backfilled}
         """
         missing = self.store.missing_ids(self._model_key)
         if not missing:
             return {"missing": 0, "filled": 0}
 
         if verbose and len(missing) >= 50:
-            # 大库补算是分钟级操作，而且它在 load() 路径上是**同步阻塞**的：
-            # MCP 服务启动预热时会卡在这，客户端可能直接超时断连。
-            # 所以先把话说清楚，让人知道"不是在挂，是在算"。
+            # Backfilling a large library is a minutes-scale operation, and on
+            # the load() path it is **synchronously blocking**: the MCP service
+            # startup warmup stalls here and the client may time out and
+            # disconnect. So say it up front, so people know "it is not hung,
+            # it is computing".
             _stderr_print(
                 f"[MemoryManager] model {self._model_key} is missing {len(missing)} vectors; "
                 f"backfilling now (synchronous and blocking -- do not interrupt; for large libraries run "
@@ -1262,19 +1439,21 @@ class MemoryManager:
                 _stderr_print(f"  backfilled vectors {filled}/{len(missing)}", flush=True)
 
         if filled:
-            # 只落盘向量库；不动 LNN 检查点（避免在 load 过程中覆盖待恢复的状态）
+            # Persist only the vector store; leave the LNN checkpoint alone
+            # (avoid overwriting the state awaiting restoration mid-load)
             self.store.save()
         return {"missing": len(missing), "filled": filled}
 
     def switch_model(self, model_key: str, dim: int) -> dict[str, int]:
-        """切换活跃嵌入模型（供离线实验对比不同模型的检索效果）.
+        """Switch the active embedding model (for offline experiments comparing
+        retrieval quality across models).
 
         Args:
-            model_key: 目标模型标识.
-            dim: 目标模型维度.
+            model_key: target model identifier.
+            dim: target model dimension.
 
         Returns:
-            ensure_vectors 的结果（缺失向量自动补算）。
+            ensure_vectors' result (missing vectors backfilled automatically).
         """
         self.store.set_model(model_key, dim)
         self._model_key = model_key
@@ -1282,7 +1461,7 @@ class MemoryManager:
         return self.ensure_vectors()
 
     def get_stats(self) -> dict[str, Any]:
-        """返回当前系统状态统计."""
+        """Return current system state statistics."""
         return {
             "total_memories": self.store.count(),
             "lnn_steps": self._step_count,
@@ -1291,11 +1470,13 @@ class MemoryManager:
             "vectors": self.store.model_stats(),
             "lnn_has_state": self.memory_core.hx is not None,
             "window_size": len(self.memory_core.window),
-            # 自曝：有几路上下文、各走到第几步。共享连接下这个数字
-            # 应当 > 1；恒为 1 说明调用方根本没传 client（接线未完成）。
+            # Self-report: how many context routes exist, each one's step count.
+            # Under a shared connection this number should be > 1; a constant 1
+            # means the caller never passed client (wiring incomplete).
             "lnn_contexts": self.lnn_context_report(),
-            # H7 自曝：CfC 实际运行时（numpy=零 torch；torch(ncps)=回退路径）。
-            # 报**实际值**而非配置值，与 embedder_runtime 同一纪律。
+            # H7 self-report: CfC's actual runtime (numpy = torch-free;
+            # torch(ncps) = fallback path). Reports the **actual** value, not the
+            # configured one -- same discipline as embedder_runtime.
             "lnn_runtime": self.memory_core.runtime,
             "lnn_backend": self.memory_core.backend,
             "scoring_mode": self.scorer.mode,
@@ -1304,23 +1485,29 @@ class MemoryManager:
             "w_recall": self.scorer.w_recall,
             "lambda_decay_days": round(self.scorer.lambda_decay / 86400, 1),
             "mu_importance_days": round(self.scorer.mu_importance / 86400, 1),
-            # 自动保存健康度：非 None 说明有整批**只在内存里**，重启即丢
+            # Auto-save health: non-None means a whole batch exists **only in
+            # memory** and is lost on restart
             "last_save_error": self.last_save_error,
             "autosave_failures": self.autosave_failures,
-            # B2-4 自曝：实际推理后端。**必须自曝实际值而非配置值**——
-            # 配了 onnx 但产物缺失时会自动回退 torch，只看配置永远不知道。
+            # B2-4 self-report: actual inference backend. **Must report the
+            # actual value, not the configured one** -- with onnx configured but
+            # artifacts missing it silently falls back to torch; looking only at
+            # config never reveals that.
             "embedder_runtime": self.embedder_runtime_backend(),
             "embedder_model_source": getattr(
                 self.embedder, "model_source", None
             ),
             "onnx_attached": self.embedder_runtime_backend() == "onnx",
-            # F6 自曝：本库的嵌入器是不是复用了进程内共享的那份重对象
-            # （False 而池里有货 = 共享没生效，第二库仍在白装一份权重）。
+            # F6 self-report: whether this library's embedder reuses the shared
+            # in-process heavy object (False while the pool has stock = sharing
+            # not effective, the second library is still pointlessly loading a
+            # full set of weights).
             "embedder_shared": bool(
                 getattr(self.embedder, "shared_from_pool", False)
             ),
             "embedder_pool": embedder_pool_stats(),
-            # C5/C6 自曝（B2-4 范式：开关状态要能从 stats 里看见）
+            # C5/C6 self-report (B2-4 paradigm: switch states must be visible
+            # from stats)
             "intent_routing_enabled": intent_routing_enabled(),
             "recall_decay_enabled": _recall_decay_enabled(),
             "recall_decay_tau_days": round(_recall_decay_tau() / 86400, 1),
@@ -1328,13 +1515,17 @@ class MemoryManager:
         }
 
     def embedder_runtime_backend(self) -> str:
-        """返回**实际**推理后端名：``onnx`` / ``torch`` / ``hash`` / …
+        """Return the **actual** inference backend name: ``onnx`` / ``torch`` /
+        ``hash`` / ...
 
-        🔴 为什么不能只报配置值：``HIPPOCAMPUS_EMB_BACKEND=onnx`` 在产物缺失时
-        会静默回退 torch（或装配阶段失败被吞），"我以为在用 ONNX 其实没有"
-        正是真库上发现过的接线缺陷。这里报的是**挂载结果**。
-        有两种 onnx 形态：ST 包装器挂了 ``_onnx``（ST 侧路径），
-        或 embedder 本身就是 ``OnnxEmbedder``（follow 直构路径）——都算 onnx。
+        RED FLAG -- why reporting only the configured value is not enough:
+        ``HIPPOCAMPUS_EMB_BACKEND=onnx`` silently falls back to torch when
+        artifacts are missing (or assembly-stage failures get swallowed); "I
+        thought I was on ONNX but was not" is exactly the wiring defect found on
+        a real library. What is reported here is the **mount outcome**. There
+        are two onnx forms: the ST wrapper with ``_onnx`` attached (ST-side
+        path), or the embedder itself being an ``OnnxEmbedder`` (the follow
+        direct-construction path) -- both count as onnx.
         """
         e = self.embedder
         if getattr(e, "_onnx", None) is not None or type(e).__name__ == "OnnxEmbedder":
@@ -1345,17 +1536,19 @@ class MemoryManager:
         return (self.embedder_backend or name).lower()
 
     def load_trained_weights(self, model_path: str) -> bool:
-        """加载训练后的 CfC 权重 (CRL 检索导向训练).
+        """Load trained CfC weights (CRL retrieval-guided training).
 
-        H7：支持两种来源——``.npz``（``scripts/export_lnn_weights.py`` 的导出物，
-        numpy/torch 核通吃，**不需要 torch**）与 legacy ``.pt``（惰性 torch 兜底，
-        保持老评测链可用）。推荐先离线跑一次导出，运行期就走零 torch 通道。
+        H7: supports two sources -- ``.npz`` (the export of
+        ``scripts/export_lnn_weights.py``, works with both numpy/torch cores,
+        **needs no torch**) and legacy ``.pt`` (lazy torch fallback, keeps the
+        old benchmark chain usable). Recommended: run the export once offline so
+        runtime stays on the torch-free path.
 
         Args:
-            model_path: .npz 或 .pt 文件路径.
+            model_path: path to a .npz or .pt file.
 
         Returns:
-            加载成功返回 True.
+            True on successful load.
         """
         try:
             if model_path.endswith(".npz"):
@@ -1363,20 +1556,23 @@ class MemoryManager:
                     arrays = {
                         k: np.asarray(z[k]) for k in z.files if k != "meta_json"
                     }
-                # npz 里可能带 mask 键；load_weights 只认 weight/bias，多余键忽略
+                # The npz may carry mask keys; load_weights only accepts
+                # weight/bias, extra keys are ignored
                 if arrays:
                     self.memory_core.load_weights(arrays)
                     return True
                 return False
-            # legacy .pt：惰性 torch（仅显式传入 .pt 的场景才付出这份依赖）
+            # legacy .pt: lazy torch (this dependency is paid only when a .pt is
+            # explicitly passed)
             import torch
 
             checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-            # CRL 训练脚本保存的键带 "cfc." 前缀, 需剥离后加载
+            # Keys saved by the CRL training script carry a "cfc." prefix; strip
+            # it before loading
             cfc_state = {}
             for k, v in checkpoint.get("model_state", checkpoint).items():
                 if k.startswith("cfc."):
-                    cfc_state[k[4:]] = v  # 去掉 "cfc." 前缀
+                    cfc_state[k[4:]] = v  # strip the "cfc." prefix
                 else:
                     cfc_state[k] = v
             if cfc_state:
@@ -1388,45 +1584,54 @@ class MemoryManager:
             return False
 
     # ------------------------------------------------------------------
-    # 持久化
+    # Persistence
     # ------------------------------------------------------------------
     @property
     def meta_path(self) -> str | None:
-        """标量元数据侧车文件路径（与 checkpoint 同目录）。"""
+        """Scalar metadata sidecar file path (same directory as the checkpoint)."""
         if self._checkpoint is None:
             return None
         return self._checkpoint.path + ".meta.json"
 
     def save(self) -> None:
-        """持久化所有状态: 向量库 + LNN 隐藏状态 + 标量元数据.
+        """Persist all state: vector store + LNN hidden state + scalar metadata.
 
-        checkpoint 走**带备份**写入（``save_with_backup``）：此前用的是不备份的
-        ``save_atomic``，导致 ``StateCheckpoint.load`` 里那段"回退 .bak"分支
-        永远没有备份可用——标称的"原子写 + 备份"只兑现了原子写（缺陷 N2）。
+        The checkpoint uses **backed-up** writes (``save_with_backup``): the
+        previous code used the non-backing-up ``save_atomic``, which left the
+        "fall back to .bak" branch in ``StateCheckpoint.load`` with no backup
+        ever available -- the advertised "atomic write + backup" only delivered
+        the atomic write (defect N2).
 
-        🔴 已知坑（已修）：core 是**单例**，``_lnn_route`` 退出时
-        会把进入前快照还原到 core 上 ⇒ 此处直接 ``get_state()`` 存的是**过期**
-        状态（新进程里 hx 恒为空，老 torch 路径同样中招——权重本就每次重启
-        随机，才没人察觉）。实时状态活在默认路的 ctx 里，从那里取；其余具名
-        路由不落盘（历史边界不变：checkpoint 只承载默认会话的时序状态）。
-        H7 权重固定化之后 hx 的持久化首次有了真实意义。
+        KNOWN TRAP (fixed): the core is a **singleton**; when ``_lnn_route``
+        exits it restores the pre-entry snapshot onto the core => a plain
+        ``get_state()`` here would persist a **stale** state (in a new process
+        hx is always empty; the old torch path was hit equally -- weights were
+        random on every restart anyway, which is why nobody noticed). The live
+        state lives in the default route's ctx; take it from there. Other named
+        routes are not persisted (historical boundary unchanged: the checkpoint
+        carries only the default session's temporal state). After H7 froze the
+        weights, persisting hx gained real meaning for the first time.
 
-        🔴 前置钩子（``_pre_persist``）：在动 L1 **之前**先把待落 L0 刷下去，
-        保证「盘上任何一条 L1 的 source_ids，都能在盘上 L0 找到」。顺序是
-        有意的：先 L0 后 L1，被杀最多留下「有 raw 无人引用」（无害）；
-        先 L1 后 L0 则留下「引用指向不存在的 raw」（不可恢复——实测某库
-        近一成条目中招，修复上线后仍在新增）。
+        Pre-persist hook (``_pre_persist``): flush the pending L0 **before**
+        touching L1, guaranteeing "every L1 entry's source_ids on disk can be
+        found in the on-disk L0". The order is deliberate: L0 first, L1 second
+        -- killed mid-way, at worst you get "raw exists but unreferenced"
+        (harmless); L1 first, L0 second leaves "references pointing at a
+        nonexistent raw" (unrecoverable -- measured at nearly 10% of entries in
+        one library, and still trickling in after the fix shipped).
         """
-        # 契约边界：**钩子抛异常 = 前置失败，但绝不阻断本次落盘**。
-        # 阻断等于"连 L1 也不存了"，比"L1 在、L0 缺"更糟；错误留到结尾
-        # 重新写回 last_save_error —— 否则末尾那句 `= None` 会把 L0 的失败
-        # 静默吞掉，而"静默失败"正是这次事故拖到被外部项目发现的原因。
+        # Contract boundary: **a hook raising = pre-persist failure, but it must
+        # never block this persist**. Blocking means "not even L1 gets saved",
+        # worse than "L1 present, L0 missing"; the error is written back into
+        # last_save_error at the end -- otherwise the trailing `= None` would
+        # silently swallow the L0 failure, and "silent failure" is exactly why
+        # this incident stayed hidden until an external project found it.
         pre_error: str | None = None
         hook = self._pre_persist
         if hook is not None:
             try:
                 hook()
-            except Exception as e:  # noqa: BLE001 —— 见上方契约
+            except Exception as e:  # noqa: BLE001 -- see the contract above
                 pre_error = f"L0 前置落盘失败：{type(e).__name__}: {e}"
                 logger.warning("[save] %s", pre_error)
         self.store.save()
@@ -1445,60 +1650,72 @@ class MemoryManager:
             state["reference_time"] = self._reference_time
             self._checkpoint.save_with_backup(state)
             self._save_meta()
-        # 落盘成功 → 清掉此前的失败痕迹（保留累计计数，供审计）；
-        # 但**前置 L0 失败不清**：那是一笔还没还上的账，得留着让人看见。
+        # Persist succeeded -> clear earlier failure traces (keep the cumulative
+        # counter for audit); but a **failed pre-persist L0 flush is not
+        # cleared**: that is an unpaid debt, kept visible on purpose.
         self.last_save_error = pre_error
 
     def set_pre_persist_hook(self, hook: Callable[[], None] | None) -> None:
-        """注册「落盘前先刷 L0」钩子（调用点与语义见 :meth:`save`）。
+        """Register the "flush L0 before persisting" hook (call sites and
+        semantics in :meth:`save`).
 
-        为什么用钩子而不是让 manager 直接持有 brain：engine 层不认识 L0
-        （它只认识 store / checkpoint）。钩子把「层的先后顺序」这条**业务
-        不变式**留在 brain，engine 只负责在正确的时机调用。
+        Why a hook instead of manager holding brain directly: the engine layer
+        does not know about L0 (it only knows store / checkpoint). The hook
+        keeps the "layer ordering" **business invariant** in brain; engine just
+        calls it at the right moment.
         """
         self._pre_persist = hook
 
     def retry_save(self) -> dict[str, Any]:
-        """并发冲突后重试保存：**先取磁盘最新版本，再只补磁盘上没有的增量**。
+        """Retry a save after a concurrency conflict: **take the disk's newest
+        version first, then re-add only the increments the disk lacks**.
 
-        为什么不能简单地"再 save() 一次"：``disk_stamp`` 已经说明磁盘被别的
-        进程改过，此时直接用内存快照覆写 = 拿陈旧版本盖掉别人的新数据。
-        ``retry_save`` 的做法是：
+        Why not simply "save() again": ``disk_stamp`` already proved another
+        process modified the disk; overwriting directly from the in-memory
+        snapshot = clobbering someone else's fresh data with a stale version.
+        ``retry_save`` does:
 
-            1. 快照本进程内存里的全部记录（此时它们还没落盘）；
-            2. 重新 ``load()`` 磁盘最新版本（以磁盘为准）；
-            3. 把"磁盘上没有的 id"补回去 —— 这些才是本进程的真实增量；
-            4. 再 ``save()``（此时 stamp 已刷新，是安全写入）。
+            1. Snapshot all records in this process's memory (they are not yet
+               persisted at this point);
+            2. Re-``load()`` the disk's newest version (disk wins);
+            3. Re-add the ids "missing on disk" -- those are this process's true
+               increments;
+            4. ``save()`` again (the stamp is refreshed by then, a safe write).
 
-        语义边界（不自动 merge，只做加法）：
-            - 磁盘缺失的 id → 补上（增量，安全）；
-            - 双方都有但内容不同 → **保留磁盘版本**，本地改动记入
-              ``dropped_local_edits`` 供人工判断（不做字段级合并，避免
-              半自动合并出谁也说不清的结果）；
-            - 本进程删过、磁盘上还在的记录 → 会"复活"，记入
-              ``disk_only``（另一进程新增的 id 也落在这里，二者本进程无法区分）。
+        Semantic boundary (no automatic merge, additive only):
+            - ids missing on disk -> re-added (increment, safe);
+            - present on both sides but differing -> **disk version kept**, the
+              local edits recorded in ``dropped_local_edits`` for human review
+              (no field-level merging, avoiding a semi-automatic merge nobody
+              can explain);
+            - records deleted by this process but still on disk -> they
+              "revive", recorded in ``disk_only`` (ids newly added by the other
+              process also land here; this process cannot tell the two apart).
 
         Returns:
-            统计字典，含 added / dropped_local_edits / disk_only 等。
+            Statistics dict with added / dropped_local_edits / disk_only etc.
 
         Raises:
-            ConcurrentWriteError: 重试期间又被写（说明冲突没停，应当先停掉
-                其它写入进程，而不是继续重试）。
+            ConcurrentWriteError: written again during the retry (the conflict
+                has not stopped; stop the other writer first instead of
+                retrying).
         """
         before = {rec.id: rec for rec in self.store.iter_records()}
 
-        # 2) 以磁盘为准重新载入（不补算向量：补算是重活，交给调用方显式触发）
+        # 2) Reload with disk as the source of truth (no vector backfill:
+        #    backfilling is heavy, the caller triggers it explicitly)
         self.load(auto_backfill=False)
         disk = {rec.id: rec for rec in self.store.iter_records()}
 
-        # 3) 只补磁盘上没有的增量
+        # 3) Re-add only the increments the disk lacks
         added: list[str] = []
         for mid, rec in before.items():
             if mid not in disk:
                 self.store.add(rec)
                 added.append(mid)
 
-        # 双方都有但内容不同 → 保留磁盘版本，登记本地被丢弃的改动
+        # Present on both sides but differing -> keep the disk version, log the
+        # locally dropped edits
         dropped: list[str] = []
         for mid, rec in before.items():
             other = disk.get(mid)
@@ -1509,7 +1726,7 @@ class MemoryManager:
 
         disk_only = [mid for mid in disk if mid not in before]
 
-        # 4) stamp 已刷新，这次是安全写入
+        # 4) The stamp is refreshed; this is now a safe write
         self.save()
         return {
             "added": added,
@@ -1522,12 +1739,15 @@ class MemoryManager:
         }
 
     def _save_meta(self) -> None:
-        """把标量元数据（``reference_time`` / ``step_count``）单独落 JSON。
+        """Persist the scalar metadata (``reference_time`` / ``step_count``) to a
+        separate JSON.
 
-        ``.pt`` 里装的是张量，任何损坏都让整份状态不可读；而 ``reference_time``
-        是打分用的关键标量——丢了会让 ``recall()`` 退回 ``time.time()``，
-        时间衰减**静默失真**（LoCoMo 评测踩过的同一个坑）。单独存一份纯文本
-        JSON，即使 ``.pt`` 完全丢失也能把它捞回来。
+        A ``.pt`` file holds tensors; any corruption makes the whole state
+        unreadable, while ``reference_time`` is the key scoring scalar -- losing
+        it makes ``recall()`` fall back to ``time.time()`` and time decay
+        **silently distorts** (the same trap the LoCoMo benchmark hit). Keeping
+        a plain-text JSON copy means it can be salvaged even if the ``.pt`` is
+        completely lost.
         """
         path = self.meta_path
         if path is None:
@@ -1547,7 +1767,8 @@ class MemoryManager:
             _stderr_print(f"[MemoryManager] metadata save failed: {e}")
 
     def _load_meta(self) -> dict[str, Any]:
-        """读取侧车元数据 JSON；不存在或损坏时返回空字典。"""
+        """Read the sidecar metadata JSON; returns an empty dict when missing or
+        corrupt."""
         path = self.meta_path
         if path is None or not os.path.isfile(path):
             return {}
@@ -1560,16 +1781,19 @@ class MemoryManager:
             return {}
 
     def _follow_store_model(self, model_key: str) -> None:
-        """把嵌入器换成库内实际使用的模型（"模型跟随数据"的执行部分）。"""
+        """Swap the embedder to the model the library actually uses (the executor
+        of "the model follows the data")."""
         old_key, old_dim = self._model_key, self.embedding_dim
         backend = self.embedder_backend
         if backend == "sentence_transformer":
             probe = create_embedder(
                 "sentence_transformer", model_name=model_key
             )
-            # H7：能走 ONNX 就**直构 OnnxEmbedder**——不经 ST 包装器，embedder
-            # 本身就是零 torch 实现。probe 只借用它的本地模型目录解析（纯路径
-            # 逻辑，构造不 import torch/ST，惰性加载在首次 encode 才发生）。
+            # H7: when ONNX is possible, **construct OnnxEmbedder directly** --
+            # bypassing the ST wrapper, the embedder itself is a torch-free
+            # implementation. probe only lends its local model directory
+            # resolution (pure path logic; construction imports no torch/ST;
+            # lazy loading happens on first encode).
             direct = None
             if backend_kind() != "torch":
                 try:
@@ -1577,27 +1801,30 @@ class MemoryManager:
 
                     model_dir = probe._find_local_model()
                     if model_dir and find_onnx_artifacts(model_dir) is not None:
-                        # F6：走共享池 —— 同模型的另一个库已经在跑的话，
-                        # 这里拿到的是同一份 session/tokenizer（省 ~400MB
-                        # 权重与一次加载），而不是再装一份。
+                        # F6: use the shared pool -- if another library with the
+                        # same model is already running, this hands back the very
+                        # same session/tokenizer (saving ~400MB of weights and
+                        # one load) instead of loading another copy.
                         direct = get_shared_onnx(
                             model_dir=model_dir, model_name=model_key
                         )
-                except Exception as e:  # noqa: BLE001 - 直构失败回落包装路径
+                except Exception as e:  # noqa: BLE001 - direct construction failed, fall back to the wrapper path
                     _stderr_print(f"[MemoryManager] direct ONNX construction failed; falling back to the ST wrapper: {e}")
             if direct is not None:
                 self.embedder = direct
             else:
-                # H2：模型名**到这一刻才最终确定**——构造时可能只是回落的默认值
-                # （如 DEFAULT_MODEL_NAME=all-MiniLM-L6-v2），而库内实际是另一个
-                # 模型。ONNX 装配必须在这里再跑一次，否则默认路径下 ONNX 永不生效
-                # 且不报错（"我以为在省内存其实没省"）。
+                # H2: the model name is only **finalized at this moment** -- at
+                # construction it may merely be the fallback default (e.g.
+                # DEFAULT_MODEL_NAME=all-MiniLM-L6-v2) while the library actually
+                # uses another model. ONNX assembly must run again here,
+                # otherwise under the default path ONNX never takes effect and
+                # never errors ("I thought I was saving memory but was not").
                 self.embedder = probe
                 attach = getattr(self.embedder, "_attach_onnx", None)
                 if callable(attach):
                     try:
                         attach(from_store=True)
-                    except Exception as e:  # noqa: BLE001 - 装配失败不许让库起不来
+                    except Exception as e:  # noqa: BLE001 - assembly failure must not keep the library from starting
                         _stderr_print(
                             f"[MemoryManager] ONNX assembly failed; keeping the torch backend: {e}"
                         )
@@ -1605,7 +1832,8 @@ class MemoryManager:
             self.embedder = create_embedder(backend, dim=old_dim)
         self.embedding_dim = self.embedder.dim
         self._model_key = self.embedder.model_key
-        # LNN 核的输入/输出维度跟着嵌入维度走（AutoNCP 要求 output_dim < n-2）
+        # The LNN core's input/output dimensions follow the embedding dimension
+        # (AutoNCP requires output_dim < n-2)
         self.memory_core = MemoryCore(
             input_dim=self.embedding_dim,
             n_neurons=max(self._ctor_n_neurons, self.embedding_dim + 3),
@@ -1625,17 +1853,21 @@ class MemoryManager:
         )
 
     def _sync_embedder_with_store(self) -> None:
-        """加载后校验"生效模型"与"库内向量"是否一致（防静默用错模型）。
+        """After loading, verify the "effective model" matches the "library's
+        vectors" (guards against silently using the wrong model).
 
-        三种情形：
+        Three cases:
 
-        * **一致**（当前模型在库里有覆盖，或库是空的）→ 什么也不做，正常路径；
-        * **不一致，且模型是显式指定的** → 抛 :class:`EmbedderModelMismatchError`。
-          配置与数据打架时不要猜；确实要比对模型就显式设
-          ``HIPPOCAMPUS_ALLOW_MODEL_SWITCH=1``；
-        * **不一致，但模型是回落出来的默认值** → **跟随库内数据**换过去
-          （这才是"服务没配 env 就静默跑成 MiniLM"的根治：默认值不再能
-          悄悄覆盖一个有明确模型的库）。
+        * **Match** (the current model has coverage in the library, or the
+          library is empty) -> do nothing, normal path;
+        * **Mismatch, and the model was explicitly specified** -> raise
+          :class:`EmbedderModelMismatchError`. When config and data disagree,
+          do not guess; to compare models deliberately set
+          ``HIPPOCAMPUS_ALLOW_MODEL_SWITCH=1``;
+        * **Mismatch, but the model is a fallback default** -> **follow the
+          library's data** and switch (this is the real cure for "the service
+          runs as MiniLM silently when env is unset": a default value can no
+          longer quietly override a library with a definite model).
         """
         self.model_follow = None
         if self.embedder_backend != "sentence_transformer":
@@ -1643,7 +1875,7 @@ class MemoryManager:
         preferred = self.store.preferred_model_key()
         if not preferred or preferred == self._model_key:
             return
-        # 库内模型有覆盖、且不是当前模型 → 冲突
+        # The library's model has coverage and is not the current model -> conflict
         source = getattr(self.embedder, "model_source", "explicit")
         allowed = load_config().allow_model_switch
         if source == "default" and not allowed:
@@ -1666,19 +1898,23 @@ class MemoryManager:
         )
 
     def load(self, auto_backfill: bool = True) -> None:
-        """从磁盘恢复所有状态.
+        """Restore all state from disk.
 
         Args:
-            auto_backfill: 加载后自动为当前嵌入模型补算缺失向量。
-                旧库（换模型前建的、或早期单向量格式）无需重新导入，
-                首次加载会自动重新嵌入；不需要时置 False 手动控制。
+            auto_backfill: after loading, automatically backfill missing vectors
+                for the current embedding model. Old libraries (built before a
+                model switch, or with the early single-vector format) need no
+                re-import; the first load re-embeds automatically; set False to
+                control it manually.
         """
         self.store.load()
-        # 加载后**先对齐模型，再碰任何向量**：库里写着用哪个模型在跑，
-        # 就按哪个模型来（或明确报错），绝不拿当前模型硬套（见方法文档）。
+        # After loading **align the model before touching any vector**: whatever
+        # model the library says it runs with is the model used (or an explicit
+        # error); never force the current model onto it (see the method docs).
         self._sync_embedder_with_store()
         if self._checkpoint is not None and (
-            # 主文件缺失但 .bak 尚在（上次保存在替换间隙崩溃）也算有状态可恢复
+            # Main file missing but .bak still present (last save crashed between
+            # replace steps) still counts as recoverable state
             self._checkpoint.exists()
             or os.path.isfile(self._checkpoint.bak_path)
         ):
@@ -1687,7 +1923,8 @@ class MemoryManager:
             self._step_count = state.get("step_count", 0)
             self._reference_time = state.get("reference_time")
 
-        # .pt 不可用（损坏/丢失）时用侧车 JSON 兜底恢复标量
+        # When the .pt is unusable (corrupt/missing), the sidecar JSON recovers
+        # the scalars as a fallback
         meta = self._load_meta()
         if self._reference_time is None and meta.get("reference_time") is not None:
             self._reference_time = meta["reference_time"]

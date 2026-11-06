@@ -1,42 +1,56 @@
 # -*- coding: utf-8 -*-
-"""O7：元记忆置信度外显（domain 纯函数，M2 纪律）。
+"""O7: making metacognitive confidence explicit (domain pure functions, M2
+discipline).
 
-生物对应：元认知监测——海马体不只给出「想起什么」，还给出「这个想起
-有多大把握」（知道自己"记不清"）。
+Biological counterpart: metacognitive monitoring -- the hippocampus does not
+only say "what was recalled"; it also says "how confident is this recall"
+(knowing that it "cannot remember clearly").
 
-现状缺口：检索结果不带逐块置信度，宿主无法区分「确证」与「似是而非」
-——与反幻觉目标（L0 回指可核）不配套的最后一公里。
+Current gap: retrieval results carry no per-block confidence, so the host
+cannot tell "confirmed" from "plausible-sounding" -- the last mile left
+unmatched with the anti-hallucination goal (L0 back-reference verifiable).
 
-置信度公式（**校准锚点全部用仓内既有常量**，不另立标尺）：
+Confidence formula (**all calibration anchors use existing in-repo
+constants**, no separate scale is erected):
 
-    conf = W_SIM   · min(sim / SUPERSEDE_SIM, 1)     # 0.5 —— 相似度：
-                                                          达到"同一事实"
-                                                          档（0.72）即满分
-         + W_STATE · state_score                      # 0.2 —— 生命周期：
+    conf = W_SIM   · min(sim / SUPERSEDE_SIM, 1)     # 0.5 -- similarity:
+                                                          reaching the
+                                                          "same fact" tier
+                                                          (0.72) is full
+                                                          marks
+         + W_STATE · state_score                      # 0.2 -- lifecycle:
                                                           active 1.0 /
                                                           superseded 0.2 /
                                                           archived 0.0
-         + W_SRC   · source_resolved_ratio            # 0.2 —— L0 可解性：
-                                                          source_ids 里能在
-                                                          raw_log 对上的
-                                                          比例；**无溯源 = 0**
-         + W_PIN   · (1.0 if pin else 0.0)            # 0.1 —— 钉住 =
-                                                          被确认过
+         + W_SRC   · source_resolved_ratio            # 0.2 -- L0
+                                                          resolvability:
+                                                          the fraction of
+                                                          source_ids that
+                                                          can be matched in
+                                                          raw_log; **no
+                                                          provenance = 0**
+         + W_PIN   · (1.0 if pin else 0.0)            # 0.1 -- pinned =
+                                                          confirmed
 
-校准合理性（验收抽查的两条，公式保证恒成立）：
+Calibration sanity (two of the acceptance spot checks; the formula
+guarantees they always hold):
 
-* pinned 高于普通：同 sim / state / 溯源下 pin 项 +0.1；
-* 无溯源低于有溯源：``source_ids`` 为空时 W_SRC 项记 0，有且可解时记满。
+* pinned above ordinary: at equal sim / state / provenance, pin adds +0.1;
+* no provenance below provenanced: when ``source_ids`` is empty the W_SRC
+  term scores 0; when present and resolvable it scores full.
 
-BM25 单路命中（``similarity`` 恒 0.0）自然落在低置信区——字面撞上但
-向量无法确证，正是"似是而非"该有的分数。
+BM25-only hits (``similarity`` always 0.0) naturally land in the
+low-confidence region -- a literal collision the vector channel cannot
+confirm; exactly the score "plausible-sounding" deserves.
 
-自曝承收据纪律：返回体带 ``confidence`` 收据
-块（各块 value / basis / 全体 inputs / weights / computed_at），回答
-"这些把握是怎么算出来的"；逐条命中在 ``hits[i]["confidence"]`` 上。
-**不加新工具、不改既有键**——只添新键，向后兼容。
+Self-report carries the receipt discipline: the response body carries a
+``confidence`` receipt block (each block's value / basis / the full inputs /
+weights / computed_at), answering "how were these confidences computed";
+per-hit values sit on ``hits[i]["confidence"]``.
+**No new tools, no changed existing keys** -- only new keys are added;
+backward compatible.
 
-依赖方向：只 import common 常量（L0）。
+Dependency direction: imports only common constants (L0).
 """
 from __future__ import annotations
 
@@ -54,17 +68,20 @@ W_STATE: float = 0.2
 W_SRC: float = 0.2
 W_PIN: float = 0.1
 
-#: 生命周期状态分。superseded 不是 0：被取代的旧口径仍是"真实说过的话"
-#: （历史事实引用价值），只是不能当当前事实用。
+#: Lifecycle state scores. superseded is not 0: a superseded old criterion is
+#: still "something really said" (it has value as a historical fact to cite);
+#: it just cannot be used as the current fact.
 STATE_SCORE: dict[str, float] = {
     "active": 1.0,
     "superseded": 0.2,
     "archived": 0.0,
 }
 
-#: 每个非空块的基础分：block_2/3/5 出自 first-party 层（intents /
-#: summaries / open_topics 是本系统自己记的账，不是检索来的），给满 1.0
-#: 并在 basis 里写明——"确凿"与"待核"的区分才有意义。
+#: Base score for each non-empty block: block_2/3/5 come from the first-party
+#: layer (intents / summaries / open_topics are books this system kept
+#: itself, not retrieved), given a full 1.0 with the basis spelled out --
+#: this is what makes the "confirmed" vs "needs verification" distinction
+#: meaningful.
 FIRST_PARTY_SCORE: float = 1.0
 
 
@@ -76,14 +93,18 @@ def hit_confidence(
     source_resolved: int,
     pin: bool,
 ) -> float:
-    """单条命中的置信度（0~1，四位小数）。入参口径见模块 docstring。
+    """Confidence of a single hit (0~1, four decimal places). For the input
+    criteria see the module docstring.
 
     Args:
-        similarity: 向量相似度（BM25 单路命中恒 0.0——按"无法确证"计）。
-        state: 生命周期状态（未知状态按 0.5 计，不武断加分或清零）。
-        source_ids: L0 回指 id 列表（空 = 无溯源，该项 0 分）。
-        source_resolved: 其中能在 L0 raw_log 对上的个数。
-        pin: 是否钉住。
+        similarity: vector similarity (BM25-only hits are always 0.0 --
+            counted as "unconfirmable").
+        state: lifecycle state (unknown states count 0.5; neither
+            arbitrarily boosted nor zeroed).
+        source_ids: L0 back-reference id list (empty = no provenance; that
+            term scores 0).
+        source_resolved: how many of them can be matched in the L0 raw_log.
+        pin: whether pinned.
     """
     sim_n = max(0.0, min(float(similarity) / SUPERSEDE_SIM, 1.0))
     state_score = STATE_SCORE.get(str(state or ""), 0.5)
@@ -98,10 +119,13 @@ def hit_confidence(
 
 
 def mean_confidence(values: Iterable[float]) -> float | None:
-    """逐条置信度的块级汇总（算术平均，四位小数；空集 = None）。
+    """Block-level aggregation of per-hit confidences (arithmetic mean, four
+    decimal places; empty set = None).
 
-    平均而非取 max：块级"把握"要为**整块**背书，一条似是而非的命中混进
-    确证命中里，块级就该掉分——宿主据底下沉到逐条 ``confidence`` 查是谁。
+    Mean rather than max: a block-level "confidence" vouches for the **whole
+    block**; if one plausible-sounding hit sneaks in among confirmed hits,
+    the block score should drop -- the host can then drill down to per-hit
+    ``confidence`` to find out which one.
     """
     vals = [float(v) for v in values]
     if not vals:
@@ -114,15 +138,16 @@ def confidence_receipt(
     *,
     computed_at: float,
 ) -> dict[str, Any]:
-    """K4 收据式的置信度自曝块（get_memory_context 返回体的新键）。
+    """K4 receipt-style confidence self-report block (a new key of the
+    get_memory_context response body).
 
     Args:
-        block_values: ``{块名: {"value": float|None, "basis": str}}``。
-        computed_at: 计算时刻（Unix 秒）。
+        block_values: ``{block name: {"value": float|None, "basis": str}}``.
+        computed_at: computation time (Unix seconds).
 
     Returns:
         ``{"blocks": ..., "inputs": [...], "weights": ..., "per_hit_key":
-        "confidence", "computed_at": ..., "note": ...}``。
+        "confidence", "computed_at": ..., "note": ...}``.
     """
     return {
         "blocks": dict(block_values),

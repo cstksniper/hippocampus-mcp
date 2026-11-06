@@ -1,29 +1,36 @@
-"""按自然语言定位候选记忆并删除（或仅预览）——编排层。
+"""Locate candidate memories by natural language and delete them (or preview only) — the orchestration layer.
 
-宿主 agent 拿到的通常是"那条关于三月上线的记错了"这类自然语言，而不是
-memory_id。流程是：先召回再删，**默认只预览**（dry_run=True），确认候选
-无误后再以 dry_run=False 执行。
+What the host agent usually holds is natural language like "the one about the
+March launch was wrong", not a memory_id. The flow is: recall first, then
+delete, **preview-only by default** (dry_run=True); execute with dry_run=False
+only after confirming the candidates are right.
 
-**执行删除（dry_run=False）有两道护栏**：
+**Executing deletion (dry_run=False) has two guardrails**:
 
-1. **必须有向量背书**：只考虑 ``similarity >= 门槛`` 的候选。recall 会放行
-   BM25 词面命中但语义无关的条目，它们的 similarity 是 **0.0**，删它们等于
-   "按关键词删库"。
-2. **默认只删最匹配的一条**：``allow_multiple=False`` 时，即便有若干条过了
-   门槛，也只删排序第一的那条。"删掉那条记错的"在语义上几乎总是单数，多出来
-   的槽位正是误删的来源。确实要批量删请显式传 ``allow_multiple=True``。
+1. **Vector endorsement required**: only candidates with
+   ``similarity >= gate`` are considered. recall lets through BM25 surface-form
+   hits that are semantically unrelated; their similarity is **0.0**, and
+   deleting them amounts to "wiping the library by keyword".
+2. **By default delete only the best match**: with ``allow_multiple=False``,
+   even if several candidates pass the gate, only the top-ranked one is
+   deleted. "Delete the one that was wrong" is almost always singular in
+   meaning; the extra slots are exactly where mis-deletions come from. For a
+   genuine bulk delete, pass ``allow_multiple=True`` explicitly.
 
-两道都不是靠"调高相似度门槛"实现的——相关性随查询长度整体漂移（见
-``FORGET_MIN_SIMILARITY`` 注释里的实测分布），定值门槛救不了这两个方向中的
-任意一个；真正稳定的是"靶子恒为 #1"这个相对优势。
+Neither guardrail is implemented by "raising the similarity gate" — relevance
+drifts wholesale with query length (see the measured distribution in the
+``FORGET_MIN_SIMILARITY`` comment), and a fixed gate saves neither direction;
+what is actually stable is the relative advantage of "the target is always #1".
 
-被跳过的候选一律原样列进 ``skipped`` 并带 ``skip_reason``，宿主可据此改用
-memory_id 精确删除。
+Skipped candidates are always listed as-is in ``skipped`` with a
+``skip_reason``; the host can then switch to precise deletion by memory_id.
 
-落点说明：本体是纯编排（分流 + 删除循环），recall / forget 两个
-brain 入口以**可调用对象**注入（不预调用）；``min_similarity_default`` 由
-调用方现取传入——``None`` 取默认值的语义原样保留，且调用方命名空间被 patch
-时跟随（与 brain 侧其它常量的处理一致）。
+Placement note: the body is pure orchestration (dispatch + deletion loop); the
+two brain entries recall / forget are injected as **callables** (not
+pre-called); ``min_similarity_default`` is fetched fresh by the caller — the
+"None takes the default" semantics is preserved as-is, and it follows when the
+caller's namespace is patched (consistent with how brain's other constants are
+handled).
 """
 from __future__ import annotations
 
@@ -41,19 +48,21 @@ def forget_by_query(
     recall: Callable[..., list[dict[str, Any]]],
     forget: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
-    """按自然语言定位候选记忆并删除（或仅预览）。
+    """Locate candidate memories by natural language and delete them (or preview only).
 
     Args:
-        query: 自然语言描述（"那条关于三月上线的记错了"）。
-        top_k: 召回条数，透传给 recall。
-        dry_run: True 只预览不删除（默认）。
-        min_similarity: 删除门槛；None 取 ``min_similarity_default``。
-        allow_multiple: 允许多条一起删，默认 False（只删最匹配的一条）。
-        min_similarity_default: 默认门槛（调用方现取，勿用 def 默认参数）。
-        recall: 召回入口，按 ``recall(query, top_k=..., include_superseded=True)``
-            形态调用。
-        forget: 单条删除入口，按
-            ``forget(memory_id, reason="forget_by_query: <query>")`` 形态调用。
+        query: natural-language description ("the one about the March launch was wrong").
+        top_k: how many to recall, passed through to recall.
+        dry_run: True previews without deleting (default).
+        min_similarity: deletion gate; None takes ``min_similarity_default``.
+        allow_multiple: allow deleting several at once; default False (only the
+            best-matching one is deleted).
+        min_similarity_default: the default gate (fetched fresh by the caller;
+            do not use a def default argument).
+        recall: the recall entry, called as
+            ``recall(query, top_k=..., include_superseded=True)``.
+        forget: the single-deletion entry, called as
+            ``forget(memory_id, reason="forget_by_query: <query>")``.
     """
     floor = min_similarity_default if min_similarity is None else float(min_similarity)
     hits = recall(query, top_k=top_k, include_superseded=True)

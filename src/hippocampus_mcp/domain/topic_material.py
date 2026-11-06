@@ -1,16 +1,20 @@
-"""knowledge_topic 单主题 brief 分支的四段纯逻辑：限额夹取 / 素材投影 /
-提示语 / 回显体。
+"""Four pure-logic pieces of the knowledge_topic single-topic brief branch:
+limit clamping / material projection / hint / echo body.
 
-与 ``knowledge_brief``（开场包的一行式知识地图槽）的区别：那个
-是「整个层缩成几行」，这个是「单个主题展开成素材列表」——两者都服务
-brief 类读取，但粒度与调用方不同。
+Difference from ``knowledge_brief`` (the one-line knowledge map slot of the
+opening pack): that one is "the whole layer compressed into a few lines",
+this one is "a single topic expanded into a material list" -- both serve
+brief-style reads, but with different granularity and callers.
 
-零 import（domain 同层互引都不行——clip 常量与 summary_state 回调
-由壳注入，不直连 domain/topic）。文案与字段口径与 brain 壳内原实现
-逐字一致，包括两处刻意保留的怪癖：
-  * ``clamp_limit``：``int(limit or default)``——limit 为假值（0/None/""）
-    时走 default 而不是夹取下界；
-  * ``build_members``：``truncated`` 用严格大于（恰好等于 clip 不算截断）。
+Zero imports (not even domain same-layer cross-references -- the clip
+constant and summary_state callback are injected by the shell, not wired
+straight to domain/topic). The wording and field conventions are verbatim
+identical to the original in-brain-shell implementation, including two
+deliberately kept quirks:
+  * ``clamp_limit``: ``int(limit or default)`` -- a falsy limit (0/None/"")
+    takes default rather than the clamp lower bound;
+  * ``build_members``: ``truncated`` uses strictly greater-than (exactly
+    equal to clip does not count as truncated).
 """
 from __future__ import annotations
 
@@ -19,10 +23,12 @@ from typing import Any
 
 def clamp_limit(limit: Any, *, default: int = 30, lo: int = 1,
                 hi: int = 200) -> int:
-    """素材条数归一：``int(limit or default)`` 后夹到 [lo, hi]。
+    """Material count normalization: ``int(limit or default)`` then clamped
+    to [lo, hi].
 
-    怪癖复刻：``limit or default`` 让 0/None/"" 都取 default（不是 lo）；
-    负值与超上界才真正被夹。非数字字符串会抛 ValueError（与原实现同）。
+    Quirk replicated: ``limit or default`` makes 0/None/"" all take default
+    (not lo); only negatives and over-the-cap values are truly clamped.
+    Non-numeric strings raise ValueError (same as the original).
     """
     n = int(limit or default)
     if n < lo:
@@ -34,11 +40,13 @@ def clamp_limit(limit: Any, *, default: int = 30, lo: int = 1,
 
 def build_members(by_id: dict[str, dict[str, Any]], picked: list[str],
                   *, clip: int) -> list[dict[str, Any]]:
-    """把 representative_ids 选中的记忆投影成素材条目。
+    """Project the memories picked by representative_ids into material
+    entries.
 
-    内容先做空白归一（``" ".join(str(...).split())``）再按 clip 截断；
-    ``truncated`` 是严格大于（恰好 clip 长度不算截断）；entities 只带前
-    3 个；timestamp 原样透传（缺键为 None）。
+    Content is first whitespace-normalized (``" ".join(str(...).split())``)
+    then truncated to clip; ``truncated`` is strictly greater-than (exactly
+    clip length does not count as truncated); entities carry only the first
+    3; timestamp passed through verbatim (None when the key is missing).
     """
     members: list[dict[str, Any]] = []
     for mid in picked:
@@ -56,7 +64,7 @@ def build_members(by_id: dict[str, dict[str, Any]], picked: list[str],
 
 def brief_hint(*, has_alive: bool, has_vec: bool,
                has_members: bool) -> str:
-    """brief 的 note 四路选择（按优先级从上到下）。"""
+    """The brief note's four-way selection (top to bottom by priority)."""
     if not has_alive:
         return "none of this topic's members are currently active; check knowledge_map first"
     if not has_vec:
@@ -73,9 +81,10 @@ def build_brief_payload(*, tid: str, topic: dict[str, Any],
                         alive_n: int, members: list[dict[str, Any]],
                         no_vec: int, auto: bool, hint: str,
                         summary: Any) -> dict[str, Any]:
-    """brief 回显体组装（十一键）。topic 投影：title 缺省 "(未命名)"，
-    entities/tags 只带前 3 个，size/member_total 用传入的存活计数，
-    shown 由 members 长度自算。"""
+    """Brief echo body assembly (eleven keys). topic projection: title
+    defaults to "(未命名)", entities/tags carry only the first 3,
+    size/member_total use the passed-in alive counts, shown is computed
+    from len(members)."""
     return {
         "ok": True, "enabled": True, "action": "brief",
         "topic_id": tid,

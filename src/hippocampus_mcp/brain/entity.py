@@ -1,42 +1,47 @@
 # -*- coding: utf-8 -*-
-"""B2-3 P2：实体与专名词库簇
+"""B2-3 P2: entity and proper-noun lexicon cluster
 
-本簇从 ``brain.py`` 逐字搬来。
+This cluster was moved over verbatim from ``brain.py``.
 
-为什么这一簇能整体搬：它写的 5 个属性（``_alias_reverse`` /
-``_lexicon_mtime`` / ``entity_lexicon`` / ``entity_lexicon_aliases`` /
-``entity_lexicon_path``）**簇外写者只有 ``__init__``** —— 写者成簇，
-搬走不会把一个属性的写者拆散到两个文件里。这是 AST 数出来的，
-不是按命名猜的。
+Why the whole cluster could move: among the writers of its 5 attributes
+(``_alias_reverse`` / ``_lexicon_mtime`` / ``entity_lexicon`` /
+``entity_lexicon_aliases`` / ``entity_lexicon_path``), **the only writer
+outside the cluster is ``__init__``** -- writers travel as a cluster, so
+moving it does not split one attribute's writers across two files. This
+was counted via AST, not guessed from naming.
 
-P1 已经先搬走了这簇里的 9 个纯方法（``_read_lexicon`` /
-``_parse_lexicon_text`` / ``_clean_entity_name`` …），本模块
-只装剩下那些真正碰实例状态的。
+P1 already moved the 9 pure methods of this cluster (``_read_lexicon`` /
+``_parse_lexicon_text`` / ``_clean_entity_name`` ...); this module only
+holds the remaining ones that actually touch instance state.
 
-⚠️ ``discover_aliases`` 搬走后，相关的结构守卫断言（原本只扫
-brain.py）已同步改为同时扫本文件——否则那个结构守卫会假失败。
+Warning: after ``discover_aliases`` moved, the related structural guard
+assertions (originally scanning only brain.py) were updated in step to
+scan this file as well -- otherwise that structural guard would fail
+falsely.
 """
 
 from __future__ import annotations
 
-from ..common.constants import *  # noqa: F401,F403  （常量表：见 common/constants.__all__）
+from ..common.constants import *  # noqa: F401,F403  (constant table: see common/constants.__all__)
 from ..common.constants import logger
 import os
 import re
 from typing import Any
 from ..domain import aliases as alias_mod
 from ..store.memory import MemoryState
-from ..config import load_config  # noqa: E402  （env 读收编 config）
+from ..config import load_config  # noqa: E402  (env reads folded into config)
 
 
 class _EntityLexiconMixin:
-    """B2-3 P2：实体与专名词库簇"""
+    """B2-3 P2: entity and proper-noun lexicon cluster"""
 
     def reload_lexicon(self) -> int:
-        """重新加载专名词库（词库文件改了不用重启服务）。返回词条数。
+        """Reload the proper-noun lexicon (no service restart needed when the
+        lexicon file changes). Returns the number of lexicon entries.
 
-        路径会重新解析：启动时若词库文件还不存在（``path=None``），
-        之后补上文件再调用本方法也能生效。
+        The path is re-resolved: if the lexicon file did not exist at startup
+        (``path=None``), adding the file afterwards and calling this method
+        still takes effect.
         """
         persist_dir = getattr(self.manager, "persist_dir", None) or self.persist_dir
         self.entity_lexicon_path = self._resolve_lexicon_path(
@@ -45,17 +50,20 @@ class _EntityLexiconMixin:
         self.entity_lexicon, self.entity_lexicon_aliases = self._read_lexicon(
             self.entity_lexicon_path
         )
-        self._alias_reverse = None      # 反向索引失效（别名映射变了）
+        self._alias_reverse = None      # reverse index invalidated (alias mapping changed)
         self._lexicon_mtime = self._lexicon_mtime_of(self.entity_lexicon_path)
         return len(self.entity_lexicon)
 
 
 
     def _ensure_default_lexicon_path(self) -> str | None:
-        """默认词库路径；**文件不存在就创建它**（解开"没词库就建不了词库"的死锁）。
+        """Default lexicon path; **create the file if it does not exist** (breaks
+        the "no lexicon without a lexicon" deadlock).
 
-        返回 None = 连 persist_dir 都没有（纯内存库）或目录不可写 —— 只有这时
-        才真的没法落盘，交给调用方报错（报错要说清查过哪三条路径）。
+        Returns None = there is not even a persist_dir (pure in-memory library)
+        or the directory is not writable -- only then is persisting truly
+        impossible; hand the error to the caller (the error must state which
+        three paths were searched).
         """
         persist_dir = getattr(self.manager, "persist_dir", None) or self.persist_dir
         if not persist_dir:
@@ -64,7 +72,7 @@ class _EntityLexiconMixin:
         if not os.path.isfile(default_lex):
             try:
                 with open(default_lex, "a", encoding="utf-8"):
-                    pass        # touch：先建一个空词库，随后按正常路径追加
+                    pass        # touch: create an empty lexicon first, then append via the normal path
             except OSError:
                 return None
         return default_lex
@@ -73,19 +81,27 @@ class _EntityLexiconMixin:
 
 
     def _reload_lexicon_if_changed(self) -> int:
-        """词库文件变了就热加载一遍（**不新增 MCP 工具**：挂在 ``stats()`` 上顺带做）。
+        """Hot-reload the lexicon when its file changed (**no new MCP tool**: done
+        alongside ``stats()``).
 
-        为什么需要它：daemon 是长驻进程，而词库路径在构造时只解析一次
-        （:meth:`_resolve_lexicon_path`）。服务启动那刻 ``entity_lexicon.txt``
-        还不存在 ⇒ ``path=None``；用户之后把文件放进记忆库，本进程**不会**
-        重新解析，``entity_lexicon_size`` 就恒为 0，而 ``lexicon_add`` 又因为
-        ``path=None`` 直接抛错 —— 死锁，只能重启 daemon。
-        （实测确认：这正是「词库热加载失效」的真实形态，不是路径没回退。）
+        Why this is needed: the daemon is a long-lived process and the lexicon
+        path is resolved only once at construction
+        (:meth:`_resolve_lexicon_path`). If ``entity_lexicon.txt`` does not
+        exist at service start => ``path=None``; when the user later drops the
+        file into the memory library, this process will **not** re-resolve,
+        ``entity_lexicon_size`` stays 0 forever, and ``lexicon_add`` raises
+        directly because ``path=None`` -- a deadlock, only escapable by
+        restarting the daemon.
+        (Confirmed by testing: this is exactly the real shape of "lexicon hot
+        reload broken", not a missing path fallback.)
 
-        返回词条数。异常一律吞掉并保留原样：自曝归自曝，不能让 ``stats()`` 挂掉。
+        Returns the number of entries. Exceptions are always swallowed and the
+        state left as-is: self-exposure aside, ``stats()`` must not die.
 
-        线程安全：只**替换** ``entity_lexicon`` 等引用，不原地改集合。并发线程
-        可能短暂读到旧引用，但不会崩（daemon 多线程共享 brain 的既有约定）。
+        Thread safety: only **replaces** references such as ``entity_lexicon``,
+        never mutates the collections in place. Concurrent threads may briefly
+        read stale references but will not crash (existing convention of the
+        daemon's multi-threaded shared brain).
         """
         persist_dir = getattr(self.manager, "persist_dir", None) or self.persist_dir
         path = self._resolve_lexicon_path(self._explicit_lexicon_path, persist_dir)
@@ -102,10 +118,13 @@ class _EntityLexiconMixin:
 
 
     def canonical_entity(self, name: str) -> str:
-        """把实体名归一到规范名（词库别名行声明的 ``别名 => 主名``）。
+        """Normalize an entity name to its canonical name (the ``别名 => 主名``
+        declared by lexicon alias lines).
 
-        未登记为别名的原样返回。**抽取侧与查询侧都走这里**——只归一一边等于
-        没归一：库里挂的是主名，查"别名"照样吃不到实体加成。
+        Names not registered as aliases are returned as-is. **Both the
+        extraction side and the query side go through here** -- normalizing
+        only one side is the same as not normalizing: the library stores the
+        main name, so querying the "alias" still gets no entity boost.
         """
         n = (name or "").strip()
         if not n:
@@ -116,7 +135,7 @@ class _EntityLexiconMixin:
 
 
     def _canonicalize_map(self, mapping: dict[str, str]) -> dict[str, str]:
-        """把 ``{实体名: origin}`` 里的别名折到规范名，同键取更高可信度来源。"""
+        """Fold aliases in ``{实体名: origin}`` to canonical names; for the same key keep the higher-trust origin."""
         if not getattr(self, "entity_lexicon_aliases", None):
             return mapping
         merged: dict[str, str] = {}
@@ -136,17 +155,19 @@ class _EntityLexiconMixin:
 
 
     def _trusted_entity_ids(self) -> set[str]:
-        """受信任实体的 id 集合。
+        """Set of ids of trusted entities.
 
-        每次现算（E 量级约千余，不到 1ms）。不缓存是为了避免"实体表被
-        增删改后缓存失效"这类难以发现的陈旧 bug——这里不是热路径。
+        Computed fresh each time (E is on the order of a thousand entries,
+        well under 1ms). No caching, to avoid hard-to-spot stale bugs like
+        "cache invalidation after the entity table is added to/removed
+        from/modified" -- this is not a hot path.
         """
         return {e["id"] for e in self.entities.values() if self._entity_trusted(e)}
 
 
 
     def entity_origin_stats(self) -> dict[str, int]:
-        """按来源统计实体数，用于观察抽取质量（受信任 vs 候选）。"""
+        """Count entities by origin, for observing extraction quality (trusted vs candidate)."""
         out: dict[str, int] = {}
         for ent in self.entities.values():
             o = self._entity_origin(ent)
@@ -156,16 +177,19 @@ class _EntityLexiconMixin:
 
 
     def _recompute_entity_stats(self, keys: list[str] | None = None) -> int:
-        """重算实体统计（mention_count / first_seen / last_seen）。
+        """Recompute entity stats (mention_count / first_seen / last_seen).
 
-        以「当前存活的记忆」为准：已被删除的记忆 id 会从 ``memory_ids``
-        里摘除。删除、作废记忆后必须调用，否则倒排索引会留下悬挂引用。
+        Based on "currently alive memories": ids of already-deleted memories
+        are pruned from ``memory_ids``. Must be called after deleting or
+        superseding memories, otherwise the inverted index keeps dangling
+        references.
 
         Args:
-            keys: 要重算的实体键列表；None 表示全量重算（加载旧库时自愈用）。
+            keys: entity keys to recompute; None means a full recompute
+                (self-heal when loading an old library).
 
         Returns:
-            被摘除的悬挂引用总数。
+            Total number of dangling references pruned.
         """
         items = (
             list(self.entities.items()) if keys is None
@@ -192,12 +216,12 @@ class _EntityLexiconMixin:
 
 
     def _task_entity_ids(self, text: str) -> set[str]:
-        """文本里**受信任**实体的 id 集合（钉住排序 / 相关性判定共用）。"""
+        """Ids of **trusted** entities found in the text (shared by pin ordering / relevance decisions)."""
         if not (text or "").strip():
             return set()
         try:
             origins = self.extract_entities_with_origin(text)
-        except Exception:  # noqa: BLE001 —— 抽取失败不该让 session_start 失败
+        except Exception:  # noqa: BLE001 -- extraction failure must not fail session_start
             return set()
         out: set[str] = set()
         for name, origin in origins.items():
@@ -212,7 +236,7 @@ class _EntityLexiconMixin:
 
 
     def _alias_siblings(self, canon_key: str) -> list[str]:
-        """指向该规范名的**别名**实体 key（小写）。惰性建反向索引，reload 时失效。"""
+        """Entity keys of the **aliases** pointing to this canonical name (lowercase). Lazily builds the reverse index; invalidated on reload."""
         if not self.entity_lexicon_aliases:
             return []
         rev = getattr(self, "_alias_reverse", None)
@@ -226,10 +250,13 @@ class _EntityLexiconMixin:
 
 
     def _alias_family(self, key: str) -> list[str]:
-        """该实体键**所属的别名同族**（含自身、规范名、全部兄弟别名）。
+        """The **alias family** this entity key belongs to (itself, the canonical
+        name, and all sibling aliases).
 
-        ``key`` 可能本身就是别名（历史数据里"子安"独立建过档），此时也要能
-        找到它的规范名与兄弟——所以先查别名映射得到规范名，再展开。
+        ``key`` may itself be an alias (in historical data "子安" was archived
+        independently); in that case we still need to find its canonical name
+        and siblings -- so first look up the alias mapping for the canonical
+        name, then expand.
         """
         k = (key or "").lower()
         if not k:
@@ -246,10 +273,11 @@ class _EntityLexiconMixin:
 
 
     def _resolve_entity(self, entity_key: str) -> dict[str, Any] | None:
-        """按名字（含别名）找实体条目。
+        """Find an entity entry by name (aliases included).
 
-        优先级：规范名实体 → 同族里**提及最多**的那个（历史数据里可能只有
-        别名建过档，此时不该报"没有这个实体"）。
+        Priority: the canonical-name entity -> the family member with the
+        **most mentions** (in historical data sometimes only the alias was
+        archived; in that case we must not report "no such entity").
         """
         canon = self.canonical_entity(entity_key or "")
         ent = self.entities.get(canon.lower())
@@ -264,11 +292,15 @@ class _EntityLexiconMixin:
 
 
     def _entity_memory_ids(self, ent: dict[str, Any]) -> list[str]:
-        """实体**连同其别名同族**的记忆 id（去重保序）。
+        """Memory ids of the entity **together with its alias family** (dedup,
+        order-preserving).
 
-        读取侧立刻合并，而不是等 ``relink_entities`` 重挂：历史数据里同一个
-        实体往往已经按别名拆成了好几份档案，只认规范名会让"刚配好别名"的人
-        看到一份残缺档案。词库是配置，配置生效不该依赖一次数据重写。
+        The read side merges immediately instead of waiting for
+        ``relink_entities`` to re-link: in historical data the same entity is
+        often already split into several archives by alias; recognizing only
+        the canonical name would show someone who "just configured an alias"
+        a partial archive. The lexicon is configuration, and configuration
+        taking effect must not depend on a one-time data rewrite.
         """
         ids = list(ent.get("memory_ids", []))
         seen = set(ids)
@@ -287,7 +319,7 @@ class _EntityLexiconMixin:
 
 
     def entity_facts(self, entity_key: str, limit: int = 5) -> list[str]:
-        """取某实体的活跃事实列表（按时间倒序）。别名会被归一到规范名。"""
+        """List an entity's active facts (newest first). Aliases are normalized to the canonical name."""
         ent = self._resolve_entity(entity_key)
         if not ent:
             return []
@@ -302,7 +334,7 @@ class _EntityLexiconMixin:
 
 
     # ==================================================================
-    # 实体档案 / 词库扩充闭环（用层需求）
+    # Entity profile / lexicon expansion closed loop (usage-layer requirement)
     # ==================================================================
     def entity_profile(
         self,
@@ -311,17 +343,23 @@ class _EntityLexiconMixin:
         order: str = "asc",
         include_superseded: bool = False,
     ) -> dict[str, Any]:
-        """取某实体的完整档案：把它参与过的记忆**按时间拉一遍**。
+        """Fetch an entity's full profile: pull all memories it participated in,
+        in time order.
 
-        与 :meth:`entity_facts` 的区别：后者只返回内容字符串（给上下文装配用），
-        本方法返回带 ``timestamp`` / ``source`` / ``memory_id`` / ``state`` 的
-        结构化条目——宿主写人物戏前要"把某人的全部定案按时间拉一遍"时，
-        需要能按时间核、能回指原文件、能看出哪条已被作废。
+        Difference from :meth:`entity_facts`: the latter returns only content
+        strings (for context assembly); this method returns structured entries
+        with ``timestamp`` / ``source`` / ``memory_id`` / ``state`` -- when the
+        host wants to "pull someone's entire set of finalized decisions in
+        time order" before writing character scenes, it needs to verify by
+        time, point back to the original file, and see which entries have
+        been superseded.
 
         Args:
-            order: ``"asc"``（默认，时间正序，适合拉时间线）/ ``"desc"``（最近的在前）。
-            include_superseded: 是否带上已作废条目（默认只看 active）。
-            limit: 最多返回条数；传 0 表示不限。
+            order: ``"asc"`` (default, chronological, good for timelines) /
+                ``"desc"`` (most recent first).
+            include_superseded: whether to include superseded entries
+                (default only active).
+            limit: max entries returned; 0 means unlimited.
         """
         canon = self.canonical_entity(entity_key or "")
         ent = self._resolve_entity(entity_key)
@@ -356,8 +394,9 @@ class _EntityLexiconMixin:
             "count": len(kept),
             "facts": kept,
         }
-        # 别名同族：合并了几个别名档案、查的是从哪个名字折过来的——
-        # 不显式说出来，宿主会以为"档案只有这些"（其实另一份挂在别名下）。
+        # Alias family: how many alias archives were merged, and which name the
+        # query was folded in from -- if not stated explicitly, the host will
+        # assume "this archive is all there is" (the rest hangs under an alias).
         sibs = [k for k in self._alias_family(ent.get("key", ""))
                 if k != ent.get("key")]
         if sibs:
@@ -376,10 +415,12 @@ class _EntityLexiconMixin:
         min_mentions: int = 1,
         trusted_only: bool = False,
     ) -> list[dict[str, Any]]:
-        """列出实体（按提及条数降序），用于发现"库里到底有哪些实体 key"。
+        """List entities (descending by mention count), to discover "which
+        entity keys actually exist in the library".
 
-        没有这个入口时，宿主只能靠猜实体名去调 :meth:`entity_profile`——
-        而实体名是抽取出来的，拼写往往和记忆里的写法不一致。
+        Without this entry point the host can only guess entity names when
+        calling :meth:`entity_profile` -- and entity names are extracted, so
+        their spelling often differs from how they appear in the memories.
         """
         rows: list[dict[str, Any]] = []
         for ent in self.entities.values():
@@ -403,27 +444,39 @@ class _EntityLexiconMixin:
 
 
     def lexicon_add(self, terms: list[str], relink: bool = True) -> dict[str, Any]:
-        """向**当前生效的**词库追加专名并热加载。
+        """Append proper nouns to the **currently effective** lexicon and
+        hot-reload.
 
-        坑（实测）：词库不一定在记忆库目录里——宿主实际生效的路径是
-        ``data/entity_lexicon_<项目名>.txt``（靠 env / 显式参数生效，记忆库目录里
-        **没有** entity_lexicon.txt）。若写回 ``<persist_dir>/entity_lexicon.txt``，
-        会凭空造出一个不生效的新文件：宿主以为加成功了，检索毫无变化。
-        因此一律写回 ``self.entity_lexicon_path``（实际生效的那个）。
+        Pitfall (found by testing): the lexicon is not necessarily in the
+        memory library directory -- the host's actually effective path is
+        ``data/entity_lexicon_<项目名>.txt`` (via env / explicit argument; the
+        memory library directory has **no** entity_lexicon.txt). Writing back
+        to ``<persist_dir>/entity_lexicon.txt`` would conjure up a new file
+        that has no effect: the host believes the addition succeeded while
+        retrieval changes not at all. Therefore always write back to
+        ``self.entity_lexicon_path`` (the actually effective one).
 
         Args:
-            terms: 词条列表。**支持别名行**——``"子安 => 顾言"``（``->`` / ``→``
-                等价）。别名会写进词库文件，抽取与查询两侧随之归一。这是
-                "同一实体多种称法"的通用解，不限于人名（简称/全称/旧称/代号
-                同理）。语法不完整的行**不写盘**，原样放进返回的 ``invalid``。
-            relink: 追加后是否对全库重挂实体。**默认必须做**：否则新词只对
-                之后写入的记忆生效，存量记忆仍然查不到，闭环断在这里。
-                写了别名时还会顺带做一次 :meth:`merge_alias_entities`，
-                把历史上按别名拆开的档案并回规范名。
+            terms: term list. **Alias lines supported** -- ``"子安 => 顾言"``
+                (``->`` / ``→`` equivalent). Aliases are written into the
+                lexicon file, and both extraction and query sides normalize
+                accordingly. This is the general solution to "one entity,
+                several names", not limited to person names (abbreviations/
+                full forms/old names/codes likewise). Syntactically incomplete
+                lines are **not persisted**; they go verbatim into the
+                returned ``invalid``.
+            relink: whether to re-link entities across the whole library after
+                appending. **Must be done by default**: otherwise new terms
+                only affect memories written later, existing memories remain
+                unfindable, and the closed loop breaks here. When aliases were
+                written, also runs :meth:`merge_alias_entities` along the way,
+                merging archives that history split apart by alias back into
+                the canonical name.
 
-        返回：``added`` 实际写盘的行 · ``skipped_duplicate`` · ``invalid`` ·
-        ``alias_count`` 生效别名总数（宿主核对归一是否真的挂了）·
-        ``lexicon_size`` / ``path`` · 可选的 ``relink`` / ``alias_merge``。
+        Returns: ``added`` lines actually persisted - ``skipped_duplicate`` -
+        ``invalid`` - ``alias_count`` total effective aliases (so the host can
+        check normalization really took hold) - ``lexicon_size`` / ``path`` -
+        optional ``relink`` / ``alias_merge``.
         """
         entries = list(dict.fromkeys(
             t.strip() for t in (terms or []) if t and t.strip()
@@ -432,15 +485,20 @@ class _EntityLexiconMixin:
         if not entries:
             return {"added": [], "lexicon_size": len(self.entity_lexicon), "path": path}
         if not path:
-            # 自愈：默认路径下文件不存在时 path 就是 None（构造时解析过一次）。
-            # 这时应当**创建**默认文件，而不是报错——否则宿主陷入死锁：
-            # 没有词库 → 本工具报错 → 建不了词库 → 只能重启 daemon。
+            # Self-heal: when the file under the default path does not exist,
+            # path is None (resolved once at construction). We should
+            # **create** the default file here, not raise -- otherwise the
+            # host deadlocks:
+            # no lexicon -> this tool raises -> lexicon cannot be created ->
+            # daemon restart is the only way out.
             path = self._ensure_default_lexicon_path()
         if not path:
             _dir = getattr(self.manager, "persist_dir", None) or self.persist_dir
             _env = load_config().entity_lexicon or ""
-            # 如实说清查过哪三条路——旧文案只说「persist_dir 未设」，而真因
-            # 通常是「默认路径下的文件不存在」，把人往完全错误的地方引。
+            # State truthfully which three paths were searched -- the old
+            # message only said "persist_dir unset", while the real cause is
+            # usually "file under the default path missing", sending people
+            # entirely the wrong way.
             raise ValueError(
                 "cannot append to the lexicon: no writable lexicon path. Searched, in order -- "
                 f"1) explicit entity_lexicon_path="
@@ -472,11 +530,11 @@ class _EntityLexiconMixin:
                 continue
             if existing_aliases.get(alias.lower(), "").lower() == canon.lower():
                 continue
-            # 落盘统一用规范写法（`别名 => 主名`），避免文件里三种箭头混用
+            # Persist using the canonical spelling (`别名 => 主名`), avoiding three arrow styles mixed in the file
             added.append(f"{alias} => {canon}")
             has_alias = True
         if added:
-            # 追加到末尾：保留原有注释与分组，不重写整个文件
+            # Append at the end: preserve existing comments and grouping, do not rewrite the whole file
             with open(path, "a", encoding="utf-8") as f:
                 f.write("\n" + "\n".join(added) + "\n")
         size = self.reload_lexicon()
@@ -489,7 +547,8 @@ class _EntityLexiconMixin:
             "path": path,
         }
         if invalid:
-            # 不静默吞：写坏的别名行若当成功返回，宿主会以为归一已生效
+            # Do not swallow silently: if a malformed alias line is returned
+            # as success, the host will believe normalization took effect
             out["invalid"] = invalid
         if relink:
             out["relink"] = self.relink_entities()
@@ -501,19 +560,26 @@ class _EntityLexiconMixin:
 
 
     def merge_alias_entities(self) -> dict[str, Any]:
-        """把别名档案并进规范名档案（消歧后的库整理）。
+        """Merge alias archives into the canonical-name archive (library cleanup
+        after disambiguation).
 
-        读取侧（:meth:`entity_profile` / :meth:`entity_facts`）本来就会合并别名
-        同族，所以**不跑它查询也是对的**；跑它是为了把库真正理干净——否则
-        ``entity_list`` 会长期并列"子安"与"顾言"两份档案，画像槽位、mention
-        计数、实体加成也各算一份。
+        The read side (:meth:`entity_profile` / :meth:`entity_facts`) already
+        merges alias families, so **not running this is also correct for
+        queries**; running it is to truly clean up the library -- otherwise
+        ``entity_list`` keeps showing "子安" and "顾言" as two parallel
+        archives, and the profile slot, mention counts, and entity boosts are
+        each counted separately.
 
-        动作：①别名条目的 ``memory_ids`` 并入规范名条目（并集，origin 取更高）；
-        ②那些记忆的 ``entity_ids`` 把别名 id 换成规范名 id；③删掉别名条目；
-        ④全量重算统计。规范名条目尚不存在时直接**改名**（id 与倒排都不动）。
+        Actions: (1) merge the alias entry's ``memory_ids`` into the canonical
+        entry (union; origin takes the higher); (2) in those memories'
+        ``entity_ids``, replace the alias id with the canonical id;
+        (3) delete the alias entry; (4) recompute all stats. When the
+        canonical entry does not exist yet, simply **rename** (id and inverted
+        index untouched).
 
-        与 :meth:`forget` 的区别：这里不是删除语义，是**同一性归并**——
-        记忆一条不少，只是不再挂在两个名字下。
+        Difference from :meth:`forget`: this is not deletion semantics but
+        **identity merging** -- not a single memory is lost; it just no longer
+        hangs under two names.
         """
         if not self.entity_lexicon_aliases:
             return {"merged": 0, "renamed": 0, "remapped_memories": 0}
@@ -548,7 +614,8 @@ class _EntityLexiconMixin:
                     remapped += 1
                 if mid not in c["memory_ids"]:
                     c["memory_ids"].append(mid)
-            # 来源只升不降：别名条目若被词库确认过，规范名也该拿到这份信任
+            # Origin only goes up, never down: if the alias entry was confirmed
+            # by the lexicon, the canonical name should receive that trust too
             if _ORIGIN_RANK.get(a.get("origin", ENTITY_ORIGIN_HEURISTIC), 0) > \
                     _ORIGIN_RANK.get(c.get("origin", ENTITY_ORIGIN_HEURISTIC), 0):
                 c["origin"] = a["origin"]
@@ -570,16 +637,23 @@ class _EntityLexiconMixin:
         in_lexicon: set[str],
         docs: dict[str, int],
     ) -> tuple[str, str, str]:
-        """判断这一对里"谁是别名、谁是规范名"，返回 ``(alias, canonical, 依据)``。
+        """Decide which of the pair is the alias and which the canonical name;
+        returns ``(alias, canonical, basis)``.
 
-        规则按可信度排序，**每一档都能说清楚理由**（依据会出现在候选里，
-        因为方向猜错等于把两份档案并错，必须让人一眼能复核）：
+        Rules ordered by trustworthiness; **each tier's reason must be
+        stateable** (the basis appears in the candidate, because guessing the
+        direction wrong means merging two archives wrongly -- a human must be
+        able to re-check at a glance):
 
-          1. 一方已在词库登记为别名 → 规范名取它指向的那个（人已经表过态）
-          2. 一方在词库（正式词条）→ 它是规范名
-          3. 提及更多的一方 → 规范名（建档 mention_count 与共现条数取大）
-          4. 更长的一方 → 规范名（全称优先于简称）
-          5. 仍平手 → 字典序，并在依据里注明"需人工确认方向"
+          1. One side already registered in the lexicon as an alias -> the
+             canonical name is the one it points to (a human already decided)
+          2. One side is in the lexicon (formal entry) -> it is the canonical
+             name
+          3. The side with more mentions -> canonical (max of archive
+             mention_count and co-occurrence count)
+          4. The longer side -> canonical (full form over abbreviation)
+          5. Still tied -> lexicographic order, and the basis notes
+             "direction needs manual confirmation"
         """
         ca = self.canonical_entity(a)
         cb = self.canonical_entity(b)
@@ -623,86 +697,130 @@ class _EntityLexiconMixin:
         refine: bool = True,
         max_probe_names: int = 200,
     ) -> dict[str, Any]:
-        """挖"同一实体的多种称法"候选。**只出候选 + 证据，不写盘。**
+        """Mine candidates for "several names for the same entity". **Candidates
+        and evidence only; nothing is written to disk.**
 
-        与 :meth:`lexicon_suggest` 的分工：那个是"这个词还没登记，要不要登记
-        成专名"；这个是"这两个名字指同一个东西吧"——问的是**关系**，不是词。
+        Division of labor vs :meth:`lexicon_suggest`: that one asks "this word
+        is not registered yet -- should it be registered as a proper noun";
+        this one asks "these two names refer to the same thing" -- the
+        question is a **relation**, not a word.
 
-        为什么要自动发现：归一的**机制**（``lexicon_add("别名 => 主名")``）早就
-        有了，缺的是**发现**——同一个实体在语料里换了三种写法，人得先读到才会
-        想到去登记。这一步把"读全库找称法"的活从人手里拿回来。
+        Why discover automatically: the normalization **mechanism**
+        (``lexicon_add("别名 => 主名")``) has existed for a long time; what
+        was missing is **discovery** -- when the same entity appears in three
+        spellings across the corpus, a human must first read them before
+        thinking of registering them. This step takes the "read the whole
+        library looking for names" work back from human hands.
 
-        为什么只出候选：别名一旦合并就**改变实体身份**，猜错等于把两个不同
-        对象的记忆混成一档且事后难拆。所以这里绝不自动写盘，只给
-        ``paste``（可直接粘给 ``lexicon_add`` 的一行）与 ``evidence``（原文）。
+        Why candidates only: once merged, an alias **changes entity
+        identity**; guessing wrong means mixing memories of two different
+        objects into one archive, hard to untangle afterwards. So this never
+        writes to disk automatically; it only returns ``paste`` (a line
+        directly pasteable into ``lexicon_add``) and ``evidence`` (original
+        text).
 
-        信号与判据见 :mod:`hippocampus_mcp.domain.aliases`；五条硬门控：
-          * **形状**：两侧都得是名字形状（纯汉字 2~12 / 纯拉丁），
-            且不能是纯数字词（"第三""一百二十"）；
-          * **噪声**：两侧都不能命中停用词三层（与 ``lexicon_suggest`` 同源）
-            或"角色/关系词"表（``作者/读者/主角/用户…``）；
-          * **提示词的位置**：分隔符必须在提示词**之前**（"甲，字乙"）。
-            提示词多是常用字（字/号/名/称），"句号""编号""简称"里的那个字
-            不是称谓——真实库实测这条是**噪声的大头**：放宽成"任一侧有分隔符"
-            时，「碎句号、长段落」「全量换号、活跃文档」「同章全称后简称」
-            这类假命中占了候选的一半以上（25 条里 16 条）。丢弃数见
-            ``skipped.cue_context`` / ``cue_sep_after_only``。
-          * **共现必须有锚**：纯共现对（``cooc``）要求至少一侧已在词库登记，
-            或两侧存在包含关系（缩写/全称）——否则"两本书名老一起出现"也会
-            进候选。
-            （注：**没有**把这条推广到模式类。实测过，不成立——见下。）
-          * **统计信号不能单独成立**（``allow_stat_only=False``，默认）：
-            ``cooc`` 与 ``abbrev`` 只用来**加强**模式信号。真实库实测
-            ``台湾外记 => 台湾`` / ``剡溪雪 => 剡溪`` / ``听女道士卞玉京弹琴歌 =>
-            卞玉京`` 这类对，包含度 100%、提升度几百，全都在"共现"上完美成立，
-            但它们不是同一个东西——**标题里出现某人的名字，不等于标题是那个
-            人的别名**。子串 + 共现推不出"同指"，这是本轮实测最重要的结论。
+        Signals and criteria are in :mod:`hippocampus_mcp.domain.aliases`;
+        five hard gates:
+          * **Shape**: both sides must be name-shaped (pure Chinese 2~12 /
+            pure Latin) and must not be pure number words ("第三""一百二十");
+          * **Noise**: neither side may hit the three stop-word layers (same
+            source as ``lexicon_suggest``) or the role/relation-word table
+            (``作者/读者/主角/用户…``);
+          * **Cue position**: the separator must come **before** the cue word
+            ("甲，字乙"). Cue words are common characters (字/号/名/称); the
+            same character inside "句号""编号""简称" is not an appellation --
+            real-library testing showed this is the **biggest noise source**:
+            relaxing to "separator on either side" produced false hits like
+            「碎句号、长段落」「全量换号、活跃文档」「同章全称后简称」
+            accounting for more than half of candidates (16 of 25). Drop
+            counts in ``skipped.cue_context`` / ``cue_sep_after_only``.
+          * **Co-occurrence needs an anchor**: pure co-occurrence pairs
+            (``cooc``) require at least one side already registered in the
+            lexicon, or a containment relation between the two sides
+            (abbreviation/full form) -- otherwise "two book titles always
+            appearing together" would also become candidates.
+            (Note: this was **not** extended to the pattern class. Tested;
+            does not hold -- see below.)
+          * **Statistical signals cannot stand alone**
+            (``allow_stat_only=False``, default): ``cooc`` and ``abbrev``
+            only **reinforce** pattern signals. Real-library testing: pairs
+            like ``台湾外记 => 台湾`` / ``剡溪雪 => 剡溪`` /
+            ``听女道士卞玉京弹琴歌 => 卞玉京`` have 100% containment and lifts
+            in the hundreds, all perfect on "co-occurrence", yet they are not
+            the same thing -- **a title containing someone's name does not
+            make the title that person's alias**. Substring + co-occurrence
+            cannot derive "same referent"; this is the round's most important
+            tested conclusion.
 
-        为什么**不**给模式类也加"至少一端在库内"的锚（试过，被数据否掉）：
-        真实库 50 条候选里 44 条是"双端都没进实体索引"的，而人工判为真的 9 条里
-        有 8 条**也是单端未知**（"苏文 => 阿文""明远 => 于山""云锦 => 俞锦"
-        全都不在实体索引里）——锚挡噪声的同时会把真候选一起删掉。
-        能分开真假的是**提示词的位置**，不是"在不在库里"。
+        Why the pattern class does **not** get an "at least one end in the
+        library" anchor (tried; rejected by the data): of 50 real-library
+        candidates, 44 had "neither end in the entity index", and 8 of the 9
+        judged true by a human **were also single-end-unknown** ("苏文 =>
+        阿文""明远 => 于山""云锦 => 俞锦" were all absent from the entity
+        index) -- while blocking noise, the anchor would delete true
+        candidates along with them. What separates true from false is **cue
+        position**, not "in the library or not".
 
         Args:
-            top_n: 最多返回多少个候选，默认 30（按置信度降序）。
-            min_confidence: 置信度门槛，默认 0.35。提示词（0.50）单独就能过；
-                括号同位语（0.30）**单独过不了**，需要多几条证据（支持度加成）
-                或再有别的信号——真实库实测"（一手）""（作者）"这类注释性括号
-                太多，让括号单独成立会拉低整张表的可用性。
-            allow_stat_only: 是否允许**只靠统计信号**（共现 / 包含）成候选，
-                默认 False。见下文"三条硬门控"里的说明——子串 + 共现推不出"同指"。
-            min_support: 纯共现对的最少共同出现条数，默认 2。
-            min_lift: 纯共现对的提升度门槛，默认 2.0（独立时 ≈1）。
-            min_containment: 纯共现对的包含度门槛，默认 0.5 ——
-                ``共同出现条数 / 两侧较少的那一方的条数``，即"提到少的那一方时，
-                有多大概率另一方也在场"。**与 min_lift 是并列关系，满足其一即可**：
-                提升度在名字很少的小语料上天然趋近 1，只看它会把真候选整批漏掉。
-            max_evidence: 每个候选最多带几条原文证据，默认 3。
-            max_names_per_record: 单条记忆最多取几个名字参与两两配对，默认 12
-                —— 成本闸门，防一条"实体清单"式长文本把挖掘拖垮。
-            exclude: 本次临时排除词（不落盘），与 ``lexicon_suggest`` 同义。
-            cue_words: 本次额外补充的称谓提示词（不落盘）。
-            with_paren: 是否扫括号同位语，默认 True。
-            refine: 是否做**第二轮全库补扫**，默认 True。未登记的别名在第一轮
-                只在那条被模式抓到的记忆里"被认识"，支持度会被严重低估；
-                第二轮拿第一轮的候选名（通常几十个）全库精确扫一遍，把
-                "在多条记忆里都出现"这件事统计出来。大库上这是主要的耗时项，
-                想快就关掉（会明显掉召回）。
-            max_probe_names: 第二轮最多补扫多少个候选名，**成本闸门**（默认 200）。
+            top_n: max candidates returned, default 30 (descending by
+                confidence).
+            min_confidence: confidence gate, default 0.35. Cue-word hits
+                (0.50) pass alone; parenthetical appositions (0.30) **cannot
+                pass alone**, needing a few more pieces of evidence (support
+                bonus) or another signal -- real-library testing found too
+                many annotational parentheses like "（一手）""（作者）";
+                letting parentheses stand alone would sink the whole table's
+                usability.
+            allow_stat_only: whether candidates may rest **only on
+                statistical signals** (co-occurrence / containment), default
+                False. See the hard-gates notes above -- substring +
+                co-occurrence cannot derive "same referent".
+            min_support: minimum shared-appearance count for pure
+                co-occurrence pairs, default 2.
+            min_lift: lift gate for pure co-occurrence pairs, default 2.0
+                (independence is ~1).
+            min_containment: containment gate for pure co-occurrence pairs,
+                default 0.5 -- ``共同出现条数 / 两侧较少的那一方的条数``, i.e.
+                "when the less-mentioned side appears, how likely the other
+                side is present too". **Parallel to min_lift; either one
+                suffices**: on small corpora with few names lift naturally
+                approaches 1, and lift alone would miss whole batches of true
+                candidates.
+            max_evidence: max original-text evidence items per candidate,
+                default 3.
+            max_names_per_record: max names per memory entering pairwise
+                matching, default 12 -- a cost gate, preventing one
+                "entity list"-style long text from dragging the mining down.
+            exclude: temporary exclusions for this run (not persisted), same
+                meaning as ``lexicon_suggest``.
+            cue_words: extra appellation cue words for this run (not
+                persisted).
+            with_paren: whether to scan parenthetical appositions, default
+                True.
+            refine: whether to run a **second whole-library sweep**, default
+                True. Unregistered aliases are only "known" in the one memory
+                the pattern caught in round one, badly undercounting support;
+                round two takes round one's candidate names (usually a few
+                dozen) and scans the library exactly once more to count
+                "appears in multiple memories". On large libraries this is
+                the main time cost; turn it off for speed (noticeably loses
+                recall).
+            max_probe_names: how many candidate names the second sweep may
+                probe, **cost gate** (default 200).
 
         Returns:
-            ``candidates``（alias/canonical/confidence/**band**/signals/support/
-            lift/direction_basis/paste/evidence）· ``scanned`` · ``cue_words`` ·
-            ``stop_words`` · ``skipped``（各门控挡掉多少，便于判断是不是阈值
-            设错了）· ``note``。
+            ``candidates`` (alias/canonical/confidence/**band**/signals/
+            support/lift/direction_basis/paste/evidence) - ``scanned`` -
+            ``cue_words`` - ``stop_words`` - ``skipped`` (how many each gate
+            blocked, to judge whether a threshold is set wrong) - ``note``.
         """
         in_lexicon = {t.lower() for t in self.entity_lexicon}
         trusted_keys = {
             k.lower() for k, e in self.entities.items() if self._entity_trusted(e)
         }
-        # 已知词只用于**切分辅助**（从"此人是顾言，字子安"里切出"顾言"），
-        # 不参与对错判断——所以宁可取得干净些，别把启发式噪声塞进来。
+        # Known terms serve only as **segmentation aid** (cutting "顾言" out
+        # of "此人是顾言，字子安"), not as correctness judges -- prefer a
+        # cleaner set over stuffing heuristic noise in.
         known = in_lexicon | trusted_keys
         name_disp = {k.lower(): e.get("name", k) for k, e in self.entities.items()}
         lex_disp = {t.lower(): t for t in self.entity_lexicon}
@@ -729,10 +847,11 @@ class _EntityLexiconMixin:
             ent["disp"].setdefault(kb, b or name_disp.get(kb) or lex_disp.get(kb) or kb)
             return ent
 
-        # ---- 扫库：模式类信号 + 共现用的名字集合 --------------------------
-        # 两条是**同一份定义**：断言不同会走偏。
-        #   形状（name_like + 不是角色/关系词 + 不撞停用词）
-        #   —— 只用来决定"这个名字值不值得拿去统计"，不影响最终候选判定。
+        # ---- Scan the library: pattern-class signals + name set for co-occurrence
+        # These two are **one and the same definition**: divergent assertions drift.
+        #   Shape (name_like + not a role/relation word + no stop-word collision)
+        #   -- only decides "is this name worth feeding into statistics"; it
+        #   does not affect final candidate adjudication.
         def _probe_ok(w: str) -> bool:
             if not alias_mod.name_like(w):
                 return False
@@ -750,10 +869,12 @@ class _EntityLexiconMixin:
             if rec.state == MemoryState.ARCHIVED.value:
                 continue
             n_records += 1
-            # 名字集合 = 已建档且受信任的实体 ∪ **本条里模式挖到的名字**。
-            # 后者很关键：模式只证明"这一条里它们并列"，共现才能证明
-            # "它们在很多条里总是一起出现"——同一对候选两条信号叠加时，
-            # 置信度与支持度才反映得出真实强度。
+            # Name set = archived trusted entities ∪ **names the pattern mined
+            # from this record**. The latter matters: patterns only prove
+            # "they are listed together in this one record"; co-occurrence is
+            # what proves "they always appear together across many records" --
+            # only when both signals stack on the same candidate pair do
+            # confidence and support reflect true strength.
             names = {
                 id_to_key[eid] for eid in (rec.entity_ids or [])
                 if id_to_key.get(eid) in trusted_keys
@@ -774,10 +895,14 @@ class _EntityLexiconMixin:
                 names.add(ka)
                 names.add(kb)
                 if p.signal == "cue":
-                    # **只有提示词信号的名字进补扫候选**。理由：提示词是一句
-                    # 明确的"这是同一个东西的另一种叫法"（"甲，字乙"），而括号
-                    # 只是并列——"《明季南略》（一手）"里的"一手"是注释不是称法。
-                    # 拿括号产物去全库补扫，等于把一个误判**放大成几十条支持度**。
+                    # **Only cue-signal names become probe-sweep candidates**.
+                    # Rationale: a cue is an explicit statement "this is
+                    # another name for the same thing" ("甲，字乙"), while
+                    # parentheses are mere juxtaposition -- "一手" in
+                    # "《明季南略》（一手）" is an annotation, not an
+                    # appellation. Feeding parenthesis products into the
+                    # whole-library probe sweep **amplifies one misjudgment
+                    # into dozens of support counts**.
                     rec_probe.add(ka)
                     rec_probe.add(kb)
                 ent = _touch(ka, kb, p.a, p.b)
@@ -795,11 +920,15 @@ class _EntityLexiconMixin:
             pass1.append((rec.id, names))
             probe |= {x for x in rec_probe if _probe_ok(x)}
 
-        # ---- 第二轮：候选名很小，全库精确扫一遍求真实支持度 ---------------
-        # 第 1 轮里，**未被识别的别名**（"子安"这种）只在那一条被模式抓到；
-        # 它在别的记忆里出现时没人认得，支持度就被严重低估。候选名字集合很小
-        # （通常几十个），所以值得再扫一遍库把它们认全——支持度是共现信号
-        # 能说话的前提，不补这一轮，"在多条记忆里都成立"就永远看不到。
+        # ---- Round two: the candidate-name set is small; one exact whole-library
+        # sweep yields true support -----------------------------------------
+        # In round 1, **unrecognized aliases** ("子安"-style) are only caught
+        # in the one record the pattern matched; when they appear in other
+        # memories nobody recognizes them, badly undercounting support. The
+        # candidate name set is small (usually a few dozen), so a second
+        # library sweep to recognize them fully is worth it -- support is the
+        # precondition for the co-occurrence signal to say anything; without
+        # this round, "holds across many memories" is never seen.
         cooc_input = pass1
         probe_list: list[str] = []
         if refine and probe:
@@ -816,7 +945,7 @@ class _EntityLexiconMixin:
                 names |= {n for n in probe_list if n in low}
                 cooc_input.append((rec.id, names))
 
-        # ---- 共现 + 提升度 ------------------------------------------------
+        # ---- Co-occurrence + lift -----------------------------------------
         pair_counts, docs, n_seen = alias_mod.cooccurrence(
             cooc_input, max_names_per_record=max_names_per_record
         )
@@ -826,17 +955,21 @@ class _EntityLexiconMixin:
                 continue
             da, db = docs.get(ka, 0), docs.get(kb, 0)
             lf = alias_mod.lift_of(cnt, da, db, n_seen)
-            # 两条**并列**判据，满足其一即可：
-            #   ① 提升度（超过独立假设）——适合"简称与全称一起出现"这类；
-            #   ② 包含度 count_ab / min(count_a, count_b) ——"只要提到 a 就总会
-            #      提到 b"。小语料上提升度天然趋近 1（库里就这么几个名字），
-            #      只看提升度会把真候选整批漏掉。
+            # Two **parallel** criteria; either one suffices:
+            #   (1) lift (exceeding the independence assumption) -- fits
+            #       "abbreviation and full form appearing together" cases;
+            #   (2) containment count_ab / min(count_a, count_b) -- "whenever
+            #       a is mentioned, b is always mentioned too". On small
+            #       corpora lift naturally approaches 1 (the library just has
+            #       few names); lift alone would miss whole batches of true
+            #       candidates.
             contain = cnt / min(da, db) if min(da, db) > 0 else 0.0
             if lf < min_lift and contain < min_containment:
                 continue
             rel = alias_mod.abbrev_relation(ka, kb)
             if ka not in in_lexicon and kb not in in_lexicon and not rel:
-                # 纯共现必须有锚：否则"两本书名总一起出现"也会进候选
+                # Pure co-occurrence needs an anchor: otherwise "two book
+                # titles always appearing together" would also become candidates
                 continue
             n_cooc_kept += 1
             ent = _touch(ka, kb)
@@ -851,19 +984,25 @@ class _EntityLexiconMixin:
                     "text": f"co-occur {cnt} times (lift {lf:.1f}x / containment {contain:.0%}）",
                 })
 
-        # ---- 门控 → 定方向 → 打分 → 排序 ---------------------------------
+        # ---- Gate -> direction -> scoring -> ordering ----------------------
         skipped = {"declared": 0, "shape": 0, "noise": 0, "stop": 0,
                    "stat_only": 0, "lowconf": 0,
-                   # 提示词前面没有分隔符而丢弃的命中数；其中"分隔符只在提示词
-                   # 之后"的那个数是**假命中的典型形态**（句号/编号/简称），
-                   # 单独露出来，好判断这条门控是不是在误杀。
+                   # Hits dropped because no separator precedes the cue word;
+                   # the subset "separator only after the cue" is the
+                   # **typical shape of a false hit** (句号/编号/简称) --
+                   # surfaced separately so one can judge whether this gate
+                   # is over-killing.
                    "cue_context": ctx_stat.get("cue_no_sep_before", 0),
                    "cue_sep_after_only": ctx_stat.get("cue_sep_after_only", 0)}
-        # 统计信号（共现 / 包含）**只能加强模式信号，不能单独成候选**。
-        # 真实库实测：`台湾外记 => 台湾`、`剡溪雪 => 剡溪`、`听女道士卞玉京弹琴歌 =>
-        # 卞玉京` 这类"书名/标题包含人名/地名"的对，包含关系与共现都完美成立
-        # （包含度 100%、提升度几百），但它们**不是同一个东西**——标题里出现
-        # 某人的名字，不代表标题就是那个人的别名。子串+共现推不出"同指"。
+        # Statistical signals (co-occurrence / containment) can **only
+        # reinforce pattern signals; they cannot become candidates alone**.
+        # Real-library testing: pairs like `台湾外记 => 台湾`, `剡溪雪 => 剡溪`,
+        # `听女道士卞玉京弹琴歌 => 卞玉京` where a book title/heading contains
+        # a person/place name have perfect containment and co-occurrence
+        # (containment 100%, lift in the hundreds), yet they are **not the
+        # same thing** -- a name appearing in a title does not make the title
+        # that person's alias. Substring + co-occurrence cannot derive "same
+        # referent".
         _STAT_SIGNALS = {"cooc", "abbrev"}
 
         def _bad_stop(w: str) -> bool:
@@ -882,7 +1021,8 @@ class _EntityLexiconMixin:
             if _bad_stop(ka) or _bad_stop(kb):
                 skipped["stop"] += 1
                 continue
-            # 已声明为同一族（两边都归到同一个规范名）→ 本来就是归一好的
+            # Already declared the same family (both sides normalize to the
+            # same canonical name) -> already normalized
             if self.canonical_entity(ka).lower() == self.canonical_entity(kb).lower():
                 skipped["declared"] += 1
                 continue
@@ -901,13 +1041,19 @@ class _EntityLexiconMixin:
                 "alias": a_disp,
                 "canonical": c_disp,
                 "confidence": conf,
-                # 三档，给调用方一个**不用自己重算**的分流依据：
-                #   high   ≥0.60 多信号（或高支持）——值得直接复核；
-                #   medium 0.45~0.60 单提示词成立——**必须逐条看 evidence**；
-                #   low    <0.45 仅括号/统计——基本是注释性并列。
-                # 为什么要这一档：真实库上单字提示词（字/号/名）歧义大，
-                # "明远 => 于山""云锦 => 俞锦" 与 "改为 => 同安""无事 => 自建"
-                # 的置信度是同一个 0.52，**分数分不开**，只能靠人看证据。
+                # Three bands, giving the caller a triage basis it does not
+                # have to recompute:
+                #   high   >=0.60 multi-signal (or high support) -- worth
+                #       reviewing directly;
+                #   medium 0.45~0.60 single cue word -- **must read each
+                #       evidence item**;
+                #   low    <0.45 parenthesis/statistics only -- mostly
+                #       annotational juxtaposition.
+                # Why this band: on the real library single-character cue
+                # words (字/号/名) are ambiguous; "明远 => 于山""云锦 =>
+                # 俞锦" and "改为 => 同安""无事 => 自建" share the very same
+                # 0.52 confidence -- **the score cannot separate them**; only
+                # a human reading the evidence can.
                 "band": ("high" if conf >= 0.60 else
                          "medium" if conf >= 0.45 else "low"),
                 "signals": sorted(ent["signals"]),
@@ -927,8 +1073,9 @@ class _EntityLexiconMixin:
                 "records_with_names": n_seen,
                 "pairs": len(agg),
                 "cooc_pairs_kept": n_cooc_kept,
-                # 第二轮补扫用了哪些名字（只来自**提示词**信号，见上）。
-                # 暴露出来是为了让"括号产物有没有被拿去做全库放大"可核对。
+                # Which names the round-two probe sweep used (from **cue**
+                # signals only, see above). Exposed so that "were parenthesis
+                # products amplified library-wide" is auditable.
                 "probe_names": probe_list,
             },
             "cue_words": cue_stat,
@@ -948,62 +1095,90 @@ class _EntityLexiconMixin:
         max_len: int = 4,
         exclude: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """列出"高频出现但没登记进词库"的候选专名，供人工过筛后追加。
+        """List candidate proper nouns that "appear frequently but are not yet
+        registered in the lexicon", for human screening and later appending.
 
-        **不用启发式抽取做信号源**（实测否决）：
-        中文没有分词与 NER，``_heuristic_entities`` 靠引号/句式正则，在真实库
-        9359 条上只产出 34 个种类、最高频次 2，且全是"活人的制""人成本逐"这类
-        被切碎的片段——它不是专名发现器，拿它做候选必然交付一堆垃圾。
+        **Heuristic extraction is not used as the signal source** (rejected by
+        testing): Chinese has no word segmentation or NER;
+        ``_heuristic_entities`` relies on quote/sentence-pattern regexes and
+        on the real library's 9359 records produced only 34 distinct kinds
+        with a top frequency of 2, all shredded fragments like "活人的制"
+        "人成本逐" -- it is not a proper-noun finder; using it as the
+        candidate source would deliver a pile of garbage.
 
-        改用**中文 n-gram 频次统计**（零依赖的新词发现最简形态）：
-          1. 按 2~4 字滑窗统计"出现在多少条记忆里"（同一条内去重，避免一条短文
-             把某个词刷高）与"跨几个源文件"；
-          2. 剔除含噪声字的、**命中停用词的**（内置通用行话 ∪ 项目文件 ∪ exclude）、
-             已在词库的、已是受信任实体的；
-          3. **碎片抑制**：若某短候选被更长的候选以 >=90% 的频次包含
-             （如"活人"总出现在"活人的制"里），判为切片碎片，丢弃。
+        Instead uses **Chinese n-gram frequency statistics** (the simplest
+        zero-dependency new-word discovery):
+          1. Sliding windows of 2~4 characters count "in how many memories it
+             appears" (deduped within one record, so a single short text
+             cannot inflate a term) and "across how many source files";
+          2. Drop terms containing noise characters, **hitting stop words**
+             (built-in generic jargon ∪ project file ∪ exclude), already in
+             the lexicon, or already trusted entities;
+          3. **Fragment suppression**: if a short candidate is contained by a
+             longer candidate at >=90% of the latter's frequency (e.g. "活人"
+             always appearing inside "活人的制"), judge it a slicing fragment
+             and drop it.
 
         Args:
-            min_docs: 至少在多少条记忆里出现过，默认 4（主力门槛）。
-            min_files: 至少跨几个源文件，默认 2。**只在单个文件里反复出现的
-                多半是该文件的小节标题 / 术语**，不是要登记的专名。
-            min_len / max_len: 候选长度，默认 3~4。默认不从 2 字起——
-                实测 2 字候选几乎被"主角/用户/正文/定案/第一次"这类通用词占满。
-            exclude: 临时排除词（一次性排雷，不落盘）。**停用词共三层，逐层增补**：
-                ① **内置通用行话**（`_DEFAULT_LEXICON_STOP`，代码里，开箱即用）——
-                   "本章/正文/时间线/待核清单/用户定案/第一次"这类跨项目套话，
-                   外加一条"纯中文数字+量词"规则（第五节/十二年）；
-                ② **项目停用词文件** `<词库同目录>/entity_lexicon_stop.txt`
-                   （一行一个，# 注释）——放**项目特有**的结构标签/行话
-                   （如"感情线/伏笔表/制度篇"）。内置层只管通用的，项目词放这里；
-                ③ 本参数 `exclude`——只想这一次排除的词。
-                匹配时会**连带压掉已登记词的切片**（登记"用户定案"即可同时挡住
-                "户定案/页定案"这类 3 字碎片），所以只需写完整短语，
-                不必再手工枚举前缀碎片。
+            min_docs: minimum number of memories it appeared in, default 4
+                (the main gate).
+            min_files: minimum number of source files, default 2. Terms
+                **recurring only within a single file are usually that file's
+                section headings / terminology**, not proper nouns to
+                register.
+            min_len / max_len: candidate length, default 3~4. Does not start
+                at 2 characters by default -- testing showed 2-char
+                candidates are almost entirely generic words like
+                "主角/用户/正文/定案/第一次".
+            exclude: temporary exclusion words (one-shot demining, not
+                persisted). **Stop words total three layers, added
+                cumulatively**:
+                (1) **built-in generic jargon** (`_DEFAULT_LEXICON_STOP`, in
+                    code, works out of the box) -- cross-project boilerplate
+                    like "本章/正文/时间线/待核清单/用户定案/第一次", plus a
+                    "pure Chinese numeral + measure word" rule (第五节/十二年);
+                (2) **project stop-word file** `<词库同目录>/entity_lexicon_stop.txt`
+                    (one per line, # comments) -- for **project-specific**
+                    structural labels/jargon (e.g. "感情线/伏笔表/制度篇").
+                    The built-in layer handles only generic words; project
+                    words go here;
+                (3) this `exclude` argument -- words to exclude just this
+                    once.
+                Matching also **suppresses slices of already-registered
+                terms** (registering "用户定案" also blocks 3-char fragments
+                like "户定案/页定案"), so write the full phrase; no need to
+                hand-enumerate prefix fragments.
         """
         in_lexicon = {t.lower() for t in self.entity_lexicon}
         trusted_keys = {
             k.lower() for k, e in self.entities.items() if self._entity_trusted(e)
         }
-        # 停用词三层（只做增补，后者不覆盖前者）：
-        #   ① **内置**通用行话 `_DEFAULT_LEXICON_STOP`——开箱即用，不需要任何配置。
-        #      这就是 D4 之前"噪声高"的根因：老版本只有 ② 和 ③，新项目不写文件
-        #      就必然被"用户定案/时间线/第一次"这种词霸榜。
-        #   ② 项目停用词文件 `<词库同目录>/entity_lexicon_stop.txt`
-        #   ③ 本次调用的 `exclude` 参数（临时排除，不落盘）
+        # Three stop-word layers (additive only; later layers do not override
+        # earlier ones):
+        #   (1) **Built-in** generic jargon `_DEFAULT_LEXICON_STOP` -- works
+        #       out of the box, needs no configuration. This is the root
+        #       cause of the pre-D4 "high noise": old versions had only (2)
+        #       and (3), so a new project without the file was inevitably
+        #       dominated by words like "用户定案/时间线/第一次".
+        #   (2) Project stop-word file `<词库同目录>/entity_lexicon_stop.txt`
+        #   (3) this call's `exclude` argument (temporary, not persisted)
         stop, stop_grams, stop_stat = self._stop_grams(exclude)
         logger.info(
             "[lexicon_suggest] %d stopwords (built-in %d / project file %d / excluded this run %d)",
             len(stop), stop_stat["builtin"], stop_stat["file"], stop_stat["extra"],
         )
         noise = tuple(self._NOISE_CHARS)
-        # 多统计一层（不输出）：4 字候选要靠 5 字频次才能识别它是不是碎片
-        # ——否则"天工开"/"工开物"会各自以 48 条混进候选，而它们只是"天工开物"的切片。
+        # Count one extra layer (not output): 4-char candidates need 5-char
+        # frequencies to identify whether they are fragments -- otherwise
+        # "天工开"/"工开物" would each sneak into candidates with 48 records,
+        # though they are mere slices of "天工开物".
         stat_max = max_len + 1
         docs: dict[str, int] = {}
-        # 全量计数（**不做**词库/受信任实体过滤），专供碎片抑制使用。
-        # 少了它就会出现这种怪事："天工开物"已在词库里 → 被排除 → 没人能证明
-        # "天工开""工开物"只是它的切片 → 两个碎片各自以 48 条混进候选列表。
+        # Full counts (**no** lexicon/trusted-entity filtering), used solely
+        # for fragment suppression. Without it this absurdity happens:
+        # "天工开物" is already in the lexicon -> excluded -> nothing can
+        # prove "天工开" and "工开物" are only its slices -> both fragments
+        # sneak into the candidate list with 48 records each.
         raw: dict[str, int] = {}
         files: dict[str, set[str]] = {}
         for rec in self.manager.store.iter_records():
@@ -1031,14 +1206,19 @@ class _EntityLexiconMixin:
                         if n <= max_len:
                             files.setdefault(g, set()).add(src)
 
-        # 碎片抑制：短候选被更长候选"包住"就丢掉（只在候选集内部比较，不再扫库）
+        # Fragment suppression: drop a short candidate "wrapped" by a longer
+        # one (compared within the candidate set only, no library re-scan)
         pool = {t: c for t, c in docs.items() if c >= min_docs}
-        # 碎片抑制：判据走 raw（已在词库里的长词也能压住自己的碎片）。
+        # Fragment suppression: the criterion uses raw (long words already in
+        # the lexicon can also suppress their own fragments).
         #
-        # 做法是"由长压短"而不是"对每个短候选找超串"——后者要拿几百个短候选
-        # 去比几百万个 gram，实测 63 秒。反过来遍历长 gram、拆出它的子串，
-        # 并**先把压不住任何东西的低频长 gram 剪掉**（候选的 docs 都 >= min_docs，
-        # 抑制它至少需要 0.9*min_docs 的频次），实测回到秒级。
+        # The approach is "long suppresses short", not "find superstrings for
+        # each short candidate" -- the latter compares hundreds of short
+        # candidates against millions of grams, measured at 63 seconds.
+        # Instead iterate long grams, split out their substrings, and **first
+        # prune low-frequency long grams that cannot suppress anything**
+        # (candidates all have docs >= min_docs, so suppressing one needs at
+        # least 0.9*min_docs frequency) -- measured back to seconds.
         short_set = {t for t in pool if len(t) < stat_max}
         floor = 0.9 * min_docs
         best: dict[str, int] = {}

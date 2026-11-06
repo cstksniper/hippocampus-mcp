@@ -1,39 +1,54 @@
-"""``hippocampus-mcp`` 命令行入口（setup / sync / doctor / models / serve）。
+"""``hippocampus-mcp`` command line entry point (setup / sync / doctor /
+models / serve).
 
-五个子命令::
+Five subcommands::
 
-    hippocampus-mcp serve     启动 MCP 服务（默认经 launcher，共享 daemon）
-    hippocampus-mcp setup     为一个宿主生成 / 合并 MCP 配置
-    hippocampus-mcp sync      发现所有宿主配置并同步同一条目（默认预览）
-    hippocampus-mcp doctor    体检：路径 / 库 / 模型 / 依赖是否就绪
-    hippocampus-mcp models    本地模型缓存：占用明细 / 谁在用 / 回收冗余
+    hippocampus-mcp serve     start the MCP service (via the launcher by
+                              default, shared daemon)
+    hippocampus-mcp setup     generate / merge MCP configuration for one host
+    hippocampus-mcp sync      discover all host configs and sync the same
+                              entry (preview by default)
+    hippocampus-mcp doctor    health check: paths / library / model /
+                              dependencies ready
+    hippocampus-mcp models    local model cache: usage detail / who uses it /
+                              reclaim redundancy
 
-**为什么要有 setup**：MCP 协议只规定传输（stdio / SSE）与 JSON-RPC，
-**没有规定配置文件放哪**。各宿主自行实现，连 JSON 顶层键名都不同
-（WorkBuddy 与 TRAE 用 ``mcpServers``，ZCode 用 ``mcp.servers``），
-本项目无法让宿主改掉这些差异。
+**Why setup exists**: the MCP protocol only specifies transport
+(stdio / SSE) and JSON-RPC; **it does not specify where config files live**.
+Each host implements its own, differing even in the JSON top-level key name
+(WorkBuddy and TRAE use ``mcpServers``, ZCode uses ``mcp.servers``); this
+project cannot make hosts change those differences.
 
-但差异可以**吸收进本命令**：用户只跑一条命令、只维护一份意图
-（用哪个库、哪个剖面、哪个模型），由本命令翻译成各宿主各自的格式。
-用户侧看到的体验是统一的 —— 这正是 setup 存在的全部理由。
+But the differences can be **absorbed into this command**: the user runs one
+command and maintains one intent (which library, which profile, which
+model), and this command translates it into each host's own format. What
+the user experiences is uniform -- that is the entire reason setup exists.
 
-**安全纪律**（写宿主配置时最容易出事的四点）：
+**Safety discipline** (the four easiest ways writing host configs goes
+wrong):
 
-1. **写前必备份**：目标文件先复制成 ``<名字>.bak-<时间戳>``，再写。
-2. **解析失败就停**：既有配置 JSON 损坏时**不覆盖**，报错并让人手工修 ——
-   那里面可能还有别的 MCP server，覆盖掉是连带损失。
-3. **只动自己那一条**：合并而非整文件替换，别的 server 条目原样保留。
-4. **写后即验**：写完自动按写入的配置**真实握手一次**（initialize +
-   tools/list），起不来当场给出原因 —— 不把发现时机留给用户重启宿主
-   撞上"工具数为 0"的那一刻。``--no-verify`` 可跳过。
-5. **sync 默认只预览**：它面向 ``_HOSTS`` 之外的宿主（文件名约定 +
-   形态嗅探，见 ``host_configs``），写错地方的代价比 setup 更高，
-   所以与 ``models`` 的删盘同款纪律 —— 不带 ``--yes`` 一个字节都不动，
-   且只对已存在的文件动手，绝不新建。
+1. **Back up before writing**: copy the target file to
+   ``<name>.bak-<timestamp>`` first, then write.
+2. **Stop on parse failure**: when an existing config's JSON is corrupt,
+   **do not overwrite**; raise and let a human fix it manually -- it may
+   contain other MCP servers, and overwriting them is collateral damage.
+3. **Touch only our own entry**: merge rather than replace the whole file;
+   other server entries are preserved as-is.
+4. **Post-write verification**: after writing, automatically perform one
+   **real handshake** (initialize + tools/list) with the written config;
+   if it cannot start, give the reason on the spot -- do not leave
+   discovery to the moment the user restarts the host and hits "0 tools".
+   ``--no-verify`` skips it.
+5. **sync previews by default**: it targets hosts outside ``_HOSTS``
+   (filename conventions + shape sniffing, see ``host_configs``), where
+   writing to the wrong place costs more than setup, so it follows the same
+   discipline as ``models``' disk deletion -- without ``--yes`` not one
+   byte is touched, and only existing files are modified, never created.
 """
 
-# 豁免登记：本文件的 env 直读是自省命令的展示透传（读给人看，
-# 值与 config 一致），封闭清单见 config.py「根层豁免清单」。
+# Exemption registry: this file's direct env reads are display pass-throughs
+# of introspection commands (read for humans; values match config); the
+# closed list is in config.py's "root-layer exemption list".
 
 from __future__ import annotations
 
@@ -53,8 +68,9 @@ LIBRARY_DEFAULT = "~/.hippocampus/brain"
 MODEL_DEFAULT = "BAAI/bge-base-zh-v1.5"
 PROFILE_DEFAULT = "common"
 
-# 宿主 → 配置文件的 JSON 键路径（**差异就在这里**，别处无差别）
-# key_path 是嵌套键：("mcpServers",) 与 ("mcp", "servers") 两种都要能读写。
+# Host -> JSON key path of the config file (**the difference lives right
+# here**; nowhere else). key_path is a nested-key tuple: both ("mcpServers",)
+# and ("mcp", "servers") must be readable and writable.
 _HOSTS: dict[str, dict] = {
     "workbuddy": {
         "label": "WorkBuddy",
@@ -80,10 +96,10 @@ _HOSTS: dict[str, dict] = {
 
 
 # --------------------------------------------------------------------------
-# 路径推导
+# Path derivation
 # --------------------------------------------------------------------------
 def user_config_path(host: str) -> Path | None:
-    """宿主的用户级配置路径；该宿主没有用户级配置时返回 None。"""
+    """The host's user-level config path; None when the host has no user-level config."""
     home = Path.home()
     appdata = os.environ.get("APPDATA", "")
     if host == "workbuddy":
@@ -101,16 +117,19 @@ def user_config_path(host: str) -> Path | None:
             return Path(appdata) / "Claude" / "claude_desktop_config.json"
         return home / ".config" / "Claude" / "claude_desktop_config.json"
     if host == "zcode":
-        # 2026-10 升级后用户级配置迁到 cli/ 子目录（旧 ~/.zcode/config.json 已废弃）。
-        # 此前本函数对 zcode 返回 None——doctor/sync 看不见用户级配置，
-        # 09-28 补在旧位置的条目升级后丢失也无人能体检出来（盲区事故，
-        # 见 docs/design/ZCode用户级接入迁移_20261030.md §一）。
+        # After the 2026-10 upgrade the user-level config moved to the cli/
+        # subdirectory (the old ~/.zcode/config.json is deprecated).
+        # Previously this function returned None for zcode -- doctor/sync
+        # could not see the user-level config, and when the 09-28 entry added
+        # at the old location was lost in the upgrade, no health check could
+        # catch it (blind-spot incident, see
+        # docs/design/ZCode用户级接入迁移_20261030.md section 1).
         return home / ".zcode" / "cli" / "config.json"
     return None
 
 
 def project_config_path(host: str, workspace: Path) -> Path | None:
-    """宿主的工作区级配置路径。"""
+    """The host's workspace-level config path."""
     if host == "workbuddy":
         return workspace / ".mcp.json"
     if host == "zcode":
@@ -119,11 +138,13 @@ def project_config_path(host: str, workspace: Path) -> Path | None:
 
 
 def package_src_dir() -> tuple[Path | None, Path]:
-    """返回 (src 目录 | None, 包目录)。
+    """Return (src dir | None, package dir).
 
-    从 ``pip install`` 的 site-packages 里跑时**不需要** PYTHONPATH（包本来
-    就在 sys.path 上），此时返回 None；从仓库的 ``src/`` 布局跑时才需要。
-    这个区分很重要 —— 无脑写 PYTHONPATH 会在别人机器上指向一个不存在的目录。
+    When running from ``pip install``'s site-packages, PYTHONPATH is **not
+    needed** (the package is already on sys.path) and None is returned; it
+    is only needed when running from the repository's ``src/`` layout. This
+    distinction matters -- blindly writing PYTHONPATH would point at a
+    nonexistent directory on other people's machines.
     """
     pkg_dir = Path(__file__).resolve().parent
     parent = pkg_dir.parent
@@ -133,10 +154,10 @@ def package_src_dir() -> tuple[Path | None, Path]:
 
 
 # --------------------------------------------------------------------------
-# 配置读写（只动自己那一条）
+# Config read/write (touch only our own entry)
 # --------------------------------------------------------------------------
 def _dig(cfg: dict, key_path: tuple[str, ...], create: bool = False) -> dict | None:
-    """按键路径取容器；``create=True`` 时逐层补空字典。"""
+    """Fetch the container at the key path; with ``create=True`` fill in empty dicts level by level."""
     node: dict = cfg
     for key in key_path:
         nxt = node.get(key)
@@ -151,7 +172,7 @@ def _dig(cfg: dict, key_path: tuple[str, ...], create: bool = False) -> dict | N
 
 def build_entry(*, python: str, src_dir: Path | None, library: str,
                 model: str, profile: str, offline: bool) -> dict:
-    """构造单个 MCP server 条目（各宿主共用同一份，差异只在壳上）。"""
+    """Build a single MCP server entry (all hosts share the same one; the difference is only the shell)."""
     env: dict[str, str] = {}
     if src_dir is not None:
         env["PYTHONPATH"] = str(src_dir)
@@ -162,8 +183,9 @@ def build_entry(*, python: str, src_dir: Path | None, library: str,
     env["HIPPOCAMPUS_TOOL_PROFILE"] = profile
     env["HIPPOCAMPUS_LAUNCHER"] = "1"
     if offline:
-        # 只在用户明确要离线时加：开源用户第一次跑需要下载模型，
-        # 默认开 offline 会让人卡在"模型加载不出来"且无提示。
+        # Only set when the user explicitly asks for offline: open-source
+        # users need to download the model on first run; enabling offline by
+        # default would leave them stuck at "model fails to load" with no hint.
         env["HF_HUB_OFFLINE"] = "1"
     return {
         "type": "stdio",
@@ -176,9 +198,10 @@ def build_entry(*, python: str, src_dir: Path | None, library: str,
 def _read_config(path: Path) -> dict:
     cfg, err = hc.load_json_config(path)
     if cfg is None:
-        # 坏文件升级为停手：setup/sync 的写入路径必须在这里死掉，
-        # 而不是把别人的 server 条目连带覆盖掉（发现式扫描可以带伤
-        # 继续，写入不行——语义差异在 host_configs.load_json_config）。
+        # A bad file escalates to a full stop: setup/sync's write path must
+        # die here rather than take other servers' entries down with it
+        # (discovery-style scanning can continue wounded; writing must not --
+        # the semantic difference lives in host_configs.load_json_config).
         raise SystemExit(
             f"Configuration file {err}; stopped without writing: {path}\n"
             f"  It may contain other MCP servers; overwriting it would lose them. "
@@ -196,11 +219,13 @@ def _backup(path: Path) -> Path | None:
 
 
 def _detect_host(workspace: Path) -> str:
-    """未指定 ``--host`` 时按工作区特征猜宿主。
+    """Guess the host from workspace traits when ``--host`` is omitted.
 
-    判据刻意保守：只认「目录里已经存在的宿主痕迹」（``.zcode/`` 目录、
-    ``.mcp.json`` 文件），猜不出来就报错列出可选值，绝不静默选一个 ——
-    setup 写的是宿主的真配置，写错宿主比不写更糟。
+    The criteria are deliberately conservative: only recognize "host traces
+    already present in the directory" (a ``.zcode/`` directory, a
+    ``.mcp.json`` file); when guessing fails, raise and list the choices --
+    never silently pick one. setup writes the host's real configuration;
+    writing to the wrong host is worse than not writing.
     """
     if (workspace / ".zcode").is_dir():
         return "zcode"
@@ -212,17 +237,17 @@ def _detect_host(workspace: Path) -> str:
 
 
 # --------------------------------------------------------------------------
-# 写后即验（真实握手）
+# Post-write verification (real handshake)
 # --------------------------------------------------------------------------
 VERIFY_TIMEOUT = 120.0
 
 
 def _stderr_tail(fh) -> str:
-    """读子进程 stderr 的尾部（探测失败时给用户的第一手线索）。"""
+    """Read the tail of the child process's stderr (the first-hand clue given to the user when probing fails)."""
     try:
         fh.seek(0)
         txt = (fh.read() or "").strip()
-    except Exception:  # noqa: BLE001 —— 尾巴读不出就算了，别盖住主因
+    except Exception:  # noqa: BLE001 -- if the tail cannot be read, so be it; do not mask the primary cause
         return ""
     if not txt:
         return ""
@@ -233,20 +258,27 @@ def _stderr_tail(fh) -> str:
 
 def _verify_entry(entry: dict, cwd: str = "",
                   timeout: float = VERIFY_TIMEOUT) -> tuple[bool, str]:
-    """按写进配置的 command/args/env **真实拉起一次握手**。
+    """Actually start one handshake using the command/args/env written into
+    the config.
 
-    setup 此前只保证「配置写进去了」，不保证「宿主照着起得来」——解释器
-    路径错了、PYTHONPATH 没生效、包没装上，都要等用户重启宿主撞上
-    "工具数为 0" 才发现。这里把发现时机提前到 setup 当场：spawn 子进程，
-    走一遍 initialize + tools/list，能用/不能用于几秒内见分晓（握手不触发
-    模型加载，不会卡在分钟级的下载上）。
+    setup previously only guaranteed "the config got written", not "the host
+    can actually start from it" -- a wrong interpreter path, PYTHONPATH not
+    taking effect, or the package not installed would only surface when the
+    user restarted the host and hit "0 tools". Here discovery is moved up to
+    setup itself: spawn a child process, run through initialize +
+    tools/list, and usable/unusable is settled within seconds (the handshake
+    does not trigger model loading, so it will not hang on minute-scale
+    downloads).
 
-    返回 ``(ok, 明细)``。失败的明细必须**带原因**（超时 / 提前退出 /
-    报错响应 / stderr 尾部），否则用户还是得自己去翻日志。
+    Returns ``(ok, detail)``. The failure detail must **carry the reason**
+    (timeout / early exit / error response / stderr tail), otherwise the
+    user still has to dig through logs.
 
-    走 launcher 路径时（配置里的 ``HIPPOCAMPUS_LAUNCHER=1``），探测会顺手
-    把 daemon 拉起来；探测进程退出后 daemon 留存保温，空闲后自动回收，
-    宿主下次启动反而是热的 —— 这是副作用，不是缺陷。
+    When going through the launcher path (``HIPPOCAMPUS_LAUNCHER=1`` in the
+    config), the probe also brings the daemon up as a side effect; after the
+    probe process exits the daemon stays warm and is reclaimed when idle, so
+    the host's next start is actually hot -- this is a side effect, not a
+    defect.
     """
     import queue
     import subprocess
@@ -269,7 +301,7 @@ def _verify_entry(entry: dict, cwd: str = "",
 
     def _reader() -> None:
         try:
-            for raw in proc.stdout:          # 按行阻塞读；进程退出后循环自然结束
+            for raw in proc.stdout:          # blocking line reads; loop ends naturally when the process exits
                 lines_q.put(raw)
         finally:
             lines_q.put(None)
@@ -299,7 +331,8 @@ def _verify_entry(entry: dict, cwd: str = "",
                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                           "clientInfo": {"name": "hippocampus-setup-verify",
                                          "version": "0"}}})
-        # 理论上第一条响应就是 initialize 的；按 id 对账可以扛住带外行。
+        # In theory the first response is initialize's; matching by id
+        # withstands out-of-band lines.
         while True:
             obj = json.loads(_readline(deadline).decode("utf-8", "replace"))
             if obj.get("id") == 1:
@@ -324,7 +357,7 @@ def _verify_entry(entry: dict, cwd: str = "",
     except EOFError:
         return False, (f"Child process exited before completing handshake (exit={proc.poll()}). "
                        f"{_stderr_tail(err_fh)}")
-    except Exception as exc:  # noqa: BLE001 —— 探测器自己不能把 setup 带崩
+    except Exception as exc:  # noqa: BLE001 -- the prober itself must not take setup down
         return False, f"{type(exc).__name__}: {exc}"
     finally:
         for closer in (proc.stdin, proc.stdout):
@@ -342,17 +375,20 @@ def _verify_entry(entry: dict, cwd: str = "",
 
 
 # --------------------------------------------------------------------------
-# 子命令：setup
+# Subcommand: setup
 # --------------------------------------------------------------------------
 def _pick_value(value: str | None, old_value: str | None, default: str
                 ) -> tuple[str, str]:
-    """取值优先级：命令行 > 既有配置 > 默认。
+    """Value priority: command line > existing config > default.
 
-    中间那档**不能省**：省略的话，在本机跑一次 setup / sync 就会把
-    既有库换成新用户默认值 —— 用户以为只是"补个配置"，实际库被搬走了，
-    而且是静默的。这是写宿主配置最容易造成的破坏，所以显式写出来。
-    setup 与 sync 共用这条规则（sync 还要求**逐文件**继承：不同宿主
-    指不同库是合法状态，不是要被抹平的差异）。
+    The middle tier **cannot be skipped**: skipping it means one run of
+    setup / sync on this machine would swap the existing library for the
+    new-user default -- the user thinks they are just "filling in a config"
+    while the library is silently moved away. This is the most damaging
+    mistake writing host configs can cause, hence spelled out explicitly.
+    setup and sync share this rule (sync additionally requires **per-file**
+    inheritance: different hosts pointing at different libraries is a legal
+    state, not a difference to be flattened).
     """
     if value:
         return value, "CLI argument"
@@ -366,8 +402,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if args.host:
         host = args.host
     else:
-        # S4：不带 --host 时按工作区特征自动判定（有 .zcode/ → zcode；
-        # 有 .mcp.json → workbuddy）。猜不出来会明确报错，绝不瞎选。
+        # S4: without --host, infer from workspace markers (has .zcode/ ->
+        # zcode; has .mcp.json -> workbuddy). Guessing fails loudly; never
+        # pick blindly.
         host = _detect_host(workspace)
         print(f"--host omitted; inferred from workspace markers: {host}")
     spec = _HOSTS[host]
@@ -441,8 +478,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("[Post-write verification skipped] (--no-verify): availability is unverified; "
               "after restarting the host, call library_whoami to confirm")
     else:
-        # S2 写后即验：按**刚写入**的 entry 真实握手一次。失败给原因，
-        # 让"配置坏了"在 setup 当场现形，而不是等用户重启宿主后 silently 0 工具。
+        # S2 post-write verification: perform one real handshake with the
+        # **just-written** entry. Failures come with reasons, so "config is
+        # broken" shows up right here in setup instead of silently leaving
+        # the user with 0 tools after restarting the host.
         print("\nPost-write verification: performing a real handshake with the written "
               "config (initialize + tools/list)...")
         ok, detail = _verify_entry(entry, cwd=str(workspace))
@@ -454,8 +493,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             return 1
 
     print("\nNext steps:")
-    # 模型不在本地时，先把话说明白：模型是首启才下的，下载失败会让宿主里
-    # 「一个工具都没有」，届时人已经在会话里了，最难排查。
+    # When the model is not local, say it up front: the model is downloaded
+    # on first start; a failed download leaves the host with "not a single
+    # tool", and by then the user is already inside a session -- the hardest
+    # thing to diagnose.
     missing_model = False
     try:
         from .engine.embeddings import _cache_roots, _default_libs_path, local_model_dir
@@ -478,19 +519,25 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# 子命令：sync
+# Subcommand: sync
 # --------------------------------------------------------------------------
 def cmd_sync(args: argparse.Namespace) -> int:
-    """发现所有宿主配置，把同一条目同步进去（"配一次、同步到各家"）。
+    """Discover all host configs and sync the same entry into them ("configure
+    once, sync everywhere").
 
-    与 setup 的分工：``setup --host`` 认识的 4 家直写不扫描；sync 面向
-    **其余所有**宿主 —— 不维护宿主清单，靠 host_configs 的「文件名约定
-    + 形态嗅探」找配置。默认只预览（列候选 + 判定），--yes 才写。
+    Division of labor vs setup: the 4 hosts ``setup --host`` knows are
+    written directly without scanning; sync targets **all other** hosts --
+    no host list is maintained; configs are found via host_configs'
+    "filename conventions + shape sniffing". Preview only by default
+    (candidates + verdicts listed); --yes to write.
 
-    写入纪律：每文件独立继承取值（不同宿主指不同库是合法状态，不抹平）；
-    只动自己那条；写入前重新解析、坏文件当场停手跳过；条目与既有完全
-    一致则跳过（幂等，不产生冗余备份）；写完对**去重后的每份 entry**
-    各握手一次（逐文件继承可能产出不同 entry，只验一份会漏）。
+    Write discipline: each file inherits values independently (different
+    hosts pointing at different libraries is a legal state, not flattened);
+    touch only our own entry; re-parse before writing and stop-and-skip on
+    bad files; skip when the entry is already identical (idempotent, no
+    redundant backups); after writing, handshake **each deduplicated entry**
+    once (per-file inheritance can produce different entries; verifying only
+    one would miss the others).
     """
     workspace = Path(args.workspace).expanduser().resolve()
     candidates = hc.discover_configs(workspace, entry_name=args.name)
@@ -502,7 +549,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
           f"{'--yes will write' if args.yes else 'not written'})")
     n_skipped = 0
     for c in candidates:
-        if c.kind == "skip":            # 形态不符的只计数，不刷屏
+        if c.kind == "skip":            # shape mismatches are only counted, not printed
             n_skipped += 1
             continue
         note = c.reason or {"mine": "our entry already exists",
@@ -525,7 +572,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     for c in targets:
         cfg, err = hc.load_json_config(c.path)
         if cfg is None:
-            # 预览到写入之间文件可能变坏：再解析失败 = 停手跳过，绝不覆盖。
+            # The file may have gone bad between preview and write: a failed
+            # re-parse = stop and skip, never overwrite.
             print(f"  ⚠ Stopped at {c.path}: {err} (bad file not written; fix it manually)")
             continue
         key_path = c.key_path or ("mcpServers",)
@@ -586,14 +634,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# 子命令：doctor
+# Subcommand: doctor
 # --------------------------------------------------------------------------
 def _mark(ok: bool, warn: bool = False) -> str:
     return "[FAIL]" if not ok else ("[WARN]" if warn else "[ OK ]")
 
 
 def _entry_verdict(cpath: Path, spec: dict) -> str:
-    """单份配置的结论行：不存在 / 存在但没条目 / 存在且库指向哪。"""
+    """Verdict line for one config file: missing / exists without our entry / exists and where its library points."""
     if not cpath.exists():
         return "Missing (not wired up here)"
     try:
@@ -610,12 +658,16 @@ def _entry_verdict(cpath: Path, spec: dict) -> str:
 
 
 def _doctor_host_project(host: str, project: Path) -> None:
-    """宿主×目录的**结论式**判定（``doctor --host X --project <dir>``）。
+    """**Verdict-style** check of host x directory (``doctor --host X --project
+    <dir>``).
 
-    旧矩阵只「列出现有的」，缺「缺了谁」「该读哪份」——接入事故的典型形态
-    （把 ZCode 的配置错写成 ``.mcp.json``）在旧矩阵里看起来一片绿。这里按
-    「宿主会读什么 → 存不存在 → 库指向哪」给结论，并把目录里**存在但该宿主
-    不读**的配置文件点名出来。
+    The old matrix only "listed what exists", missing "what is missing" and
+    "which file should be read" -- the typical wiring incident (ZCode's
+    config mistakenly written as ``.mcp.json``) looked all green in the old
+    matrix. Here a verdict is given along "what the host reads -> does it
+    exist -> where does the library point", and config files in the
+    directory that **exist but this host does not read** are named
+    explicitly.
     """
     spec = _HOSTS[host]
     print(f"\nHost/workspace verdict: {spec['label']} @ {project}")
@@ -635,12 +687,15 @@ def _doctor_host_project(host: str, project: Path) -> None:
 
 
 def _doctor_workspace_binding(project: Path) -> None:
-    """D3：工作区绑定判定（``doctor --project`` 的结论式输出）。
+    """D3: workspace binding verdict (conclusion-style output of ``doctor
+    --project``).
 
-    该项目目录在用户级任务目录里登记了吗？命中 = 首个会话 HELLO 即绑到
-    该库（并给出读侧档位）；未登记 = 首用会自曝"未绑定"，并给出 onboarding
-    的一条命令形态。library/task_directory 都是轻导入（无 torch），
-    任何失败降级为一句"查不了"，绝不炸体检。
+    Is this project directory registered in the user-level task directory?
+    Hit = the first session's HELLO binds straight to that library (with its
+    read-side access level); unregistered = first use self-reports
+    "unbound", with a one-command onboarding form. library/task_directory
+    are lightweight imports (no torch); any failure degrades to one line of
+    "cannot check" -- the health check itself must never blow up.
     """
     print("\nWorkspace binding verdict (C1/D3):")
     try:
@@ -677,16 +732,20 @@ def _doctor_workspace_binding(project: Path) -> None:
                   % project)
         else:
             print("  No workspace path to evaluate (--project was omitted or empty).")
-    except Exception as exc:  # noqa: BLE001 —— 体检赠品不炸主流程
+    except Exception as exc:  # noqa: BLE001 -- the health-check freebie must not crash the main flow
         print(f"  (Binding status unavailable: {type(exc).__name__}: {exc})")
 
 
 def _doctor_off_registry(project: Path) -> None:
-    """表外宿主配置（sync 同源扫描，只读）——doctor 不能只认识 _HOSTS。
+    """Off-registry host configs (same scan source as sync, read-only) --
+    doctor must not only know _HOSTS.
 
-    串库事故不只发生在登记在册的那几家：用户随手在某个不认识的宿主里
-    配了 hippocampus，库指错了一样静默写错。这里把扫描发现的、_HOSTS
-    没登记的配置文件点名出来（含坏文件与低置信推断，跳过的纯噪音不计）。
+    Crossed-library incidents do not only happen with the registered hosts:
+    if the user casually wires hippocampus into some unknown host with the
+    library pointing wrong, it silently writes wrong all the same. This
+    names the config files discovered by scanning that _HOSTS does not
+    register (including broken files and low-confidence inferences; skipped
+    pure noise is not counted).
     """
     print("\nOff-registry host configs discovered (MCP configs outside _HOSTS):")
     known: set[str] = set()
@@ -697,7 +756,7 @@ def _doctor_off_registry(project: Path) -> None:
                 known.add(os.path.normcase(str(cpath.resolve())))
     try:
         candidates = hc.discover_configs(project)
-    except Exception as exc:  # noqa: BLE001 —— 体检赠品不炸主流程
+    except Exception as exc:  # noqa: BLE001 -- the health-check freebie must not crash the main flow
         print(f"  (Scan failed: {type(exc).__name__}: {exc})")
         return
     found = False
@@ -725,15 +784,18 @@ def _doctor_off_registry(project: Path) -> None:
         print("  (No off-registry configs found)")
 
 
-# 实测反馈 2026-10-31：库（尤其 user 库，含嵌入向量、只增不减）落系统盘会
-# 持续挤占 C 盘。这里只体检 + 给手工迁移三步——刻意**不做 relocate 命令**：
-# 一次性操作不配常驻命令（搬 GB 级向量还要处理 daemon 文件锁，成本远超收益），
-# 迁移场景就说清楚在下面的体检输出里。
+# Field feedback 2026-10-31: a library (especially the user library, with
+# embeddings, only ever growing) landing on the system drive keeps squeezing
+# the C drive. Here we only health-check + give a three-step manual
+# migration -- deliberately **no relocate command**: one-shot operations do
+# not get resident commands (moving GB-scale vectors also means dealing with
+# daemon file locks; the cost far exceeds the benefit). The migration story
+# is spelled out in the health-check output below.
 LIB_ON_SYSTEM_DISK_WARN_BYTES = 1024 ** 3  # 1 GB
 
 
 def _dir_size_bytes(path: Path) -> int:
-    """目录体积（st_size 求和）。walk / stat 失败按 0 计——体检不许炸。"""
+    """Directory size (sum of st_size). walk / stat failures count as 0 -- the health check must not blow up."""
     total = 0
     for root, _dirs, files in os.walk(path, onerror=lambda e: None):
         for f in files:
@@ -746,15 +808,18 @@ def _dir_size_bytes(path: Path) -> int:
 
 def _system_disk_migration_hint(lib_path: Path, size_bytes: int,
                                 system_drive: str) -> str | None:
-    """库在系统盘时的体检结论（纯函数，供单测）。
+    """Health-check verdict when the library sits on the system drive (pure
+    function, unit-testable).
 
-    非系统盘 → None（不叨叨）；系统盘 + 超 1 GB → 迁移三步；
-    系统盘但没超 → 一行「暂不必迁」。库身份按清单名判定不按路径，
-    所以迁盘零代码改动（改 env + 搬目录 + 重启）。
+    Non-system drive -> None (no nagging); system drive + over 1 GB -> the
+    three migration steps; system drive but under -> one line of "no move
+    needed yet". Library identity is determined by manifest name, not path,
+    so moving drives requires zero code change (edit env + move the
+    directory + restart).
     """
     try:
         lib_drive = os.path.splitdrive(str(lib_path))[0].upper() + "\\"
-    except Exception:  # noqa: BLE001 —— 判不了盘符就当没这回事
+    except Exception:  # noqa: BLE001 -- if the drive letter cannot be determined, pretend it is not an issue
         return None
     if not system_drive or lib_drive.upper() != system_drive.upper():
         return None
@@ -799,12 +864,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"{_mark(found, warn=not found and not required)} Dependency {mod}"
               f"{'' if found else (' (missing; core functionality unavailable)' if required else ' (missing; degraded)')}")
 
-    # S7 自曝：shell 里裸跑 doctor 时没有宿主 env，检查的是默认库 —— 不说清楚
-    # 会被误读成"宿主配置的库有问题"。模型同理。
+    # S7 self-disclosure: running doctor bare in a shell has no host env, so
+    # what is checked is the default library -- without saying so it would be
+    # misread as "the library in the host config is broken". Same for the
+    # model.
     persist_env = os.environ.get("HIPPOCAMPUS_PERSIST_DIR", "").strip()
     library = Path(persist_env or LIBRARY_DEFAULT).expanduser()
-    # 库 / 模型"还没有"不算故障：首次启动会自建 / 自动下载。报成 FAIL 会
-    # 让人以为装坏了，所以这两项只给 WARN。
+    # A library / model "not there yet" is not a fault: first start creates /
+    # auto-downloads it. Reporting FAIL would make people think the install
+    # is broken, so these two items only get WARN.
     lib_exists = library.exists()
     print(f"{_mark(True, warn=not lib_exists)} Library dir   {library}"
           f"{'' if lib_exists else ' (not found yet; first start will create it)'}")
@@ -815,7 +883,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         backend = ("sqlite" if (library / "hippocampus.db").exists()
                    else ("json" if (library / "memories.json").exists() else "empty"))
         print(f"{_mark(True)} Library backend   {backend}")
-        # 实测反馈 2026-10-31：盘符 / 体积体检（relocate 场景在此说清楚）。
+        if backend != "empty":
+            # V1-c: L0 citation health (dangling/orphan) — read-only probe via
+            # tree_view's snapshot loader (same numbers audit_l0_dangling prints).
+            try:
+                from .tree_view import l0_health, snapshot_library
+                h = l0_health(snapshot_library(str(library)))
+                ok = h["dangling_ids"] == 0
+                print(f"{_mark(ok, warn=not ok)} L0 health   raw {h['l0_raw_total']}, "
+                      f"refs {h['refs_total']}, dangling {h['dangling_ids']} "
+                      f"(affecting {h['affected_memories']} memories), "
+                      f"orphan raw {h['orphan_raw']}")
+                if not ok:
+                    print("       details: python scripts/audit_l0_dangling.py "
+                          f"--persist-dir {library}")
+            except Exception as exc:  # noqa: BLE001 — probe must not fail doctor
+                print(f"{_mark(False, warn=True)} L0 health   probe failed: {exc}")
+        # Field feedback 2026-10-31: drive letter / size check (the relocate
+        # story is spelled out here).
         size_b = _dir_size_bytes(library)
         home_drive = (os.path.splitdrive(os.path.expanduser("~"))[0]
                       + "\\")
@@ -838,8 +923,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     profile = os.environ.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
     print(f"{_mark(True)} Tool profile {profile}")
 
-    # 最有价值的一段：**各宿主实际指向哪个库**。串库是本项目最贵的坑
-    # （写进错的库不报错），逐个宿主列出来才能一眼看出来。
+    # The most valuable section: **which library each host actually points
+    # at**. Crossed libraries are this project's costliest pit (writing into
+    # the wrong library raises no error); listing host by host is the only
+    # way to see it at a glance.
     print("\nLibraries configured by host (check for crossed libraries):")
     found_any = False
     for host, spec in _HOSTS.items():
@@ -864,15 +951,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             env = ent.get("env") or {}
             lib = env.get("HIPPOCAMPUS_PERSIST_DIR", "")
             prof = env.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
-            # 每行带配置文件路径：看出来"串库/没接上"之后，下一步永远是
-            # "改哪个文件" —— 路径就在眼前，不用再猜。
+            # Each line carries the config file path: once "crossed library /
+            # not wired" is spotted, the next step is always "which file to
+            # edit" -- the path is right there, no guessing.
             print(f"  {spec['label']}({scope}) <{cpath}> : "
                   f"library={lib or '(unset; falls back to default)'}  profile={prof}")
     if not found_any:
         print("  (No host config files found -- run setup --host <host> first)")
 
-    # 表外扫描与上面的矩阵互补：矩阵答「认识的宿主读到什么」，这段答
-    # 「不认识的宿主里有没有躺着一份配置」——串库不分认识不认识。
+    # The off-registry scan complements the matrix above: the matrix answers
+    # "what do the known hosts read"; this section answers "is a config lying
+    # around inside an unknown host" -- crossed libraries do not care whether
+    # the host is known.
     _doctor_off_registry(Path.cwd())
 
     print("-" * 60)
@@ -884,14 +974,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# 子命令：models
+# Subcommand: models
 # --------------------------------------------------------------------------
 def cmd_models(args: argparse.Namespace) -> int:
-    """列出本地嵌入模型缓存，并按需回收冗余。
+    """List the local embedding model cache and reclaim redundancy on demand.
 
-    **默认什么都不删**：不带 ``--prune`` 只看清单；带 ``--prune`` 只出计划；
-    真正删盘必须再加 ``--yes``。三道闸是有意的 —— 这个命令唯一会做的事就是
-    删文件，而删错的代价是「某个库下次启动加载不到模型」，离线环境下没法补救。
+    **Nothing is deleted by default**: without ``--prune`` only the inventory
+    is shown; with ``--prune`` only a plan is produced; actually deleting
+    from disk additionally requires ``--yes``. The three gates are
+    intentional -- the only thing this command can do is delete files, and
+    the cost of deleting wrongly is "some library fails to load its model on
+    next start", unfixable in an offline environment.
     """
     from .config import load_config
     from .engine import model_cache as MC
@@ -908,7 +1001,8 @@ def cmd_models(args: argparse.Namespace) -> int:
              if args.cache else _cache_roots(_default_libs_path()))
     models = MC.scan_models(roots)
 
-    # 引用关系：库清单里的 embedder_model 是**唯一**可信来源（空串=没钉死）
+    # Reference relations: the library manifest's embedder_model is the **only**
+    # trusted source (empty string = not pinned)
     refs: dict[str, list[str]] = {}
     for info in scan_libraries():
         mid = (info.embedder_model or "").strip()
@@ -922,11 +1016,13 @@ def cmd_models(args: argparse.Namespace) -> int:
         protected.add(cfg.emb_model.strip())
 
     if args.fetch:
-        # 安装期把模型先下好。
-        # 为什么必须单独有这一步：模型是**首启才下载**的，一旦断网/被墙，
-        # MCP 服务直接起不来，而在宿主里表现为「一个工具都没有」——用户和
-        # agent 都看不出根因是模型没下来。把这件事前移到安装期，并且失败时
-        # 把三条出路讲清楚。
+        # Download the model ahead of time, at install time.
+        # Why this step must exist separately: the model is **downloaded on
+        # first start**; once offline / blocked, the MCP service simply fails
+        # to start, which inside the host looks like "not a single tool" --
+        # neither user nor agent can tell the root cause is a missing model.
+        # Move this to install time, and on failure lay out the three ways
+        # out clearly.
         want = args.fetch if isinstance(args.fetch, str) else default_id
         ready = None
         try:
@@ -937,8 +1033,9 @@ def cmd_models(args: argparse.Namespace) -> int:
             print(f"[Ready] {want} already local: {ready}")
             return 0
 
-        # setdefault 的返回值就是生效值：不必再读一次环境变量
-        # （根层豁免清单钉着 cli.py 的 env 读取数，见 config.py 的表格）。
+        # setdefault's return value is the effective value: no need to read
+        # the env var again (the root-layer exemption list pins cli.py's env
+        # read count; see the table in config.py).
         hf_endpoint = os.environ.setdefault(
             "HF_ENDPOINT", "https://hf-mirror.com")
         cache = os.path.abspath(os.path.expanduser(
@@ -950,8 +1047,9 @@ def cmd_models(args: argparse.Namespace) -> int:
         try:
             from sentence_transformers import SentenceTransformer
             st = SentenceTransformer(want, cache_folder=cache)
-            # 真跑一次编码：只验「文件在位」不够，权重/分词器坏了要到
-            # 第一次检索才炸，那时人已经在会话里了。
+            # Actually run one encode: checking "files are in place" is not
+            # enough -- broken weights/tokenizers only explode on first
+            # retrieval, by which time the user is already inside a session.
             vec = st.encode(["warmup"], show_progress_bar=False)
             dim = int(len(vec[0]))
         except Exception as e:                               # noqa: BLE001
@@ -1022,7 +1120,7 @@ def cmd_models(args: argparse.Namespace) -> int:
             picked.append(MC.PruneAction(
                 kind=MC.KIND_MODEL, model_id=mid, path=m.path,
                 bytes_=m.total_bytes, reason="explicitly selected by --drop"))
-        # 保留 int8 那类「无论点名与否都可回收」的动作
+        # Keep the int8-type actions that "are reclaimable whether named or not"
         plan.actions = picked + [a for a in plan.actions
                                  if a.kind != MC.KIND_MODEL]
 
@@ -1048,13 +1146,15 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# 子命令：serve
+# Subcommand: serve
 # --------------------------------------------------------------------------
 def cmd_serve(args: argparse.Namespace) -> int:
-    """启动服务。
+    """Start the service.
 
-    默认走 **launcher**：多宿主 / 多会话共享单份 daemon，嵌入模型只装一份。
-    ``--direct`` 才退回直连 server（等价旧行为，每个会话各装一份模型）。
+    Goes through the **launcher** by default: multiple hosts / sessions
+    share one daemon, and the embedding model is installed only once.
+    ``--direct`` falls back to the direct server (equivalent to the old
+    behavior; one model copy per session).
     """
     if args.direct:
         from .server import main as _server_main
@@ -1064,16 +1164,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# 子命令：context
+# Subcommand: context
 # --------------------------------------------------------------------------
 def cmd_context(args: argparse.Namespace) -> int:
-    """hook 注入预览：按一条 query 走 hook_client 全链路。
+    """Hook injection preview: run one query through the full hook_client
+    chain.
 
-    与 UserPromptSubmit hook 共用 :func:`hook_client.fetch_context`，用于
-    手工验证与排查（daemon 活着才有效；本命令**不拉起** daemon）。
-    env 缺省口径与 launcher 相同：key 三要素读 HIPPOCAMPUS_DAEMON_LIBRARY /
-    HIPPOCAMPUS_EMB_MODEL / HIPPOCAMPUS_DAEMON_VERSION，HELLO 声明库读
-    HIPPOCAMPUS_PERSIST_DIR。
+    Shares :func:`hook_client.fetch_context` with the UserPromptSubmit hook,
+    for manual verification and troubleshooting (works only while the daemon
+    is alive; this command does **not** start the daemon). Env defaults match
+    the launcher: the key's three components read HIPPOCAMPUS_DAEMON_LIBRARY
+    / HIPPOCAMPUS_EMB_MODEL / HIPPOCAMPUS_DAEMON_VERSION; the HELLO-declared
+    library reads HIPPOCAMPUS_PERSIST_DIR.
     """
     from .hook_client import fetch_context
     trace: list[str] = []
@@ -1145,7 +1247,7 @@ def _library_for_workspace(cwd: str, user_lib: str | None = None) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# 子命令：tree（V3, read-only library tree + static HTML viewer）
+# Subcommand: tree (V3, read-only library tree + static HTML viewer)
 # --------------------------------------------------------------------------
 def cmd_tree(args: argparse.Namespace) -> int:
     """Render a read-only tree of a library (markdown, or single-file HTML).
@@ -1451,7 +1553,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
-        # 无子命令 = 启动服务（与旧 entry point 行为一致，但现在走 launcher）
+        # No subcommand = start the service (same as the old entry point's
+        # behavior, but now via the launcher)
         return cmd_serve(argparse.Namespace(direct=False))
     return int(args.func(args) or 0)
 

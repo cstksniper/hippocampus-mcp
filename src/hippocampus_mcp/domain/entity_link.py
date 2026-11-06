@@ -1,28 +1,40 @@
-"""实体链路族：实体抽取编排 + 实体表写入。
+"""Entity-linkage family: entity extraction orchestration + entity table
+writes.
 
-从 ``brain.core`` 整搬两件：``extract_entities_with_origin``（多路抽取
-→ 清洗去重按可信度合并 → 别名归一）与 ``_link_entities``（实体表写入
-与倒排维护）。两件的外部能力全部由壳**调用时现取**注入，本模块零
-import：
+Moved wholesale from ``brain.core``: ``extract_entities_with_origin``
+(multi-channel extraction → cleaning/dedup merged by trust → alias
+canonicalization) and ``_link_entities`` (entity table writes and inverted
+index maintenance). All external capabilities of both are fetched by the
+shell **at call time** and injected; this module has zero imports:
 
-  * extract：``preprocess`` / ``cjk_ratio`` / ``get_nlp``（惰性——不调
-    就不加载 spaCy）/ ``title_entities`` / ``heuristic_entities`` /
-    ``clean_name`` / ``canonicalize_map`` 是 brain 侧能力回调；
-    ``lexicon`` 是词库序列（热重载会整体换新，壳每次现取）；四档
-    origin 常量与 ``origin_rank`` / ``cjk_skip_ratio`` 按值传。
+  * extract: ``preprocess`` / ``cjk_ratio`` / ``get_nlp`` (lazy -- spaCy is
+    not loaded unless called) / ``title_entities`` / ``heuristic_entities``
+    / ``clean_name`` / ``canonicalize_map`` are brain-side capability
+    callbacks; ``lexicon`` is the lexicon sequence (hot reload swaps it
+    wholesale; the shell fetches it every time); the four origin constants
+    and ``origin_rank`` / ``cjk_skip_ratio`` are passed by value.
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (touching any one is a behavior change; the
+parity tests will catch it):
 
-  * extract 四路次序固定：词库子串（大小写不敏感）→ spaCy（**仅英文
-    比例高时**，异常吞掉不炸）→ 《》书名号 → 启发式兜底；
-  * 去重键是 ``clean 后的 lower().strip()``；**单字符候选丢弃**
-    （``len(k) <= 1``）；同键后来者只在**可信度严格更高**时覆盖 origin
-    （rank 相同不覆盖——先到先得保首现显示名）；
-  * 空 prepared（``strip()`` 后为空）直接返回空 dict，四路都不跑；
-  * link：名字先 ``dict.fromkeys`` 去重；origin 缺省视为 heuristic
-    （不可信）；升级**只升不降**（严格大于才写）；``mention_count``
-    是派生量恒等于 ``len(memory_ids)``（不累加）；``memory_id`` 假值
-    不入倒排；``last_seen`` 取 max、倒排为空时 ``first_seen`` 重置。
+  * extract's four channels have a fixed order: lexicon substrings
+    (case-insensitive) → spaCy (**only when the English ratio is high**;
+    exceptions swallowed, never fatal) → 《》 book-title marks → heuristic
+    fallback;
+  * the dedup key is ``lower().strip() after clean``; **single-character
+    candidates are dropped** (``len(k) <= 1``); for the same key, a later
+    candidate overwrites origin only when **strictly more trusted** (equal
+    rank does not overwrite -- first come, first served, preserving the
+    first-seen display name);
+  * an empty prepared text (empty after ``strip()``) returns an empty dict
+    directly; none of the four channels run;
+  * link: names are deduped with ``dict.fromkeys`` first; a missing origin
+    is treated as heuristic (untrusted); upgrades go **only up, never down**
+    (written only on strictly greater); ``mention_count`` is a derived
+    quantity always equal to ``len(memory_ids)`` (never accumulated); a
+    falsy ``memory_id`` does not enter the inverted index; ``last_seen``
+    takes the max, and ``first_seen`` resets when the inverted index is
+    empty.
 """
 from __future__ import annotations
 
@@ -47,11 +59,12 @@ def extract_entities_with_origin(
     origin_title: str,
     origin_heuristic: str,
 ) -> dict[str, str]:
-    """同 ``extract_entities``，但返回 ``{实体名: origin}``。
+    """Same as ``extract_entities`` but returns ``{entity name: origin}``.
 
-    同一实体被多条路径命中时取**可信度最高**的来源（manual > lexicon >
-    spacy > heuristic）。返回顺序按可信度降序，与旧 ``extract_entities``
-    的排序语义一致。无产出的路径不留下占位键。
+    When the same entity is hit by multiple channels, the **most trusted**
+    origin wins (manual > lexicon > spacy > heuristic). The return order is
+    descending by trust, matching the old ``extract_entities``'s ordering
+    semantics. Channels with no output leave no placeholder keys.
     """
     prepared = preprocess(text)
     if not prepared.strip():
@@ -60,14 +73,14 @@ def extract_entities_with_origin(
     is_cjk = cjk_ratio(prepared) > cjk_skip_ratio
     candidates: list[tuple[str, str]] = []
 
-    # 1) 专名词库：子串命中（不区分大小写）
+    # 1) Proper-noun lexicon: substring hits (case-insensitive)
     if lexicon:
         lowered = prepared.lower()
         for term in lexicon:
             if term.lower() in lowered:
                 candidates.append((term, origin_lexicon))
 
-    # 2) spaCy：只对英文比例高的文本启用
+    # 2) spaCy: enabled only for text with a high English ratio
     if not is_cjk:
         nlp = get_nlp()
         if nlp is not None:
@@ -82,16 +95,18 @@ def extract_entities_with_origin(
             except Exception:
                 pass
 
-    # 3) 《》书名号：中文明确的"作品名"标记，单列 title 档（受信任）
+    # 3) 《》 book-title marks: Chinese's explicit "work title" marker, given
+    # its own trusted title tier
     for n in title_entities(prepared):
         candidates.append((n, origin_title))
 
-    # 4) 启发式兜底（spaCy 不可用 / 无产出 / 中文文本都走这里）
+    # 4) Heuristic fallback (spaCy unavailable / no output / Chinese text all
+    # land here)
     for n in heuristic_entities(prepared, cjk=is_cjk):
         candidates.append((n, origin_heuristic))
 
-    out: dict[str, str] = {}        # 显示名（保留原始大小写）-> origin
-    by_key: dict[str, str] = {}     # lower -> 显示名（按小写去重）
+    out: dict[str, str] = {}        # display name (original casing kept) -> origin
+    by_key: dict[str, str] = {}     # lower -> display name (dedup by lowercase)
     for n, origin in candidates:
         cleaned = clean_name(n)
         if not cleaned:
@@ -105,10 +120,14 @@ def extract_entities_with_origin(
             out[cleaned] = origin
         elif origin_rank[origin] > origin_rank[out[disp]]:
             out[disp] = origin
-    # 5) 别名归一：词库写了 ``子安 => 顾言``，这里就把"子安"折成"顾言"。
-    #    只归一一边等于没归一——抽取侧不折，库就把一个实体的多个称法拆成
-    #    互不连通的档案；查询侧不折，查"子安"照样吃不到"顾言"的实体加成。
-    #    两侧都经本方法（recall/block_4/ingest 全都调它），所以天然一致。
+    # 5) Alias canonicalization: when the lexicon says ``子安 => 顾言``, this
+    #    folds "子安" into "顾言". Folding only one side equals folding
+    #    neither -- without folding on the extraction side, the library
+    #    splits one entity's multiple names into disconnected profiles;
+    #    without folding on the query side, querying "子安" still misses the
+    #    entity bonus of "顾言". Both sides go through this method
+    #    (recall/block_4/ingest all call it), so they stay consistent by
+    #    construction.
     return canonicalize_map(out)
 
 
@@ -123,16 +142,21 @@ def link_entities(
     origin_rank: dict,
     origin_heuristic: str,
 ) -> list[str]:
-    """把实体写入实体表并维护倒排索引，返回实体 id 列表。
+    """Write entities into the entity table, maintain the inverted index,
+    and return the list of entity ids.
 
-    ``mention_count`` 的语义是"被多少条记忆提到过"，恒等于
-    ``len(memory_ids)``——**不累加而派生**。此前的累加实现会让计数虚高
-    （一条记忆即可把计数推到 3 以上），使画像入选门槛形同虚设，
-    且在删除记忆后无法自动纠正。名字先去重，避免同一实体重复计数。
+    ``mention_count`` means "mentioned by how many memories" and always
+    equals ``len(memory_ids)`` -- **derived, not accumulated**. The earlier
+    accumulating implementation inflated the count (a single memory could
+    push it above 3), rendering the profile admission gate effectively
+    void, and it could not self-correct after a memory deletion. Names are
+    deduped first to avoid counting the same entity twice.
 
-    ``origins`` 缺省视为 ``heuristic``（不可信），避免调用方忘记标注就
-    白拿信任；同一实体被多次以不同来源命中时**只升级不降级**。
-    ``entities`` 是 brain 的实体表本体（就地修改，容器不搬）。
+    A missing ``origins`` entry is treated as ``heuristic`` (untrusted), so
+    a caller that forgets to annotate does not get trust for free; when the
+    same entity is hit multiple times from different sources, **upgrade
+    only, never downgrade**. ``entities`` is brain's entity table proper
+    (mutated in place; the container is not replaced).
     """
     origins = origins or {}
     ids = []
@@ -155,11 +179,12 @@ def link_entities(
         elif origin_rank.get(new_origin, 0) > origin_rank.get(
             ent.get("origin", origin_heuristic), 0
         ):
-            # 升级：候选来源被更可信的来源确认
+            # Upgrade: the candidate origin was confirmed by a more trusted one
             ent["origin"] = new_origin
         if memory_id and memory_id not in ent["memory_ids"]:
             ent["memory_ids"].append(memory_id)
-        # 派生量：与 memory_ids 保持恒等，删除记忆后不会失真
+        # Derived quantity: kept identical to memory_ids, so it stays correct
+        # after memory deletions
         ent["mention_count"] = len(ent["memory_ids"])
         ent["last_seen"] = max(ent.get("last_seen", ts), ts)
         if not ent["memory_ids"]:

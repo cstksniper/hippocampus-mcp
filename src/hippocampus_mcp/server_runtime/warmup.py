@@ -1,36 +1,44 @@
 # -*- coding: utf-8 -*-
-"""MCP 服务端预热区（server.py 预热区块的实现本体）。
+"""MCP server warmup section (implementation body of server.py's warmup block).
 
-这里实现：后台预热线程体（``_warmup_body`` / ``start_background_warmup`` /
-``_warmup_library`` / ``maybe_warmup_library``）、工具侧等待
-（``_await_warmup``）、零等待就绪探针（``warmup_status``）、诊断看门狗
-（``_start_warmup_watchdog``）、导入链预载（``_preload_import_chain`` /
-``_preload_list``）、``STORE_ONLY_TOOLS`` 层级表、两个预热异常类、
-torch 单线程兜底（``_prepare_torch``）。
+Implemented here: the background warmup thread body (``_warmup_body`` /
+``start_background_warmup`` / ``_warmup_library`` / ``maybe_warmup_library``),
+tool-side waiting (``_await_warmup``), the zero-wait readiness probe
+(``warmup_status``), the diagnostic watchdog (``_start_warmup_watchdog``),
+import-chain preloading (``_preload_import_chain`` / ``_preload_list``),
+the ``STORE_ONLY_TOOLS`` tier table, the two warmup exception classes, and
+the torch single-thread fallback (``_prepare_torch``).
 
-🔴 状态与常量**刻意不搬**——它们留在 server.py，因为那是测试的
-monkeypatch 面（``_WARMUP_MODE`` / ``_warmup_ready`` / ``_warmup_started``
-/ ``_warmup_error`` / ``_warmup_fatal`` / ``_warmup_phase`` / ``_store_ready``
-/ ``_WARMUP_WAIT_TIMEOUT`` / ``_WARMUP_WAIT_POLICY`` / ``_PRELOAD*`` /
-``_warmup_libs`` / ``_PERSIST_DIR`` …，见 tests/test_warmup.py 与
-tests/test_i3_warmup_per_library.py）。本模块对这些符号的读写一律经
-:func:`_srv` **现取**（教训：快照进新模块会让 monkeypatch 静默失效）；
-对 server 侧函数（``get_brain`` / ``_registry_get`` /
-``default_library_path`` …）的调用同样现取——测试替换
-``server.HippoBrain`` / ``server._registry_get`` 才能一路生效到预热线程。
+🔴 State and constants are **deliberately not moved** -- they stay in
+server.py because that is the tests' monkeypatch surface (``_WARMUP_MODE`` /
+``_warmup_ready`` / ``_warmup_started`` / ``_warmup_error`` /
+``_warmup_fatal`` / ``_warmup_phase`` / ``_store_ready`` /
+``_WARMUP_WAIT_TIMEOUT`` / ``_WARMUP_WAIT_POLICY`` / ``_PRELOAD*`` /
+``_warmup_libs`` / ``_PERSIST_DIR`` ...; see tests/test_warmup.py and
+tests/test_i3_warmup_per_library.py). This module reads/writes all of those
+symbols via :func:`_srv`, **fetching them live** (lesson: snapshotting them
+into a new module makes monkeypatching silently ineffective); calls to
+server-side functions (``get_brain`` / ``_registry_get`` /
+``default_library_path`` ...) are likewise fetched live -- only that way
+does test replacement of ``server.HippoBrain`` / ``server._registry_get``
+reach all the way into the warmup thread.
 
-server.py 侧按 import 名原样再导出本模块公共符号（``_await_warmup`` /
-``warmup_status`` / ``STORE_ONLY_TOOLS`` / ``WarmupPendingError`` /
-``WarmupFailedError`` / ``start_background_warmup`` / ``maybe_warmup_library``
-/ ``_prepare_torch`` / ``_preload_import_chain`` / ``_start_warmup_watchdog``），
-既有调用点（46 个工具体的 ``await _await_warmup()`` 字面）与测试引用
-（``srv.STORE_ONLY_TOOLS`` / ``isinstance(e, srv.WarmupPendingError)`` …
-）零改动。测试对 ``srv._await_warmup = <替身>`` 的替换同样生效——工具
-调用点与 server 模块同名，名字解析走 server 模块命名空间。
+server.py re-exports this module's public symbols verbatim by import name
+(``_await_warmup`` / ``warmup_status`` / ``STORE_ONLY_TOOLS`` /
+``WarmupPendingError`` / ``WarmupFailedError`` / ``start_background_warmup``
+/ ``maybe_warmup_library`` / ``_prepare_torch`` / ``_preload_import_chain``
+/ ``_start_warmup_watchdog``); existing call sites (the 46 tool bodies'
+literal ``await _await_warmup()``) and test references
+(``srv.STORE_ONLY_TOOLS`` / ``isinstance(e, srv.WarmupPendingError)`` ...)
+need zero changes. Test replacement of ``srv._await_warmup = <stub>``
+works the same way -- the tool call sites share the name with the server
+module, so name resolution goes through the server module's namespace.
 """
 
-# env 直读豁免：本文件的 env 直读是第三方库线程 env 与 warm 早读
-# （Config 消费前），封闭清单见 config.py「根层豁免清单」。
+# env direct-read exemption: this file's env direct reads are third-party
+# library thread env and warm early reads (before Config consumes them);
+# the closed list is in config.py under 「根层豁免清单」 (root-layer
+# exemption list).
 from __future__ import annotations
 
 import asyncio
@@ -47,45 +55,53 @@ logger = logging.getLogger("hippocampus_mcp")
 
 
 def _srv() -> Any:
-    """server 模块本体（现取入口，见模块 docstring 的 monkeypatch 面说明）。"""
+    """The server module itself (fetched live; see the module docstring's monkeypatch-surface notes)."""
     from hippocampus_mcp import server as _s
 
     return _s
 
 
 class WarmupPendingError(RuntimeError):
-    """预热未在预算内完成。
+    """Warmup did not finish within its budget.
 
-    抛给 MCP 层后变成一次**明确的工具错误**（而不是客户端超时）：调用方据此
-    可以重试，也可以提示用户；把"还没准备好"与"坏了"区分开。
+    Raised to the MCP layer it becomes an **explicit tool error** (rather
+    than a client timeout): the caller can retry or inform the user; this
+    separates "not ready yet" from "broken".
     """
 
 
 class WarmupFailedError(RuntimeError):
-    """预热过程中抛了异常。消息里带原始原因，避免把配置问题误判成性能问题。"""
+    """An exception was raised during warmup. The message carries the original cause, so a configuration problem is not misread as a performance problem."""
 
 
-# torch 不在顶层导入（见 server.py 头注），但「单线程」设置必须在 torch 被
-# 真正使用之前生效。用本函数做统一兜底：无论从哪条路径首次碰 torch（auto 的
-# 预热线程 / off 的首次工具调用 / sync 的主线程）都已经设好。
-# 本标志归本模块自有（测试无 patch 面，与 server 命名空间解耦）。
+# torch is not imported at the top level (see server.py's header comment),
+# but the "single thread" setting must be in effect before torch is truly
+# used. This function is the unified fallback: whichever path first
+# touches torch (auto's warmup thread / off's first tool call / sync's
+# main thread), the setting is already in place.
+# This flag is owned by this module (no test patch surface; decoupled from
+# the server namespace).
 _torch_ready = False
 
 
 def _prepare_torch() -> None:
-    """首次导入 torch 并限制为单线程（**仅当确有 torch 消费者时**）。
+    """Import torch for the first time and pin it to a single thread
+    (**only when there really is a torch consumer**).
 
-    Windows 下 torch/OpenMP 在 anyio 工作线程里推理偶发 access violation，
-    限制单线程可规避（嵌入吞吐对本服务不是瓶颈）。
+    On Windows, torch/OpenMP inference inside an anyio worker thread
+    occasionally hits an access violation; pinning to one thread avoids it
+    (embedding throughput is not this service's bottleneck).
 
-    ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` 必须在 ``import torch`` **之前**
-    设进环境，所以放在本函数里而不是 main() 里。
+    ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS`` must be set in the
+    environment **before** ``import torch``, so this lives in this
+    function rather than main().
 
-    默认配置（LNN=numpy + 嵌入 auto/onnx）的生产进程
-    **零 torch**，这里不再无条件导入——只有显式回退路
-    （``HIPPOCAMPUS_LNN_BACKEND=torch`` / ``HIPPOCAMPUS_EMB_BACKEND=torch``）
-    才付出这份内存。ST 回退路（auto 无产物）由 ``embeddings._load_model``
-    在真正加载 ST 时补设线程限制。
+    The default production configuration (LNN=numpy + embedding auto/onnx)
+    runs **zero torch**; we no longer import unconditionally here -- only
+    the explicit fallback paths (``HIPPOCAMPUS_LNN_BACKEND=torch`` /
+    ``HIPPOCAMPUS_EMB_BACKEND=torch``) pay this memory. The ST fallback
+    path (auto without artifacts) has ``embeddings._load_model`` set the
+    thread limits when it actually loads ST.
     """
     global _torch_ready
     if _torch_ready:
@@ -101,24 +117,26 @@ def _prepare_torch() -> None:
             import torch
 
             torch.set_num_threads(1)
-        except Exception:  # noqa: BLE001 导入失败不在这里抛，后面构造时会给出更明确的错
+        except Exception:  # noqa: BLE001 an import failure is not raised here; construction later gives a clearer error
             pass
     _torch_ready = True
 
 
 def _warmup_body() -> None:
-    """后台线程执行体：把重型初始化（记忆库 / 嵌入模型 / spaCy）挪出握手路径。
+    """Background thread body: moves heavy initialization (memory library /
+    embedding model / spaCy) out of the handshake path.
 
-    分阶段计时日志是**运维必需**的：预热一旦卡住（例如模型路径不可达、试图联网
-    下载 spaCy 模型），宿主侧表现为"工具调用了但一直没响应"，没有阶段日志就只能
-    靠猜。
+    Per-phase timing logs are **operationally essential**: once warmup
+    hangs (e.g. model path unreachable, or an attempt to download the
+    spaCy model online), the host side sees "the tool was called but never
+    responds"; without phase logs you can only guess.
     """
     t_all = time.time()
     s = _srv()
 
     def _phase(name: str, fn: Any) -> Any:
         t0 = time.time()
-        s._warmup_phase = name          # 超时时消息里要能指明"卡在哪一步"
+        s._warmup_phase = name          # the timeout message must be able to say which step hung
         logger.info("warmup phase start: %s", name)
         try:
             return fn()
@@ -129,61 +147,75 @@ def _warmup_body() -> None:
         try:
             brain = _phase("load memory library / construct HippoBrain", s.get_brain)
         except BaseException:
-            # 核心层没建起来：后续所有工具都不可能成功，标记为致命。
+            # The core layer did not come up: no later tool can succeed; mark as fatal.
             s._warmup_fatal = True
             raise
-        # 库存就绪：读条数 / 按 id 取 / 列来源 / 看统计这类操作只需要它（约 5 秒）
+        # Store ready: counting / fetch by id / list sources / stats only
+        # need it (about 5 seconds)
         s._store_ready.set()
-        # 🔴 **不预热 spaCy**。spaCy 的 thinc.compat 会
-        # `import torch`（实测 +160MB 级常驻），而 NER 路径本就是惰性的
-        # （`_get_nlp` 首次英文抽取才真正加载、失败退启发式）。预热强行加载
-        # = 每个会话进程永久多付 ~240MB（spaCy 78 + torch 160），中文库更是
-        # 纯浪费。代价：首次英文实体抽取多付一次 ~2-5s 的加载延迟。
+        # 🔴 **Do not warm up spaCy**. spaCy's thinc.compat does
+        # `import torch` (measured: +160MB resident), while the NER path is
+        # lazy anyway (`_get_nlp` only truly loads on the first English
+        # extraction, falling back to heuristics on failure). Forcing a
+        # warmup load = every session process permanently pays ~240MB extra
+        # (spaCy 78 + torch 160), pure waste for Chinese libraries. The
+        # cost: the first English entity extraction pays an extra ~2-5s
+        # load delay.
         emb = brain.manager.embedder
-        # 再拆一层：模型构造函数 vs 真正算一个向量。两者卡住的原因完全不同
-        # （前者多为模型路径/缺件或 DLL 加载慢，后者多为推理线程环境问题）。
+        # One more split: model construction vs actually computing one
+        # vector. The two hang for completely different reasons (the former
+        # usually model path/missing files or slow DLL loading; the latter
+        # usually inference-thread environment issues).
         _phase("construct embedding model", emb._ensure_model)
         _phase("first inference", lambda: emb.embed("warmup"))
-        # 后端自述必须在**启动时**就能看见。spaCy 装不上、
-        # 嵌入器静默回落 MiniLM 这两类事故的共同点就是"结果变了而没人知道"，
-        # 而日志是宿主侧唯一会去看的地方（brain_stats 要等人来调）。
-        # ⚠️ 这里**不能**调 stats()：它要遍历全库算 entity_origins 等自曝项，
-        # 一旦抛异常会被外层 try 记成「预热失败」——为打一行日志毁掉预热不值。
-        # 账簿那格只取内存里的末条，代价可忽略。
+        # The backend self-description must be visible **at startup**. The
+        # common thread of both accidents -- spaCy failing to install, the
+        # embedder silently falling back to MiniLM -- is "the result changed
+        # and nobody knew", and the log is the only place the host side
+        # will actually look (brain_stats needs a human to call it).
+        # ⚠️ **Do not** call stats() here: it walks the whole library
+        # computing entity_origins and other self-report items; if it
+        # raises, the outer try records it as a warmup failure -- ruining
+        # warmup for one log line is not worth it. The ledger cell only
+        # reads the last in-memory entry; the cost is negligible.
         try:
             _last_save = (brain.save_ledger_view().get("last_save_at")
                           or "never saved")
-        except Exception:  # noqa: BLE001 —— 日志字段缺失不影响预热成功
+        except Exception:  # noqa: BLE001 -- a missing log field does not affect warmup success
             _last_save = "unknown"
         logger.info(
             "Background warmup done: L1=%d entities=%d (total %.1fs)"
             " | NER=%s | embedding backend=%s (%sD, model source=%s)"
             " | ledger: last save=%s",
             brain.manager.store.count(), len(brain.entities), time.time() - t_all,
-            brain.ner_backend_lazy,  # 无副作用版：别在预热日志里把 spaCy/torch 拉进进程
+            brain.ner_backend_lazy,  # side-effect-free version: do not pull spaCy/torch into the process via warmup logging
             brain.manager.embedder_backend,
             getattr(brain.manager, "embedding_dim", "?"),
             getattr(brain.manager.embedder, "model_source", "n/a"),
             _last_save,
         )
-    except BaseException as e:  # noqa: BLE001 预热失败必须也不能拖垮服务
+    except BaseException as e:  # noqa: BLE001 warmup failure must not take the service down either
         s._warmup_error = f"{type(e).__name__}: {e} (phase: {s._warmup_phase})"
         logger.warning("background warmup failed (first call will initialize): %s", s._warmup_error)
     finally:
-        # 失败也要放行，否则所有工具会一直卡到超时。
-        # _store_ready 同样要置位：若 get_brain() 本身就抛错，它不会走到 set()，
-        # store 级工具会白等满超时才转惰性初始化（那时同样会失败，但至少不装死）。
+        # Release even on failure, otherwise every tool would hang until
+        # timeout.
+        # _store_ready must also be set: if get_brain() itself raised, it
+        # never reached set(); store-tier tools would wait out the full
+        # timeout before falling back to lazy initialization (which would
+        # fail too, but at least not play dead).
         s._store_ready.set()
         s._warmup_ready.set()
 
 
 def start_background_warmup() -> threading.Thread | None:
-    """启动后台预热线程（仅 auto 模式）。立即返回，不阻塞握手。"""
+    """Start the background warmup thread (auto mode only). Returns immediately, does not block the handshake."""
     s = _srv()
     if s._WARMUP_MODE != "auto":
         return None
-    # main() 这次预热覆盖的是进程级默认库，登记进集合，
-    # 免得第一条连接再为同一个库起第二个预热线程（重复加载模型）。
+    # main()'s warmup covers the process-level default library; register it
+    # in the set so the first connection does not start a second warmup
+    # thread for the same library (double model loading).
     with s._warmup_libs_lock:
         s._warmup_libs.add(_library.normpath(s.default_library_path()))
     t = threading.Thread(target=_warmup_body, name="hippo-warmup", daemon=True)
@@ -194,11 +226,14 @@ def start_background_warmup() -> threading.Thread | None:
 
 
 def _warmup_library(path: str) -> None:
-    """后台预热**指定库**（构造 brain + 装模型 + 跑一次推理）。
+    """Warm up a **specified library** in the background (build brain +
+    load model + run one inference).
 
-    与 main() 那次 ``_warmup_body`` 的区别：那次只能覆盖进程级默认库，
-    这一条是**连接声明了别的库**时补的。全程吞异常——预热失败只意味着
-    首次调用要自付加载时间，不该让连接建立或任何工具调用失败。
+    Difference from main()'s ``_warmup_body`` run: that one can only cover
+    the process-level default library; this one covers a **connection
+    having declared a different library**. Exceptions are swallowed
+    throughout -- warmup failure only means the first call pays the load
+    time itself; it must not fail connection setup or any tool call.
     """
     try:
         brain = _srv()._registry_get().get(path)
@@ -207,16 +242,18 @@ def _warmup_library(path: str) -> None:
         emb.embed("warmup")
         logger.info("library warmup done: %s (L1=%d records)", path,
                     brain.manager.store.count())
-    except BaseException as e:  # noqa: BLE001 —— 预热失败绝不能拖垮服务
+    except BaseException as e:  # noqa: BLE001 -- warmup failure must never take the service down
         logger.warning("library warmup failed (first call will initialize): %s -- %s",
                        type(e).__name__, e)
 
 
 def maybe_warmup_library(path: str) -> None:
-    """连接声明了自己的默认库之后，为该库补一次后台预热（按库去重）。
+    """After a connection declares its own default library, run one
+    background warmup for it (deduplicated per library).
 
-    **只在 auto 模式**下触发（off / sync 是用户显式选择，不替他改）；
-    同一库只起一次线程；失败不抛。
+    Triggers **only in auto mode** (off / sync are the user's explicit
+    choice; do not override them); one thread per library at most;
+    failures do not raise.
     """
     s = _srv()
     if s._WARMUP_MODE != "auto" or not path:
@@ -229,38 +266,50 @@ def maybe_warmup_library(path: str) -> None:
                      name="hippo-lib-warmup", daemon=True).start()
 
 
-# 预载档位（HIPPOCAMPUS_PRELOAD）：
-#   off / 0   不做预载 —— **会卡死**。实测 PRELOAD=off 时 150s 仍未完成。
-#   1（默认）  scipy.special + scipy.interpolate（热态 0.9s / 冷态 6.6s）
-#   其他逗号分隔的模块名亦可。
+# Preload tiers (HIPPOCAMPUS_PRELOAD):
+#   off / 0   no preload -- **will hang**. Measured: PRELOAD=off still
+#             unfinished after 150s.
+#   1 (default)  scipy.special + scipy.interpolate (warm 0.9s / cold 6.6s)
+#   other comma-separated module names also work.
 #
-# 为什么这一集**不能再收窄**（独立进程实测）：
-#   · torch 已经改成按需导入（见 server.py 头注）——它在事件循环启动之后导入
-#     **正常**，实测：预热 28.6s 完成 L1=9359、recall 命中 3 条。
-#     所以 torch 不再占用握手时间。
-#   · 但 scipy 不行：只预载 scipy.special 仍卡（卡点转移到 _fitpack）；
-#     完全不预载必卡。所以优化只能从别处找，不要再压缩这个集合。
-#   · 附注：单独预载 scipy.interpolate 实测也能通过（冷启动省约 2s），但
-#     "只 special 卡、只 interpolate 不卡"这种不对称说明卡点对加载顺序敏感，
-#     默认档仍保留两者以求保险。
+# Why this set **cannot be narrowed further** (measured in a standalone
+# process):
+#   · torch has been switched to on-demand import (see server.py's header
+#     comment) -- importing it after the event loop has started works
+#     **fine**; measured: warmup finished at 28.6s with L1=9359, recall
+#     hit 3 records. So torch no longer occupies handshake time.
+#   · but scipy does not: preloading only scipy.special still hangs (the
+#     hang point moves to _fitpack); not preloading at all hangs for
+#     sure. So the optimization must be found elsewhere; do not compress
+#     this set further.
+#   · footnote: preloading only scipy.interpolate also passes (saves ~2s
+#     of cold start), but the asymmetry of "special alone hangs,
+#     interpolate alone does not" shows the hang point is sensitive to
+#     load order; the default tier keeps both for safety.
 #
-# 实测数据（热态，probe_handshake auto）：
-#              默认档                      预载 0.9s → 工具可见 5.6s / recall 首次 29.2s ✅
-#              sklearn                     3.6s → 工具 10.3s / recall 22.4s
-#              full = sentence_transformers 13.7s → 工具 18.7s ⚠️ / recall 9.3s
-#              `full` 能把握手推过注册窗口，只在"本机确认宿主会补注册"时才用。
+# Measured data (warm state, probe_handshake auto):
+#              default tier                preload 0.9s → tools visible 5.6s / first recall 29.2s ✅
+#              sklearn                     3.6s → tools 10.3s / recall 22.4s
+#              full = sentence_transformers 13.7s → tools 18.7s ⚠️ / recall 9.3s
+#              `full` can push the handshake past the registration window;
+#              use it only when confirmed locally that the host will
+#              register afterwards.
 #
-# 档位值本体（``_PRELOAD``）与预算（``_PRELOAD_BUDGET`` / ``_HANDSHAKE_BASE_COLD``）
-# 留在 server.py（无 patch 面但属头部配置区），本模块经 _srv() 现取。
-# 实测会卡死在 LoadLibrary 上的模块。只在**事件循环启动之前**加载才安全。
-# 规律是"事件循环起来后加载 scipy 的任何 C 扩展都会卡"，所以这一集要覆盖
-# 后续导入会碰到的 scipy C 扩展；scipy.interpolate 会带出 linalg/sparse/special。
+# The tier values themselves (``_PRELOAD``) and the budgets
+# (``_PRELOAD_BUDGET`` / ``_HANDSHAKE_BASE_COLD``) stay in server.py (no
+# patch surface but part of the header config block); this module fetches
+# them live via _srv().
+# Modules measured to hang on LoadLibrary. Safe to load only **before the
+# event loop starts**. The pattern is "loading any scipy C extension after
+# the event loop is up hangs", so this set must cover the scipy C
+# extensions later imports will touch; scipy.interpolate pulls in
+# linalg/sparse/special.
 _PRELOAD_DEFAULT = ("scipy.special", "scipy.interpolate")
 _PRELOAD_FULL = ("sentence_transformers",)
 
 
 def _preload_list() -> tuple[str, ...]:
-    """把 ``HIPPOCAMPUS_PRELOAD`` 解析成要预载的模块元组。"""
+    """Parse ``HIPPOCAMPUS_PRELOAD`` into the tuple of modules to preload."""
     preload = _srv()._PRELOAD
     low = preload.lower()
     if low in ("0", "false", "no", "off", ""):
@@ -273,17 +322,25 @@ def _preload_list() -> tuple[str, ...]:
 
 
 def _preload_import_chain() -> None:
-    """在事件循环启动前预载嵌入模型的导入链（best-effort，失败不阻断启动）。
+    """Preload the embedding model's import chain before the event loop
+    starts (best-effort; failures do not block startup).
 
-    **为什么必须在循环启动前做**（全部为独立进程实测）：
-    同一句 `import sentence_transformers`（会拉起 torch / transformers / sklearn / scipy）：
-      · 在事件循环启动**之前**做 → 正常完成，之后构造模型只要 **0.7s**
-      · 在 `server.run()` **起来之后**做 → 卡在 scipy 的 C 扩展（`_ufuncs.pyd`；
-        清掉它之后换 `_fitpack.pyd`…）的 `LoadLibrary` 上，30/60/120s 三次线程栈
-        dump 停在**同一行**、永不返回（不是慢，是不动）
-    同一份加载在普通脚本里 12–16s 正常完成，所以这是本机环境的进程级现象。
+    **Why this must happen before the loop starts** (all measured in
+    standalone processes):
+    the same `import sentence_transformers` (which pulls in torch /
+    transformers / sklearn / scipy):
+      · done **before** the event loop starts → completes normally, and
+        constructing the model afterwards takes only **0.7s**
+      · done after `server.run()` is **up** → hangs on the `LoadLibrary`
+        of scipy's C extensions (`_ufuncs.pyd`; clear it and
+        `_fitpack.pyd` takes its place...); three thread-stack dumps at
+        30/60/120s all stopped at the **same line**, never returning
+        (not slow, but immobile)
+    the same load completes normally in 12-16s in a plain script, so this
+    is a process-level phenomenon of this machine's environment.
 
-    代价与取舍见 ``_PRELOAD`` 的说明（server.py 头部配置区）。
+    Costs and trade-offs: see the ``_PRELOAD`` notes (server.py header
+    config block).
     """
     s = _srv()
     mods = _preload_list()
@@ -309,10 +366,12 @@ def _preload_import_chain() -> None:
 
 
 def _start_warmup_watchdog() -> None:
-    """按 30/60/120s 逐档检查预热是否完成，未完成就 dump 全部线程栈。
+    """Check at 30/60/120s steps whether warmup has finished; if not, dump
+    all thread stacks.
 
-    与预热模式无关：卡死可以发生在后台线程（auto），也可以发生在主线程
-    （off 模式的惰性初始化），只看 auto 会漏掉一半现场。
+    Independent of the warmup mode: hangs can happen in the background
+    thread (auto) or in the main thread (off mode's lazy initialization);
+    watching only auto would miss half the scenes.
     """
     s = _srv()
 
@@ -342,10 +401,14 @@ def _start_warmup_watchdog() -> None:
     threading.Thread(target=_dump, name="hippo-diag", daemon=True).start()
 
 
-# 只需要「读库存」的工具（不需要嵌入模型）：等 _store_ready 就能干活。
-# 实测：加载 9359 条库存约 5 秒，而加载 BGE 模型要 25-100 秒不等——
-# 让这类工具陪着等模型，等于把秒级操作拖成一分钟级（且首调最容易被宿主判超时）。
-# 未列出的工具一律按 embed 级处理（保守＝安全，只影响延迟不影响正确性）。
+# Tools that only need 「reading the store」 (no embedding model): waiting
+# for _store_ready is enough for them to work.
+# Measured: loading a 9359-record store takes about 5 seconds, while the
+# BGE model takes 25-100s to load -- making these tools wait for the
+# model too drags second-scale operations into minute-scale (and the
+# first call is the one most easily judged a timeout by the host).
+# Tools not listed are treated as embed-tier (conservative = safe;
+# affects latency only, not correctness).
 STORE_ONLY_TOOLS = frozenset({
     "get_memory", "forget_memory",
     "list_memories", "list_sources", "get_stats",
@@ -354,53 +417,74 @@ STORE_ONLY_TOOLS = frozenset({
     "entity_profile", "entity_list", "lexicon_suggest",
     "lexicon_alias_suggest", "contradictions",
     "brain_stats",
-    # 主题层只读派生表（空表时会自动梳理一次，用的是已加载的向量，
-    # 不必等嵌入模型）
+    # topic-layer read-only derived tables (when empty they auto-derive
+    # once, using the already-loaded vectors; no need to wait for the
+    # embedding model)
     "knowledge_map",
-    # 源漂移审计只读库存 + 源签名层（文件 mtime/sha1），
-    # 完全不碰向量 ⇒ store 级就够，不必为它等 25-33 秒模型预热。
+    # source-drift audit reads only the store + source signature layer
+    # (file mtime/sha1); it never touches vectors ⇒ store tier suffices;
+    # no need to wait 25-33 seconds of model warmup for it.
     "drift_audit",
-    # 地图层四工具只读写 maps.json 侧车 + 真相源文件，
-    # 不碰库存不碰向量 ⇒ store 级（真实延迟只花在等库存加载完）。
+    # the four map-layer tools only read/write the maps.json sidecar +
+    # source-of-truth files; no store, no vectors ⇒ store tier (real
+    # latency is only spent waiting for the store to load).
     "map_set", "map_get", "map_list", "map_verify",
-    # ⚠️ knowledge_topic **刻意不在本表**：它查出主题 id 依赖主题层已被
-    # 建立（空库首调会 refresh 一次），store 级放行会表现成「没有这个
-    # 主题」——那比多等几十秒难查得多。写回归纳本身不用向量，但为的是
-    # 不出现这种静默失败，宁可按 embed 级保守等待。
-    # 库管理类工具只需要目录元信息，不必等嵌入模型（那要 25-33 秒）
+    # ⚠️ knowledge_topic is **deliberately not in this table**: the topic
+    # ids it queries depend on the topic layer having been built (the
+    # first call on an empty library does one refresh); letting it through
+    # at store tier would present as 「没有这个主题」 (no such topic) --
+    # far harder to debug than waiting a few dozen seconds. Writing the
+    # derivation itself does not use vectors, but to avoid that silent
+    # failure it is better to wait conservatively at embed tier.
+    # library-management tools only need directory metadata, not the
+    # embedding model (which takes 25-33 seconds)
     "library_list", "library_info", "library_whoami", "library_use",
 })
 
 
 async def _await_warmup(tier: str | None = None) -> None:
-    """MCP 工具入口的第一句：等后端就绪到所需层级再往下走。
+    """The first statement of every MCP tool entry: wait for the backend to
+    be ready to the required tier, then proceed.
 
     Args:
-        tier: ``"store"`` 只用库存（读/列/统计/按 id 删），几秒就能开始；
-              ``"embed"`` 还要用到嵌入模型（检索 / 写入 / 巩固），必须等模型到位。
-              **留空则按调用者自动判定**（见下），工具一律写 `await _await_warmup()`，
-              新增工具不必记住该选哪一级。
+        tier: ``"store"`` only uses the store (read/list/stats/delete by
+              id); can start within seconds.
+              ``"embed"`` also needs the embedding model (retrieval /
+              writes / consolidation); must wait for the model.
+              **Leave empty to auto-detect from the caller** (see below);
+              tools just write `await _await_warmup()`, and new tools need
+              not remember which tier to pick.
 
-    自动判定用调用函数名在 ``STORE_ONLY_TOOLS`` 里查表：工具本身决定是否向量相关，
-    调用点不用重复表达。之所以不在每个调用点显式传层级：30 处调用点改动面太大，
-    且外部验收脚本按字面统计 `await _await_warmup()`
-    的覆盖数——保持零参数写法才能让两边一致。
+    Auto-detection looks the calling function's name up in
+    ``STORE_ONLY_TOOLS``: the tool itself decides whether it is
+    vector-related; call sites need not repeat it. Why not pass the tier
+    explicitly at every call site: 30 call sites is too large a change
+    surface, and external acceptance scripts count coverage by the
+    literal `await _await_warmup()` -- keeping the zero-argument form
+    keeps both sides consistent.
 
-    - mode=off / 未曾启动后台预热（例如被脚本直接 import 调用）→ 立即返回；
-    - 目标层级已就绪 → 立即返回；
-    - 未就绪 → 在线程池等待（**不占事件循环**，其他 MCP 消息照常处理）。
-      等待有**预算**（``_WARMUP_WAIT_TIMEOUT``，默认 90s，小于宿主 120s 超时），
-      超预算按 ``_WARMUP_WAIT_POLICY`` 处置：raise（默认）抛
-      :class:`WarmupPendingError`，release 则放行交给惰性初始化。
+    - mode=off / background warmup never started (e.g. direct import from
+      a script) → return immediately;
+    - target tier already ready → return immediately;
+    - not ready → wait on a thread pool (**does not occupy the event
+      loop**; other MCP messages proceed normally).
+      The wait has a **budget** (``_WARMUP_WAIT_TIMEOUT``, default 90s,
+      below the host's 120s timeout); over budget, ``_WARMUP_WAIT_POLICY``
+      decides: raise (default) raises :class:`WarmupPendingError`;
+      release lets it through to lazy initialization.
 
-    为什么超时默认**抛错而不是放行**：放行会让调用方在"后端仍未就绪"的状态下
-    继续跑（多数路径接着就去碰嵌入模型），于是再等几十秒——宿主先超时，用户
-    看到的是"调用超时"而不是"还在预热"。抛错则是一条**可解析、可重试**的状态。
-    另外预热**失败**（而非慢）时立即抛 :class:`WarmupFailedError` 并带原始原因，
-    不让"配置错了"伪装成"性能问题"。
+    Why the timeout default is **raise rather than release**: releasing
+    lets the caller keep running with "backend still not ready" (most
+    paths then touch the embedding model right away) and wait tens of
+    seconds more -- the host times out first, and the user sees "call
+    timed out" instead of "still warming up". Raising is a **parseable,
+    retryable** state. Also, when warmup **failed** (as opposed to being
+    slow), :class:`WarmupFailedError` is raised immediately with the
+    original cause, so "misconfigured" cannot masquerade as a
+    "performance problem".
 
-    状态与模式常量经 :func:`_srv` 现取（server 命名空间的
-    monkeypatch 面）。
+    State and mode constants are fetched live via :func:`_srv` (the
+    server namespace's monkeypatch surface).
     """
     if tier is None:
         try:
@@ -413,8 +497,9 @@ async def _await_warmup(tier: str | None = None) -> None:
     if s._WARMUP_MODE != "auto" or not s._warmup_started:
         return
     if event.is_set():
-        # 就绪了也要看一眼是否"失败后放行"——致命失败必须当场说清楚，
-        # 否则调用方会继续往下走，再撞一次更晦涩的错。
+        # Even when ready, check whether this is "released after failure" --
+        # a fatal failure must be called out on the spot, otherwise the
+        # caller proceeds and hits a more obscure error next.
         if s._warmup_fatal and s._warmup_error:
             raise WarmupFailedError(
                 f"Backend initialization failed: {s._warmup_error}. This is not a timeout issue; check the memory library"
@@ -447,19 +532,25 @@ async def _await_warmup(tier: str | None = None) -> None:
 
 
 def warmup_status() -> dict[str, Any]:
-    """后端就绪状态自述（**零等待**，立即返回）。
+    """Backend readiness self-description (**zero wait**, returns
+    immediately).
 
-    存在的理由：预热期的"慢"与"坏"在调用方看来是一样的（都是没响应），
-    所以需要一个能被**主动查询**的 ready 探针——先问一句，再决定要不要调用，
-    比反复试错调用省事得多。（懒加载服务给个 ready 端点是通用做法；
-    这里挂在 ``brain_stats`` 的返回里，不新增工具。）
+    Reason to exist: during warmup, "slow" and "broken" look identical to
+    the caller (both are no response), so we need a ready probe that can
+    be **queried proactively** -- asking first and then deciding whether
+    to call beats repeated trial-and-error calls. (Lazy-loading services
+    exposing a ready endpoint is standard practice; here it hangs off the
+    ``brain_stats`` return instead of adding a tool.)
 
-    单进程内多线程共享同一份状态，所以任何工具调用期间查到的都是同一事实：
-    ``ready=false`` 且 ``phase`` 有值 = 正在预热；``error`` 非空 = 预热已失败
-    （此时带向量的工具会立刻抛错，不必等满预算）。
+    Threads within one process share the same state, so whatever is seen
+    during any tool call is the same fact: ``ready=false`` with a
+    non-empty ``phase`` = warming up; non-empty ``error`` = warmup
+    already failed (vector-requiring tools raise immediately then,
+    without waiting out the budget).
 
-    全部字段经 :func:`_srv` 现取——测试对 server 命名空间的
-    赋值（``srv._warmup_error = ...`` 等）在本探针里立即可见。
+    All fields are fetched live via :func:`_srv` -- test assignments to
+    the server namespace (``srv._warmup_error = ...`` etc.) are visible
+    to this probe immediately.
     """
     s = _srv()
     return {
@@ -469,8 +560,10 @@ def warmup_status() -> dict[str, Any]:
         "started": s._warmup_started,
         "phase": s._warmup_phase,
         "error": s._warmup_error,
-        # fatal=True → 核心层没建起来，带向量的工具会当场报错而不是放行；
-        # fatal=False 且 error 非空 → 降级可用（例如仅仅 spaCy 没装上）
+        # fatal=True → the core layer did not come up; vector-requiring
+        # tools error on the spot instead of being let through;
+        # fatal=False with a non-empty error → degraded but usable
+        # (e.g. only spaCy missing)
         "fatal": s._warmup_fatal,
         "wait_timeout": s._WARMUP_WAIT_TIMEOUT,
         "wait_policy": s._WARMUP_WAIT_POLICY,

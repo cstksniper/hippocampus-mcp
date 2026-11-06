@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""标准检索与 QA 评估指标.
+"""Standard retrieval and QA evaluation metrics.
 
-实现 LoCoMo、LongMemEval 和 Mem0 评估框架中使用的核心指标:
-    - 检索指标: MRR, Hit@k, Recall@k (recall_any / recall_all), NDCG@k
-    - QA 指标:   F1 (token-level, Porter stemmer), Exact Match
+Implements the core metrics used by the LoCoMo, LongMemEval and Mem0
+evaluation frameworks:
+    - Retrieval metrics: MRR, Hit@k, Recall@k (recall_any / recall_all), NDCG@k
+    - QA metrics:   F1 (token-level, Porter stemmer), Exact Match
 
-参考来源:
+Reference sources:
     - LoCoMo: https://github.com/snap-research/LoCoMo (task_eval/evaluation.py)
     - LongMemEval: https://github.com/xiaowu0162/LongMemEval (src/retrieval/eval_utils.py)
     - Mem0: https://github.com/mem0ai/memory-benchmarks
@@ -21,18 +22,18 @@ from typing import Sequence
 
 
 # ==================================================================
-# 检索指标
+# Retrieval metrics
 # ==================================================================
 
 def mrr(rankings: list[list[str]], ground_truths: list[list[str]]) -> float:
     """Mean Reciprocal Rank.
 
     Args:
-        rankings: 每个查询的检索结果列表 (doc id 有序列表).
-        ground_truths: 每个查询的正确文档 id 列表.
+        rankings: per-query retrieval result lists (ordered doc id lists).
+        ground_truths: per-query lists of correct doc ids.
 
     Returns:
-        MRR 分数 [0, 1].
+        MRR score [0, 1].
     """
     if not rankings:
         return 0.0
@@ -49,15 +50,15 @@ def mrr(rankings: list[list[str]], ground_truths: list[list[str]]) -> float:
 def hit_at_k(
     rankings: list[list[str]], ground_truths: list[list[str]], k: int = 5
 ) -> float:
-    """Hit@k: top-k 中是否命中任意一个正确文档.
+    """Hit@k: whether any correct doc is hit within the top-k.
 
     Args:
-        rankings: 检索结果列表.
-        ground_truths: 正确文档列表.
-        k: 截断位置.
+        rankings: retrieval result lists.
+        ground_truths: correct doc lists.
+        k: truncation position.
 
     Returns:
-        Hit@k 分数 [0, 1].
+        Hit@k score [0, 1].
     """
     if not rankings:
         return 0.0
@@ -73,9 +74,9 @@ def hit_at_k(
 def recall_any_at_k(
     rankings: list[list[str]], ground_truths: list[list[str]], k: int = 5
 ) -> float:
-    """Recall (any) @k: top-k 中命中任意一个正确文档的比例.
+    """Recall (any) @k: proportion of queries hitting any correct doc within the top-k.
 
-    与 Hit@k 等价, 保持命名与 LongMemEval 一致.
+    Equivalent to Hit@k; the naming follows LongMemEval.
     """
     return hit_at_k(rankings, ground_truths, k)
 
@@ -83,9 +84,9 @@ def recall_any_at_k(
 def recall_all_at_k(
     rankings: list[list[str]], ground_truths: list[list[str]], k: int = 5
 ) -> float:
-    """Recall (all) @k: top-k 中命中全部正确文档的比例.
+    """Recall (all) @k: proportion of queries hitting all correct docs within the top-k.
 
-    参照 LongMemEval 的 recall_all@k 定义.
+    Follows LongMemEval's recall_all@k definition.
     """
     if not rankings:
         return 0.0
@@ -101,20 +102,20 @@ def recall_all_at_k(
 def ndcg_at_k(
     rankings: list[list[str]], ground_truths: list[list[str]], k: int = 5
 ) -> float:
-    """NDCG@k: 归一化折损累积增益.
+    """NDCG@k: normalized discounted cumulative gain.
 
-    参照 LongMemEval 的 NDCG 实现:
+    Follows LongMemEval's NDCG implementation:
         relevance = 1 if doc in ground_truth else 0
         DCG = rel[0] + sum(rel[i] / log2(i+1) for i in 1..k)
-        NDCG = DCG / IDCG (理想排序的 DCG)
+        NDCG = DCG / IDCG (the DCG of the ideal ranking)
 
     Args:
-        rankings: 检索结果列表.
-        ground_truths: 正确文档列表.
-        k: 截断位置.
+        rankings: retrieval result lists.
+        ground_truths: correct doc lists.
+        k: truncation position.
 
     Returns:
-        NDCG@k 分数 [0, 1].
+        NDCG@k score [0, 1].
     """
     if not rankings:
         return 0.0
@@ -132,11 +133,11 @@ def ndcg_at_k(
         gt_set = set(gts)
         top_k = ranked[:k]
 
-        # 实际 DCG
+        # Actual DCG
         rels = [1 if doc_id in gt_set else 0 for doc_id in top_k]
         actual_dcg = dcg(rels)
 
-        # 理想 DCG
+        # Ideal DCG
         n_relevant = min(len(gt_set), k)
         ideal_rels = [1] * n_relevant + [0] * (k - n_relevant)
         ideal_dcg = dcg(ideal_rels)
@@ -148,17 +149,17 @@ def ndcg_at_k(
 
 
 # ==================================================================
-# QA 指标 (LoCoMo 风格)
+# QA metrics (LoCoMo style)
 # ==================================================================
 
-# Porter Stemmer 的简化实现 (避免 NLTK 依赖)
+# Simplified Porter Stemmer implementation (avoids the NLTK dependency)
 _STEM_CACHE: dict[str, str] = {}
 
 
 def _simple_stem(word: str) -> str:
-    """简化的词干提取 (Porter 风格).
+    """Simplified stemming (Porter style).
 
-    处理常见的英文后缀: -ing, -ed, -ly, -s, -es, -ment, -tion, -ness.
+    Handles common English suffixes: -ing, -ed, -ly, -s, -es, -ment, -tion, -ness.
     """
     if word in _STEM_CACHE:
         return _STEM_CACHE[word]
@@ -205,41 +206,42 @@ def _simple_stem(word: str) -> str:
     return word
 
 
-# 停用词 / 无信息词 (参照 LoCoMo)
+# Stopwords / non-informative words (following LoCoMo)
 _ARTICLES = {"a", "an", "the", "and"}
 
 
 def _normalize_text(text) -> list[str]:
-    """文本预处理: 去标点、转小写、去停用词、词干化.
+    """Text preprocessing: strip punctuation, lowercase, remove stopwords, stem.
 
-    参照 LoCoMo evaluation.py 的预处理流程.
+    Follows the preprocessing pipeline of LoCoMo evaluation.py.
     """
-    # 确保输入为字符串 (LoCoMo 数据中 answer 可能是 int/float)
+    # Ensure the input is a string (answer may be int/float in LoCoMo data)
     text = str(text) if not isinstance(text, str) else text
-    # 去逗号
+    # Remove commas
     text = text.replace(",", " ")
-    # 转小写
+    # Lowercase
     text = text.lower()
-    # 去标点
+    # Strip punctuation
     text = text.translate(str.maketrans("", "", string.punctuation))
-    # 分词
+    # Tokenize
     tokens = text.split()
-    # 去停用词 + 词干化
+    # Remove stopwords + stem
     tokens = [_simple_stem(t) for t in tokens if t and t not in _ARTICLES]
     return tokens
 
 
 def f1_score(prediction: str, ground_truth: str) -> float:
-    """Token 级别 F1 分数 (LoCoMo 风格).
+    """Token-level F1 score (LoCoMo style).
 
-    预处理: 去逗号、去冠词、去标点、转小写、Porter 词干化.
+    Preprocessing: remove commas, remove articles, strip punctuation,
+    lowercase, Porter stemming.
 
     Args:
-        prediction: 预测答案.
-        ground_truth: 标准答案.
+        prediction: predicted answer.
+        ground_truth: reference answer.
 
     Returns:
-        F1 分数 [0, 1].
+        F1 score [0, 1].
     """
     pred_tokens = _normalize_text(prediction)
     gt_tokens = _normalize_text(ground_truth)
@@ -259,14 +261,14 @@ def f1_score(prediction: str, ground_truth: str) -> float:
 
 
 def exact_match(prediction: str, ground_truth: str) -> float:
-    """Exact Match: 预处理后 token 集合完全匹配.
+    """Exact Match: token sets match exactly after preprocessing.
 
     Args:
-        prediction: 预测答案.
-        ground_truth: 标准答案.
+        prediction: predicted answer.
+        ground_truth: reference answer.
 
     Returns:
-        1.0 匹配, 0.0 不匹配.
+        1.0 match, 0.0 no match.
     """
     pred_tokens = set(_normalize_text(prediction))
     gt_tokens = set(_normalize_text(ground_truth))
@@ -274,16 +276,16 @@ def exact_match(prediction: str, ground_truth: str) -> float:
 
 
 def multi_hop_f1(prediction: str, ground_truth: str) -> float:
-    """多跳问题的 F1: 将答案按逗号切分为子答案, 对每个子答案计算 F1 后取均值.
+    """F1 for multi-hop questions: split the answer into sub-answers by comma, compute F1 for each, then average.
 
-    参照 LoCoMo category=1 的评估方式.
+    Follows LoCoMo's category=1 evaluation.
     """
     gt_str = str(ground_truth) if not isinstance(ground_truth, str) else ground_truth
     sub_answers = [a.strip() for a in gt_str.split(",") if a.strip()]
     if not sub_answers:
         return f1_score(prediction, ground_truth)
 
-    # 对每个子答案计算 F1, 取均值
+    # Compute F1 for each sub-answer, then average
     scores = []
     for sub_ans in sub_answers:
         scores.append(f1_score(prediction, sub_ans))
@@ -291,10 +293,11 @@ def multi_hop_f1(prediction: str, ground_truth: str) -> float:
 
 
 def adversarial_score(prediction: str) -> float:
-    """对抗问题评分 (LoCoMo category=5).
+    """Adversarial question scoring (LoCoMo category=5).
 
-    检查输出是否包含拒答短语 ("no information available" / "not mentioned").
-    正确拒答得 1, 错误回答得 0.
+    Checks whether the output contains a refusal phrase ("no information
+    available" / "not mentioned"). Correct refusal scores 1, a wrong answer
+    scores 0.
     """
     pred_lower = str(prediction).lower() if not isinstance(prediction, str) else prediction.lower()
     refusal_phrases = [
@@ -310,11 +313,11 @@ def adversarial_score(prediction: str) -> float:
 
 
 # ==================================================================
-# 聚合指标
+# Aggregate metrics
 # ==================================================================
 
 class EvalReport:
-    """评估结果报告."""
+    """Evaluation results report."""
 
     def __init__(self, method_name: str = "") -> None:
         self.method_name = method_name

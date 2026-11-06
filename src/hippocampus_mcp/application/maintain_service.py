@@ -1,30 +1,39 @@
 # -*- coding: utf-8 -*-
-"""MaintainService：库状态维护用例（5 工具）。
+"""MaintainService: library-state maintenance use cases (5 tools).
 
-工具面（原「Maintain 11」的**库状态维护**那一半）：
-export_memories / miss_log / brain_stats / save_brain / load_state。
+Tool surface (the **library-state maintenance** half of the original
+"Maintain 11"):
+export_memories / miss_log / brain_stats / save_brain / load_state.
 
-.. note:: session_end 随 BootstrapService 进服务（它是会话生命
-   周期收尾，语义属于开场/收尾那一组）。其余 5 个 library_* 工具
-   **不进本类**——它们不绑定单一 brain（``library_info`` 刻意不构造
-   HippoBrain 以免等嵌入模型 25–33 秒），见 ``library_admin_service``。
+.. note:: session_end went into the services with BootstrapService (it is
+   the session lifecycle wrap-up; semantically it belongs to the
+   opening/closing group). The other 5 library_* tools **do not enter this
+   class** -- they are not bound to a single brain (``library_info``
+   deliberately avoids constructing a HippoBrain so as not to wait 25-33
+   seconds for the embedding model); see ``library_admin_service``.
 
-「谁解析参数」的切分：本类 5 个工具**没有 JSON 协议解析**（唯一形态转换是
-``export_memories`` 的 ``source or None`` / ``state or None`` 空串归一），
-不存在「解析排在库解析前还是后」的保序问题——编排整体进
-服务，工厂调用即库解析，错误次序不变。
+The "who parses arguments" split: this class's 5 tools have **no JSON
+protocol parsing** (the only shape conversion is ``export_memories``'s
+``source or None`` / ``state or None`` empty-string normalization), so there
+is no ordering question of "parsing before or after library resolution" --
+orchestration moves into the service wholesale; the factory call is the
+library resolution, and the error ordering is unchanged.
 
-信封（库自曝首键）**按工具逐个保留现行形态**：
+Envelopes (the library self-report first key) **keep the current shape per
+tool**:
 
-* **带**信封：只有 ``save_brain``（现行经 ``_with_library``，含 conflict
-  分支）；
-* **不带**：export_memories / miss_log / brain_stats / load_state（现行直接
-  ``json.dumps``）。
+* **With** envelope: only ``save_brain`` (currently via ``_with_library``,
+  including the conflict branch);
+* **Without**: export_memories / miss_log / brain_stats / load_state
+  (currently a direct ``json.dumps``).
 
-``brain_stats`` 的 ``warmup`` 一节刻意由**注入的探针**产出（组合根传
-``server.warmup_status``）：它是**进程级设施状态**（后端预热到哪一步了），
-不是库存事实——两者混在一个 dict 里返回是产品决策（少一次往返），但来源必须
-看得见，故用构造注入显式标出（与 ``persist_dir`` 同类：环境值，不是领域值）。
+The ``warmup`` section of ``brain_stats`` is deliberately produced by an
+**injected probe** (the composition root passes ``server.warmup_status``):
+it is **process-level facility state** (how far the backend warm-up got),
+not a library fact -- returning the two mixed in one dict is a product
+decision (one fewer round trip), but the provenance must be visible, hence
+the constructor injection marks it explicitly (same class as
+``persist_dir``: an environment value, not a domain value).
 """
 from __future__ import annotations
 
@@ -35,38 +44,50 @@ from .base import BaseService
 
 
 class MaintainService(BaseService):
-    """维护用例：导出 / 未命中留痕 / 统计 / 落盘 / 重载（策略与算法暂居 brain，后续上收）。"""
+    """Maintenance use cases: export / miss logging / stats / persist /
+    reload (policy and algorithms temporarily live in brain; to be lifted up
+    later)."""
 
     def __init__(self, *, brain: Any, library_self: dict[str, str],
                  persist_dir: str = "",
                  probe: Callable[[], dict[str, Any]] | None = None,
                  **base_kwargs: Any) -> None:
-        """``probe`` = 零等待就绪探针（组合根注入 ``server.warmup_status``）。
+        """``probe`` = zero-wait readiness probe (composition root injects
+        ``server.warmup_status``).
 
-        缺省 ``None`` 而非必填：本服务一出就拿 5 个工具用，只有 brain_stats
-        真要探针。可选是为了让单测能最小构造（不带探针直接 new）；代价是缺
-        探针时 ``brain_stats`` 的 ``warmup`` 节退化为 ``{}`` —— 组合根恒注入，
-        这条退化路径在生产上不会被走出。
+        Defaults to ``None`` rather than being required: this service ships
+        with 5 tools from day one, and only brain_stats actually needs the
+        probe. Optional so unit tests can construct minimally (new it
+        directly without a probe); the cost is that without a probe the
+        ``warmup`` section of ``brain_stats`` degrades to ``{}`` -- the
+        composition root always injects, so this degraded path is never
+        exercised in production.
 
-        ``**base_kwargs`` 透传基类（D2b 的 ``user_access_resolver`` 等可选
-        注入由此到达，本服务自己不消费）。
+        ``**base_kwargs`` are passed through to the base class (D2b's
+        ``user_access_resolver`` and other optional injections arrive this
+        way; this service does not consume them itself).
         """
         super().__init__(brain=brain, library_self=library_self,
                          persist_dir=persist_dir, **base_kwargs)
         self.probe = probe
 
-    # ---------------------------------------------------------------- 导出
+    # ---------------------------------------------------------------- export
 
     def export_memories(self, *, since_ts: float, source: str, state: str,
                         limit: int, client: str = "") -> dict[str, Any]:
-        """按时间/来源/状态增量导出（不含向量，可直接落盘另存）。**不带**信封。
+        """Incremental export by time/source/state (no vectors; can be
+        persisted to disk elsewhere as-is). **No** envelope.
 
-        边界是「含等于」（多条同时间戳时那批最后一条会重复一次，按 id 去重
-        即可）——这条语义写在工具 docstring 里，服务侧只做编排，不重述不改写。
+        The boundary is "inclusive of equals" (with several records sharing a
+        timestamp, the last one of that batch repeats once; dedupe by id) --
+        this semantics is written in the tool docstring; the service side
+        only orchestrates and neither restates nor rewrites it.
 
-        D2b：目标是 user 库时按档位拒绝（设计稿 §4.2：导出是批量通道，
-        masked 档「要么拒绝要么仅限非敏感」取拒绝——批量逐行滤的账算不过来，
-        泄露面却一样大）。
+        D2b: refused by tier when the target is the user library (design
+        §4.2: export is a bulk channel; for the masked tier "either refuse or
+        restrict to non-sensitive" we chose refuse -- the ledger does not
+        balance for per-line filtering in bulk, while the leak surface stays
+        the same size).
         """
         tier = self._ua(client)
         if tier in ("masked", "none"):
@@ -78,13 +99,16 @@ class MaintainService(BaseService):
                                           state=state or None, limit=limit)
         return {"count": len(rows), "memories": rows}
 
-    # ---------------------------------------------------------------- 留痕
+    # ---------------------------------------------------------------- miss log
 
     def miss_log(self, *, limit: int, clear: bool) -> dict[str, Any]:
-        """查看/清空「召回不到」的查询留痕。**不带**信封。
+        """View/clear the trail of queries that failed to recall. **No**
+        envelope.
 
-        ``clear`` 走 ``brain.clear_miss_log()`` 而不是把 list 直接清空：
-        清空是删除，得先立碑，否则别的进程的旧快照一落盘就把它并回来。
+        ``clear`` goes through ``brain.clear_miss_log()`` rather than wiping
+        the list directly: clearing is a deletion, so a tombstone must be
+        laid first, or another process's old snapshot merges it back the
+        moment it persists.
         """
         brain = self.brain
         if clear:
@@ -97,26 +121,30 @@ class MaintainService(BaseService):
             "entries": rows[:limit] if limit > 0 else rows,
         }
 
-    # ---------------------------------------------------------------- 统计
+    # ---------------------------------------------------------------- stats
 
     def brain_stats(self, *, daily_days: int) -> dict[str, Any]:
-        """四层 + 索引层规模统计，兼作后端就绪探针。**不带**信封。
+        """Size stats for the four layers + index layer, doubling as a
+        backend readiness probe. **No** envelope.
 
-        ``warmup`` 一节来自注入探针：只依赖库存层级（几秒应答），所以它
-        同时回答「后端准备好没有」——``ready=false`` 时其余带向量的工具会
-        返回「稍后重试」。
+        The ``warmup`` section comes from the injected probe: this tool
+        depends only on inventory-level data (answers in seconds), so it can
+        also answer "is the backend ready" -- when ``ready=false``, the other
+        vector-dependent tools return "retry later".
         """
         out = self.brain.stats(daily_days=daily_days)
         out["warmup"] = self.probe() if self.probe else {}
         return out
 
-    # ---------------------------------------------------------------- 落盘 / 重载
+    # ---------------------------------------------------------------- persist / reload
 
     def save_brain(self) -> dict[str, Any]:
-        """持久化整个记忆底座（与 save_state 等价）。**带**信封。
+        """Persist the whole memory base (equivalent to save_state). **With**
+        envelope.
 
-        ConcurrentWriteError 的 conflict 体与 WriteService.save_state 逐字同
-        文案（hint 指向 load_state）——两个工具本来就是同一语义的两个入口。
+        The ConcurrentWriteError conflict body shares word-for-word wording
+        with WriteService.save_state (the hint points to load_state) -- the
+        two tools are two entry points of the same semantics to begin with.
         """
         try:
             self.brain.save()
@@ -127,11 +155,13 @@ class MaintainService(BaseService):
         return self._envelope({"status": "saved", "persist_dir": self.persist_dir})
 
     def load_state(self) -> dict[str, Any]:
-        """从磁盘恢复全状态，覆盖内存。**不带**信封。
+        """Restore the full state from disk, overwriting memory. **No**
+        envelope.
 
-        加载翻车时不静默：``store.last_load_issue`` 有值就把隔离文件与原因
-        一并回给调用方（因为「loadsucceeded」和「加载但丢了一层」在返回体里
-        不该长得一样）。
+        A failed load is not silent: when ``store.last_load_issue`` has a
+        value, the quarantined file and the reason are returned to the caller
+        along with it (because "loadsucceeded" and "loaded but lost a layer"
+        must not look the same in the response body).
         """
         brain = self.brain
         brain.load()

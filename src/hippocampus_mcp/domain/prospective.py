@@ -1,39 +1,51 @@
 # -*- coding: utf-8 -*-
-"""O6：前瞻记忆情境触发（domain 纯函数，M2 纪律）。
+"""O6: prospective-memory contextual triggering (domain pure functions, M2 discipline).
 
-生物对应：线索触发的前瞻记忆（prospective memory）——「到点了要做某事」
-之外，**遇到相关情境时意图自动浮上来**。
+Biological counterpart: cue-triggered prospective memory — beyond "when the
+time comes, do the thing", **the intent surfaces automatically when a related
+situation is encountered**.
 
-现状缺口：``remember_intent`` 登记的待办只在 session_start 的
-``block_pending_intents`` 带回（开场一次性、只按列表顺序截 5）；会话中途
-``get_memory_context`` 碰到相关话题时，相关待办混在「前 5 条 open」里，
-排在后面的永远不会被想起。
+Current gap: open intents registered via ``remember_intent`` are only brought
+back by session_start's ``block_pending_intents`` (one-shot at the opening,
+truncated to 5 by list order); mid-session, when ``get_memory_context``
+touches a related topic, relevant intents are mixed into the "first 5 open"
+and ones ranked later are never recalled.
 
-机制（全部纯函数，触发集**在登记时派生**、装配时只做交集判定）：
+Mechanism (all pure functions; trigger sets are **derived at registration
+time**, assembly only does intersection tests):
 
-* 登记侧（``derive_intent_triggers``）：从待办文本抽实体名（与检索同一
-  套抽取器，词库命中优先）+ 实词集合——``tokens_of``（中文 bigram /
-  英文词，去停用词）**再补中文 trigram**。补 trigram 的原因（实测）：
-  ``tokens_of`` 的 bigram 是**不重叠**切分，措辞序一变就全灭——
-  「写第三章初稿」切出 写第/三章/初稿，「第三章写到哪了」切出
-  第三/章写/到哪，明显同题却零交集；trigram「第三章」两侧都在，
-  且三字串足够特异、不引入扰民。存进 intent 条目的
-  ``trigger_entities`` / ``trigger_topic``——随 brain_intents.json 落盘，
-  多会话合并层原样保留额外键。
-* 装配侧（``prospective_block2``）：查询的实体名/实词（含 trigram，
-  与登记侧同口径）与活跃待办的触发集**相交** → 该待办在 block_2 置前
-  回带，行尾加「⚡与当前话题相关」标记；未触发的待办保持原有顺序殿后。
-  **cap 5 不膨胀**（block_2 预算不变），触发详情经返回体
-  ``prospective_intents`` 键自曝（何时触发、凭什么命中）。
+* Registration side (``derive_intent_triggers``): extract entity names from the
+  intent text (same extractor as retrieval, lexicon hits first) + a content-
+  word set — ``tokens_of`` (Chinese bigrams / English words, stopwords removed)
+  **plus Chinese trigrams**. Why add trigrams (measured): ``tokens_of``'s
+  bigrams are **non-overlapping** segments; a change of wording order kills
+  them all — "写第三章初稿" segments as 写第/三章/初稿, "第三章写到哪了"
+  segments as 第三/章写/到哪; obviously the same topic yet zero intersection.
+  The trigram 「第三章」 appears on both sides, and a three-character string is
+  specific enough without introducing noise. Stored in the intent entry's
+  ``trigger_entities`` / ``trigger_topic`` — persisted with
+  brain_intents.json; the multi-session merge layer preserves extra keys
+  as-is.
+* Assembly side (``prospective_block2``): the query's entity names/content
+  words (including trigrams, same convention as the registration side)
+  **intersect** with an active intent's trigger set → that intent is hoisted to
+  the front of block_2 and its line gains the "⚡ related to the current
+  topic" marker; untriggered intents keep their original order at the back.
+  **cap 5 does not grow** (block_2 budget unchanged); trigger details are
+  self-reported via the return body's ``prospective_intents`` key (when it
+  triggered and on what grounds).
 
-不扰民保证（验收的负对照）：查询为空、待办无触发集、交集为空——三种
-情况下 ``prospective_block2`` 的行与原实现**逐字节一致**，且不产生
-``prospective_intents`` 键（零痕迹，U5/D4 同款纪律）。
+Non-intrusiveness guarantee (the acceptance test's negative control): empty
+query, intent without a trigger set, empty intersection — in all three cases
+``prospective_block2``'s lines are **byte-for-byte identical** to the original
+implementation and produce no ``prospective_intents`` key (zero traces; the
+same discipline as U5/D4).
 
-完成语义不打架（验收第三条）：本模块只重排 block_2 的**展示顺序**、
-加展示标记，不改 intent 的 ``text`` / ``status``——complete_intent 按
-关键词匹配 text、resolve_intent 按 status 过滤，两个通道看到的都是
-原条目；触发不产生任何自动完成。
+No fight with completion semantics (acceptance item three): this module only
+reorders block_2's **display order** and adds a display marker; it never
+changes an intent's ``text`` / ``status`` — complete_intent matches on text by
+keyword, resolve_intent filters by status; both channels see the original
+entries. Triggering produces no automatic completion.
 """
 from __future__ import annotations
 
@@ -47,23 +59,27 @@ __all__ = [
     "derive_intent_triggers", "prospective_block2", "zh_trigrams",
 ]
 
-#: block_2 待办条数上限——与 domain/context_slots.py 的既有 ``[:5]``
-#: 一致（抄现状，不新增预算；改上限要两边同步，注释互指）。
+#: block_2 intent count cap — consistent with the existing ``[:5]`` in
+#: domain/context_slots.py (copies the status quo, adds no budget; changing the
+#: cap requires syncing both sides, with comments cross-referencing).
 INTENT_BLOCK_CAP = 5
 
-#: 触发待办在 block_2 行尾的标记。放在行内让文本槽直接可读；结构化详情
-#: 走 ``prospective_intents`` 键，两者同源。
+#: Marker appended to a triggered intent's block_2 line. Inline so the text slot
+#: stays directly readable; structured details go through the
+#: ``prospective_intents`` key — both from the same source.
 TRIGGER_SUFFIX = " (⚡ related to the current topic)"
 
 _ZH_RUN = re.compile(r"[\u4e00-\u9fa5]{2,}")
 
 
 def zh_trigrams(text: str) -> set[str]:
-    """中文 trigram（连续汉字串内的三字滑窗；不足三字的串不出窗）。
+    """Chinese trigrams (a three-character sliding window over runs of consecutive Han characters; runs shorter than three produce nothing).
 
-    本模块自备而不改 ``tokens_of``：那是写读两侧"同一事实"判据的分词
-    真相源（golden 44 例钉着），触发集没有资格改它的口径——只做**增量**
-    （并集），bigram / 英文词口径原样保留。
+    Provided by this module rather than modifying ``tokens_of``: that function
+    is the tokenization source of truth for the write/read sides' "same fact"
+    criterion (pinned by 44 golden cases); the trigger set has no standing to
+    change its convention — only an **increment** (union) is applied, and the
+    bigram / English-word conventions are preserved as-is.
     """
     out: set[str] = set()
     for run in _ZH_RUN.findall(text or ""):
@@ -74,9 +90,9 @@ def zh_trigrams(text: str) -> set[str]:
 
 @dataclass(frozen=True)
 class IntentTriggers:
-    """一条待办的触发条件（登记时派生一次，随层落盘）。"""
-    entities: tuple[str, ...] = ()      # 实体名（抽取器口径，保留原样）
-    topic: frozenset[str] = field(default_factory=frozenset)  # 实词+trigram
+    """One intent's trigger conditions (derived once at registration, persisted with the layer)."""
+    entities: tuple[str, ...] = ()      # entity names (extractor convention, kept as-is)
+    topic: frozenset[str] = field(default_factory=frozenset)  # content words + trigrams
 
 
 def derive_intent_triggers(
@@ -85,11 +101,13 @@ def derive_intent_triggers(
     extract_entities: Callable[[str], Iterable[str]],
     tokens_of: Callable[[str], set[str]],
 ) -> IntentTriggers:
-    """从待办文本派生触发条件（登记侧，纯函数——抽取器注入）。
+    """Derive trigger conditions from an intent text (registration side; pure function — extractor injected).
 
-    实体名保留抽取器原样（大小写/归一由抽取器负责），匹配时两侧 lower；
-    实词集合 = ``tokens_of``（检索同一套）∪ ``zh_trigrams``（措辞序
-    脆弱性的补丁，见模块 docstring）。
+    Entity names are kept exactly as the extractor produced them (casing /
+    normalization is the extractor's job); matching lowercases both sides.
+    Content-word set = ``tokens_of`` (the same one retrieval uses) ∪
+    ``zh_trigrams`` (the patch for wording-order fragility; see the module
+    docstring).
     """
     ents = tuple(dict.fromkeys(
         e for e in (extract_entities(text or "") or []) if e))
@@ -99,13 +117,16 @@ def derive_intent_triggers(
 
 @dataclass(frozen=True)
 class ProspectivePlan:
-    """block_2 的重排结果（装配侧产物）。
+    """The reordering result for block_2 (assembly-side product).
 
     Attributes:
-        lines: block_2 的行列表（格式与原实现一致 ``[status] text``，
-            触发的行尾带 ``TRIGGER_SUFFIX``）。未触发时与原实现逐字节一致。
-        triggered: 触发详情（``[{id, text, matched_on}]``）——空列表 =
-            本次没有触发（调用方据此决定是否加 ``prospective_intents`` 键）。
+        lines: block_2's line list (format identical to the original
+            implementation ``[status] text``, triggered lines carrying
+            ``TRIGGER_SUFFIX`` at the end). When nothing triggered, byte-for-byte
+            identical to the original implementation.
+        triggered: trigger details (``[{id, text, matched_on}]``) — an empty
+            list = nothing triggered this time (the caller uses this to decide
+            whether to add the ``prospective_intents`` key).
     """
     lines: list[str] = field(default_factory=list)
     triggered: list[dict[str, Any]] = field(default_factory=list)
@@ -117,7 +138,7 @@ def _matched_on(
     query_entities: set[str],
     query_tokens: frozenset[str],
 ) -> list[str]:
-    """一条待办的命中原因清单（实体/实词两路，报告用）。"""
+    """One intent's list of hit reasons (entity / content-word channels; for reporting)."""
     reasons: list[str] = []
     hits_e = sorted(set(e.lower() for e in (it.get("trigger_entities") or []))
                     & query_entities)
@@ -135,20 +156,25 @@ def prospective_block2(
     tokens_of: Callable[[str], set[str]],
     cap: int = INTENT_BLOCK_CAP,
 ) -> ProspectivePlan:
-    """装配 block_2 待办行：触发置前回带，其余保持原序（纯函数）。
+    """Assemble block_2's intent lines: triggered ones hoisted to the front, the rest keep their original order (pure function).
 
     Args:
-        intents: brain 的待办序列（原样只读；触发集字段缺失 = 老数据，
-            永不触发——行为与无触发集一致）。
-        query: 当前查询；空串 = 走原行为（触发机制只在有查询语境时生效）。
-        extract_entities / tokens_of: 查询侧的实体抽取与分词（注入）。
-        cap: 条数上限（默认 5，与原 ``[:5]`` 一致；先排序后裁——
-            触发的待办不会被无关注办挤出 cap）。
+        intents: brain's intent sequence (read-only as-is; a missing trigger-set
+            field = old data, never triggers — same behavior as having no
+            trigger set).
+        query: the current query; an empty string = original behavior (the
+            trigger mechanism only applies with a query context).
+        extract_entities / tokens_of: query-side entity extraction and
+            tokenization (injected).
+        cap: count cap (default 5, same as the original ``[:5]``; sort first,
+            cut after — triggered intents are not squeezed out of the cap by
+            unrelated ones).
 
     Returns:
-        :class:`ProspectivePlan`。``triggered`` 为空时 ``lines`` 与
-        context_slots 原实现的 ``[f"[{i['status']}] {i['text']}" ...][:cap]``
-        逐字节一致（负对照的锚点）。
+        :class:`ProspectivePlan`. When ``triggered`` is empty, ``lines`` is
+        byte-for-byte identical to context_slots' original
+        ``[f"[{i['status']}] {i['text']}" ...][:cap]`` (the negative control's
+        anchor).
     """
     open_intents = [i for i in intents
                     if isinstance(i, dict) and i.get("status") == "open"]
@@ -164,7 +190,7 @@ def prospective_block2(
         return ProspectivePlan(lines=_render(open_intents, set()), triggered=[])
 
     q_entities = {e.lower() for e in (extract_entities(query) or []) if e}
-    # 查询侧与登记侧同口径：tokens_of（bigram/英文）∪ 中文 trigram。
+    # Query side uses the same convention as the registration side: tokens_of (bigrams/English) ∪ Chinese trigrams.
     q_tokens = frozenset(tokens_of(query or "")) | frozenset(
         zh_trigrams(query or ""))
     if not q_entities and not q_tokens:

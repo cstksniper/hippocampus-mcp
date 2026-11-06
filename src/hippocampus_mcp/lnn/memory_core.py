@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-"""CfC 动态记忆核（默认纯 numpy，可回退 torch/ncps）.
+"""CfC dynamic memory core (pure numpy by default, torch/ncps fallback).
 
-封装 CfC (Closed-form Continuous-time) 网络, 维护跨 step 的隐藏状态以实现
-时序记忆. 同时维护一个最近消息的滑动窗口, get_query 返回 CfC 输出与窗口均值
-的加权融合, 构成混合架构.
+Wraps a CfC (Closed-form Continuous-time) network, maintaining the hidden
+state across steps to realize temporal memory. It also maintains a sliding
+window of recent messages; get_query returns a weighted fusion of the CfC
+output and the window mean, forming a hybrid architecture.
 
-**后端**：``HIPPOCAMPUS_LNN_BACKEND``
+**Backend**: ``HIPPOCAMPUS_LNN_BACKEND``
 
-* ``numpy``（默认）—— :class:`lnn.numpy_cfc.NumpyWiredCfc` 逐算子复刻 ncps
-  ``WiredCfCCell(mode="default")``；生产进程**不再 import torch**（内存 −370MB
-  级收益的前提）。接线仍用 ``ncps.wirings.AutoNCP``（纯 numpy、种子确定）。
-* ``torch`` —— 原 ncps.torch 实现，惰性导入；等价性由
-  ``tests/test_h7_numpy_lnn.py`` 的 A/B 对拍钉住，出问题一键回退。
+* ``numpy`` (default) -- :class:`lnn.numpy_cfc.NumpyWiredCfc` replicates
+  ncps ``WiredCfCCell(mode="default")`` operator by operator; the
+  production process **no longer imports torch** (the precondition of the
+  ~-370MB memory win). Wiring still uses ``ncps.wirings.AutoNCP`` (pure
+  numpy, deterministic seed).
+* ``torch`` -- the original ncps.torch implementation, lazily imported;
+  equivalence is pinned by the A/B cross-check in
+  ``tests/test_h7_numpy_lnn.py``, so problems fall back with one switch.
 
-环境约束:
-    - AutoNCP 要求 output_dim < n_neurons - 2
-    - CfC(input_dim, wiring) 返回 (output, hx)
+Environment constraints:
+    - AutoNCP requires output_dim < n_neurons - 2
+    - CfC(input_dim, wiring) returns (output, hx)
         output shape = (batch, time, output_dim)
         hx     shape = (batch, n_neurons)
 """
@@ -29,23 +33,27 @@ import numpy as np
 
 from .numpy_cfc import DEFAULT_INIT_SEED, NumpyWiredCfc
 
-#: 后端开关。numpy = 默认零 torch；torch = ncps 实现（惰性导入）。
+#: Backend switch. numpy = zero torch by default; torch = ncps implementation (lazy import).
 ENV_LNN_BACKEND = "HIPPOCAMPUS_LNN_BACKEND"
 
-# 构造注入缝：旋钮登记在 config（lnn_backend），生产路径由 engine
-# import 时灌入；解析序（env 先、注入值回退）见 common/config_bridge。
+# Construction injection seam: the knob is registered in config
+# (lnn_backend), and the production path pours it in at engine import; the
+# resolution order (env first, injected value as fallback) is in
+# common/config_bridge.
 from ..common.config_bridge import apply_config, resolve as _resolve  # noqa: E402
 
-# AutoNCP(wiring) 生成只依赖 numpy；ncps.torch 才依赖 torch。
-from ncps.wirings import AutoNCP  # noqa: E402  纯 numpy，不引 torch
+# AutoNCP(wiring) generation depends only on numpy; only ncps.torch needs torch.
+from ncps.wirings import AutoNCP  # noqa: E402  pure numpy, no torch import
 
 
 def _stderr_print(*args, **kwargs) -> None:
-    """诊断输出一律走 stderr。
+    """Diagnostics always go to stderr.
 
-    **MCP stdio 模式下 stdout 是 JSON-RPC 协议通道**：写到 stdout 的内容会被客户端
-    当成协议消息解析（实测报 "Invalid JSON"），可能直接导致断连。本模块的
-    "忽略不兼容的 LNN 状态" 等提示在换模型后首次启动时**必然触发**，故必须走 stderr。
+    **In MCP stdio mode stdout is the JSON-RPC protocol channel**: anything
+    written to stdout is parsed by the client as a protocol message (seen in
+    testing as "Invalid JSON"), possibly causing a direct disconnect. This
+    module's "ignoring incompatible LNN state" notice **necessarily fires**
+    on first start after switching models, so it must go to stderr.
     """
     kwargs.setdefault("file", sys.stderr)
     print(*args, **kwargs)
@@ -57,22 +65,26 @@ def _backend_from_env() -> str:
 
 
 class MemoryCore:
-    """CfC 动态记忆核.
+    """CfC dynamic memory core.
 
-    通过 CfC 网络在多次 step 调用间维持隐藏状态 ``hx``, 形成"液体状态机"
-    式的时序记忆. 每次输入消息都会更新隐藏状态, 使核能够记住最近的上下文.
+    The CfC network maintains a hidden state ``hx`` across step calls,
+    forming "liquid state machine"-style temporal memory. Each input message
+    updates the hidden state, letting the core remember recent context.
 
-    混合架构: 除 CfC 的隐式时序记忆外, 显式维护一个最近输出向量的滑动窗口,
-    get_query 返回 CfC 当前输出与窗口均值的加权融合 (默认 0.5 / 0.5),
-    兼顾对最新输入的响应性与近期上下文的稳定性.
+    Hybrid architecture: besides the CfC's implicit temporal memory, a
+    sliding window of recent output vectors is explicitly maintained;
+    get_query returns a weighted fusion of the CfC's current output and the
+    window mean (default 0.5 / 0.5), balancing responsiveness to the latest
+    input with stability of recent context.
 
     Args:
-        input_dim: 输入嵌入维度 (默认 32).
-        n_neurons: CfC 神经元数量 (默认 64). 需满足 output_dim < n_neurons - 2.
-        output_dim: 输出维度 (默认 32).
-        window_size: 滑动窗口大小 (默认 5).
-        cfc_weight: get_query 中 CfC 输出的权重 (默认 0.5).
-        window_weight: get_query 中窗口均值的权重 (默认 0.5).
+        input_dim: input embedding dimension (default 32).
+        n_neurons: number of CfC neurons (default 64). Must satisfy
+            output_dim < n_neurons - 2.
+        output_dim: output dimension (default 32).
+        window_size: sliding window size (default 5).
+        cfc_weight: weight of the CfC output in get_query (default 0.5).
+        window_weight: weight of the window mean in get_query (default 0.5).
     """
 
     def __init__(
@@ -84,7 +96,7 @@ class MemoryCore:
         cfc_weight: float = 0.5,
         window_weight: float = 0.5,
     ):
-        # AutoNCP 要求 output_dim < n_neurons - 2
+        # AutoNCP requires output_dim < n_neurons - 2
         assert output_dim < n_neurons - 2, (
             f"AutoNCP 要求 output_dim < n_neurons - 2, "
             f"但得到 output_dim={output_dim}, n_neurons={n_neurons} "
@@ -99,8 +111,9 @@ class MemoryCore:
         self.window_weight = float(window_weight)
         self.backend = _backend_from_env()
 
-        # 接线：两后端共用同一份确定性生成（AutoNCP 默认 seed=22222，
-        # 与 torch 路径构造的 wiring 逐位一致 ⇒ A/B 对拍两侧掩码天然相同）。
+        # Wiring: both backends share one deterministic generation (AutoNCP's
+        # default seed=22222, bit-identical to the torch path's wiring => the
+        # A/B cross-check's masks are naturally identical on both sides).
         wiring = AutoNCP(n_neurons, output_dim)
         wiring.build(input_dim)
         self._wiring = wiring
@@ -109,13 +122,13 @@ class MemoryCore:
         ]
 
         if self.backend == "torch":
-            import torch  # 惰性：只有显式回退才付这份内存
+            import torch  # lazy: only the explicit fallback pays this memory
             from ncps.torch import CfC
 
             self._torch = torch
             self.cfc = CfC(input_dim, wiring, batch_first=True)
         else:
-            # numpy 核：掩码按 WiredCfCCell.__init__ 的同一公式推导
+            # numpy core: masks derived by the same formula as WiredCfCCell.__init__
             masks: list[np.ndarray] = []
             prev_neurons: Any = None
             for l in range(wiring.num_layers):
@@ -138,22 +151,22 @@ class MemoryCore:
                 seed=DEFAULT_INIT_SEED,
             )
 
-        # 跨 step 维持的隐藏状态, shape = (batch, n_neurons)
-        # 初始为 None, 首次 step 时由 CfC 自动初始化
+        # Hidden state maintained across steps, shape = (batch, n_neurons)
+        # Starts as None; the CfC initializes it on first step
         self.hx: Optional[Any] = None
 
-        # 最近一次输出向量 (detached), shape = (output_dim,)
+        # Most recent output vector (detached), shape = (output_dim,)
         self.last_output = self._zeros(output_dim)
 
-        # 最近消息输出的滑动窗口
+        # Sliding window of recent message outputs
         self.window: deque = deque(maxlen=window_size)
 
     # ------------------------------------------------------------------
-    # 后端细节
+    # Backend details
     # ------------------------------------------------------------------
     @property
     def runtime(self) -> str:
-        """自曝实际运行时（范式：报实际值，不报配置值）。"""
+        """Self-expose the actual runtime (convention: report the actual value, not the configured value)."""
         return "torch(ncps)" if self.backend == "torch" else "numpy"
 
     def _zeros(self, *shape: int) -> Any:
@@ -162,7 +175,7 @@ class MemoryCore:
         return np.zeros(shape, dtype=np.float32)
 
     def _to_input(self, x: Any) -> Any:
-        """把输入统一成 (B, S, input_dim)。收 numpy（生产路径）或 torch 张量。"""
+        """Unify the input into (B, S, input_dim). Accepts numpy (production path) or torch tensors."""
         if self.backend == "torch":
             t = self._torch
             if not t.is_tensor(x):
@@ -186,13 +199,13 @@ class MemoryCore:
         return x
 
     def reset_state(self) -> None:
-        """清空时序状态（hx / last_output / window）。全局上下文重置（reset_context）走这里。"""
+        """Clear the temporal state (hx / last_output / window). Global context reset (reset_context) goes through here."""
         self.hx = None
         self.last_output = self._zeros(self.output_dim)
         self.window.clear()
 
     def load_weights_npz(self, path: str) -> bool:
-        """从 npz 加载训练权重（CRL 导出物）。两后端都可走这条通道。"""
+        """Load trained weights from npz (CRL export). Both backends can use this channel."""
         if self.backend == "torch":
             import numpy as _np
 
@@ -204,26 +217,29 @@ class MemoryCore:
         return True
 
     def load_weights(self, arrays: dict[str, "Any"]) -> bool:
-        """把训练权重灌进当前核。键名两种风格都收：
+        """Pour trained weights into the current core. Both key styles are
+        accepted:
 
-        * ``layer{i}.{head}.{weight|bias}``（numpy_cfc / npz 导出风格）
-        * ``rnn_cell.layer_{i}.…``（ncps state_dict 原生风格，legacy CRL .pt）
+        * ``layer{i}.{head}.{weight|bias}`` (numpy_cfc / npz export style)
+        * ``rnn_cell.layer_{i}.…`` (ncps state_dict native style, legacy CRL .pt)
 
-        torch 核转 tensor 走 ``load_state_dict(strict=False)``（与旧行为一致，
-        缺键/多键不炸）；numpy 核校验形状后原地换权重（ff1/ff2 重乘掩码）。
+        The torch core converts to tensors and goes through
+        ``load_state_dict(strict=False)`` (same as the old behavior;
+        missing/extra keys do not blow up); the numpy core validates shapes
+        and swaps weights in place (ff1/ff2 re-multiplied by masks).
         """
         norm = {}
         for k, v in arrays.items():
             nk = k
             if nk.startswith("rnn_cell.layer_"):
-                # ncps 原生 → numpy_cfc 风格
+                # ncps native -> numpy_cfc style
                 nk = nk[len("rnn_cell."):].replace("layer_", "layer", 1)
             norm[nk] = v
         if self.backend == "torch":
             t = self._torch
             state = {}
             for k, v in norm.items():
-                # numpy_cfc 风格 → ncps state_dict 原生键
+                # numpy_cfc style -> ncps state_dict native keys
                 nk = k
                 if k.startswith("layer") and "." in k:
                     head, rest = k.split(".", 1)
@@ -235,28 +251,30 @@ class MemoryCore:
         return True
 
     # ------------------------------------------------------------------
-    # 前向推理
+    # Forward inference
     # ------------------------------------------------------------------
     def step(self, x: Any) -> Any:
-        """处理输入, 更新隐藏状态, 返回输出向量.
+        """Process input, update the hidden state, return the output vector.
 
         Args:
-            x: 输入张量, 支持两种形式:
-                - (1, input_dim): 单个嵌入向量
-                - (batch, seq, input_dim): 嵌入序列
+            x: input tensor, in either form:
+                - (1, input_dim): a single embedding vector
+                - (batch, seq, input_dim): an embedding sequence
 
         Returns:
-            输出向量, shape = (output_dim,), 取最后一个时间步的结果.
-            CfC 的隐藏状态 hx 会跨调用维持 (时序记忆的核心).
+            Output vector, shape = (output_dim,), taking the last time
+            step's result. The CfC hidden state hx is maintained across
+            calls (the core of temporal memory).
         """
         x = self._to_input(x)
 
         if self.backend == "torch":
             t = self._torch
-            # CfC 前向: output=(batch, seq, output_dim), hx=(batch, n_neurons)
-            # hx 跨 step 维持 —— 这是时序记忆的核心
+            # CfC forward: output=(batch, seq, output_dim), hx=(batch, n_neurons)
+            # hx is maintained across steps -- the core of temporal memory
             output, hx = self.cfc(x, self.hx)
-            # 切断跨 step 的梯度图, 防止长序列下计算图无限增长 (适合推理/检索)
+            # Cut the cross-step gradient graph so it cannot grow unboundedly
+            # on long sequences (suited to inference/retrieval)
             self.hx = hx.detach()
             last = output[:, -1, :]
             out_vec = last.squeeze(0) if last.shape[0] == 1 else last[0]
@@ -274,16 +292,17 @@ class MemoryCore:
         return out_vec
 
     # ------------------------------------------------------------------
-    # 查询向量
+    # Query vector
     # ------------------------------------------------------------------
     def get_query(self) -> Any:
-        """返回当前输出与窗口均值加权融合后的归一化查询向量.
+        """Return the normalized query vector, a weighted fusion of the current
+        output and the window mean.
 
-        混合架构: query = cfc_weight * last_output + window_weight * window_mean,
-        再做 L2 归一化. 默认权重 0.5 / 0.5.
+        Hybrid architecture: query = cfc_weight * last_output + window_weight
+        * window_mean, then L2 normalized. Default weights 0.5 / 0.5.
 
         Returns:
-            归一化查询向量, shape = (output_dim,).
+            Normalized query vector, shape = (output_dim,).
         """
         cur = self.last_output
 
@@ -304,15 +323,16 @@ class MemoryCore:
         return fused / max(norm, 1e-12)
 
     # ------------------------------------------------------------------
-    # 状态持久化
+    # State persistence
     # ------------------------------------------------------------------
     def get_state(self) -> dict:
-        """返回当前隐藏状态用于 checkpoint.
+        """Return the current hidden state for checkpointing.
 
-        **统一返回 numpy 数组**（torch 核在出口处转换），checkpoint 层因此零 torch。
+        **Always returns numpy arrays** (the torch core converts at the
+        exit), so the checkpoint layer is zero-torch.
 
         Returns:
-            包含 hx / last_output / window 及配置信息的字典.
+            Dict with hx / last_output / window and configuration info.
         """
         return {
             "hx": self._state_array(self.hx),
@@ -326,7 +346,7 @@ class MemoryCore:
 
     @staticmethod
     def _state_array(t: Any) -> Optional[np.ndarray]:
-        """torch 张量 / numpy 数组 → numpy（None 透传）。"""
+        """torch tensor / numpy array -> numpy (None passes through)."""
         if t is None:
             return None
         if hasattr(t, "detach"):
@@ -334,20 +354,26 @@ class MemoryCore:
         return np.asarray(t)
 
     def load_state(self, state: dict) -> None:
-        """从 checkpoint 恢复状态.
+        """Restore state from a checkpoint.
 
-        隐藏状态与嵌入维度绑定：若 checkpoint 来自另一个嵌入模型（维度不同），
-        直接恢复会让后续 ``get_query()`` 与查询向量维度不匹配。
-        此时安全跳过恢复（重置为空状态），由后续 step 重新积累。
+        The hidden state is bound to the embedding dimension: if the
+        checkpoint came from another embedding model (different dimension),
+        restoring directly would make later ``get_query()`` dimension-
+        mismatch the query vector. In that case safely skip restoration
+        (reset to empty state); later steps re-accumulate.
 
-        收 **numpy 数组**（checkpoint npz 的原生形态）；兼容旧 `.pt` 路径读出的
-        torch 张量（自动转换）。
+        Takes **numpy arrays** (the checkpoint npz's native form); also
+        accepts torch tensors read from the legacy `.pt` path
+        (auto-converted).
 
         Args:
-            state: get_state 返回的字典. 允许为空字典 —— ``StateCheckpoint.load()``
-                在主文件与备份都读不出来时会返回 ``{}``（例如状态文件被写坏、
-                磁盘故障）。此时必须安全退化为初始状态，而不是抛异常：这条
-                路径在服务启动时就会走到，崩掉等于整个 MCP 服务起不来。
+            state: the dict returned by get_state. May be an empty dict --
+                ``StateCheckpoint.load()`` returns ``{}`` when neither the
+                main file nor the backup can be read (e.g. the state file
+                was written broken, disk failure). It must degrade safely to
+                the initial state rather than raise: this path runs at
+                service startup, and crashing there means the whole MCP
+                service cannot start.
         """
         if not state:
             self.reset_state()
@@ -391,7 +417,7 @@ class MemoryCore:
             )
 
     def _restore_array(self, t: Any) -> Any:
-        """恢复一路状态：numpy（或旧 .pt 的 torch 张量）→ 本后端的数组。"""
+        """Restore one piece of state: numpy (or a legacy .pt torch tensor) -> this backend's array."""
         arr = np.asarray(t, dtype=np.float32)
         if self.backend == "torch":
             return self._torch.from_numpy(arr)

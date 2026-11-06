@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-"""预渲染文本块：结构化 dict → 文本槽（从 brain/core.py 提取的纯函数层）。
+"""Pre-rendered text blocks: structured dict → text slots (pure-function layer extracted from brain/core.py).
 
-这五个函数是**双轨制**的文本轨（设计文档 §3.3）：session_start 的
-结构化 dict 供程序消费与未来人类 UI 渲染真信息图，这里的文本槽
-供直接拼 prompt。两边同源同口径，改渲染规则只改这一处。
+These five functions are the text track of the **dual-track design** (design doc §3.3):
+session_start's structured dict serves programmatic consumption and future human UI
+rendering of real infographics, while the text slots here serve direct prompt splicing.
+Both sides share the same source and the same account; changing the rendering rules
+happens in exactly one place.
 
-为什么放 ``common/`` 而不是 ``application/``：现调用方是 brain 的
-``_SessionMixin``（session.py），而依赖方向是「用例逻辑只从 brain
-单向流向 application，不回头」——brain 不许 import application。
-放 common 两层都能用；等 session.py 的组装体搬进
-``BootstrapService`` 后，这一层归属不变。
+Why ``common/`` rather than ``application/``: the current caller is brain's
+``_SessionMixin`` (session.py), and the dependency direction is "use-case logic flows
+one way from brain to application and never turns back" — brain must not import
+application. Putting it in common makes it usable by both layers; once session.py's
+assembly moves into ``BootstrapService``, this layer's ownership does not change.
 
-全部是纯函数：输入 dict、输出 str，零 I/O、零 brain 状态。
+All are pure functions: dict in, str out, zero I/O, zero brain state.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from .constants import TASK_PROFILE_CLIP, format_age, sparkline
 
 
 def render_overview_block(ov: dict[str, Any]) -> str:
-    """预渲染 library overview block (≤180 token target; empty library gets a placeholder)."""
+    """Pre-render the library overview block (≤180 token target; empty library gets a placeholder)."""
     if not ov.get("memories"):
         return "(Empty library: no memories yet)"
     lines = []
@@ -60,7 +62,7 @@ def render_overview_block(ov: dict[str, Any]) -> str:
 
 
 def render_status_block(st: dict[str, Any]) -> str:
-    """预渲染 status block (≤150 token target). Omitted when contradiction checking is disabled."""
+    """Pre-render the status block (≤150 token target). Omitted when contradiction checking is disabled."""
     lines = []
     pend = "[Pending] "
     parts = []
@@ -90,8 +92,9 @@ def render_status_block(st: dict[str, Any]) -> str:
     else:
         recent = sum(st.get("spark_series") or [])
         lines.append("[Activity] %d writes in last %d days" % (recent, st["spark_days"]))
-    # 文件建档：项目文件与 hippo 的同步态。
-    # 没启用建档（无侧车）时整行省略——opt-in 的东西不占非用户的 token。
+    # File registry: sync state between the project files and hippo.
+    # When the registry is not enabled (no sidecar) the whole line is omitted — an
+    # opt-in feature does not spend tokens on non-users.
     fr = st.get("file_registry")
     if fr:
         line = "[File registry] %s files" % f"{fr['total']:,}"
@@ -112,7 +115,7 @@ def render_status_block(st: dict[str, Any]) -> str:
 
 
 def render_map_index_block(mi: dict[str, Any] | None) -> str:
-    """预渲染 map index row (§5 sample): contract(42 entries · 3d ago) · genome(18 entries · ⚠️12d).
+    """Pre-render the map index row (§5 sample): contract(42 entries · 3d ago) · genome(18 entries · ⚠️12d).
 
     Drift marker: ``contract(42 entries · 3d ago · drift 2)``——number of entries
     whose truth source changed (produced by auto verify).
@@ -171,7 +174,7 @@ def render_map_detail_block(md: dict[str, Any] | None) -> str:
 
 
 def render_task_profile_block(tp: dict[str, Any] | None) -> str:
-    """预渲染 task profile block (≤200 token target; empty input returns empty string).
+    """Pre-render the task profile block (≤200 token target; empty input returns the empty string).
 
     Only non-empty lines are emitted—empty lines are pure noise for the agent.
     Numbers (hit counts / sizes) are never truncated; only titles are clipped.

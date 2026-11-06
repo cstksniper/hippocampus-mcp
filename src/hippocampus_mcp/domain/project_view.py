@@ -1,33 +1,47 @@
 # -*- coding: utf-8 -*-
-"""库级「全貌卡 / 状态卡」投影（从 core 提取）。
+"""Library-level "overview card / status card" projections (extracted from
+core).
 
-两样都是**纯派生、不检索**、O(n) 单遍：
+Both are **pure derivation, no retrieval**, O(n) single pass:
 
-* :func:`project_overview` —— 身份+规模 / 时间跨度 / 结构画像 / 热点实体；
-* :func:`project_status` —— 未决 / 健康 / 协作 / 活动四组信号。
+* :func:`project_overview` -- identity+scale / time span / structural
+  profile / hot entities;
+* :func:`project_status` -- four signal groups: open intents / health /
+  collaboration / activity.
 
-为什么放 domain/：只做「既有派生层 → 结构化投影」，`recent_ingest` /
-``spark_series`` / ``recent_miss_count`` 三个统计口径本就在 ``common.stats``，
-零 I/O、零模型、零配置读数。brain 只留薄包装，把派生层、参考时钟、两个
-Config 开关、五个上限与五个**惰性回调**在调用时绑好注入。
+Why in domain/: it only does "existing derived layer → structured
+projection"; the three statistical measures `recent_ingest` /
+``spark_series`` / ``recent_miss_count`` already live in ``common.stats``.
+Zero I/O, zero model, zero config reads. brain keeps only a thin wrapper,
+binding and injecting the derived layer, the reference clock, the two
+Config switches, the five caps, and the five **lazy callbacks** at call
+time.
 
-🔴 **惰性回调是纪律不是偷懒**：``knowledge_stats`` 只在主题层开关开时调、
-``contradictions_count`` 只在状态卡矛盾开关开时调——原实现的调用次数就
-是这样（万条库上 0.34s 的量，多调一次就是白烧）。所以这里传的是
-**可调用对象**而不是"先算好的值"：算好的值会让开关失效时照样付代价。
+🔴 **Lazy callbacks are discipline, not laziness**: ``knowledge_stats`` is
+called only when the topic-layer switch is on, ``contradictions_count``
+only when the status-card contradiction switch is on -- that is exactly how
+often the original implementation called them (0.34s-scale on a
+ten-thousand-record library; one extra call is pure burn). So what is
+passed here is a **callable**, not a "precomputed value": a precomputed
+value would pay the cost even when the switch is off.
 
-🔴 **库名走注入**：``display_name`` 住在 ``library/``，而 arch G1 的矩阵是
-``domain → 仅 common``（曾因同层互引吃过亏）。所以库名由包装层
-算好传进来。
+🔴 **Library name goes through injection**: ``display_name`` lives in
+``library/``, and arch G1's matrix is ``domain → common only`` (burned
+before by same-tier cross-imports). So the wrapper computes the library
+name and passes it in.
 
-预存口径按「只挪位置不改行为」保留：
+Pre-existing criteria preserved under "relocate only, no behavior change":
 
-* 实体 Top 只收**有实际关联**的（``memory_ids`` 非空）——启发式实体约 84%
-  是短语噪声，不过滤 Top 行会被一堆 (0) 占满；
-* 时间跨度在没有任何时间戳时是 ``(None, None)``，不是 0；
-* ``contradictions`` 在开关关闭时是 ``{"count": None, "capped": False,
-  "limit": 0}`` —— **None 不是 0**（0 会被读成"查过，没有矛盾"）；
-* L0 悬空与 ``stats()`` 同口径（受影响的 L1 条数），集合先建一次。
+* entity Top only includes entities with **actual associations**
+  (non-empty ``memory_ids``) -- about 84% of heuristic entities are phrase
+  noise; unfiltered, the Top rows would be filled with a wall of (0);
+* the time span is ``(None, None)`` when there are no timestamps at all,
+  not 0;
+* ``contradictions`` with the switch off is ``{"count": None, "capped":
+  False, "limit": 0}`` -- **None is not 0** (0 would be read as "checked,
+  no contradictions");
+* L0 dangling uses the same criterion as ``stats()`` (count of affected L1
+  entries); the id set is built once.
 """
 from __future__ import annotations
 
@@ -51,15 +65,18 @@ def project_overview(
     top_entities: int,
     top_tag_keys: int,
 ) -> dict[str, Any]:
-    """库级全貌投影（设计文档 §3.1）。纯派生、不检索、O(n) 单遍。"""
+    """Library-level overview projection (design doc §3.1). Pure derivation,
+    no retrieval, O(n) single pass."""
     total = len(records)
     ts = [r.timestamp for r in records if r.timestamp]
     first_ts, last_ts = (min(ts), max(ts)) if ts else (None, None)
     tag_cov = tag_coverage()
     kn = knowledge_stats() if topic_layer_enabled else {}
     kinds = kn.get("summary_kinds") or {}
-    # 只收**有实际关联**的实体：启发式实体约 84% 是短语噪声（见 ENTITY_ORIGIN_*
-    # 说明），不过滤的话 Top 行会被一堆 (0) 占满——那既是噪声又是误导。
+    # Only entities with **actual associations**: about 84% of heuristic
+    # entities are phrase noise (see the ENTITY_ORIGIN_* notes); unfiltered,
+    # the Top rows would be filled with a wall of (0) -- noise as well as
+    # misleading.
     top_ents = sorted(
         (e for e in entities.values()
          if len(e.get("memory_ids") or []) > 0),
@@ -104,13 +121,15 @@ def project_status(
     miss_days: int,
     spark_days: int,
 ) -> dict[str, Any]:
-    """当前状态投影（设计文档 §3.2）。纯派生、不检索。"""
+    """Current status projection (design doc §3.2). Pure derivation, no
+    retrieval."""
     series = spark_series(spark_days, daily_counts, ref_time)
     contra = (contradictions_count(contradiction_cap)
               if contradictions_enabled
               else {"count": None, "capped": False, "limit": 0})
-    # L0 悬空：与 stats() 同口径（受影响的 L1 条数），集合先建一次——
-    # 卡片上的数必须和 brain_stats 对得上（单一真相源），不能各算各的。
+    # L0 dangling: same criterion as stats() (count of affected L1 entries);
+    # the id set is built once -- the numbers on the card must match
+    # brain_stats (single source of truth), not be computed independently.
     raw_ids = {x.get("id") for x in raw_log}
     dangling = sum(
         1 for r in records
@@ -128,6 +147,7 @@ def project_status(
         "active_sessions": len(active_sessions()),
         "spark_days": spark_days,
         "spark_series": series,
-        # 文件建档：项目文件与 hippo 的同步态；未启用为 None
+        # File archiving: sync state between project files and hippo; None
+        # when not enabled
         "file_registry": file_registry_summary(),
     }

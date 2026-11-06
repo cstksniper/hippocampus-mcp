@@ -1,24 +1,36 @@
 # -*- coding: utf-8 -*-
-"""hook_client：宿主 hook 进程用的**只读**轻客户端（纯标准库）。
+"""hook_client: a **read-only** lightweight client for host hook processes
+(pure standard library).
 
-背景见 ``docs/design/UserPromptSubmit自动注入_20261105.md``：把读侧最常用的
-「现在该想起什么」从 agent 主动调用改为宿主 hook 确定性注入（机制替代纪律，
-10-31 审计证明"靠 agent 自觉 recall"会漏）。
+Background: ``docs/design/UserPromptSubmit自动注入_20261105.md`` -- moving
+the read side's most frequent "what should be recalled now" from agent
+initiated calls to deterministic injection by a host hook (mechanism instead
+of discipline; the 10-31 audit proved "relying on the agent to recall on its
+own" leaks).
 
-三条设计约束（改动前先读设计文档 §三/§四）：
+Three design constraints (read design doc §三/§四 before changing):
 
-- **纯标准库**。hook 进程每次 prompt 都要跑，唯一允许的包内依赖是
-  :mod:`hippocampus_mcp.launcher`（它也是纯标准库；``hippocampus_mcp/__init__``
-  只设 env 不拖重库，已核）。重库一进来，每条 prompt 都多背几百 MB。
-- **只读 best-effort**。daemon 不在就静默放弃，**绝不从这里拉起 daemon**
-  （模型冷载 13-35s 必然顶穿 hook 超时；daemon 的拉起是 MCP 会话 launcher
-  的职责，有单飞锁）。任何异常都返回空串，hook 故障绝不能卡会话。
-- **每条 prompt 一条新连接**：连接 → HELLO → MCP 握手 → 一次 tools/call → 关。
-  daemon 每连接一线程，成本毫秒级；不复用长连接是为了让 hook 进程无常驻状态。
+- **Pure standard library**. The hook process runs on every prompt; the only
+  allowed in-package dependency is :mod:`hippocampus_mcp.launcher` (also
+  pure standard library; ``hippocampus_mcp/__init__`` only sets env vars and
+  drags in no heavy libraries -- verified). One heavy import and every
+  prompt carries hundreds of MB.
+- **Read-only best-effort**. If the daemon is absent, give up silently;
+  **never start the daemon from here** (a 13-35s model cold load would blow
+  straight through the hook timeout; starting the daemon is the MCP session
+  launcher's job and it has a single-flight lock). Any exception returns an
+  empty string; a hook failure must never stall the session.
+- **One new connection per prompt**: connect → HELLO → MCP handshake → one
+  tools/call → close. The daemon runs one thread per connection at
+  millisecond cost; long connections are not reused so the hook process
+  keeps no resident state.
 
-与 MCP 会话的库绑定同源：launcher 怎么发 HELLO（``_send_hello``），这里就怎么发
-——``library`` 传声明库、``cwd`` 传工作区，daemon 侧按 C1 反查定家库。这样 hook
-的装配与同工作区的 MCP 会话落在同一个库，且敏感档判定口径一致。
+Same origin as the MCP session's library binding: however launcher sends
+HELLO (``_send_hello``), this sends it the same way -- ``library`` carries
+the declared library, ``cwd`` the workspace; the daemon side resolves the
+home library via C1 reverse lookup. That way the hook's assembly lands in
+the same library as the MCP sessions of the same workspace, with an
+identical sensitivity-tier criterion.
 """
 
 from __future__ import annotations
@@ -30,29 +42,37 @@ import time
 
 from .launcher import HELLO_PREFIX, daemon_key, read_registry, try_connect
 
-# hook 进程 env 里没有 HIPPOCAMPUS_*（那是 MCP server 的 per-server env），
-# 找 daemon 注册表需要的值由调用方传入；这里的默认值只覆盖"与本仓默认
-# 安装一致"的场景（cli context / 测试）。ZCode 用户级 hook 薄壳脚本里
-# 有自己的镜像常量，改配置时两处要一起看（设计文档 §八 漂移风险）。
-DEFAULT_KEY_LIBRARY = ""                      # 与 launcher：HIPPOCAMPUS_DAEMON_LIBRARY 未设同值
-DEFAULT_EMB_MODEL = "BAAI/bge-base-zh-v1.5"   # 与 cli.MODEL_DEFAULT、用户级条目 env 同值
+# The hook process's env has no HIPPOCAMPUS_* (that is the MCP server's
+# per-server env); the values needed to find the daemon registry are passed
+# in by the caller. The defaults here only cover the "matches this repo's
+# default install" scenarios (cli context / tests). The ZCode user-level
+# hook thin-shell script carries its own mirror constants; when changing
+# config, look at both places together (design doc §八 drift risk).
+DEFAULT_KEY_LIBRARY = ""                      # matches launcher: HIPPOCAMPUS_DAEMON_LIBRARY unset
+DEFAULT_EMB_MODEL = "BAAI/bge-base-zh-v1.5"   # matches cli.MODEL_DEFAULT and the user-level entry env
 
-#: 整条交换（连接 → 拿到响应）的墙钟预算。daemon 热态单查几十毫秒；
-#: daemon 正在冷启动时 warmup 会阻塞 tools/call，这里到点就放弃——
-#: 宁可这一轮不注入，也不让 hook 挂住 prompt。
+#: Wall-clock budget for the whole exchange (connect → response received).
+#: A warm daemon answers a single query in tens of milliseconds; while the
+#: daemon is cold-starting, warmup blocks tools/call -- give up when the
+#: budget runs out. Better to skip this round's injection than let the hook
+#: hang the prompt.
 EXCHANGE_DEADLINE_S = 6.0
 
-#: query 截断。嵌入模型 512 token 硬上限（写侧撞过的坑），query 同样受限。
+#: Query truncation. The embedding model has a 512 token hard cap (a pit hit
+#: on the write side); the query is bound by the same limit.
 QUERY_MAX_CHARS = 512
 
-# get_memory_context 返回的 5 槽位键（domain/context_slots.py 装配）。
-# hook 只取三段：命中 + 待办 + 未完结话题——时间线/实体槽是开场包的材料，
-# 每轮重复注入是浪费（设计文档 D1；"待办解决上次没收口"含 block_2）。
+# The 5 slot keys returned by get_memory_context (assembled by
+# domain/context_slots.py). The hook takes only three sections: hits +
+# pending + open topics -- the timeline/entity slots are opening-package
+# material; re-injecting them every round is waste (design doc D1; "pending
+# left unclosed from last time" includes block_2).
 BLOCK_HITS = "block_1_current_hits"
 BLOCK_PENDING = "block_2_pending"
 BLOCK_TOPICS = "block_5_open_topics"
 
-# 装配侧的占位行：整段只有占位行 = 该段为空，不进注入。
+# Placeholder lines from the assembly side: a section holding only
+# placeholders = that section is empty, excluded from injection.
 _PLACEHOLDERS = {"(No todos)", "(No session history)", "(No related entity state)", "(No open topics)"}
 
 _INJECTION_HEADER = "[HippoMCP auto-injected memory related to the current input (fetched by hook; for reference only)]:"
@@ -62,11 +82,15 @@ _SECTION_HEADERS = ((BLOCK_HITS, "◆ Relevant hits"), (BLOCK_PENDING, "◆ Open
 
 def format_injection(blocks: dict, *, item_max_chars: int = 150,
                      token_budget: int = 600) -> str:
-    """把装配块渲染成注入文本。空结果返回 ``""``（调用方据此零输出）。
+    """Render the assembled blocks into injection text. Empty results return
+    ``""`` (the caller emits zero output accordingly).
 
-    独立成纯函数是为了单测可以直接盯：占位段跳过、逐行截断、预算逐行硬检查。
-    预算是**软首行**：第一条内容行即使超预算也保留（否则会出现"只有标题
-    没有内容"的注入），其后一律硬截并打标记。
+    Kept as a pure function so unit tests can stare directly at it:
+    placeholder sections skipped, per-line truncation, budget hard-checked
+    line by line. The budget is a **soft first line**: the first content line
+    is kept even if it exceeds the budget (otherwise you get an injection
+    with "headers but no content"); everything after is hard-truncated and
+    flagged.
     """
     sections = []
     for key, header in _SECTION_HEADERS:
@@ -116,10 +140,12 @@ def format_injection(blocks: dict, *, item_max_chars: int = 150,
 
 
 class _LineReader:
-    """行分帧读取（带墙钟预算）。
+    """Line-framed reading (with a wall-clock budget).
 
-    🔴 逐次 ``recv`` 自攒缓冲，别用 ``makefile``：socket 超时要按剩余预算
-    动态收紧，文件对象会把它藏进内部缓冲里失真。
+    🔴 Accumulate the buffer across individual ``recv`` calls; do not use
+    ``makefile``: the socket timeout must tighten dynamically against the
+    remaining budget, and a file object would hide it inside internal
+    buffering, distorting it.
     """
 
     def __init__(self, sock: socket.socket, deadline: float) -> None:
@@ -146,7 +172,8 @@ def _send_json(sock: socket.socket, obj: dict) -> None:
 
 
 def _read_response(reader: _LineReader, want_id: int) -> dict:
-    """读到指定 id 的响应帧为止（服务器主动通知一律跳过）。"""
+    """Read until the response frame with the given id (server-initiated
+    notifications are always skipped)."""
     while True:
         obj = json.loads(reader.readline())
         if isinstance(obj, dict) and obj.get("id") == want_id:
@@ -156,12 +183,16 @@ def _read_response(reader: _LineReader, want_id: int) -> dict:
 def _exchange(sock: socket.socket, *, query: str, top_k: int, token_budget: int,
               item_max_chars: int, hello_library: str, cwd: str,
               deadline: float) -> dict:
-    """HELLO → initialize → initialized → tools/call，返回装配 dict。
+    """HELLO → initialize → initialized → tools/call; returns the assembled
+    dict.
 
-    握手三步是 F8（launcher.py:984-986 注释）推断 + 实测确认的：daemon 内部
-    是标准 MCP low-level server，未 initialize 的 tools/call 会被拒。
+    The three handshake steps were inferred from F8 (comment at
+    launcher.py:984-986) and confirmed by measurement: inside the daemon is
+    a standard MCP low-level server; a tools/call without initialize is
+    rejected.
     """
-    # HELLO 必须先于一切 MCP 字节（launcher._send_hello 同款纪律：不发会串库）
+    # HELLO must precede any MCP bytes (same discipline as
+    # launcher._send_hello: skipping it cross-contaminates libraries)
     payload = {"library": hello_library, "cwd": cwd, "pid": os.getpid()}
     sock.sendall((HELLO_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
                  .encode("utf-8"))
@@ -185,7 +216,8 @@ def _exchange(sock: socket.socket, *, query: str, top_k: int, token_budget: int,
     if resp.get("error"):
         raise RuntimeError(f"tools/call was rejected: {resp['error']}")
     result = resp.get("result") or {}
-    # structured_output=False：结果在 content[0].text 里，是一层 JSON 字符串
+    # structured_output=False: the result lives in content[0].text as one
+    # more JSON string
     content = (result.get("content") or [{}])[0]
     inner = json.loads(content.get("text") or "{}")
     if not isinstance(inner, dict):
@@ -201,18 +233,25 @@ def fetch_context(prompt: str, cwd: str, *, top_k: int = 3,
                   hello_library: str = "",
                   deadline_s: float = EXCHANGE_DEADLINE_S,
                   trace: list | None = None) -> str:
-    """按 prompt 查记忆，返回注入文本；**任何失败都返回 ``""``**。
+    """Query memory by prompt and return injection text; **any failure
+    returns ``""``**.
 
     Args:
-        prompt: 用户提示词原文（内部截到 :data:`QUERY_MAX_CHARS`）。
-        cwd: 工作区根目录——daemon 按 C1 反查定家库的依据，必须与
-            同工作区 MCP 会话的 cwd 同源（hook 里取 ``ZCODE_PROJECT_DIR``
-            或进程 cwd）。
-        key_library / emb_model / daemon_version: daemon 注册表 key 三要素，
-            必须与目标 daemon 被拉起时的 env 一致（见模块 docstring 常量说明）。
-        hello_library: HELLO 声明库（launcher 的 ``HIPPOCAMPUS_PERSIST_DIR``
-            同款；用户级形态传用户库路径，空则声明为无）。
-        trace: 传 list 则逐步追加人读诊断（cli context 用；hook 传 None 零开销）。
+        prompt: the user's prompt verbatim (truncated internally to
+            :data:`QUERY_MAX_CHARS`).
+        cwd: workspace root -- the basis for the daemon's C1 reverse lookup
+            of the home library; must share origin with the cwd of the MCP
+            sessions of the same workspace (in the hook, take
+            ``ZCODE_PROJECT_DIR`` or the process cwd).
+        key_library / emb_model / daemon_version: the three elements of the
+            daemon registry key; must match the env the target daemon was
+            started with (see the module docstring's constant notes).
+        hello_library: library declared in HELLO (same as launcher's
+            ``HIPPOCAMPUS_PERSIST_DIR``; the user-level form passes the user
+            library path; empty declares none).
+        trace: when given a list, human-readable diagnostics are appended
+            step by step (used by cli context; the hook passes None for zero
+            overhead).
     """
     def _note(msg: str) -> None:
         if trace is not None:
@@ -248,6 +287,6 @@ def fetch_context(prompt: str, cwd: str, *, top_k: int = 3,
                                 token_budget=token_budget)
         _note("context assembled" if text else "context is empty (no hits and no pending items)")
         return text
-    except Exception as exc:  # noqa: BLE001 —— fail-open：hook 故障绝不卡会话
+    except Exception as exc:  # noqa: BLE001 -- fail-open: a hook failure must never stall the session
         _note(f"failed ({type(exc).__name__}: {exc})")
         return ""

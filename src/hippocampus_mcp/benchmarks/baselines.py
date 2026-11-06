@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""基线方法实现.
+"""Baseline method implementations.
 
-为评估 hippocampus_mcp (LNN + 打分) 提供对照基线:
-    - RandomBaseline:       随机检索
-    - PureEmbedding:        纯文本嵌入余弦相似度
-    - TimeDecayBaseline:    嵌入相似度 × 时间衰减
-    - MeanEmbedding:        最近 N 条嵌入均值作为查询
-    - LNNBaseline:          CfC LNN 查询 (不含打分)
-    - FullMethod:           LNN + 打分 + 抽样 (hippocampus_mcp 完整方法)
+Provides comparison baselines for evaluating hippocampus_mcp (LNN + scoring):
+    - RandomBaseline:       random retrieval
+    - PureEmbedding:        pure text-embedding cosine similarity
+    - TimeDecayBaseline:    embedding similarity × time decay
+    - MeanEmbedding:        mean of the most recent N embeddings as the query
+    - LNNBaseline:          CfC LNN query (no scoring)
+    - FullMethod:           LNN + scoring + sampling (hippocampus_mcp full method)
 
-所有基线实现统一接口:
+All baselines implement the same interface:
     store(content, timestamp) -> None
     retrieve(query, top_k) -> list[(doc_id, score)]
     reset() -> None
@@ -26,17 +26,17 @@ from typing import Optional
 
 import numpy as np
 
-# 确保项目根目录在 sys.path 中 (用于导入 embeddings 模块)
+# Ensure the project root is in sys.path (for importing the embeddings module)
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_CURRENT_DIR)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# 导入主项目的嵌入器
+# Import the main project's embedders
 from hippocampus_mcp.engine.embeddings import HashEmbedder as _ProjectHashEmbedder
 from hippocampus_mcp.engine.embeddings import SentenceTransformerEmbedder as _STEmbedder
 
-# 延迟导入 torch 和 ncps, 仅 LNN 基线需要
+# Lazily import torch and ncps; only the LNN baselines need them
 _torch = None
 _ncps = None
 
@@ -55,14 +55,14 @@ def _ensure_torch():
 
 
 def create_eval_embedder(backend: str = "sentence_transformer", dim: int = 384):
-    """创建评测用嵌入器.
+    """Create an embedder for evaluation.
 
     Args:
-        backend: "sentence_transformer" 或 "hash".
-        dim: hash 后端的维度 (sentence_transformer 由模型决定).
+        backend: "sentence_transformer" or "hash".
+        dim: the hash backend's dimension (sentence_transformer is decided by the model).
 
     Returns:
-        嵌入器实例.
+        An embedder instance.
     """
     if backend == "sentence_transformer":
         return _STEmbedder()
@@ -71,7 +71,7 @@ def create_eval_embedder(backend: str = "sentence_transformer", dim: int = 384):
 
 
 class BaseRetriever:
-    """检索基类, 定义统一接口."""
+    """Retrieval base class, defining the unified interface."""
 
     name: str = "base"
 
@@ -111,10 +111,11 @@ class BaseRetriever:
         self._ids.clear()
 
     def _get_reference_time(self) -> float:
-        """获取参考时间: 使用已存储的最新时间戳, 而非 wall-clock.
+        """Get the reference time: use the newest stored timestamp, not the wall clock.
 
-        这确保时间衰减基于数据内部的时间跨度 (如 LoCoMo 中会话间隔数周),
-        而非数据生成时间与当前实际时间的巨大差异.
+        This ensures time decay is based on the data's internal time span (e.g. sessions
+        in LoCoMo weeks apart), not on the huge gap between when the data was generated
+        and the actual current time.
         """
         if self._timestamps:
             return max(self._timestamps)
@@ -132,7 +133,7 @@ class BaseRetriever:
 
 
 class RandomBaseline(BaseRetriever):
-    """随机检索基线."""
+    """Random-retrieval baseline."""
 
     name = "Random"
 
@@ -146,7 +147,7 @@ class RandomBaseline(BaseRetriever):
 
 
 class PureEmbedding(BaseRetriever):
-    """纯文本嵌入余弦相似度检索."""
+    """Pure text-embedding cosine similarity retrieval."""
 
     name = "PureEmbedding"
 
@@ -161,7 +162,7 @@ class PureEmbedding(BaseRetriever):
 
 
 class TimeDecayBaseline(BaseRetriever):
-    """嵌入相似度 × 时间衰减."""
+    """Embedding similarity × time decay."""
 
     name = "TimeDecay"
 
@@ -190,7 +191,7 @@ class TimeDecayBaseline(BaseRetriever):
 
 
 class MeanEmbedding(BaseRetriever):
-    """最近 N 条嵌入均值作为查询 (滑动窗口)."""
+    """Mean of the most recent N embeddings as the query (sliding window)."""
 
     name = "MeanEmbedding"
 
@@ -206,7 +207,7 @@ class MeanEmbedding(BaseRetriever):
     def retrieve(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
         if not self._embeddings:
             return []
-        # 查询向量 = 文本嵌入与最近窗口均值的融合
+        # query vector = fusion of the text embedding and the recent-window mean
         q_text = self.embedder.embed(query)
         recent = self._embeddings[-self.window_size :]
         if recent:
@@ -225,9 +226,10 @@ class MeanEmbedding(BaseRetriever):
 
 
 class LNNBaseline(BaseRetriever):
-    """CfC LNN 查询向量 (不含打分引擎).
+    """CfC LNN query vector (no scoring engine).
 
-    使用 CfC 的隐藏状态 h(t) 作为查询向量, 与文本嵌入加权融合.
+    Uses CfC's hidden state h(t) as the query vector, weighted-fused with the text
+    embedding.
     """
 
     name = "LNN-CfC"
@@ -242,7 +244,7 @@ class LNNBaseline(BaseRetriever):
         super().__init__(dim, embedder_backend)
         torch, F, CfC, AutoNCP = _ensure_torch()
         self._F = F
-        # AutoNCP 要求 output_dim < n_neurons - 2
+        # AutoNCP requires output_dim < n_neurons - 2
         actual_n_neurons = max(n_neurons, self.dim + 3)
         wiring = AutoNCP(actual_n_neurons, self.dim)
         self.cfc = CfC(self.dim, wiring, batch_first=True)
@@ -253,7 +255,7 @@ class LNNBaseline(BaseRetriever):
 
     def store(self, content: str, timestamp: float | None = None) -> str:
         doc_id = super().store(content, timestamp)
-        # 更新 LNN 状态
+        # update the LNN state
         emb = self.embedder.embed(content)
         x = self._torch_tensor(emb)
         output, self.hx = self.cfc(x, self.hx)
@@ -274,7 +276,7 @@ class LNNBaseline(BaseRetriever):
         torch = _ensure_torch()[0]
         q_text = self.embedder.embed(query)
 
-        # LNN 查询向量
+        # LNN query vector
         if self.window:
             window_mean = torch.stack(list(self.window)).mean(dim=0)
             lnn_query = 0.5 * self.last_output + 0.5 * window_mean
@@ -282,7 +284,7 @@ class LNNBaseline(BaseRetriever):
         else:
             lnn_np = q_text
 
-        # 融合: 0.6 * 文本 + 0.4 * LNN
+        # fusion: 0.6 * text + 0.4 * LNN
         q_vec = 0.6 * q_text + 0.4 * lnn_np
         norm = np.linalg.norm(q_vec)
         if norm > 1e-12:
@@ -300,18 +302,18 @@ class LNNBaseline(BaseRetriever):
         self.window.clear()
 
     def load_trained_weights(self, model_path: str) -> None:
-        """加载训练后的 CfC 权重.
+        """Load the trained CfC weights.
 
         Args:
-            model_path: train_cfc.py 保存的 .pt 文件路径.
+            model_path: path to the .pt file saved by train_cfc.py.
         """
         torch = _ensure_torch()[0]
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-        # 训练脚本保存的键带 "cfc." 前缀, 需剥离后加载到 self.cfc
+        # keys saved by the training script carry the "cfc." prefix; strip it before loading into self.cfc
         cfc_state = {}
         for k, v in checkpoint["model_state"].items():
             if k.startswith("cfc."):
-                cfc_state[k[4:]] = v  # 去掉 "cfc." 前缀
+                cfc_state[k[4:]] = v  # drop the "cfc." prefix
         if cfc_state:
             self.cfc.load_state_dict(cfc_state)
             print(f"  [LNNBaseline] training weights loaded: {model_path} (val_loss={checkpoint.get('best_val_loss', '?')})")
@@ -321,10 +323,10 @@ class LNNBaseline(BaseRetriever):
 
 
 class FullMethod(LNNBaseline):
-    """hippocampus_mcp 完整方法: LNN + 打分引擎 + 抽样.
+    """hippocampus_mcp full method: LNN + scoring engine + sampling.
 
-    在 LNN 查询的基础上, 叠加时间衰减与回忆频次打分.
-    支持条件性时间衰减: 根据问题类型动态调整时间权重.
+    On top of the LNN query, adds time-decay and recall-frequency scoring.
+    Supports conditional time decay: time weights adjusted dynamically by question type.
     """
 
     name = "HippocampusMCP"
@@ -349,14 +351,14 @@ class FullMethod(LNNBaseline):
         self.w_time = w_time
         self.w_recall = w_recall
         self.conditional_time = conditional_time
-        # 条件性时间衰减权重映射 (按 LoCoMo category)
-        # category=2 (时序推理): 高时间权重; 其他: 极低
+        # conditional time-decay weight map (by LoCoMo category)
+        # category=2 (temporal reasoning): high time weight; others: extremely low
         self._cat_time_weights = {
-            1: 0.01,   # 多跳推理 — 时间不重要
-            2: 0.10,   # 时序推理 — 时间关键
-            3: 0.01,   # 开放域 — 时间不重要
-            4: 0.01,   # 单跳推理 — 时间不重要
-            5: 0.01,   # 对抗问题 — 时间不重要
+            1: 0.01,   # multi-hop reasoning — time not important
+            2: 0.10,   # temporal reasoning — time critical
+            3: 0.01,   # open-domain — time not important
+            4: 0.01,   # single-hop reasoning — time not important
+            5: 0.01,   # adversarial questions — time not important
         }
         self._recall_counts: list[int] = []
 
@@ -371,7 +373,7 @@ class FullMethod(LNNBaseline):
         if not self._embeddings:
             return []
 
-        # 复用 LNN 的相似度计算
+        # reuse the LNN similarity computation
         torch = _ensure_torch()[0]
         q_text = self.embedder.embed(query)
 
@@ -389,13 +391,13 @@ class FullMethod(LNNBaseline):
 
         sims = self._cosine_sim(q_vec)
 
-        # 确定时间权重: 条件性衰减或固定权重
+        # determine the time weight: conditional decay or the fixed weight
         if self.conditional_time and category is not None:
             w_time_eff = self._cat_time_weights.get(category, self.w_time)
         else:
             w_time_eff = self.w_time
 
-        # 打分: 加权加法公式 (相似度为主, 时间/回忆为辅)
+        # scoring: weighted additive formula (similarity dominant, time/recall auxiliary)
         current_time = self._get_reference_time()
         ages = np.maximum(
             np.array([current_time - t for t in self._timestamps]), 0.0
@@ -404,13 +406,13 @@ class FullMethod(LNNBaseline):
         recall_arr = np.array(self._recall_counts, dtype=np.float64)
         recall_boost = np.log1p(recall_arr) * np.exp(-ages / self.mu_importance)
 
-        # 加权: 可配置的相似度/时间/回忆权重
+        # weighting: configurable similarity/time/recall weights
         scores = self.w_sim * sims + w_time_eff * time_decay + self.w_recall * recall_boost
 
         k = min(top_k, len(scores))
         top_idx = np.argsort(-scores)[:k]
 
-        # 更新回忆计数
+        # update the recall counts
         for i in top_idx:
             self._recall_counts[i] += 1
 
@@ -422,11 +424,11 @@ class FullMethod(LNNBaseline):
 
 
 class FullMethodRejection(FullMethod):
-    """HippocampusMCP + 拒答机制.
+    """HippocampusMCP + rejection mechanism.
 
-    在 FullMethod 基础上增加置信度阈值:
-    - 当 top-1 检索分数低于阈值时, 返回空结果 (拒答)
-    - 主要用于对抗类问题 (category=5), 避免给出错误答案
+    Adds a confidence threshold on top of FullMethod:
+    - when the top-1 retrieval score is below the threshold, return an empty result (reject)
+    - mainly for adversarial questions (category=5), to avoid giving wrong answers
     """
 
     name = "HippocampusMCP-Reject"
@@ -447,10 +449,10 @@ class FullMethodRejection(FullMethod):
     ) -> list[tuple[str, float]]:
         results = super().retrieve(query, top_k=top_k, category=category)
 
-        # 对抗问题: 低置信度时拒答
+        # adversarial questions: reject on low confidence
         if category == self.reject_category and results:
             top_score = results[0][1]
             if top_score < self.reject_threshold:
-                return []  # 拒答
+                return []  # reject
 
         return results

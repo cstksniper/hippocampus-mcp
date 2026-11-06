@@ -1,24 +1,31 @@
-"""update_tags 的候选筛选段：按过滤条件挑出待改标签的记录。
+"""update_tags' candidate-selection segment: pick the records whose tags
+will be updated, per the filter conditions.
 
-从 ``brain.core._select_for_tag_update`` 整搬。这是
-update_tags 的私有 helper，没有工具直调面；壳只留「取
-``store.iter_records()`` → 派发」。
+Moved wholesale from ``brain.core._select_for_tag_update``. This is a
+private helper of update_tags with no direct tool-call surface; the
+shell keeps only 「fetch ``store.iter_records()`` → dispatch」.
 
-零 import。``records`` 由壳传入（``store.iter_records()`` 的
-结果），记录按鸭子类型使用（要有 ``id`` / ``source`` / ``content`` /
-``state`` / ``tags`` 属性）。
+Zero imports. ``records`` is passed in by the shell (the result of
+``store.iter_records()``); records are used duck-typed (must have
+``id`` / ``source`` / ``content`` / ``state`` / ``tags`` attributes).
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
-  * ``memory_ids`` 归一成 ``str`` 集合后做**精确 id 匹配**；空列表
-    （falsy）视作"未指定"而不是"一个都不要"；
-  * ``source`` / ``state`` 是**全等**匹配（``source`` 对比时对记录侧
-    做 ``or ""`` 兜底）；``source_contains`` / ``contains`` 是子串；
-  * ``untagged_only`` 是"有任何标签就排除"（``tags`` 非空即 tagged）；
-  * ``missing_keys`` 的语义是「**至少缺其中一个键**」（补缺场景），
-    不是「全部都缺」——后者在补两个键时几乎恒为空集；
-  * 返回的第二项是**过滤条件自曝**：过滤条件写错时 ``matched=0`` 和
-    「真没有符合条件的记录」长得一模一样，自曝是唯一的辨析手段。
-    空串/空列表归一成 ``None``。
+Semantics preserved verbatim (changing any one is a behavior change;
+parity will catch it):
+  * ``memory_ids`` is normalized into a ``str`` set for **exact id
+    matching**; an empty list (falsy) means "unspecified", not "want
+    none of them";
+  * ``source`` / ``state`` are **equality** matches (the record side
+    gets an ``or ""`` fallback in the ``source`` comparison);
+    ``source_contains`` / ``contains`` are substrings;
+  * ``untagged_only`` is "exclude if it has any tags" (a non-empty
+    ``tags`` means tagged);
+  * ``missing_keys`` means 「**at least one of the keys is missing**」
+    (the fill-missing scenario), not 「all missing」 -- the latter is
+    almost always an empty set when filling two keys;
+  * the second return item is the **filter self-report**: when the
+    filter is written wrong, ``matched=0`` and 「really no matching
+    records」 look identical; the self-report is the only way to tell
+    them apart. Empty strings/lists are normalized to ``None``.
 """
 from __future__ import annotations
 
@@ -36,11 +43,14 @@ def select_for_tag_update(
     missing_keys: list[str] | None = None,
     memory_ids: list[str] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
-    """按过滤条件挑出待改标签的记录。
+    """Pick the records whose tags will be updated, per the filter
+    conditions.
 
-    之所以要 ``contains``（正文关键词）这一路：真库实测 **52% 的无标签
-    条目来自同一个文件**（``PROJECT_MEMORY_LOG.md``），``source`` 前缀
-    过滤对这块完全无法细分，只能靠正文关键词把「这一批」圈出来。
+    Why the ``contains`` (body-keyword) path exists: a real-library
+    measurement found **52% of untagged entries come from one file**
+    (``PROJECT_MEMORY_LOG.md``); ``source`` prefix filtering cannot
+    subdivide that block at all -- only body keywords can circle out
+    「this batch」.
     """
     wanted = {str(i) for i in memory_ids} if memory_ids else None
     mkeys = [str(k) for k in (missing_keys or []) if str(k)]

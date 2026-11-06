@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""投影层 (Projector).
+"""Projection layer (Projector).
 
-简单的线性投影层. 该功能在 MemoryCore 中已合并使用, 此处保留独立接口
-以便单独复用或做维度对齐 (例如将外部嵌入投影到记忆核的输入维度).
+A simple linear projection layer. This functionality is already merged into
+use inside MemoryCore; the standalone interface is kept here so it can be
+reused on its own or for dimension alignment (e.g. projecting external
+embeddings into the memory core's input dimension).
 """
 
 import torch
@@ -10,11 +12,11 @@ import torch.nn as nn
 
 
 class Projector(nn.Module):
-    """线性投影层.
+    """Linear projection layer.
 
     Args:
-        input_dim: 输入维度.
-        output_dim: 输出维度.
+        input_dim: Input dimension.
+        output_dim: Output dimension.
     """
 
     def __init__(self, input_dim: int, output_dim: int):
@@ -24,12 +26,12 @@ class Projector(nn.Module):
         self.linear = nn.Linear(input_dim, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """对输入做线性投影.
+        """Apply a linear projection to the input.
 
         Args:
-            x: 输入张量, 最后一维需为 input_dim.
+            x: Input tensor; its last dimension must be input_dim.
 
         Returns:
-            投影后的张量, 最后一维为 output_dim.
+            The projected tensor; its last dimension is output_dim.
         """
         return self.linear(x)

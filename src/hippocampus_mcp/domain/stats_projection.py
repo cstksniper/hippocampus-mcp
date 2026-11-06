@@ -1,31 +1,41 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.stats`` 的六块计算逻辑（从 core 抽取）。
+"""The six computation blocks of ``brain.core.stats`` (extracted from core).
 
-**为什么值得搬**：``stats`` 是宿主必调的自查入口，183 行里除「调用各层
-自曝方法」外，还缠着六块纯计算——状态分布、L0↔L1 悬挂引用、按日活动
-窗口、源签名覆盖率、共库写者投影、遗忘计数。它们全是纯 dict/list 运算，
-却因为长在 self 面的上下文里而无法单测；搬走后 ``stats`` 只剩
-「取数 → 投影 → 组装回显」一条直线。
+**Why worth moving**: ``stats`` is the self-check entry hosts must call; of
+its 183 lines, besides "calling each layer's self-exposure methods", six
+blocks of pure computation are tangled in -- state distribution, L0<->L1
+dangling references, per-day activity window, source-signature coverage,
+shared-library writer projection, forgotten count. They are all pure
+dict/list operations, yet untestable because they grew inside self-facing
+context; after the move ``stats`` is one straight line of "fetch ->
+project -> assemble the echo".
 
-**依赖方向**：本模块只 import 标准库（domain → 仅 common 的纪律这里连
-common 都没用上——所有记录/计数/pid 均由壳现取后传入）。
+**Dependency direction**: this module imports only the standard library
+(domain -> common-only discipline; here not even common is used -- all
+records/counts/pids are fetched fresh by the shell and passed in).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (touching one is a behavior change; parity will catch
+it)**:
 
-1. ``state_counts`` 用 ``dict.get`` 递惯而非 ``Counter``——两者计数结果
-   相同，但**键序 = 首次出现序**必须保留（回显体直接 JSON 化，顺序即信号）。
-2. ``dangling_report`` 的受影响条数只对**真有悬挂**的记录 +1；一条记录
-   多个悬挂 id 只计一次（``if hit`` 门在 update 之外）。
-3. ``daily_activity`` 的 totals 统计**全量天数**（不是回显窗口内）；
-   ``recent`` 取 ``sorted(daily_counts)[-n_days:]``——``_resolve_daily_days``
-   恒返回 ≥1（显式 max(...,1) / env 校验 >0 / 默认 14），故 ``[-0:]``
-   整表怪癖在本路径不可达（记录在案，别"修"成 ``[:n]``）。
-4. ``source_sig_block`` 的 referenced 对 source 做 ``str().strip()`` 双重
-   归一：空白串等价于没 source，不计入也不挡筛。
-5. ``writers_block`` 的 ``is_self`` 按 **pid 相等**判定（不是对象身份），
-   pid 缺失时恒 False。
-6. ``forgotten_count`` 用 ``r.get("forgotten")`` 而非 ``r["forgotten"]``——
-   raw 条目缺键是常态（老版本落的盘），下标访问会 KeyError。
+1. ``state_counts`` counts via ``dict.get`` rather than ``Counter`` -- both
+   count the same, but **key order = first-appearance order** must be kept
+   (the echo body is JSON-serialized directly; order is signal).
+2. ``dangling_report``'s affected count +1s only records that **truly have
+   dangling refs**; one record with several dangling ids counts once (the
+   ``if hit`` gate sits outside the update).
+3. ``daily_activity``'s totals cover **all days** (not within the echo
+   window); ``recent`` takes ``sorted(daily_counts)[-n_days:]`` --
+   ``_resolve_daily_days`` always returns >=1 (explicit max(...,1) / env
+   validated >0 / default 14), so the ``[-0:]`` whole-table quirk is
+   unreachable on this path (on record; do not "fix" it to ``[:n]``).
+4. ``source_sig_block``'s referenced double-normalizes source with
+   ``str().strip()``: a blank string equals no source; neither counted nor
+   blocking the filter.
+5. ``writers_block``'s ``is_self`` is decided by **pid equality** (not
+   object identity); always False when pid is missing.
+6. ``forgotten_count`` uses ``r.get("forgotten")`` rather than
+   ``r["forgotten"]`` -- raw entries missing the key are the norm (data
+   persisted by old versions); subscript access would KeyError.
 """
 from __future__ import annotations
 
@@ -33,13 +43,15 @@ from typing import Any, Iterable
 
 
 # ======================================================================
-# 块 1：状态分布（旧壳 3371-3373）
+# Block 1: state distribution (old shell 3371-3373)
 # ======================================================================
 def state_counts(records: Iterable[Any]) -> dict[str, int]:
-    """L1 记忆按生命周期状态计数（键序 = 首次出现序，见模块 docstring 怪癖 1）。
+    """Count L1 memories by lifecycle state (key order = first-appearance
+    order; see module docstring quirk 1).
 
     Args:
-        records: 库存记录迭代器（鸭子类型：有 ``.state`` 属性）。
+        records: library record iterator (duck-typed: has a ``.state``
+            attribute).
     """
     states: dict[str, int] = {}
     for r in records:
@@ -48,21 +60,23 @@ def state_counts(records: Iterable[Any]) -> dict[str, int]:
 
 
 # ======================================================================
-# 块 2：L0↔L1 引用完整性（旧壳 3379-3386）
+# Block 2: L0↔L1 reference integrity (old shell 3379-3386)
 # ======================================================================
 def dangling_report(
     records: Iterable[Any],
     raw_ids: set[str],
 ) -> tuple[set[str], int]:
-    """被 L1 引用却不在 L0 里的 source_id 集合 + 受影响的 L1 条数。
+    """The set of source_ids referenced by L1 but absent from L0 + the count
+    of affected L1 entries.
 
     Args:
-        records: 库存记录迭代器（鸭子类型：有 ``.source_ids``）。
-        raw_ids: L0 层全部 raw id 的集合。
+        records: library record iterator (duck-typed: has ``.source_ids``).
+        raw_ids: the set of all raw ids on the L0 layer.
 
     Returns:
-        ``(dangling_ids, affected_records)``。受影响条数只对真有悬挂的
-        记录 +1，一条记录多个悬挂 id 只计一次（见模块 docstring 怪癖 2）。
+        ``(dangling_ids, affected_records)``. The affected count +1s only
+        records that truly have dangling refs; one record with several
+        dangling ids counts once (see module docstring quirk 2).
     """
     dangling: set[str] = set()
     dangling_recs = 0
@@ -75,20 +89,22 @@ def dangling_report(
 
 
 # ======================================================================
-# 块 3：按日活动窗口（旧壳 3393-3425 的 daily_activity 键）
+# Block 3: per-day activity window (old shell 3393-3425's daily_activity keys)
 # ======================================================================
 def daily_activity(daily_counts: dict[str, dict[str, int]],
                    n_days: int) -> dict[str, Any]:
-    """按日写入/召回计数的回显体（窗口 + 全量 totals 分离自曝）。
+    """Echo body of per-day write/recall counts (window + all-days totals,
+    separately self-exposed).
 
     Args:
-        daily_counts: ``{day: {"recall": n, "ingest": n}}``。
-        n_days: 回显窗口条数（由壳经 ``_resolve_daily_days`` 现取，
-            恒 ≥1；显式传大数只看存量，不补空位）。
+        daily_counts: ``{day: {"recall": n, "ingest": n}}``.
+        n_days: echo window length (fetched fresh by the shell via
+            ``_resolve_daily_days``, always >=1; passing an explicitly large
+            number just shows what exists, no empty slots padded).
 
     Returns:
-        ``recent`` / ``totals`` / ``kept_days`` / ``shown_days`` 四键。
-        totals 统计**全量天数**（见模块 docstring 怪癖 3）。
+        Four keys: ``recent`` / ``totals`` / ``kept_days`` / ``shown_days``.
+        totals cover **all days** (see module docstring quirk 3).
     """
     days = sorted(daily_counts)[-n_days:]
     total_recall = sum(d.get("recall", 0) for d in daily_counts.values())
@@ -102,25 +118,27 @@ def daily_activity(daily_counts: dict[str, dict[str, int]],
         ],
         "totals": {"recall": total_recall, "ingest": total_ingest},
         "kept_days": len(daily_counts),
-        # 自曝窗口：宿主看到"只有 7 天"时要能知道是窗口而不是存量
+        # Self-exposed window: when the host sees "only 7 days", it must be
+        # able to tell that is a window, not the inventory
         "shown_days": len(days),
     }
 
 
 # ======================================================================
-# 块 4：源签名覆盖率（旧壳 3455-3461 的 source_sig 键）
+# Block 4: source-signature coverage (old shell 3455-3461's source_sig keys)
 # ======================================================================
 def source_sig_block(source_sigs: dict[str, Any],
                      records: Iterable[Any]) -> dict[str, int]:
-    """源签名采集覆盖率：recorded（采集过）vs referenced（库内被引用）。
+    """Source-signature collection coverage: recorded (collected) vs
+    referenced (referenced within the library).
 
     Args:
-        source_sigs: ``brain.source_sigs``（采集过的 source → 签名）。
-        records: 库存记录迭代器（鸭子类型：有 ``.source``）。
+        source_sigs: ``brain.source_sigs`` (collected source -> signature).
+        records: library record iterator (duck-typed: has ``.source``).
 
     Returns:
-        ``{"recorded": n, "referenced": n}``。referenced 对 source 做
-        ``str().strip()`` 双重归一（见模块 docstring 怪癖 4）。
+        ``{"recorded": n, "referenced": n}``. referenced double-normalizes
+        source with ``str().strip()`` (see module docstring quirk 4).
     """
     return {
         "recorded": len(source_sigs),
@@ -131,20 +149,24 @@ def source_sig_block(source_sigs: dict[str, Any],
 
 
 # ======================================================================
-# 块 5：共库写者投影（旧壳 3463-3473 的 writers 键）
+# Block 5: shared-library writer projection (old shell 3463-3473's writers keys)
 # ======================================================================
 def writers_block(active: list[dict[str, Any]], stale_cleaned: int,
                   self_pid: int) -> dict[str, Any]:
-    """共库写者可见化：此刻的真相（不是上次落盘的快照）。
+    """Make shared-library writers visible: the truth right now (not the
+    last persisted snapshot).
 
     Args:
-        active: ``brain.writers_active``（心跳未过期的写者列表）。
-        stale_cleaned: ``brain.writers_stale_cleaned``（上次清理数）。
-        self_pid: 本进程 pid（壳传 ``os.getpid()``，替身可注入）。
+        active: ``brain.writers_active`` (writers whose heartbeat has not
+            expired).
+        stale_cleaned: ``brain.writers_stale_cleaned`` (count cleaned last
+            time).
+        self_pid: this process's pid (the shell passes ``os.getpid()``; a
+            stand-in can be injected).
 
     Returns:
-        ``active`` / ``stale_cleaned`` / ``self_pid`` / ``list`` 四键；
-        ``is_self`` 按 pid 相等判定（见模块 docstring 怪癖 5）。
+        Four keys ``active`` / ``stale_cleaned`` / ``self_pid`` / ``list``;
+        ``is_self`` decided by pid equality (see module docstring quirk 5).
     """
     return {
         "active": len(active),
@@ -160,8 +182,9 @@ def writers_block(active: list[dict[str, Any]], stale_cleaned: int,
 
 
 # ======================================================================
-# 块 6：遗忘 raw 计数（旧壳 3477）
+# Block 6: forgotten raw count (old shell 3477)
 # ======================================================================
 def forgotten_count(raw_log: Iterable[dict[str, Any]]) -> int:
-    """L0 里被标记 forgotten 的条数（``.get`` 保老盘缺键不崩，怪癖 6）。"""
+    """The count of entries marked forgotten in L0 (``.get`` keeps old
+    persisted data missing the key from crashing; quirk 6)."""
     return sum(1 for r in raw_log if r.get("forgotten"))

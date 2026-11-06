@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""状态持久化 (StateCheckpoint).
+"""State persistence (StateCheckpoint).
 
-主格式为 **npz**（``lnn_state.npz``）：``MemoryCore.get_state()``
-统一产出 numpy 数组，落盘/读回**全程不需要 torch**——这是"生产进程零 torch"目标
-的一部分。历史库里的 ``lnn_state.pt`` 仍可读（惰性 ``import torch``；环境里没有
-torch 时告警并安全重置，与"损坏→重置"既有语义一致）。
+The primary format is **npz** (``lnn_state.npz``): ``MemoryCore.get_state()``
+produces numpy arrays uniformly, so persisting/reading back needs **no torch at
+all** — part of the "zero torch in the production process" goal. ``lnn_state.pt``
+from historical libraries remains readable (lazy ``import torch``; when torch is
+absent from the environment, warn and safely reset, consistent with the existing
+"corrupt → reset" semantics).
 
-写入采用原子替换 (先写 ``.tmp`` 再 ``os.replace``) 防止中途崩溃损坏数据;
-可选的备份机制 (``.bak``) 保留上一版本以便回滚恢复.
+Writes use atomic replacement (write ``.tmp`` first, then ``os.replace``) to
+prevent a mid-way crash from corrupting data; the optional backup mechanism
+(``.bak``) keeps the previous version for rollback recovery.
 """
 
 import json
@@ -18,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-# npz 载荷键名（格式 v1）
+# npz payload key names (format v1)
 _KEY_HAS_HX = "has_hx"
 _KEY_HX = "hx"
 _KEY_LAST = "last_output"
@@ -31,28 +34,31 @@ _NPZ_VERSION = 1
 
 
 def _stderr_print(*args, **kwargs) -> None:
-    """诊断输出一律走 stderr。
+    """Diagnostic output always goes to stderr.
 
-    **MCP stdio 模式下 stdout 是 JSON-RPC 协议通道**：任何写到 stdout 的内容都会被
-    客户端当成协议消息解析，报 "Invalid JSON" 并可能直接断连（实测由 LNN 状态
-    维度不匹配的提示触发，见 memory_core.load_state）。故诊断信息改走 stderr。
+    **In MCP stdio mode, stdout is the JSON-RPC protocol channel**: anything
+    written to stdout gets parsed by the client as a protocol message, raising
+    "Invalid JSON" and possibly dropping the connection outright (measured,
+    triggered by the LNN state dimension-mismatch notice; see
+    memory_core.load_state). Hence diagnostics go to stderr instead.
     """
     kwargs.setdefault("file", sys.stderr)
     print(*args, **kwargs)
 
 
 def _to_array(value: Any) -> np.ndarray:
-    """torch 张量 / numpy / 标量 → numpy 数组（checkpoint 载荷统一形态）。"""
-    if hasattr(value, "detach"):  # torch tensor（旧 .pt 路径可能出现）
+    """torch tensor / numpy / scalar → numpy array (the unified shape for checkpoint payloads)."""
+    if hasattr(value, "detach"):  # torch tensor (may appear on the legacy .pt path)
         return value.detach().cpu().numpy()
     return np.asarray(value)
 
 
 def payload_from_state(state: dict) -> dict:
-    """把 ``MemoryCore.get_state()``（+ manager 追加的标量）压成 npz 载荷。
+    """Compress ``MemoryCore.get_state()`` (+ scalars appended by the manager) into the npz payload.
 
-    模块级函数：``_write_npz`` 与迁移子进程 ``pt_migrate`` 共用同一份编码，
-    防止两处格式漂移。
+    Module-level function: ``_write_npz`` and the migration subprocess
+    ``pt_migrate`` share the same encoding, preventing format drift between the
+    two sites.
     """
     hx = state.get("hx")
     window = list(state.get("window", []) or [])
@@ -77,63 +83,68 @@ def payload_from_state(state: dict) -> dict:
 
 
 class StateCheckpoint:
-    """记忆核状态的磁盘持久化（npz 主格式 + legacy .pt 兼容读）.
+    """Disk persistence of the memory core's state (npz primary format + legacy .pt compatibility read).
 
     Args:
-        path: checkpoint 文件路径（``lnn_state.npz``）。
+        path: checkpoint file path (``lnn_state.npz``).
     """
 
     def __init__(self, path: str):
         self.path = path
 
     # ------------------------------------------------------------------ #
-    # 路径辅助
+    # Path helpers
     # ------------------------------------------------------------------ #
     @property
     def tmp_path(self) -> str:
-        """原子写入使用的临时文件路径."""
+        """Temporary file path used for atomic writes."""
         return self.path + ".tmp"
 
     @property
     def bak_path(self) -> str:
-        """上一版本备份文件路径."""
+        """Backup file path of the previous version."""
         return self.path + ".bak"
 
     @property
     def legacy_pt_path(self) -> str:
-        """历史格式的 ``lnn_state.pt``（同目录同基名）。"""
+        """The historical-format ``lnn_state.pt`` (same directory, same basename)."""
         root, _ = os.path.splitext(self.path)
         return root + ".pt"
 
     # ------------------------------------------------------------------ #
-    # 保存
+    # Save
     # ------------------------------------------------------------------ #
     def save(self, state: dict) -> None:
-        """将状态字典序列化到磁盘 (便捷接口).
+        """Serialize the state dict to disk (convenience interface).
 
-        内部委托至 :meth:`save_with_backup`，即**原子写 + 备份上一版本**。
-        （早期版本这里走的是不备份的 :meth:`save_atomic`，于是 ``.bak`` 回退
-        分支永远无备份可用——缺陷 N2。默认带备份，避免再次踩同一个坑。）
+        Internally delegates to :meth:`save_with_backup`, i.e. **atomic write +
+        backup of the previous version**. (Earlier versions used the
+        non-backing :meth:`save_atomic` here, so the ``.bak`` fallback branch
+        never had a backup available — defect N2. Defaults to backing up, to
+        avoid stepping on the same pit again.)
 
-        持久化失败时仅打印警告, 不抛出异常, 保证调用方不会因此崩溃.
+        On persistence failure only a warning is printed, no exception is
+        raised, guaranteeing the caller does not crash because of it.
 
         Args:
-            state: 待保存的状态字典 (通常来自 MemoryCore.get_state()).
+            state: state dict to save (usually from MemoryCore.get_state()).
         """
         if not self.save_with_backup(state):
             _stderr_print("[StateCheckpoint] save failed; state was not persisted (see the error output above)")
 
     def save_atomic(self, state: dict) -> bool:
-        """原子写入: 先写 ``.tmp``, 成功后 ``os.replace`` 替换目标文件.
+        """Atomic write: write ``.tmp`` first, then ``os.replace`` onto the target file on success.
 
-        不备份旧版本; 如需保留上一版本请使用 :meth:`save_with_backup`.
-        即使写入过程中崩溃, 目标文件也只可能是旧版本或新版本, 不会被写坏.
+        Does not back up the old version; use :meth:`save_with_backup` if you
+        need to keep the previous version. Even if the process crashes mid-write,
+        the target file can only be the old version or the new version, never
+        half-written.
 
         Args:
-            state: 待保存的状态字典.
+            state: state dict to save.
 
         Returns:
-            写入成功返回 True, 失败返回 False.
+            True on successful write, False on failure.
         """
         tmp = self.tmp_path
         try:
@@ -156,31 +167,33 @@ class StateCheckpoint:
             return False
 
     def save_with_backup(self, state: dict) -> bool:
-        """原子写入并备份上一版本.
+        """Atomic write with a backup of the previous version.
 
-        完整流程: 写 ``.tmp`` -> 将当前目标文件备份为 ``.bak`` -> 原子替换目标.
-        替换前备份旧文件, 这样即使新 checkpoint 损坏, 也能从 ``.bak`` 恢复上一版本.
+        Full flow: write ``.tmp`` -> back up the current target file as ``.bak``
+        -> atomically replace the target. The old file is backed up before the
+        replacement, so even if the new checkpoint is corrupt, the previous
+        version can be restored from ``.bak``.
 
         Args:
-            state: 待保存的状态字典.
+            state: state dict to save.
 
         Returns:
-            写入成功返回 True, 失败返回 False.
+            True on successful write, False on failure.
         """
         tmp = self.tmp_path
         bak = self.bak_path
         try:
             self._ensure_dir()
-            # 1. 写入临时文件
+            # 1. Write the temporary file
             payload = payload_from_state(state)
             target_eff = tmp if tmp.endswith(".npz") else tmp + ".npz"
             np.savez(target_eff, **payload)
             if target_eff != tmp:
                 os.replace(target_eff, tmp)
-            # 2. 备份当前目标文件 (若存在)
+            # 2. Back up the current target file (if present)
             if os.path.isfile(self.path):
                 os.replace(self.path, bak)
-            # 3. 原子替换目标文件
+            # 3. Atomically replace the target file
             os.replace(tmp, self.path)
             return True
         except Exception as exc:
@@ -189,21 +202,23 @@ class StateCheckpoint:
             return False
 
     # ------------------------------------------------------------------ #
-    # 加载
+    # Load
     # ------------------------------------------------------------------ #
     def load(self) -> dict:
-        """从磁盘恢复状态字典.
+        """Restore the state dict from disk.
 
-        优先加载 npz 主文件; 失败则尝试从 ``.bak`` 恢复; 都没有再试历史
-        legacy ``.pt``（惰性 torch）。仍失败则返回空字典.
-        状态数组统一以 **numpy** 形态返回（torch 张量在出口处转换）。
+        Loads the npz primary file first; on failure tries to restore from
+        ``.bak``; if neither exists, tries the historical legacy ``.pt`` (lazy
+        torch). If all fail, returns an empty dict. State arrays are returned
+        uniformly as **numpy** (torch tensors are converted at the exit).
 
-        损坏的文件会被**隔离**重命名为 ``.corrupt-<时间戳>`` 而不是留在原地:
-        否则下一次 :meth:`save_with_backup` 会把这个坏文件"备份"过去，
-        覆盖掉本可救命的 ``.bak``。
+        A corrupt file is **quarantined** by renaming to ``.corrupt-<timestamp>``
+        instead of being left in place: otherwise the next
+        :meth:`save_with_backup` would "back up" that bad file over the ``.bak``
+        that could have been lifesaving.
 
         Returns:
-            反序列化后的状态字典; 无可用文件时返回 ``{}``.
+            The deserialized state dict; ``{}`` when no usable file exists.
         """
         main_err: Exception | None = None
         if os.path.isfile(self.path):
@@ -212,7 +227,7 @@ class StateCheckpoint:
             except Exception as exc:
                 main_err = exc
                 _stderr_print(f"[StateCheckpoint] main file load failed ({self.path}): {exc}")
-        # 2. 回退到备份文件（主文件缺失或损坏都走这里）
+        # 2. Fall back to the backup file (reached whether the main file is missing or corrupt)
         data: dict | None = None
         if os.path.isfile(self.bak_path):
             try:
@@ -226,7 +241,7 @@ class StateCheckpoint:
                 if q:
                     _stderr_print(f"[StateCheckpoint] quarantined corrupt main file -> {q}")
             return data
-        # 3. legacy .pt（历史格式的库；惰性 torch——环境里没有就安全放弃）
+        # 3. legacy .pt (historical-format libraries; lazy torch — safely give up when absent from the environment)
         legacy = self._load_legacy_pt()
         if legacy is not None:
             if main_err is not None:
@@ -234,7 +249,7 @@ class StateCheckpoint:
                 if q:
                     _stderr_print(f"[StateCheckpoint] quarantined corrupt main file -> {q}")
             return legacy
-        # 4. 全部失败: 隔离现场（保留证据，避免反复失败）
+        # 4. All failed: quarantine the scene (preserve evidence, avoid repeated failures)
         if main_err is not None:
             q = self._quarantine(self.path)
             if q:
@@ -261,7 +276,7 @@ class StateCheckpoint:
         if k > 0:
             dim = window_arr.shape[1]
             window = [window_arr[i].copy() for i in range(k)]
-            _ = dim  # (k, dim) 已含维度信息
+            _ = dim  # (k, dim) already carries the dimension info
         else:
             window = []
         out: dict[str, Any] = dict(scalars)
@@ -271,22 +286,27 @@ class StateCheckpoint:
         return out
 
     def _load_legacy_pt(self) -> dict | None:
-        """读历史版本的 ``lnn_state.pt``。
+        """Read the historical-version ``lnn_state.pt``.
 
-        🔴 **只在 torch 已在场的进程里就地读**（评测脚本等）——主进程（MCP
-        server）的目标是**零 torch 常驻**，而惰性拉迁移子进程在本机 server
-        父进程上下文里**确定性挂死**（实测：子进程 31ms CPU 后
-        阻塞在解释器启动期的原生调用，py-spy 无 Python 栈；独立运行 4.5s
-        正常。native 级问题，不再深挖）。缺 torch 时告警一次 + 返回 None
-        （安全重置；``reference_time`` 由 meta JSON 兜底恢复，hx 重新积累
-        ——权重固定（生产路径不训练），重积累的语义是干净的）。
-        想把 legacy 状态搬进新格式：在**独立进程**里离线跑一次迁移脚本
-        （不进主进程，避开上面的挂死）。
+        🔴 **Read in place only in processes where torch is already present**
+        (evaluation scripts etc.) — the main process (MCP server) aims for
+        **zero resident torch**, and lazily spawning the migration subprocess
+        **deterministically hangs** in this machine's server parent-process
+        context (measured: the subprocess burns 31ms of CPU then blocks on a
+        native call during interpreter startup, py-spy shows no Python stack;
+        running standalone for 4.5s works fine. A native-level issue, not dug
+        into further). When torch is missing: warn once + return None (safe
+        reset; ``reference_time`` is recovered via the meta JSON fallback, hx
+        re-accumulates — weights are fixed (the production path does not
+        train), so re-accumulation has clean semantics).
+        To move legacy state into the new format: run the migration script once
+        offline in a **separate process** (not inside the main process, avoiding
+        the hang above).
         """
         for cand in (self.legacy_pt_path, self.legacy_pt_path + ".bak"):
             if not os.path.isfile(cand):
                 continue
-            # 已迁移过（npz 在）就不该再走到这里；防御：npz 存在则直接读它
+            # Already migrated (npz present) should never reach here; defense: if the npz exists, just read it
             if os.path.isfile(self.path):
                 try:
                     return self._read_npz(self.path)
@@ -323,14 +343,15 @@ class StateCheckpoint:
         return None
 
     def exists(self) -> bool:
-        """判断是否存在**可恢复**的 checkpoint.
+        """Whether a **recoverable** checkpoint exists.
 
-        主文件缺失但 ``.bak`` / legacy ``.pt`` 仍在（上一次保存在「备份旧文件」
-        与「替换新文件」之间崩溃）也算存在——否则那份备份永远不会被读到，
-        状态白丢。
+        The main file being missing while ``.bak`` / legacy ``.pt`` remain (the
+        last save crashed between "back up the old file" and "replace with the
+        new file") also counts as existing — otherwise that backup would never
+        be read and the state would be lost for nothing.
 
         Returns:
-            npz / 备份 / legacy .pt 任一存在返回 True, 否则 False.
+            True if any of npz / backup / legacy .pt exists, otherwise False.
         """
         return (
             os.path.isfile(self.path)
@@ -340,10 +361,10 @@ class StateCheckpoint:
         )
 
     def _quarantine(self, path: str) -> str | None:
-        """把损坏文件重命名为 ``<path>.corrupt-<时间戳>``，保留事故现场.
+        """Rename the corrupt file to ``<path>.corrupt-<timestamp>``, preserving the incident scene.
 
         Returns:
-            隔离后的新路径; 文件不存在或重命名失败时返回 ``None``.
+            The new path after quarantine; ``None`` when the file does not exist or the rename fails.
         """
         if not os.path.isfile(path):
             return None
@@ -361,16 +382,16 @@ class StateCheckpoint:
             return None
 
     # ------------------------------------------------------------------ #
-    # 内部工具
+    # Internal helpers
     # ------------------------------------------------------------------ #
     def _ensure_dir(self) -> None:
-        """确保目标文件所在目录存在."""
+        """Ensure the directory containing the target file exists."""
         dir_path = os.path.dirname(os.path.abspath(self.path))
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
 
     def _safe_remove(self, path: str) -> None:
-        """安全删除文件, 忽略不存在或权限错误."""
+        """Delete a file safely, ignoring missing files or permission errors."""
         try:
             for cand in (path, path + ".npz"):
                 if os.path.isfile(cand):

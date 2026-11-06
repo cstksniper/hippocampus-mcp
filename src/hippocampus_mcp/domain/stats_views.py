@@ -1,20 +1,26 @@
-"""统计自曝投影（只读）：pin / 召回反馈 / 字面通道 三个槽 + 钉住条目简报。
+"""Stats self-report projections (read-only): the pin / recall-feedback / literal-channel slots plus a pinned-entries brief.
 
-从 ``brain/core.py`` 提取（``_recall_feedback_stats`` 45 行 /
-``_pin_stats`` 50 行 / ``lexical_self_report`` 48 行 / ``_pinned_brief`` 43 行）。
+Extracted from ``brain/core.py`` (``_recall_feedback_stats`` 45 lines /
+``_pin_stats`` 50 lines / ``lexical_self_report`` 48 lines / ``_pinned_brief``
+43 lines).
 
-落点理由：四个都是**纯只读投影**——输入是库存记录（或后端对象）与几个
-标量，输出是一个自曝 dict / 条目列表。零检索、零写盘、零模型，符合
-domain「只准依赖 common」的矩阵（``typing`` 是标准库）。
+Why here: all four are **pure read-only projections** — inputs are store
+records (or backend objects) plus a few scalars; outputs are a self-report
+dict / entry list. Zero retrieval, zero disk writes, zero models, matching the
+domain matrix rule "may only depend on common" (``typing`` is standard
+library).
 
-🔴 **不 import store**：``MemoryState.ACTIVE.value`` 与 ``PIN_IMPORTANCE``
-都在 store 包 ⇒ 一律由调用方注入（``active_state`` 字符串 /
-``pin_threshold`` 浮点）。对齐 map_view 的 ``archived_state`` 口径。
+🔴 **No store import**: both ``MemoryState.ACTIVE.value`` and
+``PIN_IMPORTANCE`` live in the store package ⇒ they are always injected by the
+caller (``active_state`` string / ``pin_threshold`` float). Aligns with
+map_view's ``archived_state`` convention.
 
-🔴 **``pinned_brief`` 的相关度是回调**：``relevance(task, task_hit_ids)``
-由调用方注入（brain 侧是 ``HippoBrain._pin_task_relevance``，它还要读
-``_task_entity_ids`` ⇒ 留在 brain）。传的是**可调用对象**不是调用结果——
-与原实现逐次对齐，且替身可注。
+🔴 **``pinned_brief``'s relevance is a callback**: ``relevance(task,
+task_hit_ids)`` is injected by the caller (brain-side it is
+``HippoBrain._pin_task_relevance``, which also reads ``_task_entity_ids`` ⇒ it
+stays in brain). What is passed is the **callable**, not a call result —
+aligned with the original implementation's per-call behavior, and a stand-in
+can be injected.
 """
 
 from __future__ import annotations
@@ -33,18 +39,21 @@ def recall_feedback_stats(
     records: list[Any],
     active_state: str = "active",
 ) -> dict[str, Any]:
-    """召回反馈自曝：``last_recalled_at`` 实际覆盖了多少条。
+    """Recall-feedback self-report: how many records ``last_recalled_at`` actually covers.
 
-    ``recall_count`` 记的是**候选集**（谁进过检索池），
-    ``last_recalled_at`` 记的是**结果集**（谁真的返回给了调用方）。
-    两者覆盖率的差 = "检索到了但没被采用"的量。
+    ``recall_count`` records the **candidate set** (who entered the retrieval
+    pool); ``last_recalled_at`` records the **result set** (who was actually
+    returned to the caller). The difference between the two coverage rates =
+    the amount of "retrieved but not adopted".
 
-    为什么要自曝：``last_recalled_at`` 正是 consolidate / 衰减的**时间基准**，
-    而历史数据里它曾长期零写入（实测覆盖率约 9.5%）—— 覆盖率低时，
-    "这条多久没被用过"这类归档结论会失真，且**不会报错**。
+    Why self-report: ``last_recalled_at`` is exactly consolidate/decay's
+    **time basis**, and historically it went long stretches with zero writes
+    (measured coverage ~9.5%) — with low coverage, archival conclusions like
+    "how long since this was used" become distorted, and **without any error**.
 
-    口径：**不回填**（回填等于编造召回历史），
-    改为每次统计自曝，把"可信度打几折"的判断交回给宿主。
+    Convention: **no backfill** (backfilling equals fabricating recall
+    history); instead, each stats call self-reports, handing the "how much to
+    discount this credibility" judgment back to the host.
     """
     active = [r for r in records if r.state == active_state]
     total = len(active)
@@ -84,22 +93,27 @@ def pin_stats(
     pin_threshold: float = 0.7,
     error: str | None = None,
 ) -> dict[str, Any]:
-    """钉住（pin）自曝：到底钉了多少、其中多少是**词面规则自动钉**的。
+    """Pin self-report: how many are pinned, and how many of those were **auto-pinned by lexical rules**.
 
-    为什么要自曝：``PIN_IMPORTANCE = 0.7``，而 :meth:`_guess_importance`
-    命中「现在 / 不再 / changed / ！」即给 0.7 ⇒ **自动 pin**；而 pin
-    在系统内**只进不退**（唯一"退出"是调用方显式动作）⇒ 长库里 pin 会
-    单调堆积（实测某库 78%），挤掉用层的动态位，且**全程无报错**。
+    Why self-report: ``PIN_IMPORTANCE = 0.7``, and :meth:`_guess_importance`
+    grants 0.7 upon hitting 「现在 / 不再 / changed / ！」 ⇒ **auto pin**; and
+    pin is **one-way** in this system (the only "exit" is an explicit caller
+    action) ⇒ in long-lived libraries pins pile up monotonically (measured: 78%
+    in one library), crowding out the usage layer's dynamic slots, all
+    **without a single error**.
 
-    "疑似自动"的判据：``pin=True`` 且 importance 落在 ``_guess_importance``
-    的值域内（``[PIN_IMPORTANCE, 0.75]``）。这是**疑似**不是确证 ——
-    调用方显式传 0.7 也会落进来，所以字段名带 ``suspected``。
+    The "suspected auto" criterion: ``pin=True`` and importance within
+    ``_guess_importance``'s value range (``[PIN_IMPORTANCE, 0.75]``). This is
+    **suspected**, not confirmed — an explicit caller-passed 0.7 also lands
+    here, hence the ``suspected`` field name.
 
     Args:
-        records: 库存记录（调用方已取好；取记录本身失败时传 ``error``）。
-        active_state: 活跃状态字符串（``MemoryState.ACTIVE.value``）。
-        pin_threshold: ``PIN_IMPORTANCE``，由调用方现取注入。
-        error: 取记录失败的异常类型名——统计失败不该让其它自曝项挂掉。
+        records: store records (already fetched by the caller; pass ``error``
+            when fetching the records themselves failed).
+        active_state: the active-state string (``MemoryState.ACTIVE.value``).
+        pin_threshold: ``PIN_IMPORTANCE``, fetched and injected by the caller.
+        error: the exception type name from a record-fetch failure — a stats
+            failure must not take down the other self-report fields.
     """
     if error is not None:
         return {"active_total": 0, "pinned_total": 0, "pinned_ratio": None,
@@ -150,30 +164,35 @@ def pinned_brief(
     task_hit_ids: set[str] | None = None,
     active_state: str = "active",
 ) -> list[dict[str, Any]]:
-    """钉住记忆槽。
+    """The pinned-memories slot.
 
-    排序口径：**任务相关优先**。
+    Ordering convention: **task relevance first**.
 
-    钉住条目的 importance 普遍偏高且彼此接近（实测：书级铁律 0.9 vs
-    章节级卡 0.8），纯 importance 排序排出来的其实是"谁先被提权"——
-    于是本次会话用得上的铁律被无关的会话卡挤掉。真正有区分度的是
-    "跟这次 task 对不对得上"，故分三档：
+    Pinned entries' importance is generally high and close together (measured:
+    book-level iron rule 0.9 vs chapter-level card 0.8); pure importance
+    ordering really yields "who got promoted first" — so the iron rules useful
+    for this session get crowded out by unrelated session cards. What truly
+    discriminates is "does it match this task", hence three tiers:
 
-        ``task_relevance`` = 2  task 语义召回命中了这条
-                           = 1  与 task 里的**受信任实体**相交
-                           = 0  无关
+        ``task_relevance`` = 2  the task's semantic recall hit this entry
+                           = 1  intersects the task's **trusted entities**
+                           = 0  unrelated
 
-    同档内再按 importance / timestamp 降序；``task`` 为空时退回纯 importance
-    （与旧行为一致）。实体只认受信任来源：启发式实体约 84% 是短语噪声，
-    让它们参与"相关性"判定等于随机重排。
+    Within a tier, descending by importance / timestamp; with an empty
+    ``task``, fall back to pure importance (same as the old behavior).
+    Entities are only trusted from trusted sources: ~84% of heuristic entities
+    are phrase noise; letting them into the "relevance" judgment amounts to a
+    random reshuffle.
 
     Args:
-        records: 库存记录。
-        relevance: 相关度回调 ``(task, task_hit_ids) -> {memory_id: 0/1/2}``。
-        limit: 返回条数。**负数 = 关闭该槽**（返回空列表）。
-        task: 本次会话任务描述，用于任务相关优先。
-        task_hit_ids: task 语义召回命中的 memory_id（``session_start`` 里
-            已经算过一次，传进来复用，不重复检索）。
+        records: store records.
+        relevance: relevance callback ``(task, task_hit_ids) -> {memory_id: 0/1/2}``.
+        limit: number of entries to return. **Negative = slot off** (returns an
+            empty list).
+        task: this session's task description, used for task-relevance-first.
+        task_hit_ids: memory_ids hit by the task's semantic recall (already
+            computed once in ``session_start``; pass it in for reuse, no
+            repeated retrieval).
     """
     pinned = [
         r for r in records
@@ -189,7 +208,7 @@ def pinned_brief(
             "state": r.state, "cognitive_type": r.cognitive_type,
             "source_ids": r.source_ids or [], "entity_ids": r.entity_ids or [],
             "pin": True, "source": r.source or "",
-            # 自曝排序依据：宿主发现"铁律怎么掉出前三了"时要能查到原因
+            # Self-reported ordering basis: when the host asks "why did the iron rule drop out of the top three", the reason must be traceable
             "task_relevance": int(rel.get(r.id, 0)),
         })
     return out
@@ -200,21 +219,27 @@ def lexical_self_report(
     indexed: int,
     path: str,
 ) -> dict[str, Any]:
-    """字面通道（BM25 / FTS5）的运行期自曝。
+    """Runtime self-report of the literal channel (BM25 / FTS5).
 
-    为什么要这一节：sqlite + FTS5 最大的卖点是「**不用再建内存 BM25 索引**，
-    省 34.5MB」，而这个优化此前在生产侧没有观测入口，「到底省没省」
-    只能靠猜。这里把每一项都自曝**实测值**：
+    Why this section: sqlite + FTS5's biggest selling point is "**no more
+    in-memory BM25 index to build, saving 34.5MB**", yet this optimization had
+    no observation entry on the production side — "did it actually save" could
+    only be guessed. Every item here self-reports a **measured value**:
 
-    - ``store_backend``：实际存储后端（json / sqlite）
-    - ``fts5_ready``：FTS5 虚表在本连接里是否真的可用
-    - ``bm25_indexed``：内存 BM25 现有几条 —— **FTS5 路真正生效时这里必须是 0**
-    - ``last_lexical_path``：上次检索的字面通道实际走的路（fts5 / memory / off）
+    - ``store_backend``: the actual storage backend (json / sqlite)
+    - ``fts5_ready``: whether the FTS5 virtual table is really usable on this
+      connection
+    - ``bm25_indexed``: how many entries the in-memory BM25 currently holds —
+      **must be 0 when the FTS5 path is genuinely in effect**
+    - ``last_lexical_path``: the path the literal channel actually took on the
+      last retrieval (fts5 / memory / off)
 
     Args:
-        backend: 存储后端对象（``store._backend``，可为 ``None``）。
-        indexed: 内存 BM25 现有条数（``len(brain._bm25_indexed)``）。
-        path: 上次检索实际走的路（``brain._last_lexical_path``）。
+        backend: the storage backend object (``store._backend``, may be ``None``).
+        indexed: the in-memory BM25's current entry count
+            (``len(brain._bm25_indexed)``).
+        path: the path the last retrieval actually took
+            (``brain._last_lexical_path``).
     """
     name = getattr(backend, "name", None) or "unknown"
     fts_ready: bool | None = None
@@ -223,7 +248,7 @@ def lexical_self_report(
         if callable(fn):
             try:
                 fts_ready = bool(fn())
-            except Exception:  # noqa: BLE001 —— 自曝不能因为探测失败就整体失败
+            except Exception:  # noqa: BLE001 — self-report must not fail wholesale because a probe failed
                 fts_ready = False
             break
     if name == "sqlite" and fts_ready and indexed == 0:

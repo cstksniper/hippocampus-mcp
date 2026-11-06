@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-"""F2'·② 工作区引导文件 ``.hippocampus.json`` 的回归测试。
+"""Regression tests for the F2'·② workspace guide file ``.hippocampus.json``.
 
-被钉住的是**「零配置便利项」的四条边界**——它的价值全在这些边界上：
+What gets pinned are the **four boundaries of the zero-config convenience** — its whole value lives on them:
 
-  * 文件不存在 ⇒ **完全不生效**，行为与多库之前逐位一致；
-  * 解析不明 / 文件坏了 ⇒ **出声**回退 env 默认（串库比回退危险得多）；
-  * 向上找**不超过 5 层**（防止误吃到无关上级目录的配置）；
-  * 只认**精确文件名**（``hippocampus.json`` 无点前缀的不算）。
+  * file absent ⇒ **fully inert**, behavior bit-identical to pre-multi-library;
+  * unresolvable / broken file ⇒ **loud** fallback to env default (a cross-library leak is far more dangerous);
+  * upward search **no more than 5 levels** (no swallowing unrelated upper-directory configs);
+  * only the **exact filename** counts (``hippocampus.json`` without the dot prefix does not).
 
-为什么值得单开一个套件：这段逻辑**此前没有任何测试覆盖**，而它是
-「便利项」——一旦它悄悄生效却指错库，症状是**静默串库**（写到别人的库里），
-比报错难查得多。
+Why a separate suite: this logic previously had **no test coverage at all**, and it is a
+"convenience" — if it quietly activates yet points at the wrong library, the symptom is a
+**silent cross-library leak** (writing into someone else's library), far harder to debug than an error.
 
-用法：
+Usage:
     python tests/test_workspace_guide.py
 """
 from __future__ import annotations
@@ -51,12 +51,12 @@ def _tmpdir() -> str:
 
 
 def _np(p: str) -> str:
-    """与被测代码同一把归一化尺子（Windows 下会得到 8.3 短名，必须两边一致）。"""
+    """Same normalization ruler as the code under test (Windows may yield 8.3 short names; both sides must agree)."""
     return L.normpath(os.path.expanduser(p))
 
 
 class _Info:
-    """够用的 ``LibraryInfo`` 替身：被测代码只用到 ``name`` / ``path``。"""
+    """A good-enough ``LibraryInfo`` stub: the code under test only uses ``name`` / ``path``."""
 
     def __init__(self, name: str, path: str) -> None:
         self.name = name
@@ -71,7 +71,7 @@ def _write_guide(d: str, obj: object = None, raw: str | None = None) -> str:
 
 
 def _patch_resolve(known: dict[str, tuple[str, str]]):
-    """把库解析换成受控实现：只有 known 里的名字能解析，其余抛解析不明。"""
+    """Swap library resolution for a controlled fake: only names in known resolve, everything else raises unresolvable."""
     orig = L.resolve_library
 
     def fake(query, roots=None, libs=None, default_path=None):
@@ -85,7 +85,7 @@ def _patch_resolve(known: dict[str, tuple[str, str]]):
 
 
 def _patch_warning():
-    """捕获 logger.warning 的调用（比挂 Handler 稳，不受 level/propagate 影响）。"""
+    """Capture logger.warning calls (sturdier than attaching a Handler; immune to level/propagate)."""
     calls: list[str] = []
     orig = S.logger.warning
 
@@ -99,17 +99,17 @@ def _patch_warning():
 
 
 # ----------------------------------------------------------------------
-# A · _find_workspace_guide：向上找，最多 5 层，只认精确文件名
+# A · _find_workspace_guide: search upward, max 5 levels, exact filename only
 # ----------------------------------------------------------------------
 def part_a() -> None:
     print("\n【A】引导文件查找（向上 ≤5 层 / 精确文件名）")
 
-    check("A1 无引导文件 ⇒ None", S._find_workspace_guide(_tmpdir()) is None)
+    check("A1 no guide file => None", S._find_workspace_guide(_tmpdir()) is None)
 
     direct = _tmpdir()
     g = _write_guide(direct, {"library": "hippo_probe"})
     got = S._find_workspace_guide(direct)
-    check("A2 同目录有 ⇒ 返回该文件", got is not None and _np(got) == _np(g),
+    check("A2 same-dir file => returns it", got is not None and _np(got) == _np(g),
           f"got={got}")
 
     root = _tmpdir()
@@ -117,14 +117,14 @@ def part_a() -> None:
     os.makedirs(deep, exist_ok=True)
     g3 = _write_guide(root, {"library": "hippo_probe"})
     got3 = S._find_workspace_guide(deep)
-    check("A3 向上 3 层能找到", got3 is not None and _np(got3) == _np(g3),
+    check("A3 found 3 levels up", got3 is not None and _np(got3) == _np(g3),
           f"got={got3}")
 
     root2 = _tmpdir()
     d6 = os.path.join(root2, "l1", "l2", "l3", "l4", "l5", "l6")
     os.makedirs(d6, exist_ok=True)
     _write_guide(root2, {"library": "hippo_probe"})
-    check("A4 超过 5 层 ⇒ None（不误吃上级配置）",
+    check("A4 beyond 5 levels => None (no swallowing upper configs)",
           S._find_workspace_guide(d6) is None,
           f"got={S._find_workspace_guide(d6)}")
 
@@ -132,11 +132,11 @@ def part_a() -> None:
     with open(os.path.join(near, "hippocampus.json"), "w",
               encoding="utf-8") as fh:
         fh.write(json.dumps({"library": "hippo_probe"}))
-    check("A5 缺前导点的近似名不认", S._find_workspace_guide(near) is None)
+    check("A5 near-name without the leading dot is rejected", S._find_workspace_guide(near) is None)
 
 
 # ----------------------------------------------------------------------
-# B · _resolve_default_lib_path：引导文件 > env，且坏情况必须出声
+# B · _resolve_default_lib_path: guide file > env, and broken cases must be loud
 # ----------------------------------------------------------------------
 def part_b() -> None:
     print("\n【B】默认库解析：引导文件 > env，坏情况出声")
@@ -149,39 +149,39 @@ def part_b() -> None:
     orig_w, warns = _patch_warning()
     try:
         got = S._resolve_default_lib_path(base, root)
-        check("B1 无引导文件 ⇒ 回退 env 默认", _np(got) == base, f"got={got}")
+        check("B1 no guide file => fall back to env default", _np(got) == base, f"got={got}")
 
         _write_guide(root, {"library": "hippo_probe"})
         got2 = S._resolve_default_lib_path(base, root)
-        check("B2 引导文件优先于 env",
+        check("B2 guide file takes precedence over env",
               _np(got2) == _np("/tmp/target_lib"), f"got={got2}")
 
         _write_guide(root, {"library": "   "})
         got3 = S._resolve_default_lib_path(base, root)
-        check("B3 library 空白 ⇒ 回退", _np(got3) == base, f"got={got3}")
+        check("B3 blank library => fallback", _np(got3) == base, f"got={got3}")
 
         _write_guide(root, {"other": 1})
         got4 = S._resolve_default_lib_path(base, root)
-        check("B4 缺 library 键 ⇒ 回退", _np(got4) == base, f"got={got4}")
+        check("B4 missing library key => fallback", _np(got4) == base, f"got={got4}")
 
         warns.clear()
         _write_guide(root, raw="{not json")
         with_ = S._resolve_default_lib_path(base, root)
-        check("B5 坏 JSON ⇒ 回退", _np(with_) == base, f"got={with_}")
-        check("B5 坏 JSON 必须出声（不静默回退）",
+        check("B5 broken JSON => fallback", _np(with_) == base, f"got={with_}")
+        check("B5 broken JSON must be loud (no silent fallback)",
               any("read failed" in m for m in warns), f"warns={warns[:2]}")
 
         warns.clear()
         _write_guide(root, {"library": "不存在的库"})
         got6 = S._resolve_default_lib_path(base, root)
-        check("B6 解析不明 ⇒ 回退", _np(got6) == base, f"got={got6}")
-        check("B6 解析不明必须出声（串库比回退危险）",
+        check("B6 unresolvable => fallback", _np(got6) == base, f"got={got6}")
+        check("B6 unresolvable must be loud (a leak is riskier than a fallback)",
               any("unresolvable" in m for m in warns), f"warns={warns[:2]}")
 
         warns.clear()
         _write_guide(root, raw="[1,2,3]")
         got7 = S._resolve_default_lib_path(base, root)
-        check("B7 顶层非 dict ⇒ 回退不崩", _np(got7) == base, f"got={got7}")
+        check("B7 non-dict top level => fallback without crashing", _np(got7) == base, f"got={got7}")
     finally:
         L.resolve_library = orig_r
         S.logger.warning = orig_w

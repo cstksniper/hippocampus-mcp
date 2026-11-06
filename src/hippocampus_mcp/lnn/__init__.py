@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""LNN 动态记忆核 (Liquid Neural Network Dynamic Memory Core).
+"""LNN dynamic memory core (Liquid Neural Network Dynamic Memory Core).
 
-默认为**纯 numpy** 的 CfC 实现（见 ``numpy_cfc`` /
-``memory_core``），生产进程不再 import torch；``HIPPOCAMPUS_LNN_BACKEND=torch``
-可回退 ncps.torch 实现（惰性导入）。
+Defaults to a **pure numpy** CfC implementation (see ``numpy_cfc`` /
+``memory_core``); production processes no longer import torch; ``HIPPOCAMPUS_LNN_BACKEND=torch``
+falls back to the ncps.torch implementation (lazy import).
 
-``Projector`` 依赖 torch，改为惰性导出——顶层 ``from .projector import
-Projector`` 会把 torch 拖进每一个 ``import hippocampus_mcp.lnn`` 的进程，
-正是这里要拆掉的那条隐式依赖链。
+``Projector`` depends on torch and is therefore lazily exported — a top-level ``from .projector import
+Projector`` would drag torch into every process that does ``import hippocampus_mcp.lnn``,
+which is exactly the implicit dependency chain this module exists to break.
 """
 
 from .checkpoint import StateCheckpoint
@@ -17,7 +17,7 @@ __all__ = ["MemoryCore", "Projector", "StateCheckpoint"]
 
 
 def __getattr__(name: str):
-    """PEP 562 惰性导出：Projector（及其 torch 依赖）只在真正用到时加载。"""
+    """PEP 562 lazy export: Projector (and its torch dependency) is loaded only when actually used."""
     if name == "Projector":
         from .projector import Projector
 

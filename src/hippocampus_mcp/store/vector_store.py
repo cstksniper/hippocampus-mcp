@@ -1,14 +1,20 @@
-"""基于 numpy 内存数组的向量存储（多模型版）。
+"""Numpy in-memory array based vector store (multi-model version).
 
-设计要点（v0.4）：
-    - **向量是派生物**：记忆本体（文本 + 结构）存在 JSON，嵌入向量单独存
-      二进制 .npz。删除 .npz 只会让下次检索时补算，不会丢记忆。
-    - **多模型并存**：每条记录持有 ``{模型标识: 向量}``。切换嵌入模型时，
-      已有该模型向量的记录直接可用；没有的由上层补算（无需重新导入文档）。
-    - 检索只使用**当前活跃模型**的向量；缺向量的记录通过 ``missing_ids()``
-      暴露给上层补算。
+Design points (v0.4):
+    - **Vectors are derivatives**: the memory bodies (text + structure) live
+      in JSON; embedding vectors are stored separately in a binary .npz.
+      Deleting the .npz only triggers recomputation at the next retrieval;
+      no memory is lost.
+    - **Multiple models coexist**: each record holds ``{model key: vector}``.
+      When switching embedding models, records that already have that model's
+      vector are usable directly; the rest are backfilled by the layer above
+      (no need to re-import documents).
+    - Retrieval only uses vectors of the **currently active model**; records
+      missing vectors are exposed to the layer above via ``missing_ids()``
+      for backfill.
 
-后续可平滑替换为 chromadb 等专业向量数据库，只要保持对外接口不变即可。
+Later this can be smoothly replaced by a dedicated vector database such as
+chromadb, as long as the external interface stays unchanged.
 """
 
 from __future__ import annotations
@@ -30,26 +36,33 @@ from .memory import LEGACY_MODEL_KEY, PIN_IMPORTANCE, MemoryRecord
 from .backend import DB_FILENAME, StoreBackend, get_backend
 
 
-# 滚动备份保留份数（zcode 需求 C2）。0 = 关闭（只留固定的 .bak）。
-# 之所以还要滚动副本：``.bak`` 每次保存都被覆盖，等于只有"上一次保存"能回退。
-# 真出事时想找回的是"今天下午改坏之前的库"，而不是最后一次保存前的状态。
+# Number of rolling backup copies to keep (zcode requirement C2). 0 = off
+# (only the fixed .bak remains).
+# Why keep rolling copies at all: the ``.bak`` gets overwritten on every
+# save, so effectively only "the previous save" can be rolled back. When
+# things really break, what you want back is "the library as it was before
+# this afternoon's bad edits", not the state right before the last save.
 BACKUP_ROTATE_KEEP = 3
 
 
-# ── 构造注入缝 ────────────────────────────────────────────────────
-# 本模块（及 backend / lnn）受 G1 依赖矩阵约束**不 import config**；旋钮的
-# 登记处与唯一 env 读取点在 config（ENV_MAP）。生产路径由唯一构造方
-# **engine**（manager import 时）经 :func:`apply_config` 灌入 config 字符串
-# 运输值；解析序（env 先、注入值回退）与零漂移论证见
-# ``common/config_bridge.py`` 模块 docstring。
+# ── Construction injection seam ──────────────────────────────────
+# This module (and backend / lnn) is constrained by the G1 dependency matrix
+# to **not import config**; the registry of knobs and the single env read
+# point live in config (ENV_MAP). In production the sole constructor,
+# **engine** (at manager import time), feeds config string transport values
+# in via :func:`apply_config`; for the parse order (env first, injected
+# value as fallback) and the zero-drift argument see the
+# ``common/config_bridge.py`` module docstring.
 from ..common.config_bridge import apply_config as _bridge_apply_config
 from ..common.config_bridge import resolve as _resolve
 
 
 def apply_config(**values: str) -> None:
-    """构造方注入（包装 config_bridge；``save_lock_timeout`` 额外刷新模块
-    快照 :data:`SAVE_LOCK_TIMEOUT`——M1b ring 三件先例：模块属性即测试
-    monkeypatch 面；float() 脏值在此抛错＝原 import 期崩溃语义平移）。"""
+    """Constructor injection (wraps config_bridge; ``save_lock_timeout``
+    additionally refreshes the module snapshot :data:`SAVE_LOCK_TIMEOUT` --
+    the M1b ring trio precedent: a module attribute is the test monkeypatch
+    surface; a dirty value raising in float() here = the original
+    import-time crash semantics carried over verbatim)."""
     _bridge_apply_config(**values)
     if "save_lock_timeout" in values:
         global SAVE_LOCK_TIMEOUT
@@ -57,11 +70,13 @@ def apply_config(**values: str) -> None:
 
 
 def snapshot_min_hours() -> float:
-    """sqlite 滚动快照的最短间隔（小时）；``0`` = 每次 save 都做（仅调试用）。
+    """Minimum interval (hours) between sqlite rolling snapshots; ``0`` = do
+    one on every save (debug only).
 
-    为什么只有 sqlite 需要节流：``VACUUM INTO`` 实测约 **1 秒 / 64MB 库**，
-    而 ``save()`` 每 10 步就走一次；json 后端那份只是几 MB 的 ``copy2``，
-    沿用"每次保存都转一份"的既有语义。
+    Why only sqlite needs throttling: ``VACUUM INTO`` measures about
+    **1 second per 64MB library**, while ``save()`` triggers it once every
+    10 steps; the json backend's copy is just a few MB via ``copy2``, so it
+    keeps the existing "copy one on every save" semantics.
     """
     raw = _resolve("HIPPOCAMPUS_SNAPSHOT_MIN_HOURS", "snapshot_min_hours", "6")
     try:
@@ -70,30 +85,42 @@ def snapshot_min_hours() -> float:
         return 6.0
 
 
-# 多进程共用一个库（两个 ZCode 工作区各起一个 MCP 子进程）时的写策略：
-#   1 / true（默认）→ 加跨进程锁 + 把本进程的改动重放到对方最新状态之上（合并）
-#   0 / false      → 退回旧的乐观锁语义：检测到别人写过就抛 ConcurrentWriteError
-# 为什么默认改成合并：旧的"检测到冲突就报错"在双窗口下是**必然发生**的 ——
-# 两边各自 load 一次快照，之后任何一次保存都会撞上，用户侧只会看到保存失败。
+# Write policy when multiple processes share one library (two ZCode
+# workspaces each spawning an MCP subprocess):
+#   1 / true (default) → take a cross-process lock + replay this process's
+#       changes on top of the other side's latest state (merge)
+#   0 / false      → fall back to the old optimistic-lock semantics: raise
+#       ConcurrentWriteError as soon as another writer is detected
+# Why the default changed to merging: the old "error out on detected
+# conflict" was **guaranteed to happen** with two windows --
+# each side loads a snapshot once, after which any save collides, and the
+# user only ever sees save failures.
 def multi_writer_enabled() -> bool:
-    """是否启用多进程合并保存（每次调用时读环境变量，便于测试与运行时切换）。"""
+    """Whether multi-process merge saving is enabled (reads the env var on
+    every call, easing tests and runtime switching)."""
     return _resolve("HIPPOCAMPUS_MULTI_WRITER", "multi_writer", "1").lower() not in (
         "0", "false", "no", "off",
     )
 
 
 def _serialized(func):
-    """进程内写互斥：把方法体整体放进 ``self._io_lock``。
+    """In-process write mutual exclusion: runs the whole method body under
+    ``self._io_lock``.
 
-    为什么需要它（daemon 化之后才成为必需件）：跨进程那套保护（filelock +
-    脏集合重放）假设"另一方是**另一个进程**、持有独立的内存副本"。daemon 模式
-    下同一进程内 N 条连接 = N 个线程**共享同一个 VectorStore 对象**，于是
-    ``add()`` 与 ``save()`` 会交错，而 ``_write_to_disk`` 的"取快照 → 清脏集"
-    不是原子的 —— 另一方在中间 add 的记录既不在写出的文件里、也不再被记为
-    "改过"，下一次 ``_merge_with_disk`` 就把它静默丢掉。
+    Why it is needed (it only became a necessity after daemonization): the
+    cross-process protection (filelock + dirty-set replay) assumes "the
+    other side is **another process** holding an independent in-memory
+    copy". In daemon mode N connections in one process = N threads **sharing
+    one VectorStore object**, so ``add()`` and ``save()`` interleave, and
+    ``_write_to_disk``'s "take snapshot → clear dirty set" is not atomic --
+    a record the other side adds in between is neither in the written file
+    nor recorded as "changed", and the next ``_merge_with_disk`` silently
+    drops it.
 
-    只包写操作（add / update / delete / save），读操作（recall / count）不加锁，
-    否则 daemon 的并发读会被串行化，白丢掉共享进程带来的吞吐。
+    Only write operations are wrapped (add / update / delete / save); reads
+    (recall / count) take no lock, otherwise the daemon's concurrent reads
+    would be serialized, throwing away the throughput a shared process
+    provides.
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -102,23 +129,31 @@ def _serialized(func):
     return wrapper
 
 
-# 等锁上限（秒）。正常写入是毫秒级；等这么久还没拿到，说明对方卡住了
-# （例如正在整体覆写 9000+ 条的大库），宁可明确失败也不要无限等下去。
-# 默认值登记进 config（``save_lock_timeout``），实际值由 engine
-# import 时经 :func:`apply_config` 注入刷新——模块属性即 monkeypatch 面
-# （ring 快照语义）；这里保留的 float() 解析与脏值抛错的语义原样。
+# Lock wait upper bound (seconds). Normal writes are millisecond-scale; if
+# the wait takes this long, the other side is stuck (e.g. doing a full
+# overwrite of a 9000+ record library) -- better to fail explicitly than to
+# wait forever.
+# The default value is registered in config (``save_lock_timeout``); the
+# actual value is injected and refreshed by engine at import time via
+# :func:`apply_config` -- the module attribute is the monkeypatch surface
+# (ring snapshot semantics); the float() parsing and dirty-value raise kept
+# here preserve their original semantics.
 SAVE_LOCK_TIMEOUT: float = 60.0
 
 
 def _matrix_dtype() -> np.dtype:
-    """检索缓冲矩阵的 dtype（默认 fp32，每次读 env 便于测试/探针切换）。
+    """dtype of the retrieval buffer matrix (default fp32; env is read on
+    every call to ease test/probe switching).
 
-    为什么 fp32 够：向量落盘本来就是 float32（npz / sqlite blob 均按 fp32
-    序列化），``record.embeddings`` 也已归一为 ``array('f')``（双存修复）
-    ——检索缓冲是这两者的派生物，用 fp64 是"对已舍入的数据假装精确"，
-    白付一倍内存（真库 9859×768 ⇒ 58MB vs 29MB）。相对误差 ~1e-7，只会
-    在近平局的相邻两条上可能翻转排序，A/B 验收锚定 top-k 一致率 100%。
-    逃逸舱：``HIPPOCAMPUS_MATRIX_DTYPE=fp64`` 回旧行为。
+    Why fp32 is enough: vectors are stored as float32 anyway (both npz and
+    sqlite blobs serialize as fp32), and ``record.embeddings`` is already
+    normalized to ``array('f')`` (dual-store fix) -- the retrieval buffer is
+    a derivative of these two, and fp64 is "pretending precision on already
+    rounded data" at double the memory (real library 9859×768 ⇒ 58MB vs
+    29MB). Relative error ~1e-7 can only flip the ranking of two near-tied
+    adjacent entries; A/B acceptance anchored top-k agreement at 100%.
+    Escape hatch: ``HIPPOCAMPUS_MATRIX_DTYPE=fp64`` restores the old
+    behavior.
     """
     raw = _resolve("HIPPOCAMPUS_MATRIX_DTYPE", "matrix_dtype", "fp32")
     raw = raw.strip().lower()
@@ -128,12 +163,16 @@ def _matrix_dtype() -> np.dtype:
 
 
 def _vectors_mmap_enabled() -> bool:
-    """向量文件映射加载开关（默认关；每次读 env 便于测试/探针切换）。
+    """Vector file-mapping load switch (default off; env is read on every
+    call to ease test/probe switching).
 
-    开启后 ``record.embeddings`` 从匿名 ``array('f')``（真库 ~32.6MB）变成
-    np.memmap 只读切片——file-backed、可被系统回收、多进程共享页缓存。
-    判定收益看 **Private Bytes** 不看瞬时 WS（file-backed 页被触碰后仍会
-    驻留 WS，但不是"占住不放"的那类内存，见 h3_selective_quant REPORT §2.3）。
+    When enabled, ``record.embeddings`` changes from an anonymous
+    ``array('f')`` (~32.6MB in the real library) to a read-only np.memmap
+    slice -- file-backed, reclaimable by the OS, page cache shared across
+    processes. Judge the benefit by **Private Bytes**, not by instantaneous
+    WS (file-backed pages still stay resident in WS after being touched, but
+    are not the "held onto forever" kind of memory; see h3_selective_quant
+    REPORT §2.3).
     """
     return _resolve(
         "HIPPOCAMPUS_VECTORS_MMAP", "vectors_mmap", "0").strip().lower() in (
@@ -142,41 +181,53 @@ def _vectors_mmap_enabled() -> bool:
 
 
 class ConcurrentWriteError(RuntimeError):
-    """磁盘上的记忆文件已被**其他进程**改写，且本次保存**无法安全合并**。
+    """The on-disk memory file has been rewritten by **another process**, and
+    this save **cannot be merged safely**.
 
-    触发场景：同一个 ``persist_dir`` 被两个进程同时持有（两个 ZCode 窗口各起
-    一个 MCP 子进程；或导入脚本与正在运行的 MCP 服务并存）。两边各自 ``load()``
-    拿到快照、各自改内存、再各自**整体覆写**文件，后保存的一方会让先保存方的
-    写入整段消失，且双方都打印"已保存"——**静默数据丢失**。
+    Trigger scenario: the same ``persist_dir`` is held by two processes at
+    once (two ZCode windows each spawning an MCP subprocess; or an import
+    script coexisting with a running MCP service). Each side ``load()``s a
+    snapshot, mutates its own memory, then **fully overwrites** the file;
+    the later saver makes the earlier saver's writes vanish entirely, and
+    both print "saved" -- **silent data loss**.
 
-    当前处理（默认，见 ``multi_writer_enabled``）：``load()`` 记下文件版本戳
-    （mtime_ns + size），``save()`` 前先在**跨进程写锁**内核对；不一致就把本
-    进程的改动重放到磁盘最新状态之上（``_merge_with_disk``）—— 双方的新增与
-    删除都不会丢。所以两个窗口并存时**默认不再报错**。
+    Current handling (default, see ``multi_writer_enabled``): ``load()``
+    records the file version stamp (mtime_ns + size), and ``save()`` first
+    verifies it under the **cross-process write lock**; on mismatch this
+    process's changes are replayed on top of the disk's latest state
+    (``_merge_with_disk``) -- neither side's additions nor deletions are
+    lost. So with two windows coexisting the default **no longer raises**.
 
-    仍然抛本异常的情形：「磁盘上的 JSON 读不出来（宁可明确失败，也不拿半截
-    数据去合并）」·「HIPPOCAMPUS_MULTI_WRITER=0 显式关掉合并」·「拿不到写锁，
-    通常意味着环境里没有 filelock」。
+    Cases that still raise this exception: "the JSON on disk is unreadable
+    (better to fail explicitly than merge with half the data)" /
+    "HIPPOCAMPUS_MULTI_WRITER=0 explicitly turns merging off" / "the write
+    lock cannot be acquired, usually meaning filelock is missing from the
+    environment".
 
-    处置：调用方应重新 ``load()``（MCP 工具 ``load_state``）拿到最新状态后重做
-    本次修改；或者确认另一进程已退出。若确实要强制覆盖（例如明知另一进程是
-    只读的），设 ``HIPPOCAMPUS_ALLOW_STALE_SAVE=1`` 降级为告警。
+    Remedy: the caller should ``load()`` again (MCP tool ``load_state``) to
+    get the latest state and redo the change; or make sure the other process
+    has exited. If you truly need to force the overwrite (e.g. you know the
+    other process is read-only), set ``HIPPOCAMPUS_ALLOW_STALE_SAVE=1`` to
+    downgrade to a warning.
     """
 
 
 class VectorStore:
-    """基于 numpy 内存数组的多模型向量存储。
+    """Multi-model vector store based on numpy in-memory arrays.
 
-    内部维护一份 ``list[MemoryRecord]``（记录自带各模型向量），
-    检索时按活跃模型惰性构建 ``(N, dim)`` 矩阵并缓存。
+    Internally keeps one ``list[MemoryRecord]`` (records carry each model's
+    vectors); at retrieval time the ``(N, dim)`` matrix for the active model
+    is built lazily and cached.
 
     Args:
-        dim: 当前活跃模型的向量维度。
-        persist_path: 记忆本体（JSON）持久化路径；为 ``None`` 时不落盘。
-        model_key: 当前活跃模型标识（如 ``"BAAI/bge-base-zh-v1.5"``）。
+        dim: vector dimension of the currently active model.
+        persist_path: persistence path for the memory bodies (JSON);
+            ``None`` means no persistence to disk.
+        model_key: key of the currently active model (e.g.
+            ``"BAAI/bge-base-zh-v1.5"``).
     """
 
-    # 持久化格式版本：1 = 单向量旧格式，2 = 多model + 独立 .npz
+    # Persistence format version: 1 = legacy single-vector format, 2 = multi-model + separate .npz
     FORMAT_VERSION = 2
 
     def __init__(
@@ -189,93 +240,114 @@ class VectorStore:
         self.persist_path = persist_path
         self.model_key = model_key or LEGACY_MODEL_KEY
 
-        # id -> 在 _records 中的行索引
+        # id -> row index within _records
         self._id_to_index: dict[str, int] = {}
-        # 保持插入顺序的记录列表
+        # Record list preserving insertion order
         self._records: list[MemoryRecord] = []
-        # 活跃模型的矩阵缓存：**定长缓冲 + 已用行数**，惰性构建。
-        # 追加写入走增量维护（``_sync_row``），不再整体重建 —— 这是写入
-        # O(N²) 的根因修复（缺陷 D2）：原先 add() 无条件失效，去重检索又
-        # 每次触发全量 vstack，于是"写第 k 条"的代价是 O(k)。
-        self._matrix: np.ndarray | None = None      # 缓冲，行数 >= _matrix_n
-        self._matrix_n: int = 0                      # 已用行数
-        self._matrix_ids: list[str] = []             # 行 -> id（长度 == _matrix_n）
-        self._id_to_row: dict[str, int] = {}          # id -> 行号
+        # Matrix cache for the active model: **fixed-size buffer + used row
+        # count**, built lazily. Appends go through incremental maintenance
+        # (``_sync_row``) instead of a full rebuild -- this is the root-cause
+        # fix for O(N²) writes (defect D2): add() used to invalidate
+        # unconditionally and the dedup lookup triggered a full vstack every
+        # time, making "write the k-th record" cost O(k).
+        self._matrix: np.ndarray | None = None      # buffer, rows >= _matrix_n
+        self._matrix_n: int = 0                      # used row count
+        self._matrix_ids: list[str] = []             # row -> id (len == _matrix_n)
+        self._id_to_row: dict[str, int] = {}          # id -> row number
 
-        # 已知模型的维度：model_key -> dim
+        # Known model dimensions: model_key -> dim
         self.model_dims: dict[str, int] = {}
-        # 模型标识 -> npz 内短名（避免 "/" 出现在 npz key 中）
+        # Model key -> short name inside npz (avoids "/" in npz keys)
         self._model_slugs: dict[str, str] = {}
-        # 落盘时记录的活跃模型（JSON 的 "model_key" 字段）。这是"这个库上次
-        # 是**用哪个模型**在跑"的权威记录，load 时恢复，供"让嵌入模型跟随
-        # 数据"用（见 preferred_model_key）。
+        # Active model recorded at persist time (the JSON's "model_key"
+        # field). This is the authoritative record of "which model this
+        # library last **ran on**", restored on load, used for "letting the
+        # embedding model follow the data" (see preferred_model_key).
         self.persisted_model_key: str | None = None
 
-        # 上一次 load 的异常报告（None = 干净）。
-        # 损坏时不会静默清空，而是把现场记录在这里供上层告警/测试断言。
+        # Issue report from the last load (None = clean).
+        # On corruption the state is not silently cleared; the scene is
+        # recorded here for upper-layer alerts / test assertions.
         self.last_load_issue: dict[str, Any] | None = None
 
-        # 并发写保护：最近一次"与磁盘同步"时的文件版本戳。
-        # None = 磁盘上还没有本文件（或从未同步过）。
+        # Concurrent write protection: file version stamp at the last
+        # "synced with disk". None = the file is not on disk yet (or never
+        # synced).
         self._disk_stamp: tuple[int, int] | None = None
-        # 滚动备份保留份数（见 BACKUP_ROTATE_KEEP）。置 0 可关闭。
+        # Rolling backup copies to keep (see BACKUP_ROTATE_KEEP). 0 disables.
         self.backup_rotate_keep: int = BACKUP_ROTATE_KEEP
-        # 最近一次被拦截的并发写冲突（供上层告警/测试断言）
+        # Most recent intercepted concurrent write conflict (for upper-layer
+        # alerts / test assertions)
         self.last_conflict: dict[str, Any] | None = None
 
-        # ---- 多进程共享同一个 persist_dir（见 save / _merge_with_disk）----
-        # 本进程自上次成功落盘以来"改过 / 删过"的 id。save 时若发现磁盘已被
-        # 别的进程改写，就用这两个集合把本进程的改动**重放**到对方的最新状态
-        # 之上，而不是整体覆盖 —— 后者会静默抹掉对方的写入。
-        # 记录里没有 updated_at（timestamp 是记忆发生时间，不是修改时间），
-        # 所以做不了记录级 LWW，只能靠"谁改过谁重放"来合并。
+        # ---- Multiple processes sharing one persist_dir (see save /
+        # _merge_with_disk) ----
+        # Ids this process has "changed / deleted" since the last successful
+        # persist. If a save finds the disk was rewritten by another process,
+        # these two sets replay this process's changes **on top of** the
+        # other side's latest state rather than fully overwriting -- the
+        # latter would silently erase the other side's writes.
+        # Records carry no updated_at (timestamp is when the memory happened,
+        # not when it was modified), so record-level LWW is impossible;
+        # merging can only rely on "whoever changed it replays it".
         self._dirty_ids: set[str] = set()
         self._deleted_ids: set[str] = set()
-        # 最近一次合并的统计（供日志 / 测试断言）
+        # Stats of the most recent merge (for logs / test assertions)
         self.last_merge: dict[str, Any] | None = None
 
-        # ---- 进程内写互斥（daemon 化后才出现的必需件）----
-        # 跨进程那套（filelock + 脏集合重放）假设"另一方是另一个进程、有独立的
-        # 内存副本"。daemon 模式下同一进程内有 N 条连接 = N 个线程**共享同一个
-        # VectorStore 对象**，于是：
-        #   * A 在 _write_to_disk 里取了 _records 快照、还没清 _dirty_ids；
-        #   * B 此时 add() 了新记录（同进程同列表，A 的快照里没有它）；
-        #   * A 把 _dirty_ids 清空 —— B 那条既不在 A 写出的文件里，也不再被
-        #     记为"改过"；
-        #   * 下次任何一方的 save 触发 _merge_with_disk，merged 只认磁盘版本 +
-        #     脏集重放 ⇒ 那条记录**静默消失**。
-        # 实测（tests/test_f9_4b_daemon_mcp_e2e.py E2）：两连接各写 15 条，
-        # 修复前落盘 20~25 条，丢失数与时序相关（不可复现的偶发丢数据）。
-        # 所以 add / update / delete / save 必须共用这一把锁。
+        # ---- In-process write mutual exclusion (a necessity that only
+        # appeared after daemonization) ----
+        # The cross-process set (filelock + dirty-set replay) assumes "the
+        # other side is another process with an independent in-memory copy".
+        # In daemon mode one process has N connections = N threads **sharing
+        # one VectorStore object**, so:
+        #   * A takes a _records snapshot in _write_to_disk and has not yet
+        #     cleared _dirty_ids;
+        #   * B add()s a new record at that moment (same process, same list;
+        #     it is not in A's snapshot);
+        #   * A clears _dirty_ids -- B's record is neither in the file A
+        #     wrote nor recorded as "changed";
+        #   * the next save by either side triggers _merge_with_disk, where
+        #     merged only trusts the disk version + dirty-set replay ⇒ that
+        #     record **silently disappears**.
+        # Measured (tests/test_f9_4b_daemon_mcp_e2e.py E2): two connections
+        # writing 15 records each persisted only 20~25 records before the
+        # fix; losses depended on timing (non-reproducible sporadic data
+        # loss). So add / update / delete / save must share this one lock.
         self._io_lock = threading.RLock()
 
-        # ---- G1：落盘后端（json 多文件 / sqlite 单库）----
-        # 只替换"读盘 / 落盘"这一层，内存结构（_records / 矩阵 / 脏集）不动，
-        # 于是检索 / 合并 / 去重那些业务逻辑一行都不用改。见 store/backend.py。
+        # ---- G1: persistence backend (json multi-file / sqlite single db) ----
+        # Only the "read disk / write disk" layer is swapped; the in-memory
+        # structures (_records / matrix / dirty sets) stay untouched, so the
+        # retrieval / merge / dedup business logic needs zero changes. See
+        # store/backend.py.
         self._backend: StoreBackend | None = None
         if persist_path:
             self._backend = get_backend(
                 os.path.dirname(os.path.abspath(persist_path))
             )
-        # 磁盘上是否已有完整基线。首次必须全量写：增量写的前提是库里已经有
-        # 一份完整数据，"只 upsert 脏行"否则会写出一个只有几条记录的库。
+        # Whether a full baseline already exists on disk. The first save must
+        # be a full write: incremental writing presupposes the library
+        # already holds a complete copy, otherwise "upsert only dirty rows"
+        # would produce a library with just a few records.
         self._full_saved = False
-        # 向量 mmap（HIPPOCAMPUS_VECTORS_MMAP=1）：挂住映射对象
+        # Vector mmap (HIPPOCAMPUS_VECTORS_MMAP=1): holds the mapping object
         self._vectors_mm = None
 
     # ------------------------------------------------------------------
-    # 派生路径
+    # Derived paths
     # ------------------------------------------------------------------
     @property
     def vectors_path(self) -> str | None:
-        """二进制向量文件路径（与 ``persist_path`` 同目录）。"""
+        """Binary vector file path (same directory as ``persist_path``)."""
         if not self.persist_path:
             return None
         base, _ = os.path.splitext(self.persist_path)
         return base + ".vectors.npz"
 
     def _slug_for(self, model_key: str) -> str:
-        """为模型标识分配稳定的短名（用于 npz 键前缀）。"""
+        """Assign a stable short name for a model key (used as the npz key
+        prefix)."""
         existing = self._model_slugs.get(model_key)
         if existing:
             return existing
@@ -291,13 +363,15 @@ class VectorStore:
         return f"{self._slug_for(model_key)}::{record_id}"
 
     # ------------------------------------------------------------------
-    # 内部辅助方法
+    # Internal helpers
     # ------------------------------------------------------------------
     def _invalidate(self) -> None:
-        """整体失效矩阵缓存，下次搜索时全量重建。
+        """Invalidate the whole matrix cache; rebuild fully on the next
+        search.
 
-        只在结构性变更（删除 / 换model / 裁剪model / 加载）时调用。
-        新增记录与原地改向量走 ``_sync_row`` 增量维护，不整体重建。
+        Called only on structural changes (delete / model switch / model
+        prune / load). Added records and in-place vector updates go through
+        ``_sync_row`` incremental maintenance, not a full rebuild.
         """
         self._matrix = None
         self._matrix_n = 0
@@ -316,7 +390,7 @@ class VectorStore:
         return dim
 
     def _validate_embedding(self, embedding: Any, model_key: str | None = None) -> np.ndarray:
-        """校验并转换为 1D float64 向量。"""
+        """Validate and convert to a 1D float64 vector."""
         key = model_key or self.model_key
         emb = np.asarray(embedding, dtype=np.float64).reshape(-1)
         if key == self.model_key and emb.shape[0] != self.dim:
@@ -327,11 +401,13 @@ class VectorStore:
         return emb
 
     def _active_matrix(self) -> tuple[list[str], np.ndarray]:
-        """取活跃模型的 (ids, matrix)，按需重建。
+        """Return (ids, matrix) for the active model, rebuilding on demand.
 
         Returns:
-            (ids, matrix)：ids 与 matrix 行一一对应，顺序与记录插入顺序一致。
-            matrix 是内部缓冲的**视图**（行数 == len(ids)），调用方只读。
+            (ids, matrix): ids and matrix rows correspond one to one, in
+            record insertion order. matrix is a **view** of the internal
+            buffer (row count == len(ids)); callers must treat it as
+            read-only.
         """
         if self._matrix is None:
             ids: list[str] = []
@@ -354,7 +430,7 @@ class VectorStore:
         return self._matrix_ids, self._matrix[: self._matrix_n]
 
     def _grow_matrix(self) -> None:
-        """矩阵缓冲扩容（翻倍），均摊 O(1)。"""
+        """Grow the matrix buffer (doubling), amortized O(1)."""
         old = self._matrix
         if old is None:
             return
@@ -363,11 +439,14 @@ class VectorStore:
         self._matrix = new
 
     def _sync_row(self, memory_id: str, vector: Any | None) -> None:
-        """把一条记录的活跃模型向量增量同步进矩阵缓存。
+        """Incrementally sync one record's active-model vector into the
+        matrix cache.
 
-        仅当矩阵已构建时生效；矩阵未构建则保持惰性，下次检索自然包含。
-        行需要被**移除**时（记录丢了当前模型的向量）numpy 无法 O(1) 删行，
-        退化为整体失效 —— 这条路径在正常写入中不会出现。
+        Takes effect only when the matrix is already built; if not built it
+        stays lazy and the next retrieval naturally includes it. When a row
+        must be **removed** (the record lost the current model's vector),
+        numpy cannot delete a row in O(1), so it degrades to a full
+        invalidation -- this path never occurs in normal writes.
         """
         if self._matrix is None:
             return
@@ -378,7 +457,7 @@ class VectorStore:
             return
         vec = np.asarray(vector, dtype=self._matrix.dtype).reshape(-1)
         if vec.shape[0] != self._matrix.shape[1]:
-            # 维度异常（理论上被 _validate_embedding 拦住），安全退化
+            # Dimension anomaly (theoretically blocked by _validate_embedding); degrade safely
             self._invalidate()
             return
         if row is not None:
@@ -392,11 +471,14 @@ class VectorStore:
         self._matrix_n += 1
 
     def _cosine_similarity(self, query: np.ndarray) -> np.ndarray:
-        """批量计算查询向量与活跃模型所有存储向量的余弦相似度。
+        """Batch-compute cosine similarity between the query vector and all
+        stored vectors of the active model.
 
-        query 转成**矩阵同 dtype** 再乘：fp32 矩阵 @ fp64 向量会让 numpy
-        临时把整份矩阵升维 fp64（一份 58MB 级临时数组，fp32 化就白改了）。
-        返回仍转回 float64，保持调用方拿到的分数口径不变。
+        query is cast to the **matrix's dtype** before the multiply: an fp32
+        matrix @ fp64 vector makes numpy temporarily promote the whole
+        matrix to fp64 (a 58MB-scale temporary array, undoing the fp32
+        conversion). The result is still cast back to float64, keeping the
+        score semantics callers see unchanged.
         """
         _, matrix = self._active_matrix()
         if matrix.shape[0] == 0:
@@ -417,33 +499,46 @@ class VectorStore:
         chunk: int = 512,
         normalize: bool = True,
     ) -> list[tuple[str, str, float]]:
-        """在 id 子集内找相似度落在 ``[low, high)`` 的对，按相似度降序返回。
+        """Find pairs within an id subset whose similarity falls in
+        ``[low, high)``, returned in descending similarity order.
 
-        为什么要单独开这个口子：**两两比对比"一条对全部"贵一个量级**，而
-        ``consolidate`` 的矛盾检测正是桶内两两比对——它要的是"同一个实体下的
-        记忆里谁和谁像"，不是"哪条最像查询"。
+        Why this separate entry point exists: **pairwise comparison is an
+        order of magnitude more expensive than "one against all"**, and
+        ``consolidate``'s contradiction detection is exactly pairwise within
+        a bucket -- it wants "who resembles whom among the memories of the
+        same entity", not "which memory best matches the query".
 
-        实现是**分块矩阵乘**而不是逐对 Python 循环。两者的**数值完全一致**
-        （都是归一化后的点积），但代价差两个数量级：真实大库（数千条 /
-        数百个实体桶）实测从分钟级降到秒级。
-        逐对版的开销根本不在点积上，而在**每对都要把 Python list 转成
-        numpy 数组**（``manager.vector_of`` 返回 ``record.embeddings[key]``，
-        每次 ``np.asarray`` 768 个元素）——这一点必须写在注释里，否则后人
-        很容易以为"点积本来就慢"而放弃优化。
+        The implementation is **blocked matrix multiplication**, not a
+        per-pair Python loop. The two give **numerically identical** results
+        (both are dot products of normalized rows), but the cost differs by
+        two orders of magnitude: on a real large library (thousands of
+        records / hundreds of entity buckets) measured to drop from minutes
+        to seconds.
+        The per-pair version's cost is not in the dot product at all -- it
+        is in **converting a Python list to a numpy array for every pair**
+        (``manager.vector_of`` returns ``record.embeddings[key]``, an
+        ``np.asarray`` over 768 elements each time) -- this must be written
+        in a comment, otherwise people later assume "dot products are just
+        slow" and give up on optimizing.
 
         Args:
-            ids: 待比对的子集（同一个实体桶）。
-            low / high: 相似度区间 ``[low, high)``。**上界是刻意的**：
-                ≥ high 的对通常是同一条事实的两个副本，不构成"矛盾"，
-                交由写入侧去重处理，这里不重复报告。
-            limit: 每个子集最多返回多少对（按相似度降序）。
-            chunk: 分块行数。控制临时矩阵峰值内存（``chunk × n × 8`` 字节）。
-            normalize: 是否先按行归一化。默认 True（返回真余弦值）；
-                传 False 时按点积筛选，仅在调用方已知向量已归一化时用。
+            ids: the subset to compare (one entity bucket).
+            low / high: similarity interval ``[low, high)``. **The upper
+                bound is deliberate**: pairs with similarity ≥ high are
+                usually two copies of the same fact, not a "contradiction";
+                they are left to write-side dedup and not re-reported here.
+            limit: max pairs returned per subset (descending by similarity).
+            chunk: block row count. Controls peak memory of the temporary
+                matrix (``chunk × n × 8`` bytes).
+            normalize: whether to normalize rows first. Default True
+                (returns true cosine values); False filters by raw dot
+                product, only for callers that already know the vectors are
+                normalized.
 
         Returns:
-            ``[(id_a, id_b, sim), ...]``，按 sim 降序；只含上三角（``i < j``），
-            不自我比对。缺失向量的 id 自动跳过。
+            ``[(id_a, id_b, sim), ...]``, descending by sim; only the upper
+            triangle (``i < j``), no self-comparison. ids missing vectors
+            are skipped automatically.
         """
         if len(ids) < 2:
             return []
@@ -472,7 +567,7 @@ class VectorStore:
             blk = sub[s:s + chunk]
             sims = blk @ sub.T
             for i in range(blk.shape[0]):
-                lo = s + i + 1          # 只算上三角
+                lo = s + i + 1          # upper triangle only
                 if lo >= len(rows):
                     break
                 row = sims[i, lo:]
@@ -480,7 +575,7 @@ class VectorStore:
                 if hit.size:
                     for g in hit:
                         best.append((float(row[g]), s + i, lo + int(g)))
-            # 边算边剪：把候选压回 limit，避免大桶把内存吃满
+            # Prune while computing: shrink candidates back to limit so large buckets do not eat all the memory
             if len(best) > limit * 4:
                 best.sort(key=lambda x: -x[0])
                 del best[limit:]
@@ -489,13 +584,14 @@ class VectorStore:
         return [(kept[i], kept[j], sim) for sim, i, j in best[:limit]]
 
     # ------------------------------------------------------------------
-    # 公开 API
+    # Public API
     # ------------------------------------------------------------------
     @_serialized
     def add(self, record: MemoryRecord) -> str:
-        """添加一条记忆，返回其 id。
+        """Add a memory and return its id.
 
-        若 ``record.id`` 为空则自动生成 UUID；若 id 已存在则执行原地更新。
+        If ``record.id`` is empty a UUID is generated; if the id already
+        exists an in-place update is performed.
         """
         if not record.id:
             record.id = str(uuid.uuid4())
@@ -510,7 +606,7 @@ class VectorStore:
             self._records.append(record)
             self._id_to_index[record.id] = len(self._records) - 1
 
-        # 增量维护矩阵缓存（缓存未构建时保持惰性，下次检索重建即包含本条）
+        # Incrementally maintain the matrix cache (stays lazy when unbuilt; the next retrieval rebuild includes this record)
         self._sync_row(record.id, record.vector_for(self.model_key))
         self._mark_dirty(record.id)
         return record.id
@@ -518,7 +614,8 @@ class VectorStore:
     def set_vector(
         self, memory_id: str, model_key: str, vector: Any
     ) -> bool:
-        """为指定记忆写入某个模型的向量（补算路径使用）。"""
+        """Write a model's vector for the given memory (used by the backfill
+        path)."""
         rec = self.get(memory_id)
         if rec is None:
             return False
@@ -533,12 +630,15 @@ class VectorStore:
         self, query: np.ndarray, top_k: int = 10,
         allow_ids: set[str] | None = None,
     ) -> list[tuple[MemoryRecord, float]]:
-        """余弦相似度检索（仅活跃模型），返回 (record, similarity) 降序列表。
+        """Cosine similarity search (active model only); returns a (record,
+        similarity) list in descending order.
 
         Args:
-            allow_ids: 只允许返回这些 id 的记忆（None = 不限）。标签过滤
-                走这里：先在**检索前**把候选集收窄，而不是检索完再筛——
-                后者会在"满足条件的都在 top_k 之外"时漏召回。
+            allow_ids: only memories with these ids may be returned (None =
+                no restriction). Tag filtering goes through here: narrow the
+                candidate set **before retrieval** rather than filtering
+                after the fact -- the latter misses recalls when everything
+                matching lies outside top_k.
         """
         if len(self._records) == 0:
             return []
@@ -558,7 +658,7 @@ class VectorStore:
 
         sims = self._cosine_similarity(query)
         if allow_ids is not None:
-            # 屏蔽不在白名单里的行（-inf 而不是 0：0 仍可能被"矮子里拔将军"选中）
+            # Mask rows not in the allowlist (-inf rather than 0: 0 can still be picked as "the tallest among the short")
             keep = np.fromiter(
                 (rid in allow_ids for rid in ids), dtype=bool, count=len(ids)
             )
@@ -572,7 +672,7 @@ class VectorStore:
         ]
 
     def get(self, memory_id: str) -> MemoryRecord | None:
-        """根据 id 获取记忆记录，不存在则返回 None。"""
+        """Fetch a memory record by id; returns None if absent."""
         idx = self._id_to_index.get(memory_id)
         if idx is None:
             return None
@@ -580,10 +680,12 @@ class VectorStore:
 
     @_serialized
     def update(self, memory_id: str, **fields: Any) -> bool:
-        """更新指定记忆的字段（如 recall_count）。返回是否更新成功。
+        """Update fields of the given memory (e.g. recall_count). Returns
+        whether the update succeeded.
 
-        支持任意 dataclass 字段；``embedding`` 为兼容旧调用保留，
-        等价于写入当前活跃模型的向量。
+        Accepts any dataclass field; ``embedding`` is kept for backward
+        compatibility with old calls and is equivalent to writing the active
+        model's vector.
         """
         idx = self._id_to_index.get(memory_id)
         if idx is None:
@@ -603,10 +705,13 @@ class VectorStore:
                 continue
             setattr(record, key, value)
 
-        # 缺陷 D4：pin 原先只在 MemoryRecord.__post_init__ 里按 importance 设定，
-        # 而这里走 setattr 会绕过它 —— 于是"importance>=0.7 自动钉住"只对新建生效，
-        # 合并（dedup）路径提升 importance 时 pin 仍是 False、stats().pinned 也是 0。
-        # 仅在本次确实改了 importance、且调用方没有显式指定 pin 时才重算。
+        # Defect D4: pin was originally set from importance only in
+        # MemoryRecord.__post_init__, and setattr here bypasses it -- so
+        # "importance>=0.7 pins automatically" only worked for newly created
+        # records; when the merge (dedup) path raised importance, pin stayed
+        # False and stats().pinned stayed 0.
+        # Recompute only when importance actually changed this time and the
+        # caller did not pass pin explicitly.
         if "importance" in fields and "pin" not in fields:
             record.sync_pin()
         self._mark_dirty(memory_id)
@@ -614,47 +719,55 @@ class VectorStore:
 
     @_serialized
     def delete(self, memory_id: str) -> bool:
-        """删除指定记忆，返回是否删除成功。"""
+        """Delete the given memory; returns whether deletion succeeded."""
         idx = self._id_to_index.get(memory_id)
         if idx is None:
             return False
 
         del self._records[idx]
-        # 重建索引映射，保持列表紧凑
+        # Rebuild the index mapping, keeping the list compact
         self._id_to_index.clear()
         for i, rec in enumerate(self._records):
             self._id_to_index[rec.id] = i
         self._invalidate()
-        # 删除也要记账：合并时要把这条从对方的最新状态里去掉，
-        # 否则对方磁盘上的副本会被"保留下来"，表现为删了又活。
+        # Deletions must be booked too: during a merge this id must be
+        # removed from the other side's latest state, otherwise its on-disk
+        # copy gets "kept", manifesting as a record that comes back after
+        # deletion.
         self._dirty_ids.discard(memory_id)
         self._deleted_ids.add(memory_id)
         return True
 
     def count(self) -> int:
-        """返回当前存储的记忆数量。"""
+        """Return the number of memories currently stored."""
         return len(self._records)
 
     def iter_records(self) -> Iterator[MemoryRecord]:
-        """M3：只读遍历全部记录的**公开**入口。
+        """M3: **public** entry point for read-only iteration over all
+        records.
 
-        迁移前上层（brain/core、engine/manager 等 45 处）直接摸
-        ``self._records``——那让 VectorStore 的内部表示（list + 插入序）
-        成了事实上 API，改存储结构就会炸一层。本方法把「遍历」收归
-        端口契约：调用方拿迭代器，不拿容器。
+        Before this migration the upper layers (brain/core, engine/manager,
+        45 call sites) reached directly into ``self._records`` -- that made
+        VectorStore's internal representation (list + insertion order) a de
+        facto API, and any storage-structure change would blow up a layer.
+        This method folds "iteration" into the port contract: callers get an
+        iterator, not the container.
 
-        语义与直接 ``iter(self._records)`` 完全一致（同一 list 对象、
-        同一顺序、惰性求值）——所以这是**零行为变化**的收编，不是
-        语义增强。线程安全边界与原来相同：进程内写互斥由调用方
-        持有的锁负责，本方法不加锁也不该加。
+        Semantics are identical to a direct ``iter(self._records)`` (same
+        list object, same order, lazy evaluation) -- so this is a
+        **zero-behavior-change** consolidation, not a semantic enhancement.
+        The threading-safety boundary is unchanged: in-process write mutual
+        exclusion is the caller's held lock's job; this method takes no lock
+        and should not.
         """
         return iter(self._records)
 
     # ------------------------------------------------------------------
-    # 多模型相关 API
+    # Multi-model API
     # ------------------------------------------------------------------
     def set_model(self, model_key: str, dim: int | None = None) -> None:
-        """切换活跃模型（检索将使用该模型的向量）。"""
+        """Switch the active model (retrieval will use that model's
+        vectors)."""
         self.model_key = model_key
         if dim is not None:
             self.dim = dim
@@ -663,15 +776,17 @@ class VectorStore:
         self._invalidate()
 
     def missing_ids(self, model_key: str | None = None) -> list[str]:
-        """返回缺少指定（默认活跃）模型向量的记忆 id 列表。"""
+        """Return ids of memories missing vectors for the given (default:
+        active) model."""
         key = model_key or self.model_key
         return [r.id for r in self._records if not r.has_vector(key)]
 
     def model_stats(self) -> dict[str, dict[str, int]]:
-        """统计各模型的向量覆盖情况。
+        """Report per-model vector coverage.
 
         Returns:
-            ``{模型标识: {"vectors": 有向量的条数, "dim": 维度}}``。
+            ``{model key: {"vectors": records holding a vector, "dim":
+            dimension}}``.
         """
         stats: dict[str, dict[str, int]] = {}
         for rec in self._records:
@@ -683,19 +798,27 @@ class VectorStore:
         return stats
 
     def preferred_model_key(self) -> str | None:
-        """判定"这个库实际跑在哪个嵌入模型上"，供嵌入模型跟随数据。
+        """Determine "which embedding model this library actually runs on",
+        for letting the embedding model follow the data.
 
-        优先级：
-            1. 落盘记录的 ``model_key``（JSON 顶层字段，= 上次保存时的活跃
-               模型）——但要求它**确实有向量覆盖**，否则是"某次用错模型跑
-               过并落了盘"留下的脏值，不能盲从；
-            2. 覆盖率最高的非 ``__legacy__`` 槽位（向量在哪，模型就是谁）；
-            3. 都没有（空库 / 只有旧格式单向量）→ ``None``。
+        Priority:
+            1. the persisted ``model_key`` (top-level JSON field, = the
+               active model at last save) -- but only if it **really has
+               vector coverage**; otherwise it is dirty residue left by
+               "some run with the wrong model that got persisted", not to be
+               trusted blindly;
+            2. the non-``__legacy__`` slot with the highest coverage (where
+               the vectors are, the model is);
+            3. neither exists (empty library / only a legacy single vector)
+               → ``None``.
 
-        ``__legacy__`` 永远不作为候选：它是"旧格式单向量"的占位槽，认领它
-        需要显式的 :meth:`adopt_legacy`，不能被当成一个真实的嵌入模型跟随。
+        ``__legacy__`` is never a candidate: it is the placeholder slot for
+        the "legacy single-vector format"; claiming it requires an explicit
+        :meth:`adopt_legacy`, it must not be followed as if it were a real
+        embedding model.
 
-        返回 ``None`` 表示"库内没有可跟随的模型"，由调用方决定用什么默认值。
+        ``None`` means "no followable model in the library"; the caller
+        decides what default to use.
         """
         stats = self.model_stats()   # {model_key: {"vectors": n, "dim": d}}
         counted = {
@@ -708,11 +831,12 @@ class VectorStore:
         pk = self.persisted_model_key
         if pk and pk != LEGACY_MODEL_KEY and counted.get(pk):
             return pk
-        # 覆盖率最高者胜；并列时取字典序最小，保证可复现
+        # Highest coverage wins; ties broken by lexicographically smallest key for reproducibility
         return sorted(counted.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
     def prune_models(self, keep: set[str]) -> int:
-        """丢弃不在 ``keep`` 中的模型向量，返回丢弃的向量总数。"""
+        """Drop model vectors not in ``keep``; returns the total number of
+        dropped vectors."""
         dropped = 0
         for rec in self._records:
             dropped += rec.drop_vectors(keep)
@@ -728,10 +852,11 @@ class VectorStore:
         return dropped
 
     def adopt_legacy(self, model_key: str) -> int:
-        """把 ``__legacy__`` 槽位的向量认领为 ``model_key``（维度需一致）。
+        """Reclaim vectors in the ``__legacy__`` slot as ``model_key``
+        (dimensions must match).
 
         Returns:
-            被认领的向量条数。
+            Number of vectors reclaimed.
         """
         moved = 0
         legacy_dim = self.model_dims.get(LEGACY_MODEL_KEY, self.dim)
@@ -752,43 +877,55 @@ class VectorStore:
         return moved
 
     # ------------------------------------------------------------------
-    # 持久化
+    # Persistence
     # ------------------------------------------------------------------
     @_serialized
     def save(self, check_conflict: bool = True) -> None:
-        """持久化：记忆本体写 JSON，向量写 .npz。
+        """Persist: memory bodies go to JSON, vectors to .npz.
 
-        两者都采用"先写临时文件再原子替换"策略，避免写入中断导致损坏。
-        向量以 float32 存储（体积减半，检索精度无实质影响）。
+        Both use the "write temp file then atomically replace" strategy to
+        avoid corruption from interrupted writes. Vectors are stored as
+        float32 (half the size, no material impact on retrieval precision).
 
         Args:
-            check_conflict: 是否做跨进程校验（默认开）。开着时：先取跨进程写锁，
-                若磁盘已被别的进程改过，则按 ``HIPPOCAMPUS_MULTI_WRITER``
-                （默认 1）合并保存、或（=0 时）明确失败。仅在明确知道另一进程
-                不会写、且要强制覆写时才传 False。
+            check_conflict: whether to perform the cross-process check
+                (default on). When on: take the cross-process write lock
+                first; if the disk was changed by another process, either
+                merge-save per ``HIPPOCAMPUS_MULTI_WRITER`` (default 1) or
+                fail explicitly (=0). Pass False only when you positively
+                know the other process will not write and you want to force
+                the overwrite.
 
         Raises:
-            ConcurrentWriteError: 冲突**且无法安全合并**时（磁盘读不出来 /
-                显式关闭了多进程合并 / 拿不到写锁）——见类文档。
+            ConcurrentWriteError: on a conflict **that cannot be merged
+                safely** (disk unreadable / multi-process merge explicitly
+                disabled / write lock unavailable) -- see the class
+                docstring.
         """
         if self.persist_path is None:
             return
         if not check_conflict:
             self._write_to_disk()
             return
-        # 多进程共存（两个 ZCode 工作区各起一个子进程）时：先拿跨进程写锁——
-        # 两个进程会踩同一个 ``memories.json.tmp``，那是比"后写覆盖"更糟的损坏；
-        # 再看磁盘是否被改过：改过就把本进程的改动**重放**上去，而不是报错。
+        # With multiple processes coexisting (two ZCode workspaces each
+        # spawning a subprocess): take the cross-process write lock first --
+        # two processes would trample the same ``memories.json.tmp``, a
+        # corruption worse than "last write wins"; then check whether the
+        # disk changed: if so, **replay** this process's changes on top
+        # instead of erroring out.
         with self._save_lock() as locked:
             self._resolve_conflict(locked)
             self._write_to_disk()
 
     def _write_to_disk(self) -> None:
-        """落盘（记忆本体 + 向量）；成功后清空脏集合。
+        """Persist to disk (memory bodies + vectors); clears the dirty sets
+        on success.
 
-        落盘动作走 :attr:`_backend`。sqlite 后端在**磁盘已有基线**时只
-        upsert 脏行、删掉删过的行 —— 改 1 条不再重写 5.28MB 的 memories.json
-        和 32.7MB 的 npz（实测账单）。首次落盘（还没有基线）仍走全量。
+        The disk write goes through :attr:`_backend`. When the **disk
+        already has a baseline**, the sqlite backend only upserts dirty rows
+        and deletes removed rows -- editing 1 record no longer rewrites the
+        5.28MB memories.json and the 32.7MB npz (measured bill). The first
+        persist (no baseline yet) is still a full write.
         """
         if not self.persist_path:
             return
@@ -809,7 +946,7 @@ class VectorStore:
             },
         }
 
-        # ---- 1. 记忆本体 ----
+        # ---- 1. Memory bodies ----
         incremental = backend.supports_incremental and self._full_saved
         try:
             if incremental:
@@ -825,21 +962,25 @@ class VectorStore:
                 self._full_saved = True
         except Exception as e:
             logging.warning("保存记忆到 %s 失败: %s", self.persist_path, e)
-            # 基线可能只写了一半 ⇒ 退回全量，免得之后一直增量补一个残缺库
+            # The baseline may be half-written ⇒ fall back to full save, so we do not keep incrementally patching a crippled library
             self._full_saved = False
             return
 
-        # 落盘后同步磁盘戳（json = 文件 mtime；sqlite = 写序号 + 记录数）。
-        # 下一次 save 靠它判断"有没有被别的进程改过"，从而触发合并而非覆盖。
+        # After persisting, sync the disk stamp (json = file mtime; sqlite =
+        # write sequence number + record count). The next save uses it to
+        # detect "was it changed by another process", triggering a merge
+        # rather than an overwrite.
         self._disk_stamp = backend.store_stamp()
         self.last_conflict = None
 
-        # 滚动快照（json 复制 .bak 副本 / sqlite 用 VACUUM INTO）。
-        # 放在 L1 落盘后、向量前：保护的是记忆本体，且只留一个调用点
-        # （向量分支有早退 return，挂到末尾会漏掉）。
+        # Rolling snapshot (json copies the .bak / sqlite uses VACUUM INTO).
+        # Placed after the L1 persist and before vectors: what it protects
+        # is the memory bodies, and it keeps a single call site (the vector
+        # branch has an early return; hanging this at the end would miss
+        # it).
         self._rotate_after_save(backend)
 
-        # ---- 2. 向量 ----
+        # ---- 2. Vectors ----
         if not self.vectors_path:
             self._dirty_ids.clear()
             self._deleted_ids.clear()
@@ -852,7 +993,7 @@ class VectorStore:
                     for mk, vec in r.embeddings.items()
                 }
                 backend.upsert_vectors(dirty_arrays)
-                # 删掉的记忆：它的向量已随 delete_memories 清掉，这里再兜一次
+                # Deleted memories: their vectors were cleared with delete_memories; sweep once more here as a backstop
                 backend.delete_vectors_for(list(self._deleted_ids))
             else:
                 arrays = {
@@ -870,10 +1011,13 @@ class VectorStore:
         self._deleted_ids.clear()
 
     def _rotate_backup(self, bak_path: str) -> None:
-        """把刚腾出来的 ``.bak`` 另存一份带时间戳的副本，只保留最近若干份。
+        """Save an extra timestamped copy of the just-vacated ``.bak``,
+        keeping only the most recent few.
 
-        ``.bak`` 始终保留不动（load 的回退路径依赖它），滚动的是它的副本。
-        时间戳用 ``YYYYMMDD_HHMMSS``——字典序即时间序，清理时直接排序取尾部。
+        The ``.bak`` itself is always kept untouched (load's fallback path
+        depends on it); what rotates is its copies. Timestamps use
+        ``YYYYMMDD_HHMMSS`` -- lexicographic order is time order, so pruning
+        just sorts and trims the tail.
         """
         keep = int(getattr(self, "backup_rotate_keep", BACKUP_ROTATE_KEEP) or 0)
         if keep <= 0:
@@ -881,7 +1025,7 @@ class VectorStore:
         directory = os.path.dirname(bak_path) or "."
         prefix = os.path.basename(bak_path) + "-"
         if not os.path.isfile(bak_path):
-            return  # 首次保存：主文件原本不存在，没腾出 .bak，无需转存
+            return  # first save: the main file did not exist before, no .bak was vacated, nothing to copy
         dst = os.path.join(directory, prefix + time.strftime("%Y%m%d_%H%M%S"))
         try:
             shutil.copy2(bak_path, dst)
@@ -891,13 +1035,16 @@ class VectorStore:
         self._prune_snapshots(directory, prefix, keep)
 
     def _rotate_snapshot_db(self, backend: Any, keep: int) -> None:
-        """sqlite 后端：``VACUUM INTO`` 一份全库快照，保留最近若干份。
+        """sqlite backend: ``VACUUM INTO`` a full-library snapshot, keeping
+        the most recent few.
 
-        sqlite 下全库就是一个文件（记忆 + 向量 + 派生层 + 实体 + 来源都在里面），
-        所以这一份就是完整快照 —— 比 json 时代散装文件的备份更简单也更一致。
+        Under sqlite the whole library is one file (memories + vectors +
+        derived layer + entities + sources all inside), so this one file is
+        the complete snapshot -- simpler and more consistent than the json
+        era's loose-file backups.
 
-        节流见 :func:`snapshot_min_hours`：快照代价约 1 秒 / 64MB，
-        不能跟着 ``save()`` 每次都做。
+        Throttling: see :func:`snapshot_min_hours` -- a snapshot costs about
+        1 second per 64MB, so it cannot run on every ``save()``.
         """
         directory = os.path.dirname(os.path.abspath(self.persist_path))
         prefix = DB_FILENAME + ".bak-"
@@ -905,12 +1052,13 @@ class VectorStore:
             return
         dst = os.path.join(directory, prefix + time.strftime("%Y%m%d_%H%M%S"))
         if os.path.exists(dst):
-            return  # 时间戳精度到秒：同一秒内的多次保存共用一份，跳过
+            return  # timestamps have second precision: multiple saves within the same second share one snapshot, skip
         backend.snapshot_to(dst)
         self._prune_snapshots(directory, prefix, keep)
 
     def _snapshot_due(self, directory: str, prefix: str) -> bool:
-        """距最近一份快照是否已超过最短间隔（目录为空 / 读不到 ⇒ 立刻做）。"""
+        """Whether the minimum interval since the newest snapshot has
+        elapsed (empty / unreadable directory ⇒ do it now)."""
         hours = snapshot_min_hours()
         if hours <= 0:
             return True
@@ -927,7 +1075,8 @@ class VectorStore:
         return age >= hours * 3600.0
 
     def _prune_snapshots(self, directory: str, prefix: str, keep: int) -> None:
-        """只留最近 ``keep`` 份带时间戳的副本（字典序即时间序）。"""
+        """Keep only the most recent ``keep`` timestamped copies
+        (lexicographic order is time order)."""
         try:
             olds = sorted(f for f in os.listdir(directory) if f.startswith(prefix))
         except OSError:
@@ -939,10 +1088,12 @@ class VectorStore:
                 pass
 
     def _rotate_after_save(self, backend: Any) -> None:
-        """落盘成功后产出一份历史副本。**失败一律不抛**（与 auto_save 同约定）。
+        """Produce a historical copy after a successful save. **Never raises
+        on failure** (same contract as auto_save).
 
-        备份不该把保存搞挂：真出问题时宁可没备份，也不能让这次保存失败。
-        json 走既有的 ``.bak`` 复制，sqlite 走 ``VACUUM INTO``。
+        Backups must not break the save: when things go wrong, better no
+        backup than a failed save. json uses the existing ``.bak`` copy;
+        sqlite uses ``VACUUM INTO``.
         """
         keep = int(getattr(self, "backup_rotate_keep", BACKUP_ROTATE_KEEP) or 0)
         if keep <= 0:
@@ -956,11 +1107,14 @@ class VectorStore:
             logging.warning("滚动快照失败（不影响本次保存）: %s", e)
 
     def _stamp_of(self, path: str | None) -> tuple[int, int] | None:
-        """文件的版本戳 ``(mtime_ns, size)``；不存在则返回 ``None``。
+        """The file's version stamp ``(mtime_ns, size)``; ``None`` if it
+        does not exist.
 
-        用 mtime+size 而不是内容 hash：万条库的 JSON 有几 MB，每次 save 前
-        重算 hash 不划算，而"被别的进程动过"这件事用元数据判足够可靠
-        （同一秒内改写且体积恰好相同的情况在实践中需要刻意构造）。
+        mtime+size instead of a content hash: a ten-thousand-record
+        library's JSON is several MB, and re-hashing before every save is
+        not worth it, while "was it touched by another process" is reliably
+        judged from metadata (a rewrite within the same second with exactly
+        the same size would have to be deliberately contrived in practice).
         """
         if not path:
             return None
@@ -972,14 +1126,19 @@ class VectorStore:
 
     @property
     def disk_stamp(self) -> tuple[int, int] | None:
-        """最近一次与磁盘同步（load / save 成功）时的版本戳。"""
+        """Version stamp at the most recent disk sync (successful load /
+        save)."""
         return self._disk_stamp
 
     def _check_write_conflict(self) -> None:
-        """保存前核对磁盘版本；被别的进程改过就抛 :class:`ConcurrentWriteError`。
+        """Verify the disk version before saving; raise
+        :class:`ConcurrentWriteError` if another process changed it.
 
-        仅在**当前有内存记录**时校验：空库覆盖一份非空文件同样危险，所以也拦。
-        若磁盘上的文件已被删除（另一进程清了库），同样视为冲突。
+        Verified even when there are **no in-memory records**: an empty
+        library overwriting a non-empty file is just as dangerous, so that
+        is blocked too.
+        If the file on disk was deleted (another process wiped the library),
+        that also counts as a conflict.
         """
         if self.persist_path is None:
             return
@@ -987,7 +1146,7 @@ class VectorStore:
         if current == self._disk_stamp:
             return
 
-        # 从未同步过（stamp is None）且磁盘无文件 → 首次写入，放行
+        # Never synced (stamp is None) and no file on disk → first write, allow
         if self._disk_stamp is None and current is None:
             return
 
@@ -1022,34 +1181,42 @@ class VectorStore:
         )
 
     # ------------------------------------------------------------------
-    # 多进程共享同一个库：跨进程锁 + 脏集合重放合并
+    # Multiple processes sharing one library: cross-process lock + dirty-set
+    # replay merge
     # ------------------------------------------------------------------
     def _mark_dirty(self, memory_id: str) -> None:
-        """记账：本进程改动过这条记忆，落盘时要把它重放到对方的最新状态之上。"""
+        """Book-keeping: this process changed this memory; on save it must
+        be replayed on top of the other side's latest state."""
         if not memory_id:
             return
         self._dirty_ids.add(memory_id)
         self._deleted_ids.discard(memory_id)
 
     def _rebuild_index(self) -> None:
-        """重排 ``_id_to_index`` 并让矩阵缓存失效（合并后调用）。"""
+        """Rebuild ``_id_to_index`` and invalidate the matrix cache (called
+        after a merge)."""
         self._id_to_index = {r.id: i for i, r in enumerate(self._records)}
         self._invalidate()
 
     @property
     def lock_path(self) -> str | None:
-        """跨进程写锁的文件路径（与 ``memories.json`` 同目录）。"""
+        """File path of the cross-process write lock (same directory as
+        ``memories.json``)."""
         if not self.persist_path:
             return None
         return self.persist_path + ".lock"
 
     @contextmanager
     def _save_lock(self):
-        """跨进程互斥（best-effort）：环境里没有 filelock 时退回原乐观锁行为。
+        """Cross-process mutual exclusion (best-effort): falls back to the
+        original optimistic-lock behavior when filelock is missing from the
+        environment.
 
-        没有这把锁时，两个进程会同时往**同一个** ``memories.json.tmp`` 里写；
-        ``os.replace`` 本身是原子的，但临时文件会互相踩 —— 这是比"后写覆盖"
-        更糟的一类损坏。所以锁是保底，不只是为了让冲突检测更准。
+        Without this lock, two processes would write into the **same**
+        ``memories.json.tmp`` simultaneously; ``os.replace`` is atomic, but
+        the temp files trample each other -- a class of corruption worse
+        than "last write wins". So the lock is the floor, not merely a way
+        to make conflict detection more accurate.
         """
         path = self.lock_path
         if path is None:
@@ -1057,7 +1224,7 @@ class VectorStore:
             return
         try:
             from filelock import FileLock, Timeout
-        except Exception:  # noqa: BLE001 缺依赖不该阻断保存
+        except Exception:  # noqa: BLE001 a missing dependency must not block saving
             logging.warning(
                 "未找到 filelock，多进程写保护降级为乐观锁（冲突时仍会明确失败）"
             )
@@ -1077,18 +1244,23 @@ class VectorStore:
         finally:
             try:
                 lock.release()
-            except Exception:  # noqa: BLE001 释放失败不影响本次保存结果
+            except Exception:  # noqa: BLE001 a release failure does not affect this save's result
                 pass
 
     def _read_records_from_disk(self) -> list[MemoryRecord] | None:
-        """只读地解析磁盘上的记忆（含向量），**不动内存状态**。
+        """Read-only parse of the memories on disk (with vectors); **does
+        not touch in-memory state**.
 
-        返回 ``None`` 表示数据在但读不出来 —— 那种情况宁可回到"明确失败"，
-        也不要拿一份半截数据去合并（合并会把坏数据写回去，比报错更糟）。
+        A ``None`` return means the data is there but unreadable -- in that
+        case, better to fall back to "explicit failure" than to merge with
+        half the data (a merge would write the bad data back, worse than an
+        error).
 
-        G2：读盘必须走 :attr:`_backend`。sqlite 下记录在 db 里、没有
-        memories.json 可读；不改这里，多进程合并会读到一份"空磁盘"，
-        于是本进程的全量覆写把对方刚写的记录全部抹掉。
+        G2: disk reads must go through :attr:`_backend`. Under sqlite the
+        records live in the db and there is no memories.json to read;
+        without this, multi-process merging would see an "empty disk" and
+        this process's full overwrite would erase everything the other side
+        just wrote.
         """
         backend = self._backend
         if backend is None:
@@ -1104,8 +1276,9 @@ class VectorStore:
             logging.warning("合并前解析磁盘记录失败（将退回明确失败）: %s", e)
             return None
 
-        # 向量：key 形如 "<slug>::<id>"。slug → 模型标识的映射以磁盘上的
-        # models 段为准，本进程已知的映射作补充。
+        # Vectors: keys look like "<slug>::<id>". The slug → model key
+        # mapping follows the models section on disk; this process's known
+        # mapping is a supplement.
         slug_to_model = {
             str(meta["slug"]): str(key)
             for key, meta in (data.get("models") or {}).items()
@@ -1128,22 +1301,32 @@ class VectorStore:
         return recs
 
     def _merge_with_disk(self) -> bool:
-        """把本进程的改动**重放**到磁盘最新状态之上（多进程合并保存）。
+        """**Replay** this process's changes on top of the disk's latest
+        state (multi-process merge save).
 
-        规则只依赖"谁改过"这一事实 —— 记录里没有 ``updated_at``
-        （``timestamp`` 是记忆发生时间，不是修改时间），做不了记录级 LWW：
+        The rules depend only on the fact of "who changed it" -- records
+        carry no ``updated_at`` (``timestamp`` is when the memory happened,
+        not when it was modified), so record-level LWW is impossible:
 
-        * 磁盘有、本进程没碰过 → 原样保留（对方的写入被吸收进内存）
-        * 本进程改过（``_dirty_ids``）→ 用本进程内存里的版本覆盖
-        * 本进程删过（``_deleted_ids``）→ 从结果中移除
-        * 对方新增的记录 → 进入本进程内存（此后本进程也能看到）
+        * on disk, untouched by this process → kept as-is (the other side's
+          write is absorbed into memory)
+        * changed by this process (``_dirty_ids``) → overwritten with this
+          process's in-memory version
+        * deleted by this process (``_deleted_ids``) → removed from the
+          result
+        * records newly added by the other side → enter this process's
+          memory (visible here afterwards)
 
-        副作用：同一条被两边同时改过时以本进程为准（后写胜），这是没有版本号
-        时的必然取舍；但**任何一方的新增/删除都不会丢**。
+        Side effect: when the same record was changed by both sides, this
+        process wins (last write wins) -- an unavoidable trade-off without
+        version numbers; but **neither side's additions/deletions are ever
+        lost**.
 
         Returns:
-            True = 可以继续落盘（内存已换成合并结果）；
-            False = 磁盘状态读不出来，调用方应退回"明确失败"。
+            True = safe to continue persisting (memory now holds the merged
+            result);
+            False = disk state unreadable, the caller should fall back to
+            "explicit failure".
         """
         disk_records = self._read_records_from_disk()
         if disk_records is None:
@@ -1181,19 +1364,24 @@ class VectorStore:
         return True
 
     def _resolve_conflict(self, locked: bool) -> None:
-        """判定本次保存是否安全；需要时先做合并。不安全则抛异常。
+        """Decide whether this save is safe; merge first when needed. Raise
+        if unsafe.
 
         Args:
-            locked: 当前是否已持有跨进程写锁（没拿到锁就不敢合并 —— 合并
-                期间若有第三个进程写入，结果仍会互相覆盖）。
+            locked: whether the cross-process write lock is currently held
+                (without the lock, merging is too risky -- if a third
+                process writes during the merge, the results still overwrite
+                each other).
         """
-        # G2：sqlite 没有 memories.json 可 stat，磁盘戳由后端自己给
-        # （写序号 + 记录数）。否则永远判定"没变过"，并发写会直接覆盖对方。
+        # G2: sqlite has no memories.json to stat; the disk stamp is
+        # provided by the backend itself (write sequence number + record
+        # count). Otherwise it would always judge "unchanged", and
+        # concurrent writes would directly overwrite the other side.
         current = (self._backend.store_stamp() if self._backend
                    else self._stamp_of(self.persist_path))
         if current == self._disk_stamp:
             return
-        # 从未同步过（stamp 为 None）且磁盘也没文件 → 首次写入，放行
+        # Never synced (stamp None) and no file on disk → first write, allow
         if self._disk_stamp is None and current is None:
             return
 
@@ -1238,11 +1426,13 @@ class VectorStore:
         )
 
     def load(self) -> None:
-        """从磁盘加载记忆与向量，覆盖当前内存状态。
+        """Load memories and vectors from disk, replacing the current
+        in-memory state.
 
-        本方法是公开入口：无论内部加载成功、失败还是隔离了坏文件，退出时都会
-        把磁盘版本戳同步到内存（供并发写保护使用）。真正的加载逻辑见
-        :meth:`_load_impl`。
+        This is the public entry point: whether the internal load succeeds,
+        fails, or quarantines a bad file, the disk version stamp is synced
+        into memory on exit (for concurrent-write protection). The real
+        loading logic is in :meth:`_load_impl`.
         """
         try:
             self._load_impl()
@@ -1251,37 +1441,48 @@ class VectorStore:
                 self._backend.store_stamp() if self._backend
                 else self._stamp_of(self.persist_path)
             )
-        # 只有**干净**加载才算"内存与磁盘已对齐"，此时此前的本进程改动都已落盘、
-        # 无需再重放。加载出过问题（坏文件被隔离、结构不可解析）时保留脏集合，
-        # 免得把"这些改动还需要重放"这件事一起丢掉。
+        # Only a **clean** load counts as "memory aligned with disk"; at that
+        # point this process's prior changes are all persisted and need no
+        # replay. When the load had problems (bad file quarantined,
+        # structure unparseable), keep the dirty sets so we do not also lose
+        # the fact "these changes still need replaying".
         if self.last_load_issue is None:
             self._dirty_ids.clear()
             self._deleted_ids.clear()
 
     def _load_impl(self) -> None:
-        """从磁盘加载记忆与向量，覆盖当前内存状态。
+        """Load memories and vectors from disk, replacing the current
+        in-memory state.
 
-        兼容旧格式（v1，每条记录内嵌单个 ``embedding``）：旧向量归入
-        ``__legacy__`` 槽位，不会丢失，但也不参与当前模型的检索——
-        由上层补算当前模型向量，或由 ``adopt_legacy()`` 显式认领。
+        Legacy format compatibility (v1, a single inline ``embedding`` per
+        record): legacy vectors go into the ``__legacy__`` slot -- not lost,
+        but excluded from the active model's retrieval; the layer above
+        backfills the current model's vectors, or ``adopt_legacy()`` claims
+        them explicitly.
 
-        损坏处理（缺陷 N1）：**文件存在但读不出来**时不再静默清空。坏文件被
-        隔离重命名为 ``<path>.corrupt-<时间戳>`` 保留现场，异常详情记入
-        :attr:`last_load_issue`，并显式告警；内存中已有记录也不会被抹掉。
-        只有"文件本就不存在"（全新目录）才是静默返回的正常路径。
+        Corruption handling (defect N1): **a file that exists but cannot be
+        read** no longer silently clears state. The bad file is quarantined,
+        renamed to ``<path>.corrupt-<timestamp>`` to preserve the scene, the
+        exception details are recorded in :attr:`last_load_issue` with an
+        explicit warning; records already in memory are not wiped. Only "the
+        file never existed" (fresh directory) is the normal silent-return
+        path.
 
-        另外支持"主文件缺失但 ``.bak`` 尚在"的恢复——上一次 ``save()`` 在
-        「备份旧文件」与「替换新文件」之间崩溃就会留下这个状态，此时备份是
-        唯一的有效副本。
+        Also supports recovery when "the main file is missing but the
+        ``.bak`` is still there" -- the previous ``save()`` crashed between
+        "backing up the old file" and "replacing with the new file", leaving
+        that state, where the backup is the only valid copy.
         """
         self.last_load_issue = None
         self.persisted_model_key = None
         if self.persist_path is None:
             return
 
-        # G1：读盘走后端。json 的「主文件 -> .bak 回退 -> 隔离现场」整段逻辑
-        # 已搬进 JsonBackend，sqlite 则由它自己报告"库打不开"。两者返回的 data
-        # 与旧版 memories.json 同构，下面的解析逻辑因此一行都不用改。
+        # G1: disk reads go through the backend. The json flow's "main file
+        # -> .bak fallback -> quarantine the scene" logic has moved into
+        # JsonBackend; sqlite reports "library won't open" itself. The data
+        # both return is isomorphic to the legacy memories.json, so the
+        # parsing below needed zero changes.
         backend = self._backend or get_backend(
             os.path.dirname(os.path.abspath(self.persist_path))
         )
@@ -1289,7 +1490,7 @@ class VectorStore:
         if issue is not None:
             self.last_load_issue = issue
         if data is None:
-            # 全新目录（issue 为 None，静默返回）或不可恢复（issue 已记好）
+            # Fresh directory (issue None, silent return) or unrecoverable (issue already recorded)
             if issue is not None:
                 self._invalidate()
             return
@@ -1298,11 +1499,11 @@ class VectorStore:
                 "the main file was corrupt and has been restored from backup; the corrupt file quarantined as %s",
                 issue.get("quarantined"),
             )
-        # 磁盘已有完整基线 ⇒ 之后的保存可以走行级增量
+        # The disk already has a full baseline ⇒ later saves can use row-level increments
         self._full_saved = True
 
         try:
-            # 模型元数据（slug 映射 + 各模型维度）
+            # Model metadata (slug mapping + per-model dimensions)
             self._model_slugs = {}
             self.model_dims = {}
             for key, meta in (data.get("models") or {}).items():
@@ -1313,7 +1514,7 @@ class VectorStore:
                         self._model_slugs[key] = slug
                     self.model_dims[key] = int(meta.get("dim", 0))
 
-            # 活跃模型以构造方（当前嵌入器）为准；维度取该模型已记录的维度
+            # The active model follows the constructor (current embedder); the dimension comes from that model's recorded dimension
             if self.model_key in self.model_dims and self.model_dims[self.model_key]:
                 self.dim = self.model_dims[self.model_key]
 
@@ -1321,24 +1522,26 @@ class VectorStore:
             self._id_to_index.clear()
             for rec_dict in data.get("records", []):
                 rec = MemoryRecord.from_dict(rec_dict)
-                # 记录内嵌向量（旧格式，或 with_embeddings 导出的 JSON）
+                # Inline record vectors (legacy format, or JSON exported with_embeddings)
                 for key, vec in rec.embeddings.items():
                     self._record_dim(vec, key)
                 self._records.append(rec)
                 self._id_to_index[rec.id] = len(self._records) - 1
 
-            # 落盘时的活跃模型（供 preferred_model_key 用；缺失留 None）
+            # Active model at last persist (for preferred_model_key; left None if missing)
             self.persisted_model_key = (str(data.get("model_key") or "") or None)
 
-            # 从 .npz 注入向量（mmap 开启且可行时走文件映射，否则原路径）
+            # Inject vectors from the .npz (file mapping when mmap is enabled and viable, otherwise the original path)
             if _vectors_mmap_enabled() and self._load_vectors_mmap():
                 pass
             else:
                 self._load_vectors()
             self._invalidate()
         except Exception as e:
-            # JSON 能解析但结构不对（半截字段、类型错乱）——同样隔离现场，
-            # 否则下一次 save 会用这份半成品覆盖掉还能读的备份。
+            # JSON parses but the structure is wrong (truncated fields,
+            # scrambled types) -- quarantine the scene here too, otherwise
+            # the next save would overwrite the still-readable backup with
+            # this half-built data.
             q = self._quarantine(self.persist_path)
             self.last_load_issue = {
                 "kind": "unparseable",
@@ -1354,13 +1557,17 @@ class VectorStore:
             self._invalidate()
 
     def _quarantine(self, path: str) -> str | None:
-        """把损坏文件重命名为 ``<path>.corrupt-<时间戳>``，保留事故现场。
+        """Rename a corrupted file to ``<path>.corrupt-<timestamp>``,
+        preserving the incident scene.
 
-        不做删除：坏文件是唯一的事故证据，人工可能还能从里面捞出记录。
-        同一秒内多次损坏时追加序号，避免互相覆盖。
+        No deletion: the bad file is the only incident evidence, and a human
+        may still be able to salvage records from it. Multiple corruptions
+        within the same second append a sequence number to avoid overwriting
+        each other.
 
         Returns:
-            隔离后的新路径；文件不存在或重命名失败时返回 ``None``。
+            The new quarantined path; ``None`` if the file does not exist or
+            the rename fails.
         """
         if not os.path.isfile(path):
             return None
@@ -1378,7 +1585,8 @@ class VectorStore:
             return None
 
     def _load_vectors(self) -> None:
-        """把向量注入到记录里（经后端：npz 文件 或 sqlite 的 vectors 表）。"""
+        """Inject vectors into records (via the backend: the npz file or the
+        sqlite vectors table)."""
         backend = self._backend
         if backend is None:
             return
@@ -1400,25 +1608,29 @@ class VectorStore:
             self._record_dim(vec, model_key)
 
     def _load_vectors_mmap(self) -> bool:
-        """HIPPOCAMPUS_VECTORS_MMAP=1：向量走文件映射注入。
+        """HIPPOCAMPUS_VECTORS_MMAP=1: inject vectors via file mapping.
 
-        侧车：``<base>.vectors.bin``（fp32 顺序 blob）+
-        ``<base>.vectors.bin.json``（``npz_stamp`` + ``keys: {slug::id: [offset, nelem]}``）。
-        bin 缺失或 npz 戳变了（save 过）→ 一次性顺序重建（临时文件 +
-        ``os.replace`` 防并发撕文件）。所有记录共享**一个** memmap 映射，
-        每条记录只持一个切片视图。
+        Sidecar: ``<base>.vectors.bin`` (fp32 sequential blob) +
+        ``<base>.vectors.bin.json`` (``npz_stamp`` + ``keys: {slug::id: [offset, nelem]}``).
+        Missing bin or a changed npz stamp (a save happened) → one-shot
+        sequential rebuild (temp file + ``os.replace`` to prevent concurrent
+        file tearing). All records share **one** memmap mapping; each record
+        holds only a slice view.
 
         Returns:
-            True = 已按 mmap 注入；False = 不适用/失败（调用方回退原 npz 路径）。
-            任何异常都在本方法内消化——绝不把 mmap 的问题变成加载失败。
+            True = injected via mmap; False = not applicable / failed (the
+            caller falls back to the original npz path). Any exception is
+            swallowed inside this method -- an mmap problem must never
+            become a load failure.
         """
         try:
             npz_path = self.vectors_path
             if not npz_path or not os.path.isfile(npz_path):
-                return False          # sqlite 后端 / 无 npz：不适用
-            # 注意：vectors_path = splitext(persist_path)[0] + ".vectors.npz"，
-            # 再 splitext 只能剥掉 ".npz" ⇒ 侧车 base 必须从 persist_path 取，
-            # 否则会拼出 memories.vectors.vectors.bin 这种双缀名。
+                return False          # sqlite backend / no npz: not applicable
+            # Note: vectors_path = splitext(persist_path)[0] + ".vectors.npz";
+            # splitext again only strips ".npz" ⇒ the sidecar base must be
+            # taken from persist_path, otherwise you get double-suffixed
+            # names like memories.vectors.vectors.bin.
             base = os.path.splitext(self.persist_path)[0]
             bin_path = base + ".vectors.bin"
             idx_path = base + ".vectors.bin.json"
@@ -1444,9 +1656,11 @@ class VectorStore:
                 try:
                     os.replace(bin_path + ".tmp", bin_path)
                 except OSError:
-                    # Windows：旧 memmap 还开着时 replace 会因文件锁失败
-                    # （同进程 load_state / 测试里旧 store 未释放都会踩）。
-                    # 退路 = 写唯一名 bin，index 记录实际文件名。
+                    # Windows: replace fails on the file lock while the old
+                    # memmap is still open (same-process load_state / an
+                    # unreleased old store in tests both hit this).
+                    # Fallback = write a uniquely named bin; the index
+                    # records the actual filename.
                     bin_used = (f"{os.path.basename(bin_path)}."
                                 f"{os.getpid()}-{int(time.time() * 1000) % 10 ** 9}")
                     os.replace(bin_path + ".tmp",
@@ -1460,7 +1674,7 @@ class VectorStore:
             bin_file = index.get("bin") or os.path.basename(bin_path)
             mm = np.memmap(os.path.join(os.path.dirname(bin_path), bin_file),
                            dtype=np.float32, mode="r")
-            self._vectors_mm = mm      # 挂住映射，防 GC 后 Windows 句柄漂移
+            self._vectors_mm = mm      # hold the mapping to prevent Windows handle drift after GC
             slug_to_model = {slug: key for key, slug in self._model_slugs.items() if slug}
             n_set = 0
             for vkey, (off, ne) in keys.items():
@@ -1469,11 +1683,11 @@ class VectorStore:
                 rec = self.get(rec_id)
                 if model_key is None or rec is None:
                     continue
-                vec = mm[off:off + ne]      # 只读切片视图，匿名内存 0 字节
+                vec = mm[off:off + ne]      # read-only slice view, 0 bytes of anonymous memory
                 rec.embeddings[model_key] = vec
                 self._record_dim(vec, model_key)
                 n_set += 1
             return n_set > 0 or not keys
-        except Exception as e:  # noqa: BLE001 —— mmap 永远只是优化，不能变成故障
+        except Exception as e:  # noqa: BLE001 -- mmap is always just an optimization, never a failure
             logging.warning("向量 mmap 加载失败，回退 npz 路径: %s", e)
             return False

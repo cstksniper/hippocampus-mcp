@@ -1,29 +1,41 @@
 # -*- coding: utf-8 -*-
-"""``brain.core.forget`` 的墓碑与受影响键前置纯段（从 core 抽取）。
+"""The tombstone and affected-keys pre-stages of ``brain.core.forget`` (pure
+segments extracted from core).
 
-**背景**：forget 的级联清理辅助已搬进 forget_cleanup，
-forget_by_query 已搬进 forget_flow；``forget`` 本体的前置段还剩两块纯
-计算——墓碑 dict 构建（含 ``deleted_at`` 时钟注入）与受影响实体键计算
-（扫 entities 倒排）。它们决定「删了什么、为什么、牵连谁」，此前没有
-独立单测钉住（墓碑键形 / 快照拷贝 / 时钟恰调一次 / 倒排扫描序），回归
-只能靠 forget 的端到端套件兜底。
+**Background**: forget's cascade-cleanup helpers have moved into
+forget_cleanup, and forget_by_query into forget_flow; the pre-stage of
+``forget`` itself still has two pure computations -- tombstone dict
+construction (with the ``deleted_at`` clock injection) and affected entity key
+computation (scanning the entities inverted index). They decide "what was
+deleted, why, and who was implicated", but previously had no dedicated unit
+tests pinning them (tombstone key shape / snapshot copies / clock called
+exactly once / index scan order); regression coverage leaned on forget's
+end-to-end suite.
 
-**依赖方向**：本模块只 import 标准库（连 common 都不用——时钟由壳
-调用时现取后注入；entities 倒排表按值传入，本模块不碰 brain 状态）。
+**Dependency direction**: this module imports only the standard library (not
+even common -- the clock is fetched by the shell at call time and injected;
+the entities inverted index is passed in by value, and this module never
+touches brain state).
 
-**复刻的怪癖（动一个就是行为变化，parity 会抓）**：
+**Replicated quirks (touching any one is a behavior change; parity will
+catch it)**:
 
-1. ``build_tombstone`` 的 reason 兜底：``reason or ""``——None 与空串
-   同形（墓碑里 reason 恒为字符串）。
-2. ``build_tombstone`` 的快照拷贝：``entity_ids`` / ``source_ids`` 走
-   ``list(x or [])``——墓碑持**副本**，原记录（及其列表）随后被删，
-   共享可变对象会让墓碑跟着变；None / 空列表同形为 ``[]``。
-3. ``build_tombstone`` 的时钟恰调一次：``deleted_at`` 只在构建时取
-   ``now()`` 一次（其余字段全部来自被删记录的既有值）。
-4. ``compute_affected_keys`` 的扫描序：按 ``entities`` 的 dict 插入序
-   产出（回显 ``entities_touched`` 的顺序即此序，调用方可复现）；
-   ``memory_ids`` 缺键 / None / 空列表的实体**不命中**（``or []`` 兜底），
-   entities 本体只读不动。
+1. ``build_tombstone``'s reason fallback: ``reason or ""`` -- None and the
+   empty string are the same shape (the tombstone's reason is always a
+   string).
+2. ``build_tombstone``'s snapshot copies: ``entity_ids`` / ``source_ids`` go
+   through ``list(x or [])`` -- the tombstone holds **copies**; the original
+   record (and its lists) is deleted right after, and shared mutable objects
+   would let the tombstone mutate with them; None / empty list both normalize
+   to ``[]``.
+3. ``build_tombstone``'s clock called exactly once: ``deleted_at`` takes
+   ``now()`` exactly once at construction (all other fields come from the
+   deleted record's existing values).
+4. ``compute_affected_keys``' scan order: produced in ``entities``' dict
+   insertion order (the order echoed in ``entities_touched`` is this order,
+   reproducible by the caller); entities whose ``memory_ids`` key is missing /
+   None / empty **do not hit** (``or []`` fallback), and the entities dict
+   itself is read-only and untouched.
 """
 from __future__ import annotations
 
@@ -31,7 +43,8 @@ from typing import Any, Callable
 
 
 # ======================================================================
-# 段 1：墓碑 dict 构建（旧壳 2105-2115 行；append 状态写留壳）
+# Segment 1: tombstone dict construction (old shell lines 2105-2115; the
+# append state write stays in the shell)
 # ======================================================================
 def build_tombstone(
     *,
@@ -44,21 +57,26 @@ def build_tombstone(
     source_ids: list[str] | None,
     now: Callable[[], float],
 ) -> dict[str, Any]:
-    """构建墓碑 dict（八键，键序即 ``tombstones`` 条目形状）。
+    """Build the tombstone dict (eight keys; the key order is the ``tombstones``
+    entry shape).
 
-    墓碑先记是审计前提：原文保住，删除后仍可追溯「删了什么、为什么」。
+    Recording the tombstone first is the audit prerequisite: the original text
+    is preserved, so "what was deleted and why" stays traceable after deletion.
 
     Args:
-        memory_id: 被删记忆的 id。
-        content / timestamp / state: 被删记录的既有值，原样透传。
-        reason: 删除原因；``or ""`` 兜底（怪癖 1）。
-        entity_ids / source_ids: 被删记录的引用清单；取**快照副本**
-            （怪癖 2），None 兜底空列表。
-        now: ``brain_core._now`` 本体（壳调用时现取；parity 冻结打在
-            它上，两侧 deleted_at 同值）。恰调一次（怪癖 3）。
+        memory_id: the deleted memory's id.
+        content / timestamp / state: the deleted record's existing values,
+            passed through as-is.
+        reason: deletion reason; ``or ""`` fallback (quirk 1).
+        entity_ids / source_ids: the deleted record's reference lists; taken as
+            **snapshot copies** (quirk 2), None falls back to an empty list.
+        now: the ``brain_core._now`` function itself (fetched by the shell at
+            call time; the parity freeze is pinned on it so both sides get the
+            same deleted_at). Called exactly once (quirk 3).
 
     Returns:
-        八键 dict。append 由壳做——本函数只组装，不碰状态。
+        An eight-key dict. The append is done by the shell -- this function
+        only assembles, never touching state.
     """
     return {
         "memory_id": memory_id,
@@ -73,22 +91,26 @@ def build_tombstone(
 
 
 # ======================================================================
-# 段 2：受影响实体键计算（旧壳 2117-2120 行；纯读 entities 倒排）
+# Segment 2: affected entity key computation (old shell lines 2117-2120; pure
+# read of the entities inverted index)
 # ======================================================================
 def compute_affected_keys(
     entities: dict[str, dict[str, Any]],
     memory_id: str,
 ) -> list[str]:
-    """算出 forget 后需要重算统计的实体键（扫 entities 倒排）。
+    """Compute the entity keys whose stats need recomputing after forget
+    (scans the entities inverted index).
 
     Args:
-        entities: ``brain.entities`` 倒排表（键 = 实体小写键，值含
-            ``memory_ids`` 引用清单）。**只读**——重算/清空是壳里
-            后续级联的事。
-        memory_id: 被删记忆的 id。
+        entities: the ``brain.entities`` inverted index (keys = lowercased
+            entity keys, values carry the ``memory_ids`` reference list).
+            **Read-only** -- recomputing/clearing is the shell's subsequent
+            cascade business.
+        memory_id: the deleted memory's id.
 
     Returns:
-        引用了该记忆的实体键列表，按 entities 的插入序（怪癖 4）。
+        List of entity keys referencing that memory, in entities' insertion
+        order (quirk 4).
     """
     return [
         k for k, e in entities.items()

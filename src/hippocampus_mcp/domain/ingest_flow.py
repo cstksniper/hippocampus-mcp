@@ -1,21 +1,29 @@
 # -*- coding: utf-8 -*-
-"""ingest 的分句写循环（从 ``brain.core.ingest`` 内联抽取）。
+"""The per-sentence write loop of ingest (extracted inline from
+``brain.core.ingest``).
 
-**为什么值得搬**：这是 ingest 主体里最大的一块内联编排（约 50 行）——
-逐句调 ``manager.store_memory``，再读三个**侧信道**（``last_store_near_miss``
-/ ``last_truncation`` / ``last_store_merge_of``）决定回显什么，最后按需把
-新挂的实体 id 并回记忆。它缠着 L1 存储端口与 brain 的实体链接入口，
-在 6299 行的 core.py 里无法脱离整个 brain 单测。
+**Why it is worth moving**: this is the largest piece of inline orchestration in
+the ingest body (about 50 lines) -- it calls ``manager.store_memory`` per
+sentence, then reads three **side channels** (``last_store_near_miss`` /
+``last_truncation`` / ``last_store_merge_of``) to decide what to echo back, and
+finally merges newly attached entity ids back into the memory as needed. It is
+tangled with the L1 storage port and brain's entity-linking entry point, and
+inside the 6299-line core.py it cannot be unit-tested apart from the whole
+brain.
 
-搬动**零行为变化**的保障：
-1. 循环体逐字复制，只把 ``self.`` 换成注入的 ports 字段；
-2. ``memory_type`` 的判定（``cognitive_type == EXPERIENCE``）是循环不变量，
-   由包装层算好传入——``CognitiveType`` 住在 store 包，domain 看不着；
-3. parity 探针（``_probe_out/m5_batch19_parity.py``）用 HEAD 的旧 ingest
-   与新 ingest 跑同种子库，完整返回体逐字段比对，DRIFT 必须为 0。
+Guarantees that the move is **zero behavior change**:
+1. The loop body is copied verbatim, with only ``self.`` replaced by injected
+   ports fields;
+2. The ``memory_type`` decision (``cognitive_type == EXPERIENCE``) is a loop
+   invariant, computed by the wrapper and passed in -- ``CognitiveType`` lives
+   in the store package, invisible to domain;
+3. The parity probe (``_probe_out/m5_batch19_parity.py``) runs the HEAD old
+   ingest and the new ingest against the same seeded library and compares the
+   complete response bodies field by field; DRIFT must be 0.
 
-依赖方向：本模块只 import 标准库（domain → 仅 common 的纪律这里连 common
-都没用上——全部经 :class:`SentenceWritePorts` 注入）。
+Dependency direction: this module imports only the standard library (the
+"domain -> common only" discipline; here not even common is used -- everything
+is injected via :class:`SentenceWritePorts`).
 """
 from __future__ import annotations
 
@@ -25,40 +33,48 @@ from typing import Any, Callable
 
 @dataclass(frozen=True)
 class SentenceWritePorts:
-    """分句写循环的全部依赖（brain 侧注入；domain 不 import 任何上层）。
+    """All dependencies of the per-sentence write loop (injected by the brain
+    side; domain imports no upper layer).
 
     Attributes:
-        manager: L1 存储端口。用到 ``store_memory`` / ``last_store_near_miss``
-            / ``last_truncation`` / ``last_store_merge_of`` / ``store.get`` /
-            ``store.update`` 六个面。
-        link_entities: brain 的 ``_link_entities(names, memory_id, ts, origins)``。
-        merge_ids: ``store.memory.merge_id_lists``（有序并集）。
-        guess_importance: brain 的 ``_guess_importance(text)``（委托到
-            ``domain.policies.guess_importance``）。
+        manager: the L1 storage port. Uses six surfaces: ``store_memory`` /
+            ``last_store_near_miss`` / ``last_truncation`` /
+            ``last_store_merge_of`` / ``store.get`` / ``store.update``.
+        link_entities: brain's ``_link_entities(names, memory_id, ts, origins)``.
+        merge_ids: ``store.memory.merge_id_lists`` (ordered union).
+        guess_importance: brain's ``_guess_importance(text)`` (delegates to
+            ``domain.policies.guess_importance``).
     """
     manager: Any
     link_entities: Callable[..., list[str]]
     merge_ids: Callable[..., list[str]]
     guess_importance: Callable[[str], float]
-    # D2a 写侧隔离（默认 False = 现状）：True 时本批每张 L1 卡带
-    # quarantine 标记，且**不参与去重合并**（见 manager.store_memory）。
-    # sensitivity 是整批共用一个标签（对 ingest 原文分类一次的结果，
-    # 逐句重打是过度工程——待审卡本来就要人工复审，宁枉勿纵）。
+    # D2a write-side isolation (default False = status quo): when True, every L1
+    # card in this batch carries the quarantine marker and **does not
+    # participate in dedup merging** (see manager.store_memory).
+    # sensitivity is one label shared by the whole batch (the result of
+    # classifying the ingest source text once; re-classifying per sentence is
+    # over-engineering -- quarantined cards get manual review anyway, better
+    # safe than sorry).
     quarantine: bool = False
     sensitivity: str = ""
-    # P0（Super-agent 适配）：
-    #   origin  = 写入凭据 {session/task/surface}，整批共用（一次工具调用
-    #             就是一个凭据单元，逐句重算没有意义）；
-    #   idem_key= 幂等键，整批共用——多句拆出来的 L1 里**第一句**落键，
-    #             重放时在入口就被拦住（见 brain.ingest 的幂等前置）。
-    # 两者都为默认值时记录侧零变化（origin 稀疏 / idem 空串）。
+    # P0 (Super-agent adaptation):
+    #   origin  = the write credential {session/task/surface}, shared by the
+    #             whole batch (one tool call is one credential unit;
+    #             recomputing per sentence is meaningless);
+    #   idem_key= the idempotency key, shared by the whole batch -- the
+    #             **first sentence** of the L1 cards split from multiple
+    #             sentences takes the key, so a replay is stopped at the
+    #             entrance (see brain.ingest's idempotency precheck).
+    # With both at their defaults, the record side sees zero change (origin
+    # sparse / idem empty string).
     origin: dict[str, str] | None = None
     idem_key: str = ""
 
 
 @dataclass(frozen=True)
 class SentenceWriteResult:
-    """一次分句写循环的四路产出（ingest 回显体的原料）。"""
+    """The four outputs of one per-sentence write loop (raw material for ingest's echo body)."""
     memory_ids: list[str] = field(default_factory=list)
     merged_into: list[dict[str, Any]] = field(default_factory=list)
     kept_separate: list[dict[str, Any]] = field(default_factory=list)
@@ -81,27 +97,34 @@ def write_sentences(
     names: list[str],
     origins: dict[str, str],
 ) -> SentenceWriteResult:
-    """逐句写入 L1，并按侧信道收集回显原料。
+    """Write into L1 sentence by sentence, collecting echo material from the
+    side channels.
 
-    行为与 ``brain.core.ingest`` 内联循环逐字一致（含三条保留语义）：
+    Behavior is verbatim identical to the inline loop in ``brain.core.ingest``
+    (including three preserved semantics):
 
-    * 重要性**按分句**判定（显式传入时整批共用块级值）；
-    * ``last_store_merge_of`` 非空 = 本次内容并进了既有记忆（未新建），
-      记 ``merged_into``；
-    * 新挂实体与记忆既有 ``entity_ids`` 取**并集**（缺陷 D3：直接覆盖会
-      让命中去重合并时丢掉此前积累的实体关联）。
+    * importance is judged **per sentence** (when passed explicitly, the whole
+      batch shares the block-level value);
+    * non-empty ``last_store_merge_of`` = this content was merged into an
+      existing memory (not newly created); record it in ``merged_into``;
+    * newly attached entities are **unioned** with the memory's existing
+      ``entity_ids`` (defect D3: overwriting directly would drop previously
+      accumulated entity associations when a dedup merge hits).
     """
     manager = ports.manager
     memory_ids: list[str] = []
     merged_into: list[dict[str, Any]] = []
-    # C10（方案 B）：命中去重但含新硬信息、**未合并**的那些近重复
+    # C10 (plan B): those near-duplicates that hit dedup but carry new hard
+    # information and were **not merged**
     kept_separate: list[dict[str, Any]] = []
-    # C13：本批里被嵌入模型 token 上限截断的部分
+    # C13: the parts of this batch truncated by the embedding model's token cap
     truncations: list[dict[str, Any]] = []
     for sent in sentences:
-        # 重要性**按分句**判定，而不是整块共用（覆盖报告·高 5）：
-        # 块级判定会让块内一句"重要！"把几十条句子全部抬到高分区，
-        # 其中一部分（>=0.7）还会被自动钉住、豁免时间衰减、灌进 L3 画像。
+        # Importance is judged **per sentence**, not shared by the whole block
+        # (coverage report, high 5): block-level judgment would let one sentence
+        # saying "important!" inside the block lift dozens of sentences into the
+        # high band, some of which (>=0.7) would then be auto-pinned, exempted
+        # from time decay, and fed into the L3 profile.
         sent_importance = (
             importance if explicit_importance else ports.guess_importance(sent)
         )
@@ -122,19 +145,22 @@ def write_sentences(
         )
         memory_ids.append(mid)
         if manager.last_store_near_miss:
-            # C10：这条很像某条既有记忆，但因为带它没见过的数字/日期，
-            # 按方案 B **没有合并**——本次 mid 是真正新建的。
+            # C10: this one closely resembles an existing memory, but because it
+            # carries numbers/dates that memory has not seen, plan B **did not
+            # merge** -- this mid is a genuinely new record.
             kept_separate.append(
                 dict(manager.last_store_near_miss, new_memory_id=mid)
             )
         _tcov = manager.last_truncation or {}
         if _tcov.get("truncated"):
-            # C13：写进去了，但 embedded_chars 之后的原文**检索不到**。
+            # C13: it was written, but the source text beyond embedded_chars is **unretrievable**.
             truncations.append(dict(_tcov, memory_id=mid))
         if manager.last_store_merge_of:
-            # 命中去重：本次内容没有新建条目，而是并进了这条既有记忆。
-            # 双写场景下这是最容易踩的坑——宿主以为写进了新的一条，
-            # 实际旧口径还在原地（内容取更长者、实体取并集）。
+            # Dedup hit: this content did not create a new entry but merged into
+            # that existing memory. In dual-write scenarios this is the easiest
+            # trap -- the host believes a new record was written, while the old
+            # wording is still in place (content takes the longer, entities take
+            # the union).
             rec = manager.store.get(mid)
             merged_into.append({
                 "memory_id": mid,
@@ -146,10 +172,12 @@ def write_sentences(
         if eids:
             rec = manager.store.get(mid)
             if rec is not None:
-                # 并集而非覆盖（缺陷 D3）：命中去重合并时 mid 是**既存**记忆，
-                # 直接覆盖会把它此前积累的实体关联全部丢掉，实体倒排索引随之
-                # 断裂（_recompute_entity_stats 以记录上的 entity_ids 为准，
-                # 会据此把实体判成悬挂而摘除）。
+                # Union, not overwrite (defect D3): when a dedup merge hits, mid
+                # is an **existing** memory; overwriting directly would drop all
+                # of its previously accumulated entity associations, and the
+                # entity inverted index breaks with it (_recompute_entity_stats
+                # trusts the record's entity_ids and would thereupon judge the
+                # entities dangling and remove them).
                 merged_eids = ports.merge_ids(rec.entity_ids, eids)
                 if merged_eids != list(rec.entity_ids or []):
                     manager.store.update(mid, entity_ids=merged_eids)

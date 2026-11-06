@@ -1,55 +1,72 @@
-"""ONNX Runtime 嵌入器：运行期**不加载 torch / sentence-transformers**。
+"""ONNX Runtime embedder: **does not load torch / sentence-transformers** at runtime.
 
-为什么要有这个模块
-------------------
-生产进程单份稳态 ~1.25GB，其中 torch 运行时 ~160MB + sentence-transformers
-~210MB 是**纯推理开销**（实测分段账单）。
-本模块用 ``onnxruntime`` + ``tokenizers``（Rust，都很轻）复刻同一套向量，
-把这两块换成 ONNX 推理，实测可省 ~280MB。
+Why this module exists
+----------------------
+The production process holds a single steady-state footprint of ~1.25GB, of
+which the torch runtime ~160MB + sentence-transformers ~210MB is **pure
+inference overhead** (measured with a segmented bill).
+This module reproduces the same vectors using ``onnxruntime`` +
+``tokenizers`` (Rust, both very light), replacing those two pieces with
+ONNX inference; measured saving ~280MB.
 
-它和 SentenceTransformerEmbedder 的关系
----------------------------------------
-**接口完全对齐**（``embed`` / ``embed_query`` / ``embed_batch`` /
-``max_seq_length`` / ``embedding_coverage`` / ``dim`` / ``model_key``），
-所以上层一行不用改。切换靠环境变量 ``HIPPOCAMPUS_EMB_BACKEND``：
+Its relationship with SentenceTransformerEmbedder
+-------------------------------------------------
+**Fully aligned interface** (``embed`` / ``embed_query`` / ``embed_batch`` /
+``max_seq_length`` / ``embedding_coverage`` / ``dim`` / ``model_key``),
+so callers do not need to change a line. Switching is via the environment
+variable ``HIPPOCAMPUS_EMB_BACKEND``:
 
-* ``torch`` —— 旧的 sentence-transformers 路径（行为与今天完全一致）
-* ``onnx``  —— 本模块；**必须有导出产物**，缺了就报错，不静默回落
-* ``auto``  —— 有产物走 onnx，没有走 torch（默认）
+* ``torch`` -- the old sentence-transformers path (behavior identical to today)
+* ``onnx``  -- this module; **exported artifacts are mandatory**, missing ones raise, no silent fallback
+* ``auto``  -- onnx when artifacts exist, otherwise torch (default)
 
-四个容易踩的坑（都踩过或差点踩）
---------------------------------
-1. **pooling 不能猜**：bge-base-zh-v1.5 在 sentence-transformers 里是
-   **CLS pooling**（``1_Pooling/config.json: pooling_mode_cls_token=true``），
-   不是常见的 mean。猜成 mean 的话向量完全对不上，而且**不报错**。
-   本模块只信 ``onnx_meta.json`` 里写死的 ``pooling`` 字段。
-2. **不要静默回落**：ONNX 产物缺失时若悄悄回 torch，省内存这件事就永远
-   没人知道没生效。所以 ``onnx`` 模式下缺产物必须抛错。
-3. **维度也不能猜**（踩过的缺陷）：``word_embedding_dimension``
-   早先只认顶层字段、读不到就 ``or 768`` 兜底，而导出器曾把维度写在
-   ``pooling_config`` 嵌套里 ⇒ 非 bge 模型（MiniLM 384）挂 ONNX 后
-   ``dim`` 恒报 768，LNN 核按 768 建、向量实出 384，直到首次 ingest 才在
-   ``matmul`` 上炸（x=386 vs w=770）——报错点离病根十万八千里。现在两种
-   嵌套形态都认，都没有则显式抛错，见 :func:`_resolve_embedding_dim`。
-4. **并发**（🔴 早期注释曾写错，已更正）：
-   早期注释这里写的是「onnxruntime 与 Rust tokenizer 都没有 ST 那个可变借用
-   问题，因此**不加全局编码锁**」——**这是错的，且后果是进程崩溃**。
+Four easy-to-trip pitfalls (all tripped, or nearly)
+---------------------------------------------------
+1. **pooling must not be guessed**: bge-base-zh-v1.5 in sentence-transformers
+   is **CLS pooling** (``1_Pooling/config.json: pooling_mode_cls_token=true``),
+   not the common mean. Guessing mean makes the vectors completely mismatch,
+   and **without raising any error**.
+   This module only trusts the ``pooling`` field written in ``onnx_meta.json``.
+2. **No silent fallback**: if a missing ONNX artifact quietly falls back to
+   torch, nobody will ever know the memory saving never took effect. So in
+   ``onnx`` mode, missing artifacts must raise.
+3. **The dimension must not be guessed either** (a defect actually hit):
+   ``word_embedding_dimension`` used to only recognize the top-level field,
+   falling back to ``or 768`` when unreadable, while the exporter once wrote
+   the dimension nested inside ``pooling_config`` => for a non-bge model
+   (MiniLM 384) on ONNX, ``dim`` always reported 768, the LNN core was built
+   for 768 while vectors actually came out 384, and it only blew up at
+   ``matmul`` on the first ingest (x=386 vs w=770) -- the error site was
+   miles away from the root cause. Now both nested forms are recognized,
+   and if neither exists an explicit error is raised; see
+   :func:`_resolve_embedding_dim`.
+4. **Concurrency** (🔴 an early comment got this wrong, since corrected):
+   The early comment here said "onnxruntime and the Rust tokenizer both lack
+   the mutable-borrow problem ST has, therefore **no global encode lock**"
+   -- **that was wrong, and the consequence is a process crash**.
 
-   本类实测一直在用 ``enable_truncation`` / ``no_truncation``（下面 185 行、
-   ``embedding_coverage`` 里都有），它们与 ST 侧踩的是**同一个**
-   ``tokenizers`` Rust 可变借用：并发调用会 panic。区别在于 ST 侧抛的是
-   Python 层 ``RuntimeError: Already borrowed``（能进日志），而本路径在
-   daemon 的 worker 线程里直接把**进程**带走 —— 没有 traceback、没有
-   faulthandler dump，表现就是「daemon 无声消失」。
+   This class has in fact always been using ``enable_truncation`` /
+   ``no_truncation`` (at line 185 below and inside ``embedding_coverage``),
+   which hit the **same** ``tokenizers`` Rust mutable borrow as the ST side:
+   concurrent calls panic. The difference is that the ST side raises a
+   Python-level ``RuntimeError: Already borrowed`` (which reaches logs),
+   while this path, running in the daemon's worker thread, takes the whole
+   **process** down -- no traceback, no faulthandler dump; it presents as
+   "the daemon disappearing silently".
 
-   复现场景：两个工作区复用同一个 daemon，两个 brain 并发首次
-   encode ⇒ daemon 崩，两个宿主会话一起挂住（等一个已经死了的连接）。
-   这正是「两个任务同时开」这个**正常用法**，不是边缘场景。
+   Reproduction scenario: two workspaces reuse the same daemon, two brains
+   encode concurrently for the first time => daemon crashes, both host
+   sessions hang together (waiting on a connection that is already dead).
+   This is exactly the **normal usage** of "two tasks opened at the same
+   time", not an edge case.
 
-   锁只包 tokenizer 那段（``session.run`` 仍可并发，不牺牲吞吐）。
-   不用 ``embeddings._ENCODE_LOCK`` 是因为依赖方向：``embeddings`` 会 import
-   本模块（取 ``backend_kind`` / ``OnnxEmbedder``），反向 import 会成环。
-   两个嵌入器各自护各自的 tokenizer 实例，语义上是对的。
+   The lock only wraps the tokenizer part (``session.run`` remains
+   concurrent, no throughput sacrificed). Not using
+   ``embeddings._ENCODE_LOCK`` is a dependency-direction issue:
+   ``embeddings`` imports this module (for ``backend_kind`` /
+   ``OnnxEmbedder``); importing back would create a cycle. The two
+   embedders each guard their own tokenizer instance, which is
+   semantically correct.
 """
 
 from __future__ import annotations
@@ -64,33 +81,36 @@ from typing import Optional
 
 import numpy as np
 
-#: tokenizer 的**可变借用**互斥锁（理由见本模块顶部第 3 条）。
-#: 只护 tokenizer，不护 ``session.run``。
+#: Mutex for the tokenizer's **mutable borrow** (rationale: item 3 at the top
+#: of this module). Guards only the tokenizer, not ``session.run``.
 _ENCODE_LOCK = threading.RLock()
 
 logger = logging.getLogger(__name__)
 
-#: 环境变量：选择嵌入后端（torch / onnx / auto）
+#: Environment variable: select the embedding backend (torch / onnx / auto)
 ENV_BACKEND = "HIPPOCAMPUS_EMB_BACKEND"
 
-#: ONNX 产物在模型目录下的子目录名
+#: Subdirectory name holding the ONNX artifacts under the model directory
 ONNX_SUBDIR = "onnx"
 ONNX_MODEL_FILE = "model.onnx"
 ONNX_META_FILE = "onnx_meta.json"
 
-# BGE zh 系列官方查询指令前缀（与 SentenceTransformerEmbedder 保持一致）
+# BGE zh family official query instruction prefix (kept consistent with
+# SentenceTransformerEmbedder)
 BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
-# 模型加载串行锁（同 ST 版：并发 import / 建 session 会互相等）
+# Model-load serial lock (same as the ST version: concurrent import /
+# session construction would wait on each other)
 _MODEL_LOAD_LOCK = threading.RLock()
 
-# 模型生命周期（延迟加载 / 空闲卸载）。与 torch 侧共用同一份状态。
+# Model lifecycle (lazy load / idle unload). Shares the same state as the
+# torch side.
 from . import model_lifecycle as _ML  # noqa: E402
-from ..config import load_config  # noqa: E402  （env 读收编 config）
+from ..config import load_config  # noqa: E402  (env reads folded into config)
 
 
 def _with_model_use(fn):
-    """给会用到 session/tokenizer 的方法包租约（理由同 ST 版装饰器）。"""
+    """Wraps methods that touch the session/tokenizer in a lease (rationale same as the ST-version decorator)."""
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
@@ -101,13 +121,13 @@ def _with_model_use(fn):
 
 
 def backend_kind() -> str:
-    """读 ``HIPPOCAMPUS_EMB_BACKEND``，未设置或非法值一律按 ``auto``。"""
+    """Reads ``HIPPOCAMPUS_EMB_BACKEND``; unset or invalid values are all treated as ``auto``."""
     raw = (load_config().onnx_backend or "").strip().lower()
     return raw if raw in ("torch", "onnx", "auto") else "auto"
 
 
 def find_onnx_artifacts(model_dir: str) -> tuple[str, dict] | None:
-    """在模型目录下找 ONNX 产物。找到返回 ``(model_path, meta)``，否则 None。"""
+    """Find ONNX artifacts under the model directory. Returns ``(model_path, meta)`` when found, else None."""
     d = os.path.join(model_dir, ONNX_SUBDIR)
     model_path = os.path.join(d, ONNX_MODEL_FILE)
     meta_path = os.path.join(d, ONNX_META_FILE)
@@ -119,18 +139,23 @@ def find_onnx_artifacts(model_dir: str) -> tuple[str, dict] | None:
 
 
 def _resolve_embedding_dim(meta: dict, meta_file: str) -> int:
-    """从 ``onnx_meta.json`` 解析向量维度；解析不到**显式报错**，不猜。
+    """Parse the vector dimension from ``onnx_meta.json``; if unparseable,
+    **raise explicitly** -- never guess.
 
-    实测踩中的缺陷：这里原先写作
-    ``int(meta.get("word_embedding_dimension", 0)) or 768``，而
-    ``scripts/export_onnx.py`` 早期把维度写在 ``pooling_config`` 嵌套里 ⇒
-    非 bge 模型（MiniLM 384）挂 ONNX 后 ``dim`` 恒报 768 ⇒ LNN 核按 768
-    建、向量实出 384 ⇒ 首次 ingest 才在 ``matmul`` 上炸（x=386 vs w=770），
-    报错点离病根十万八千里。
+    A defect actually hit: this used to read
+    ``int(meta.get("word_embedding_dimension", 0)) or 768``, while
+    ``scripts/export_onnx.py`` once wrote the dimension nested inside
+    ``pooling_config`` => for a non-bge model (MiniLM 384) on ONNX,
+    ``dim`` always reported 768 => the LNN core was built for 768 while
+    vectors actually came out 384 => it only blew up at ``matmul`` on the
+    first ingest (x=386 vs w=770), the error site miles away from the
+    root cause.
 
-    依次认两种形态：顶层 ``word_embedding_dimension``（现行导出器）与
-    ``pooling_config.word_embedding_dimension``（早期导出器）；两处都没有
-    或不是正数 ⇒ 抛错，并指明重导出的命令。
+    Two forms are recognized in order: top-level
+    ``word_embedding_dimension`` (current exporter) and
+    ``pooling_config.word_embedding_dimension`` (early exporter); if
+    neither exists or is not a positive number => raise, pointing out
+    the re-export command.
     """
     raw = meta.get("word_embedding_dimension")
     if raw in (None, "", 0):
@@ -153,13 +178,16 @@ def _resolve_embedding_dim(meta: dict, meta_file: str) -> int:
 
 
 class OnnxEmbedder:
-    """用 onnxruntime 跑 sentence-transformers 导出的模型。
+    """Run a sentence-transformers-exported model via onnxruntime.
 
     Args:
-        model_dir: **本地模型目录**（如 ``.../libs/models/bge-base-zh-v1.5``）。
-            本类不接受 Hub 名称——它设计的前提就是"运行期不联网、不碰 torch"。
-        model_name: 对外报告的模型名（用于向量槽位键 ``model_key``），
-            必须与 torch 版一致，否则同一份语料会被当成两个模型的向量。
+        model_dir: **local model directory** (e.g.
+            ``.../libs/models/bge-base-zh-v1.5``). This class does not accept
+            Hub names -- its design premise is "no network access and no
+            torch at runtime".
+        model_name: model name reported outward (used as the vector slot key
+            ``model_key``); must match the torch version, otherwise the same
+            corpus would be treated as vectors of two different models.
     """
 
     def __init__(
@@ -176,8 +204,10 @@ class OnnxEmbedder:
         self.model_explicit = True
         self.resolved_model_path: str | None = None
         self._libs_path = libs_path
-        #: F6：本实例是否被进程级共享池持有（True = 同模型的另一个库也在用
-        #: 这一份）。打在**入池的那一刻**，见 ``get_shared_onnx``。
+        #: F6: whether this instance is held by the process-level shared pool
+        #: (True = another library for the same model is also using this
+        #: copy). Stamped at **the moment of entering the pool**; see
+        #: ``get_shared_onnx``.
         self.shared_from_pool = False
 
         found = find_onnx_artifacts(self.model_dir)
@@ -204,24 +234,27 @@ class OnnxEmbedder:
         self._session = None
         self._tok = None
         self._model_ready = False
-        # 登记到进程级生命周期（弱引用，不阻碍回收）
+        # Register with the process-level lifecycle (weak reference; does not block reclamation)
         _ML.register(self)
 
     def release_model(self) -> bool:
-        """卸掉 session + tokenizer，把 ~400MB 还给操作系统。
+        """Unload the session + tokenizer, returning ~400MB to the OS.
 
-        与 ST 版同理：**保留本实例**（它的 ``model_dir`` / ``_meta`` / pooling
-        配置还要复用），只丢掉占内存的那两样，并把 ``_model_ready`` 置回
-        False —— 下一次 :meth:`_ensure_model` 会原样重载。
+        Same reasoning as the ST version: **keep this instance** (its
+        ``model_dir`` / ``_meta`` / pooling config are still reused), drop
+        only the two memory-hogging objects, and set ``_model_ready`` back
+        to False -- the next :meth:`_ensure_model` reloads it as before.
 
         Returns:
-            是否真的卸掉了东西（本来就没加载返回 False）。
+            Whether anything was actually unloaded (False if nothing was
+            loaded in the first place).
         """
         did = False
         if self._session is not None:
-            # ort.InferenceSession 没有 close()：断开引用即可，它的 native
-            # 内存在 refcount 归零时释放（本机实测卸载后 PrivateUsage 从
-            # 537MB 回落到 138MB，见 mem_lifecycle 探针）。
+            # ort.InferenceSession has no close(): dropping the reference is
+            # enough; its native memory is freed when the refcount hits zero
+            # (measured locally: PrivateUsage fell from 537MB to 138MB after
+            # unload; see the mem_lifecycle probe).
             self._session = None
             did = True
         if self._tok is not None:
@@ -237,7 +270,7 @@ class OnnxEmbedder:
         where = self.resolved_model_path or "(not yet loaded)"
         return f"{self.model_name} @ {where} [onnx]"
 
-    # -- 加载 ------------------------------------------------------------
+    # -- Loading ---------------------------------------------------------
     def _ensure_model(self) -> None:
         if self._model_ready:
             return
@@ -247,10 +280,10 @@ class OnnxEmbedder:
             self._load_model()
 
     def _load_model(self) -> None:
-        """加载 onnxruntime session 与 Rust tokenizer（**都不需要 torch**）。"""
+        """Load the onnxruntime session and the Rust tokenizer (**neither needs torch**)."""
         try:
             import onnxruntime as ort
-        except ImportError as e:  # pragma: no cover - 依赖缺失分支
+        except ImportError as e:  # pragma: no cover - missing-dependency branch
             raise ImportError(
                 "ONNX 后端需要 onnxruntime：`pip install onnxruntime`（"
                 "注意：它不依赖 torch，装它不会把 torch 拉回来）。\n"
@@ -265,19 +298,25 @@ class OnnxEmbedder:
                 f"错误: {e}"
             ) from e
 
-        # 加载状态先行 flush 到 stderr（stdout 是 JSON-RPC 专用通道）：
-        # 让"慢"与"坏"可区分 —— 冷启动几秒属正常，反复卡死看 daemon 日志。
+        # Flush the loading status to stderr first (stdout is the dedicated
+        # JSON-RPC channel): keeps "slow" and "broken" distinguishable --
+        # a few seconds of cold start is normal; repeated hangs mean look
+        # at the daemon log.
         print(f"[hippocampus] loading embedding model (ONNX): {self._onnx_path}",
               file=sys.stderr, flush=True)
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, (os.cpu_count() or 2) // 2)
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # 🔴 批量 embed 的内存/延迟权衡（实测依据）：
-        # * arena/pattern **开**（默认）：单句延迟 ~34ms（recall 路径的生命线）；
-        #   但特定批量内容下首次大 batch 会一次性分配 ~2GB 且被 arena 常驻
-        #   （无泄漏、不随次数增长；精确触发条件待查，生产单句路径不受影响）。
-        # * **关**（HIPPOCAMPUS_ONNX_NO_ARENA=1）：批量内存完全平稳（820MB 恒定），
-        #   但单句延迟 ~1048ms（30×）——只给离线批量脚本用（reembed 等）。
+        # 🔴 Memory/latency trade-off for batch embed (measured evidence):
+        # * arena/pattern **on** (default): single-sentence latency ~34ms
+        #   (the lifeline of the recall path); but under certain batch
+        #   contents the first large batch allocates ~2GB at once and the
+        #   arena keeps it resident (no leak, does not grow with repeats;
+        #   exact trigger conditions unknown; the production single-sentence
+        #   path is unaffected).
+        # * **off** (HIPPOCAMPUS_ONNX_NO_ARENA=1): batch memory completely
+        #   flat (constant 820MB), but single-sentence latency ~1048ms
+        #   (30x) -- for offline batch scripts only (reembed etc.).
         if (load_config().onnx_no_arena or "").strip() not in ("1", "true"):
             so.enable_mem_pattern = True
             so.enable_cpu_mem_arena = True
@@ -294,42 +333,51 @@ class OnnxEmbedder:
         if not os.path.isfile(tok_path):
             raise FileNotFoundError(f"the model directory lacks tokenizer.json: {tok_path}")
         self._tok = Tokenizer.from_file(tok_path)
-        # 截断到模型硬上限：与 ST 的 max_seq_length 行为对齐（超出静默丢弃）
-        # 这两个调用改的是 tokenizer 的**可变状态**，同样要过锁
+        # Truncate to the model's hard cap: aligned with ST's max_seq_length
+        # behavior (overflow silently dropped). These two calls mutate the
+        # tokenizer's **mutable state**, so they also go through the lock.
         with _ENCODE_LOCK:
             self._tok.enable_truncation(max_length=self._max_seq_length)
-            # 🔴 实测：padding **不能**恒定到 max_seq_length。
-            # 原 `enable_padding(length=512)` 让每个查询都按 512 token 跑前向——
-            # 单句延迟 480ms（batch-longest 动态 padding 只要 ~30ms，**16 倍**），
-            # 且批量 36 句时 attention 中间量 (36×12×512×512) 直接把 ORT arena
-            # 撑出 ~2GB 常驻。CLS pooling + attention mask 下 padding 与数值无关
-            # （cos=1.0 实测验证），改 batch-longest 纯赚。
+            # 🔴 Measured: padding must **not** be fixed to max_seq_length.
+            # The original `enable_padding(length=512)` made every query run
+            # the forward pass at 512 tokens -- single-sentence latency
+            # 480ms (batch-longest dynamic padding takes ~30ms, **16x**),
+            # and with 36 sentences per batch the attention intermediates
+            # (36×12×512×512) bloated the ORT arena by ~2GB resident. Under
+            # CLS pooling + attention mask, padding is numerically
+            # irrelevant (verified by cos=1.0), so batch-longest is pure win.
             self._tok.enable_padding()
 
         self.resolved_model_path = self._onnx_path
-        # 维度以 session 输出为准（meta 里的只是预估）
+        # The session output is authoritative for the dim (the meta value is only an estimate)
         shape = self._session.get_outputs()[0].shape
         if len(shape) == 3 and isinstance(shape[2], int):
             self.dim = int(shape[2])
-        # 与 ST 版同纪律：跑通一次再置 ready，避免别的线程提前进场。
-        # 🔴 这里必须走 ``_forward`` 而不是 ``_encode``：``_encode`` 会调
-        # ``_ensure_model``，而此时 ``_model_ready`` 还是 False ⇒ 无限递归
-        # （实测：RecursionError，且它把真正的加载错误一起掩盖了）。
+        # Same discipline as the ST version: set ready only after one
+        # successful run, so other threads cannot slip in early.
+        # 🔴 This must go through ``_forward`` rather than ``_encode``:
+        # ``_encode`` calls ``_ensure_model``, but ``_model_ready`` is still
+        # False here => infinite recursion (measured: RecursionError, and
+        # it also masked the real loading error).
         _ = self._forward(["warmup"])
         print(f"[hippocampus] embedding model ready (ONNX): {self.model_name}"
               f"（{self.dim}D)", file=sys.stderr, flush=True)
         self._model_ready = True
 
-    # -- 编码 ------------------------------------------------------------
+    # -- Encoding --------------------------------------------------------
     def _forward(self, texts: list[str]) -> np.ndarray:
-        """纯前向：**不**做加载检查（调用方保证已加载）。
+        """Pure forward pass: **no** load check (the caller guarantees the
+        model is loaded).
 
-        与 :meth:`_encode` 分开的唯一理由就是上面那条递归红线——加载收尾
-        时的 warmup 只能走这里。
+        The only reason this is separate from :meth:`_encode` is the
+        recursion red line above -- the warmup at the end of loading can
+        only go through here.
         """
-        # 🔴 tokenizer 的可变借用必须串行（见模块顶部第 3 条）：并发 encode
-        # 会让 Rust 侧 panic，在 daemon 的 worker 线程里表现为**整个进程
-        # 无声消失**。``session.run`` 留在锁外——它才是耗时的部分。
+        # 🔴 The tokenizer's mutable borrow must be serialized (see item 3
+        # at the top of the module): concurrent encode panics on the Rust
+        # side, which in the daemon's worker thread presents as **the whole
+        # process vanishing silently**. ``session.run`` stays outside the
+        # lock -- that is the time-consuming part.
         with _ENCODE_LOCK:
             encodings = self._tok.encode_batch(texts)
             input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
@@ -340,7 +388,7 @@ class OnnxEmbedder:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
-        # 有些模型没有 token_type_ids 输入（导出时会记在 meta.input_names 里）
+        # Some models have no token_type_ids input (recorded in meta.input_names at export time)
         if "token_type_ids" in self._input_names:
             feed["token_type_ids"] = token_type_ids
 
@@ -362,13 +410,13 @@ class OnnxEmbedder:
         return (pooled / norm).astype(np.float64)
 
     def _encode(self, texts: list[str]) -> np.ndarray:
-        """tokenize → onnx 前向 → pooling → L2 归一化（含懒加载）。"""
+        """tokenize → onnx forward → pooling → L2 normalization (including lazy load)."""
         self._ensure_model()
         return self._forward(texts)
 
     @_with_model_use
     def embed(self, text: str) -> np.ndarray:
-        """文档侧嵌入（不加查询前缀）。返回 L2 归一化向量。"""
+        """Document-side embedding (no query prefix). Returns an L2-normalized vector."""
         if not text:
             self._ensure_model()
             return np.zeros(self.dim, dtype=np.float64)
@@ -376,25 +424,29 @@ class OnnxEmbedder:
 
     @_with_model_use
     def embed_query(self, text: str) -> np.ndarray:
-        """查询侧嵌入（BGE 系加官方指令前缀）。"""
+        """Query-side embedding (BGE family gets the official instruction prefix)."""
         if self.is_bge:
             text = BGE_ZH_QUERY_PREFIX + text
         return self.embed(text)
 
     @_with_model_use
     def embed_batch(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
-        """批量嵌入。返回 ``(N, dim)``，每行已 L2 归一化。
+        """Batch embedding. Returns ``(N, dim)``, each row already
+        L2-normalized.
 
-        🔴 **空串不要跳过**：sentence-transformers 的 ``encode(["", ...])``
-        对空串照样跑一次前向（[CLS][SEP]），得到的是**非零**向量；而单条
-        :meth:`embed("")` 按既有约定返回**零**向量。这两个不一致是 torch 版
-        的既有行为，本类必须**逐字复刻**——早期版本我在这里把空串短路成零
-        向量，结果批量路径 cos=0.000000（验收直接挂）。
+        🔴 **Do not skip empty strings**: sentence-transformers'
+        ``encode(["", ...])`` still runs a forward pass for an empty string
+        ([CLS][SEP]) and yields a **non-zero** vector, whereas a single
+        :meth:`embed("")` returns a **zero** vector by existing convention.
+        These two inconsistencies are the torch version's existing behavior,
+        and this class must **replicate them verbatim** -- an early version
+        short-circuited empty strings to the zero vector here, and the batch
+        path then scored cos=0.000000 (acceptance failed outright).
         """
         if not texts:
             self._ensure_model()
             return np.zeros((0, self.dim), dtype=np.float64)
-        # 分块：一次塞几万条会把内存打爆，且与 ST 的 batch_size 语义对齐
+        # Chunking: stuffing tens of thousands at once blows up memory, and it aligns with ST's batch_size semantics
         out = np.zeros((len(texts), self.dim), dtype=np.float64)
         step = max(1, int(batch_size))
         for start in range(0, len(texts), step):
@@ -404,21 +456,24 @@ class OnnxEmbedder:
 
     @property
     def max_seq_length(self) -> int:
-        """模型硬上限 token 数（超出部分被静默丢弃，与 torch 版同语义）。"""
+        """The model's hard cap on tokens (overflow silently dropped; same semantics as the torch version)."""
         return self._max_seq_length
 
     @_with_model_use
     def embedding_coverage(self, text: str) -> dict:
-        """截断自曝——**返回键必须与 torch 版逐字一致**。
+        """Truncation self-report -- **the returned keys must match the torch
+        version verbatim**.
 
-        上层（``brain`` / ``brain_stats``）读的是 ``truncated`` /
-        ``embedded_chars`` / ``dropped_ratio``。少一个键就是**静默降级**：
-        写入照样成功、库里照样有，只是"第 N 字之后检索不到"这件事没人知道
-        ——这条红线比向量算错更隐蔽。
+        The upper layer (``brain`` / ``brain_stats``) reads ``truncated`` /
+        ``embedded_chars`` / ``dropped_ratio``. One missing key means
+        **silent degradation**: writes still succeed, the data is still in
+        the library, only nobody knows that "nothing beyond char N is
+        retrievable" -- a red line even more insidious than wrong vectors.
 
-        ``no_truncation()`` 是必须的：本类的 tokenizer 常驻着
-        ``enable_truncation(512)``，不关掉的话 ids 长度永远 ≤ 512，
-        ``truncated`` 恒为 False —— 自曝直接失去意义。
+        ``no_truncation()`` is mandatory: this class's tokenizer permanently
+        holds ``enable_truncation(512)``; without turning it off, ids length
+        is always <= 512 and ``truncated`` stays False -- the self-report
+        would be rendered meaningless.
         """
         total = len(text or "")
         out = {
@@ -433,12 +488,16 @@ class OnnxEmbedder:
             return out
         try:
             self._ensure_model()
-            # 关截断是**临时**改 tokenizer 状态，与正在 encode 的
-            # 别的线程撞上同样是可变借用冲突 —— 必须与 encode 同一把锁。
-            # 🔴 no_truncation() 是普通方法（永久关闭、返回 None），不是上下文
-            # 管理器——`with self._tok.no_truncation():` 会在关掉截断后立刻抛
-            # TypeError 且被下方 except 吞掉，截断从此再也回不来，超 512 token
-            # 的文本全部打穿到 ORT 报广播错。必须显式关、finally 里显式恢复。
+            # Turning off truncation **temporarily** mutates tokenizer state;
+            # colliding with another thread that is mid-encode is the same
+            # mutable-borrow conflict -- must use the same lock as encode.
+            # 🔴 no_truncation() is a plain method (permanently disables,
+            # returns None), not a context manager -- `with
+            # self._tok.no_truncation():` would raise TypeError right after
+            # disabling truncation and get swallowed by the except below,
+            # truncation would never come back, and any text over 512 tokens
+            # would punch through to an ORT broadcast error. Must disable
+            # explicitly and restore explicitly in finally.
             with _ENCODE_LOCK:
                 self._tok.no_truncation()
                 try:
@@ -460,39 +519,47 @@ class OnnxEmbedder:
                 if 0 < end <= total:
                     kept = end
             if kept <= 0:
-                # 与 torch 版同兜底：拿不到 offset 就按比例估，宁可给近似值
-                # 也不要回退成"没截断"。
+                # Same fallback as the torch version: without offsets,
+                # estimate proportionally -- better an approximate value
+                # than regressing to "not truncated".
                 kept = int(total * limit / max(n, 1))
             out["embedded_chars"] = max(0, min(total, kept))
             out["dropped_ratio"] = round(1.0 - out["embedded_chars"] / total, 4)
-        except Exception as exc:      # 自曝绝不能反过来把写入搞挂
+        except Exception as exc:      # the self-report must never break the write in return
             out["error"] = f"{type(exc).__name__}: {exc}"
         return out
 
 
 # ==================================================================
-# F6 · 进程级共享池（同模型只驻留一份）
+# F6 · Process-level shared pool (one resident copy per model)
 # ==================================================================
-# 为什么不共享"整个嵌入器实例"而只共享"重的那一层"：
-#   ``OnnxEmbedder`` 只装 session + Rust tokenizer，没有任何随库变化的状态，
-#   可以安全共享；而上层（``SentenceTransformerEmbedder`` / ``MemoryManager``）
-#   身上带着 **决策元数据** —— ``model_source``（模型名是显式给的还是回落出来的）
-#   决定"库内模型与当前模型冲突时是报错还是跟随库数据"（见
-#   ``manager._sync_embedder_with_store``）。把整个实例共享出去，第二个库会
-#   继承第一个库的 source，本该"跟随库数据"的库可能被判成"显式指定"而直接抛
-#   ``EmbedderModelMismatchError`` ⇒ **库起不来**。所以只共享重对象，
-#   每个库仍持有自己的薄壳与自己的元数据。
+# Why share only "the heavy layer" instead of "the whole embedder instance":
+#   ``OnnxEmbedder`` carries only session + Rust tokenizer, no state that
+#   varies per library, so it can be shared safely; whereas the upper layer
+#   (``SentenceTransformerEmbedder`` / ``MemoryManager``) carries
+#   **decision metadata** -- ``model_source`` (whether the model name was
+#   given explicitly or fell out of a fallback) decides "when the
+#   in-library model conflicts with the current model, error out or follow
+#   the library data" (see ``manager._sync_embedder_with_store``). Sharing
+#   the whole instance, the second library inherits the first library's
+#   source; a library that should "follow the library data" may be judged
+#   "explicitly specified" and raise ``EmbedderModelMismatchError`` outright
+#   => **the library fails to start**. So only the heavy object is shared,
+#   and each library keeps its own thin shell and its own metadata.
 #
-# 收益（实测基线：单库 daemon 543.5MB、双库 947.8MB，第二库增量
-# ≈404MB = 第二份权重）：共享后同模型的第二库不再加载权重。
+# Benefit (measured baseline: single-library daemon 543.5MB, two libraries
+# 947.8MB, second-library delta ≈404MB = the second copy of weights): after
+# sharing, a second library for the same model no longer loads weights.
 
-#: 逃逸舱：``HIPPOCAMPUS_SHARED_EMBEDDER=0`` 关闭共享（行为回到 F6 之前）。
+#: Escape hatch: ``HIPPOCAMPUS_SHARED_EMBEDDER=0`` disables sharing (behavior reverts to pre-F6).
 ENV_SHARED = "HIPPOCAMPUS_SHARED_EMBEDDER"
 
-#: 池上限（保险丝）。正常只用得上 1 份；留余量是给"库内模型不同"的场景
-#: （如一个 bge 库 + 一个 MiniLM 库 ⇒ 2 份，本来就该 2 份）。超过上限的
-#: 不再入池，**不报错**——新建的照常工作，只是不复用。防的是换模型实验把
-#: N 份权重全攥在池里永不释放。
+#: Pool cap (a fuse). Normal operation needs only 1 copy; the headroom is
+#: for the "libraries with different in-library models" scenario (e.g. one
+#: bge library + one MiniLM library => 2 copies, which is right). Beyond
+#: the cap, new instances simply stay out of the pool, **no error** -- they
+#: still work, just without reuse. This guards against model-swap
+#: experiments pinning N copies of weights in the pool forever.
 POOL_MAX = 4
 
 _ONNX_POOL: "dict[tuple[str, str], OnnxEmbedder]" = {}
@@ -500,17 +567,18 @@ _ONNX_POOL_LOCK = threading.Lock()
 
 
 def shared_embedder_enabled() -> bool:
-    """共享嵌入器总开关（默认开；``HIPPOCAMPUS_SHARED_EMBEDDER=0`` 关闭）。"""
+    """Master switch for the shared embedder (default on; ``HIPPOCAMPUS_SHARED_EMBEDDER=0`` turns it off)."""
     raw = (load_config().shared_embedder or "").strip().lower()
     return raw not in ("0", "false", "off", "no")
 
 
 def _pool_key(model_dir: str, model_name: str) -> tuple[str, str]:
-    """池键 = （绝对路径, 对外模型名）。
+    """Pool key = (absolute path, outward-facing model name).
 
-    带上 ``model_name`` 是因为同一个目录可以被不同名字引用，而 ``model_key``
-    （向量槽位键）取的是名字——名字不同就必须算两个槽位，不能共用一份实例
-    报告同一个 ``model_key``。
+    ``model_name`` is included because the same directory can be referenced
+    under different names, and ``model_key`` (the vector slot key) takes the
+    name -- different names must occupy two slots; one shared instance must
+    not report the same ``model_key``.
     """
     return (os.path.abspath(model_dir), model_name or "")
 
@@ -520,15 +588,18 @@ def get_shared_onnx(
     model_name: str = "",
     libs_path: Optional[str] = None,
 ) -> "OnnxEmbedder":
-    """取一份 ``OnnxEmbedder``：**同（目录, 名字）复用同一实例**。
+    """Fetch an ``OnnxEmbedder``: **the same (dir, name) reuses one instance**.
 
-    命中池时不重新建 session、不重新读 tokenizer.json——这就是 F6 省下的
-    那 ~400MB 与那 30s 加载。返回的实例可能**尚未** ``_ensure_model()``
-    （构造是轻的，加载在首次 encode），调用方照常调 ``_ensure_model`` 即可，
-    它内部有双重检查锁。
+    On a pool hit, no session is rebuilt and tokenizer.json is not re-read
+    -- that is exactly the ~400MB and the 30s load that F6 saves. The
+    returned instance may **not yet** have run ``_ensure_model()``
+    (construction is light; loading happens on first encode); callers
+    simply call ``_ensure_model`` as usual -- it has a double-checked lock
+    inside.
 
-    ``shared_from_pool`` 会被打在入池的实例上：拿到 True 就说明这份权重是
-    进程级共享的（第二个库拿到时必然是 True）。
+    ``shared_from_pool`` gets stamped on the pooled instance: receiving
+    True means these weights are process-level shared (the second library
+    necessarily receives True).
     """
     key = _pool_key(model_dir, model_name)
     if shared_embedder_enabled():
@@ -546,7 +617,7 @@ def get_shared_onnx(
 
 
 def onnx_pool_stats() -> dict:
-    """自曝池现状（给 ``brain_stats`` 与测试用）。"""
+    """Self-report the pool's current state (for ``brain_stats`` and tests)."""
     with _ONNX_POOL_LOCK:
         return {
             "enabled": shared_embedder_enabled(),
@@ -557,10 +628,11 @@ def onnx_pool_stats() -> dict:
 
 
 def reset_onnx_pool() -> int:
-    """清空 ONNX 池（**只给测试用**），返回清掉的份数。
+    """Clear the ONNX pool (**tests only**); returns the number cleared.
 
-    测试要在同一进程里验证"关闭共享后确实各建各的"，不重置会被上一个用例
-    留在池里的实例污染，变成假绿。
+    Tests need to verify within one process that "disabling sharing really
+    builds separate instances"; without a reset, instances left in the pool
+    by a previous case pollute the result, producing a false green.
     """
     with _ONNX_POOL_LOCK:
         n = len(_ONNX_POOL)

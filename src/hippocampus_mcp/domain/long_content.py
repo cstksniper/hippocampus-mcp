@@ -1,41 +1,54 @@
 # -*- coding: utf-8 -*-
-"""超长内容的处置策略：**纯判定与纯切分**，不落盘、不读配置。
+"""Handling policy for over-long content: **pure decisions and pure
+splitting**, no disk writes, no config reads.
 
-## 起因（实测，不是推测）
+## Origin (measured, not conjectured)
 
-嵌入模型有 token **硬上限**（BGE / MiniLM = 512）。3372 字的卡实测
-``embedded_chars=511``、``dropped_ratio=0.8485``——**第 512 字之后的原文
-对向量零贡献，但写入照样返回成功**。关掉 BM25 字面通道后，尾部事实
-（/etc/secret/db.key）用语义问法**完全召回不到**。
+Embedding models have a token **hard cap** (BGE / MiniLM = 512). A 3372-char
+card measured ``embedded_chars=511`` and ``dropped_ratio=0.8485`` -- **the
+text after char 512 contributes zero to the vector, yet the write still
+returns success**. With the BM25 literal channel off, tail facts
+(/etc/secret/db.key) are **completely unrecallable** by semantic phrasing.
 
-这是「写进去了但检索看不见」，属于本项目最忌的静默失败。
+This is "written in but invisible to retrieval" -- the silent failure this
+project fears most.
 
-## 三态策略（默认 = 现状，零回归）
+## Three-state policy (default = status quo, zero regression)
 
-* ``warn``（**默认**）—— 只自曝，行为与改动前逐字节一致。
-* ``split`` —— 超窗时按句拆成多张卡写入，每张都进向量。
-* ``reject`` —— 超窗时拒写，返回体说明怎么改。
+* ``warn`` (**default**) -- self-report only; behavior byte-identical to
+  before the change.
+* ``split`` -- when over the window, split into multiple cards by sentence
+  and write each; every card enters the vector index.
+* ``reject`` -- refuse the write when over the window; the response body
+  explains how to fix it.
 
-**白名单解析**：只有明确写 ``split`` / ``reject`` 才生效，未知值一律回落
-``warn``。理由同家库写边界开关：默认关闭的开关若用黑名单语义，
-``''`` / ``'maybe'`` 会把它悄悄打开；这里反过来——**改变写入行为的两个档
-必须由用户显式点名**，写错等同于没写。
+**Whitelist parsing**: only an explicit ``split`` / ``reject`` takes effect;
+unknown values always fall back to ``warn``. Same reasoning as the
+home-library write boundary switch: a default-off switch with blacklist
+semantics would be quietly opened by ``''`` / ``'maybe'``; here it is the
+reverse -- **the two modes that change write behavior must be named
+explicitly by the user**; a typo equals not setting it.
 
-## 为什么切分器要注入
+## Why the splitter is injected
 
-``domain`` 只准依赖 ``common``（架构约束），而真正的分句器
-（``brain._split_facts``，含「短句并入上一条」等怪癖）住在 brain。
-在本模块**另写一份分句**会立刻产生第二份真相，因此：分句器由组合根注入，
-取不到就退化为「按上限硬切」——降级**显式可见**（返回体带 note），不静默。
+``domain`` may depend only on ``common`` (architectural constraint), while
+the real sentence splitter (``brain._split_facts``, with quirks like "short
+sentences merge into the previous one") lives in brain. Writing **a second
+splitter** in this module would instantly create a second source of truth;
+therefore: the splitter is injected by the composition root, and when
+unavailable we degrade to "hard split at the limit" -- the degradation is
+**explicitly visible** (the response body carries a note), never silent.
 
-## 切分口径
+## Splitting rules
 
-1. 先按注入的分句器切句；
-2. 单句仍超过上限时，在上限的 ``[1/2, 1]`` 区间内找**最后一个强断点**
-   （``。！？；`` 及换行）断开；找不到就硬切。
-3. 上限取 ``max_seq_length * SAFE_RATIO``（默认 0.9）：512 token 的模型
-   要到 460 字就断。留出 ``[CLS]``/``[SEP]`` 与中文 1 字≈1 token 的余量
-   ——**贴着 512 切会刚好再撞一次边界**。
+1. Split into sentences with the injected splitter first;
+2. When a single sentence still exceeds the limit, break it at the **last
+   strong break** (``。！？；`` and newlines) within the ``[1/2, 1]`` region
+   of the limit; if none is found, hard-split.
+3. The limit is ``max_seq_length * SAFE_RATIO`` (default 0.9): a 512-token
+   model must break at 460 chars. This leaves room for ``[CLS]``/``[SEP]``
+   and for Chinese's 1 char ≈ 1 token -- **cutting right at 512 would hit
+   the boundary exactly once more**.
 """
 
 from __future__ import annotations
@@ -49,34 +62,41 @@ POLICY_REJECT = "reject"
 
 POLICIES: tuple[str, ...] = (POLICY_WARN, POLICY_SPLIT, POLICY_REJECT)
 
-#: 字符上限相对 token 上限的折扣（见模块 docstring 切分口径 3）。
+#: Discount from the token cap to the char cap (see module docstring,
+#: splitting rule 3).
 SAFE_RATIO = 0.9
 
-#: 单条写入最多拆出多少张卡。超了就拒写——宁可报错，也不要一次灌进去
-#: 上千条把库冲垮（那种情况多半是整本书被当成一条记忆塞进来了）。
-#: 200 而不是更小：``ingest`` 把一篇长文拆成上百句本来就是常态（实测
-#: 100 句的长文 = 101 片），定 50 会把正常文档误判成"灌库"。
+#: Maximum number of cards one write may be split into. Over that, refuse the
+#: write -- better an error than flooding the library with thousands of
+#: entries at once (that situation is usually a whole book stuffed in as one
+#: memory).
+#: 200 rather than smaller: ``ingest`` splitting a long article into hundreds
+#: of sentences is normal (measured: a 100-sentence article = 101 pieces);
+#: setting 50 would misjudge normal documents as "library flooding".
 MAX_PIECES = 200
 
-#: 强断点：断句优先落在这里（``_hard_split`` 从后往前找）。
+#: Strong breaks: sentence cuts prefer these (``_hard_split`` searches from
+#: the end backwards).
 _STRONG_BREAKS = "。！？；!?;\n"
 _WEAK_BREAKS = "，、, "
 
 
 @dataclass(frozen=True)
 class LongContentPlan:
-    """一次超长写入的处置计划（纯数据，调用方据此执行）。"""
+    """The handling plan for one over-long write (pure data; the caller
+    executes it)."""
 
     action: str                      # "write" | "split" | "reject"
-    policy: str                      # 生效的策略（解析后）
-    pieces: tuple[str, ...] = ()     # action=="split" 时的分片
-    reason: str = ""                 # 为什么这么判（回显给用户，不静默）
-    note: str = ""                   # 降级/边界说明
+    policy: str                      # the effective policy (after parsing)
+    pieces: tuple[str, ...] = ()     # the pieces when action=="split"
+    reason: str = ""                 # why this verdict (echoed to the user, never silent)
+    note: str = ""                   # degradation/boundary note
     fields: dict[str, object] = field(default_factory=dict)
 
 
 def parse_policy(raw: Optional[str]) -> str:
-    """把配置值解析成三态之一。**白名单**：未知值 → ``warn``（= 现状）。"""
+    """Parse a config value into one of the three states. **Whitelist**:
+    unknown value → ``warn`` (= status quo)."""
     v = (raw or "").strip().lower()
     if v in POLICIES:
         return v
@@ -84,10 +104,11 @@ def parse_policy(raw: Optional[str]) -> str:
 
 
 def char_limit(max_seq_length: int, *, safe_ratio: float = SAFE_RATIO) -> int:
-    """token 上限 → 安全的字符上限。
+    """Token cap → safe character cap.
 
-    ``max_seq_length <= 0``（hash 后端 / 取不到）返回 0，调用方据此**跳过
-    一切干预**——没有上限就谈不上超窗。
+    Returns 0 for ``max_seq_length <= 0`` (hash backend / unavailable); the
+    caller then **skips all intervention** -- with no cap there is no
+    over-long window to speak of.
     """
     if not max_seq_length or max_seq_length <= 0:
         return 0
@@ -95,7 +116,7 @@ def char_limit(max_seq_length: int, *, safe_ratio: float = SAFE_RATIO) -> int:
 
 
 def _hard_split(text: str, limit: int) -> list[str]:
-    """把一段超长文本按 ``limit`` 切开，尽量落在断句处。"""
+    """Cut an over-long text at ``limit``, preferring sentence breaks."""
     out: list[str] = []
     start = 0
     n = len(text)
@@ -104,7 +125,7 @@ def _hard_split(text: str, limit: int) -> list[str]:
             out.append(text[start:])
             break
         end = start + limit
-        # 在后半段里找最后一个断点，避免切出「半句话」。
+        # Find the last break in the second half, avoiding a cut mid-sentence.
         window_lo = start + max(1, limit // 2)
         cut = -1
         for ch in _STRONG_BREAKS:
@@ -123,17 +144,19 @@ def split_pieces(
     limit: int,
     split_facts: Optional[Callable[[str], list[str]]] = None,
 ) -> tuple[list[str], str]:
-    """返回 ``(分片, 降级说明)``。
+    """Returns ``(pieces, degradation note)``.
 
-    分句器可用就先分句（保留 brain 侧「短句并入上一条」的怪癖）；不可用
-    则整体走硬切，并在第二个返回值里说明——**降级要看得见**。
+    When the splitter is available, sentence-split first (preserving brain's
+    "short sentences merge into the previous one" quirk); when unavailable,
+    hard-split the whole thing and say so in the second return value -- **the
+    degradation must be visible**.
     """
     note = ""
     sents: list[str] = []
     if split_facts is not None:
         try:
             sents = [s for s in (split_facts(text) or []) if s and s.strip()]
-        except Exception as exc:  # 分句器坏了不能让写入挂掉
+        except Exception as exc:  # a broken splitter must not take the write down
             note = f"the splitter raised {type(exc).__name__}; degraded to hard length-based splitting"
             sents = []
     if not sents:
@@ -159,19 +182,22 @@ def plan_long_content(
     split_facts: Optional[Callable[[str], list[str]]] = None,
     safe_ratio: float = SAFE_RATIO,
 ) -> LongContentPlan:
-    """判定一次写入该怎么写。
+    """Decide how one write should be handled.
 
     Args:
-        content: 待写正文。
-        max_seq_length: 嵌入模型的 token 硬上限（0 = 无上限 / 取不到）。
-        policy_raw: 配置原值（未解析）。
-        truncated: 引擎侧已算出的精确截断结论。
-        split_facts: 注入的分句器（可空）。
+        content: The content to write.
+        max_seq_length: The embedding model's token hard cap (0 = no cap /
+            unavailable).
+        policy_raw: The raw config value (unparsed).
+        truncated: The precise truncation verdict already computed by the
+            engine.
+        split_facts: The injected splitter (may be None).
     """
     policy = parse_policy(policy_raw)
     limit = char_limit(max_seq_length, safe_ratio=safe_ratio)
 
-    # 没有上限信息，或确实没超窗 → 原样写（策略不介入）。
+    # No cap information, or genuinely not over the window → write as-is
+    # (the policy does not intervene).
     if limit <= 0 or not truncated:
         return LongContentPlan(action="write", policy=policy,
                                pieces=(content,))

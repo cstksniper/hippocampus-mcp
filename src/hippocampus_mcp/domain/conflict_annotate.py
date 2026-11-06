@@ -1,23 +1,29 @@
-"""并存口径标注（读侧）：结果集内「疑似同一事实的不同口径」打标。
+"""Coexisting-version annotation (read side): flag "suspected different versions of the same fact" within a result set.
 
-从 ``brain/core.py`` 的 ``_annotate_conflicts`` 提取。
+Extracted from ``brain/core.py``'s ``_annotate_conflicts``.
 
-**只做标注**：给配对的条目加 ``conflict_group``（同组同号）/
-``conflict_with``（对方 id 列表）/ ``newer``（组内时间最新的那条）。
-分数、顺序、条数一律不动——旧口径可能是被引用的历史事实，也可能才是对
-的那条；哪条为准由权威来源（docs）决定，检索器不替用户裁定。
+**Annotation only**: adds ``conflict_group`` (same group, same number) /
+``conflict_with`` (list of counterpart ids) / ``newer`` (the member with the
+latest timestamp in the group) to the paired entries. Scores, order, and
+counts are never touched — an old version may be a referenced historical fact,
+or may be the correct one; which version wins is decided by the authority
+(docs), not arbitrated by the retriever on the user's behalf.
 
-落点理由：这是**纯派生加工**——输入是结果集（list[dict]）与两个纯函数
-能力（分词、判据），输出是就地打标 + 配对数。零 I/O、零模型、零配置读数，
-符合 domain「只准依赖 common」的矩阵（``numpy`` 是第三方数值库，
-``domain/topic.py`` 已在用，不属于包内依赖）。
+Placement rationale: this is **pure derived processing** — the input is a
+result set (list[dict]) plus two pure-function capabilities (tokenization,
+criterion), the output is in-place labeling + a pair count. Zero I/O, zero
+model, zero config reads, matching domain's "may only depend on common"
+matrix (``numpy`` is a third-party numeric library already used by
+``domain/topic.py``; it is not an in-package dependency).
 
-🔴 判据**不在这里**：``is_restatement`` 由调用方注入（brain 侧是
-``HippoBrain._is_restatement``，它委托 ``domain.policies.is_restatement``）。
-写侧（``store/supersede.py``）用同一个回调，两边共用一份判据——若各写
-一套阈值，迟早出现「写时判为同一事实、读时判为不同事实」的自相矛盾。
-本模块不 import 它，是为了保住测试对 ``brain._is_restatement`` 的
-monkeypatch 面。
+🔴 The criterion is **not here**: ``is_restatement`` is injected by the caller
+(on the brain side it is ``HippoBrain._is_restatement``, which delegates to
+``domain.policies.is_restatement``). The write side (``store/supersede.py``)
+uses the same callback; both sides share one criterion — if each wrote its own
+thresholds, sooner or later you would get the self-contradiction of "judged
+the same fact at write time, judged different facts at read time". This module
+does not import it in order to preserve the monkeypatch surface of tests
+against ``brain._is_restatement``.
 """
 
 from __future__ import annotations
@@ -37,44 +43,52 @@ def annotate_conflicts(
     is_restatement: Callable[..., bool],
     max_items: int = CONFLICT_ANNOTATE_MAX,
 ) -> int:
-    """标注 ``items`` 内的并存口径，返回配对数（就地改 ``items``）。
+    """Annotate coexisting versions within ``items`` and return the pair count (mutates ``items`` in place).
 
     Args:
-        items: 检索结果条目。每条需有 ``memory_id`` / ``content``；
-            ``_emb``（当前模型的向量）缺失时该对不参与判定——BM25 单路
-            命中的 ``similarity`` 恒为 0.0，不能拿来当相似度用。
-        tokens_of: 文本 → 实词集合（预先算好，不在 O(n²) 里重复分词）。
-        is_restatement: 同一事实判据，签名见
-            ``domain.policies.is_restatement``。
-        max_items: O(n²) 保护上限。超出直接跳过——**只影响标注，
-            不影响检索结果本身**。
+        items: Recall-result entries. Each needs ``memory_id`` / ``content``;
+            when ``_emb`` (the current model's vector) is missing, that pair
+            is excluded from judgment — a BM25-only hit's ``similarity`` is
+            always 0.0 and must not be used as a similarity.
+        tokens_of: text → content-word set (computed up front, no repeated
+            tokenization inside the O(n²)).
+        is_restatement: The same-fact criterion; see the signature of
+            ``domain.policies.is_restatement``.
+        max_items: O(n²) protection cap. Past it, skip outright — **affects
+            only annotation, not the recall results themselves**.
 
     Returns:
-        配成的对数。
+        The number of pairs formed.
 
-    预存行为（与原实现逐条对齐，不要「顺手修好」）：
+    Preserved behaviors (aligned item by item with the original; do not
+    "fix them in passing"):
 
-    * 条目数 ``<2`` 或 ``>max_items`` ⇒ 直接返回 0，一条都不打标；
-    * 已判定过的对（``b`` 已在 ``a["conflict_with"]`` 里）跳过，但
-      **并查集仍然连通**（A~B、B~C 则三者同族），朴素「同组就跳过」
-      会把第三条漏掉或把组号分裂；
-    * 组号只在**连通分量 ≥2 条**时才分配，且从 1 开始递增；
-    * ``newer`` 只在组内时间戳**不全相等**时才打，且只打在第一条
-      时间最大的上（``break``）——时间戳全同则整组都不打。
+    * Entry count ``<2`` or ``>max_items`` ⇒ return 0 directly, not one label
+      applied;
+    * Already-judged pairs (``b`` already in ``a["conflict_with"]``) are
+      skipped, but the **union-find stays connected** (A~B, B~C ⇒ all three
+      same family); naive "same group, skip" would miss the third one or
+      split the group number;
+    * Group numbers are assigned only for **connected components of >=2
+      members**, incrementing from 1;
+    * ``newer`` is applied only when the group's timestamps are **not all
+      equal**, and only on the first one with the maximum timestamp
+      (``break``) — with identical timestamps the whole group gets nothing.
     """
     if len(items) < 2 or len(items) > max_items:
         return 0
     toks = {it["memory_id"]: tokens_of(it["content"]) for it in items}
     by_id = {it["memory_id"]: it for it in items}
-    # 并查集：冲突关系是**传递**的（A~B、B~C 则 A/B/C 同族），
-    # 用"同组就跳过"这类朴素去重会把第三条漏掉或把组号分裂成两个。
+    # Union-find: the conflict relation is **transitive** (A~B, B~C ⇒ A/B/C
+    # same family); naive dedup like "same group, skip" would miss the third
+    # one or split the group number in two.
     parent: dict[str, str] = {mid: mid for mid in by_id}
 
     def find(x: str) -> str:
         root = x
         while parent[root] != root:
             root = parent[root]
-        while parent[x] != root:      # 路径压缩
+        while parent[x] != root:      # path compression
             parent[x], x = root, parent[x]
         return root
 
@@ -83,11 +97,12 @@ def annotate_conflicts(
         for j in range(i + 1, len(items)):
             a, b = items[i], items[j]
             if b["memory_id"] in (a.get("conflict_with") or []):
-                continue               # 已判定过这一对
+                continue               # this pair was already judged
             va, vb = a.get("_emb"), b.get("_emb")
             if va is None or vb is None:
-                # 缺当前模型向量（BM25 单路命中）→ 无法判定，跳过。
-                # 不能用"分数"充当相似度：BM25-only 的 similarity 恒为 0.0。
+                # Missing the current model's vector (BM25-only hit) →
+                # undecidable, skip. The "score" must not stand in for
+                # similarity: BM25-only similarity is always 0.0.
                 continue
             denom = (np.linalg.norm(va) * np.linalg.norm(vb)) or 1e-12
             sim = float(va @ vb / denom)
@@ -105,8 +120,9 @@ def annotate_conflicts(
                     ids.append(other)
             pairs += 1
 
-    # 收尾：按连通分量编号，并给每条同族里**时间最新**的那条打 newer——
-    # "取错了值"的典型形态就是取了旧口径。
+    # Wrap-up: number by connected component, and mark ``newer`` on the member
+    # with the **latest** timestamp in each family — the classic shape of
+    # "took the wrong value" is having taken the old version.
     groups: dict[str, list[dict[str, Any]]] = {}
     for mid in by_id:
         groups.setdefault(find(mid), []).append(by_id[mid])

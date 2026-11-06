@@ -1,29 +1,39 @@
-"""存储后端抽象（TODO G1）。
+"""Storage backend abstraction (TODO G1).
 
-把"读盘 / 落盘"这一层从 :class:`HippoBrain` 与 :class:`VectorStore` 里剥出来，
-让 **JSON 多文件** 与 **SQLite 单库** 两种实现可以互换。
+Peels the "read from disk / persist to disk" layer out of :class:`HippoBrain` and
+:class:`VectorStore`, so that the **multi-file JSON** and **single-file SQLite**
+implementations are interchangeable.
 
-为什么只抽象读写、不动内存结构
-------------------------------
-brain 与 VectorStore 的业务逻辑（检索、合并、去重、裁剪、脏集）全部建立在
-内存对象上。把它们一起搬进 SQL，会让一次改动同时横跨"进程内存模型"和
-"磁盘格式"两层 —— 出问题分不清是哪层（TODO 纪律：一次只动一层）。
-所以这里只替换最外层的 read / write，内存里的 dict / 矩阵 / 脏集一概不动。
+Why only read/write is abstracted, not the in-memory structures
+---------------------------------------------------------------
+The business logic of brain and VectorStore (retrieval, merging, dedup, trimming,
+dirty sets) is entirely built on in-memory objects. Moving those into SQL too would
+make one change straddle two layers at once — "process memory model" and
+"disk format" — and when something breaks you cannot tell which layer (TODO
+discipline: change one layer at a time).
+So only the outermost read / write is replaced; the in-memory dicts / matrices /
+dirty sets are untouched.
 
-由此得到的收益
---------------
-* **事务**：一次保存 = 一个事务（JSON 方案在文件系统层没有多文件原子提交的原语，
-  10 个层文件只能逐个 ``os.replace``，中途失败必然层间不一致）。
-* **行级写**：复用 G0 已经建好的 ``_dirty_ids`` / ``_deleted_ids``，改 1 条只写 1 行，
-  取代"改 1 条重写 5.28MB memories.json + 32.7MB npz"。
+Benefits this yields
+--------------------
+* **Transactions**: one save = one transaction (the JSON approach has no
+  multi-file atomic-commit primitive at the filesystem level; the 10 layer files
+  can only be ``os.replace``-ed one by one, and a mid-way failure inevitably
+  leaves layers inconsistent).
+* **Row-level writes**: reuses the ``_dirty_ids`` / ``_deleted_ids`` already built
+  in G0; changing 1 record writes 1 row, replacing "change 1 record and rewrite
+  the 5.28MB memories.json + 32.7MB npz".
 
-后端选择
---------
-``HIPPOCAMPUS_STORE_BACKEND=json|sqlite``（默认 **json**，与改动前行为完全一致）。
-``HIPPOCAMPUS_FTS5=1`` 额外启用 FTS5 全文索引（H4：把 BM25 索引挪上盘）。
+Backend selection
+-----------------
+``HIPPOCAMPUS_STORE_BACKEND=json|sqlite`` (default **json**, behavior identical to
+before the change).
+``HIPPOCAMPUS_FTS5=1`` additionally enables the FTS5 full-text index (H4: moving
+the BM25 index onto disk).
 
-⚠️ 老库**不自动迁移**：目录里有 ``memories.json`` 而没有 ``hippocampus.db`` 时，
-sqlite 后端会把它当成新库（空），并留一条 warning 提示跑 ``migrate-store``。
+⚠️ Old libraries are **not migrated automatically**: when the directory contains
+``memories.json`` but no ``hippocampus.db``, the sqlite backend treats it as a new
+(empty) library and leaves a warning suggesting you run ``migrate-store``.
 """
 
 from __future__ import annotations
@@ -41,47 +51,53 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# env 开关名（唯一定义处；测试与文档都引用这里的常量）
+# env switch names (the single definition site; tests and docs both reference these constants)
 BACKEND_ENV = "HIPPOCAMPUS_STORE_BACKEND"
 FTS5_ENV = "HIPPOCAMPUS_FTS5"
 
-# 构造注入缝：旋钮登记在 config（store_backend / fts5），生产路径由
-# engine import 时灌入；解析序（env 先、注入值回退）见 common/config_bridge。
+# Construction-time injection seam: the knobs are registered in config
+# (store_backend / fts5) and filled in by the engine at import time in the
+# production path; the resolution order (env first, injected value as fallback)
+# is in common/config_bridge.
 from ..common.config_bridge import apply_config, resolve as _resolve  # noqa: E402
 
 DB_FILENAME = "hippocampus.db"
 MEMORIES_FILENAME = "memories.json"
 VECTORS_SUFFIX = ".vectors.npz"
 
-# G2：WAL 的写串行化 = 协议级的"一个库同一时刻只有一个写者"，
-# 比自研 filelock 可靠。busy_timeout 让并发写排队而不是直接抛 SQLITE_BUSY。
+# G2: WAL's write serialization = protocol-level "one library has at most one
+# writer at a time", more reliable than a home-grown filelock. busy_timeout makes
+# concurrent writes queue up instead of directly raising SQLITE_BUSY.
 _BUSY_TIMEOUT_MS = 60000
-# 并发首次建库的重试参数（见 SqliteBackend._init_resilient）。
-# 5 次 × 递增间隔 ≈ 0.75s，足够让先到的那个进程把库建完，又不至于
-# 在真失败时把调用方挂住。
+# Retry parameters for concurrent first-time DB creation (see SqliteBackend._init_resilient).
+# 5 tries × increasing intervals ≈ 0.75s — enough for the first-arriving process
+# to finish creating the library, without hanging the caller on a real failure.
 _INIT_RETRIES = 5
 _INIT_RETRY_SLEEP = 0.05
 
 
 def _is_readonly_error(exc: BaseException) -> bool:
-    """是不是"被降级成只读连接"那类错误。
+    """Is this the "silently downgraded to a read-only connection" kind of error.
 
-    判据只认 SQLite 的原话，不认我们自己起的名 —— 误判会把真错误（比如
-    disk I/O error）也吞进重试循环，那比重试本身更糟。
+    The criterion trusts only SQLite's own words, not names we made up — a
+    misjudgment would swallow real errors (e.g. disk I/O error) into the retry
+    loop too, which is worse than the retrying itself.
     """
     return isinstance(exc, sqlite3.OperationalError) and (
         "readonly" in str(exc).lower())
 
 
 def _is_transient_init_error(exc: BaseException) -> bool:
-    """首次建库阶段**可以靠重开连接解决**的错误。
+    """Errors during first-time DB creation that **can be fixed by reopening the connection**.
 
-    两类都实测出现过（并发首次建库压测 160 进程）：
-      * `attempt to write a readonly database` —— 见 `_init_resilient` 注释；
-      * `database is locked` —— 撞在 `PRAGMA journal_mode=WAL` 上：切 WAL 需要
-        短暂的独占，另一个进程正建库时它会直接抛，而不是等 busy_timeout
-        （PRAGMA 不吃 busy_timeout 这一套）。
-    其它错误一律不认，原样抛给调用方。
+    Both kinds actually occurred (160-process stress test of concurrent first-time
+    creation):
+      * `attempt to write a readonly database` —— see the `_init_resilient` comment;
+      * `database is locked` —— hits `PRAGMA journal_mode=WAL`: switching to WAL
+        needs brief exclusivity; when another process is creating the library it
+        raises directly instead of waiting for busy_timeout
+        (PRAGMA does not honor busy_timeout).
+    All other errors are not recognized and are raised to the caller as-is.
     """
     if not isinstance(exc, sqlite3.OperationalError):
         return False
@@ -90,7 +106,7 @@ def _is_transient_init_error(exc: BaseException) -> bool:
 
 
 def backend_kind() -> str:
-    """当前后端种类（默认 json）。未知取值**显式报错**，不静默回退。"""
+    """The current backend kind (default json). Unknown values **raise explicitly**, no silent fallback."""
     raw = (_resolve(BACKEND_ENV, "store_backend", "") or "json").strip().lower()
     if raw not in ("json", "sqlite"):
         raise ValueError(
@@ -100,14 +116,14 @@ def backend_kind() -> str:
 
 
 def fts5_enabled() -> bool:
-    """是否启用 FTS5 全文索引（H4）。默认关——检索语义不变，避免影响评测分。"""
+    """Whether the FTS5 full-text index is enabled (H4). Off by default — retrieval semantics unchanged, to avoid affecting benchmark scores."""
     return (_resolve(FTS5_ENV, "fts5", "") or "").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
 
 def needs_migration(directory: str) -> bool:
-    """目录是 JSON 老库、但当前要按 sqlite 打开 ⇒ 需要先跑 migrate-store。"""
+    """The directory is an old JSON library but would be opened as sqlite ⇒ migrate-store must run first."""
     return (
         backend_kind() == "sqlite"
         and os.path.isfile(os.path.join(directory, MEMORIES_FILENAME))
@@ -116,17 +132,18 @@ def needs_migration(directory: str) -> bool:
 
 
 class StoreBackend:
-    """落盘层抽象。
+    """The persistence-layer abstraction.
 
-    子类只需实现下面这些原语；业务语义（合并 / 去重 / 裁剪）仍在上层。
+    Subclasses only need to implement the primitives below; business semantics
+    (merge / dedup / trim) remain upstream.
     """
 
     name = "?"
-    #: 是否支持行级增量写（json 不支持：它只能整份重写文件）
+    #: whether row-level incremental writes are supported (json does not: it can only rewrite whole files)
     supports_incremental = False
 
     # ------------------------------------------------------------------
-    # 派生层（L0 / L2 / L3 …，整块 JSON 语义）
+    # Derived layers (L0 / L2 / L3 …, whole-blob JSON semantics)
     # ------------------------------------------------------------------
     def read_layer(self, name: str) -> Any | None:
         raise NotImplementedError
@@ -135,39 +152,42 @@ class StoreBackend:
         raise NotImplementedError
 
     def layer_stamp(self, name: str) -> tuple[int, int] | None:
-        """这一层的"版本戳"（判断有没有被别的进程改过）。
+        """This layer's "version stamp" (to judge whether another process changed it).
 
-        json 用 ``(mtime_ns, size)``；sqlite 没有文件，用 ``(updated_at_ns, 长度)``
-        顶上。返回 ``None`` 表示"这一层还不存在"。
+        json uses ``(mtime_ns, size)``; sqlite has no file and substitutes
+        ``(updated_at_ns, length)``. Returning ``None`` means "this layer does not
+        exist yet".
         """
         raise NotImplementedError
 
     def write_layers(self, layers: dict[str, Any]) -> None:
-        """写入若干派生层。**要么全成功要么全不写**（事务）。"""
+        """Write several derived layers. **All succeed or none is written** (transactional)."""
         raise NotImplementedError
 
     def store_stamp(self) -> tuple[int, int] | None:
-        """整库的"磁盘戳"：判断上次落盘之后有没有被别的进程写过。
+        """The whole library's "disk stamp": to judge whether another process wrote after the last persist.
 
-        json 用 ``memories.json`` 的 ``(mtime_ns, size)``；sqlite 没有这个文件，
-        用 ``(写序号, 记录数)`` 顶上 —— 写序号在每个写事务提交前 +1。
+        json uses ``memories.json``'s ``(mtime_ns, size)``; sqlite has no such file
+        and substitutes ``(write sequence number, record count)`` — the sequence
+        number is +1'd before every write transaction commits.
         """
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # L1 记忆本体
+    # L1 memory bodies
     # ------------------------------------------------------------------
     def load_memories(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """返回 ``(data, issue)``。
+        """Return ``(data, issue)``.
 
-        ``data`` 与旧版 memories.json 同构：``{"format","dim","model_key",
-        "models","records"}``；目录全新时返回 ``(None, None)``。
-        ``issue`` 是加载异常说明（供上层自曝 / 隔离现场），正常时为 ``None``。
+        ``data`` is isomorphic to the old memories.json: ``{"format","dim","model_key",
+        "models","records"}``; a brand-new directory returns ``(None, None)``.
+        ``issue`` describes a load anomaly (for the upper layer to self-report /
+        quarantine the scene) and is ``None`` when normal.
         """
         raise NotImplementedError
 
     def save_memories_full(self, data: dict[str, Any]) -> None:
-        """整份覆写 L1（首次落盘、或后端不支持增量时走这条）。"""
+        """Overwrite L1 in full (used for the first persist, or when the backend does not support incremental writes)."""
         raise NotImplementedError
 
     def upsert_memories(self, records: list[dict[str, Any]]) -> None:
@@ -177,14 +197,14 @@ class StoreBackend:
         raise NotImplementedError
 
     def save_meta(self, meta: dict[str, Any]) -> None:
-        """只更新元数据（format / dim / model_key / models），不动记录。"""
+        """Update only metadata (format / dim / model_key / models), leaving records untouched."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 向量
+    # Vectors
     # ------------------------------------------------------------------
     def load_vectors(self) -> dict[str, np.ndarray] | None:
-        """返回 ``{vec_key: ndarray}``（vec_key 形如 ``"m0::<id>"``）。"""
+        """Return ``{vec_key: ndarray}`` (vec_key looks like ``"m0::<id>"``)."""
         raise NotImplementedError
 
     def save_vectors_full(self, arrays: dict[str, np.ndarray]) -> None:
@@ -194,35 +214,36 @@ class StoreBackend:
         raise NotImplementedError
 
     def delete_vectors_for(self, memory_ids: list[str]) -> None:
-        """删除这些记忆的全部向量（跨所有模型槽位）。"""
+        """Delete all vectors of these memories (across all model slots)."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 事务 / 生命周期
+    # Transactions / lifecycle
     # ------------------------------------------------------------------
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
-        """默认：无事务（json 后端逐文件 replace，本来就没有跨文件原子性）。"""
+        """Default: no transaction (the json backend replaces file by file; there is no cross-file atomicity to begin with)."""
         yield
 
     def close(self) -> None:
         pass
 
     # ------------------------------------------------------------------
-    # 在线快照（可选；只有 sqlite 支持）
+    # Online snapshot (optional; only sqlite supports it)
     # ------------------------------------------------------------------
     supports_snapshot = False
 
     def snapshot_to(self, dst: str) -> None:
-        """产出一份在线一致快照到 ``dst``。仅 ``supports_snapshot`` 为真的后端实现。
+        """Produce an online consistent snapshot at ``dst``. Implemented only by backends with ``supports_snapshot`` true.
 
-        ``dst`` 必须不存在——SQLite 的 ``VACUUM INTO`` 不覆盖已存在的文件，
-        所以调用方要用时间戳命名，撞名就跳过。
+        ``dst`` must not exist — SQLite's ``VACUUM INTO`` does not overwrite an
+        existing file, so callers should name it with a timestamp and skip on
+        collision.
         """
         raise NotImplementedError("the current backend does not support online snapshots")
 
     # ------------------------------------------------------------------
-    # FTS5（H4，可选）
+    # FTS5 (H4, optional)
     # ------------------------------------------------------------------
     def fts5_supported(self) -> bool:
         return False
@@ -235,10 +256,10 @@ class StoreBackend:
 
 
 # ======================================================================
-# JSON 后端：与改动前完全一致的文件布局
+# JSON backend: file layout identical to before the change
 # ======================================================================
 class JsonBackend(StoreBackend):
-    """多文件 JSON + npz。**默认后端**，行为与 G1 之前逐字节等价。"""
+    """Multi-file JSON + npz. The **default backend**; behavior is byte-for-byte equivalent to pre-G1."""
 
     name = "json"
     supports_incremental = False
@@ -249,13 +270,13 @@ class JsonBackend(StoreBackend):
         base, _ = os.path.splitext(self.memories_path)
         self.vectors_path = base + VECTORS_SUFFIX
 
-    # -- 派生层 --------------------------------------------------------
+    # -- Derived layers --------------------------------------------------------
     def read_layer(self, name: str) -> Any | None:
         path = os.path.join(self.dir, name)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:      # noqa: BLE001 —— 读不到不阻塞保存
+        except Exception:      # noqa: BLE001 —— an unreadable layer does not block saving
             return None
 
     def has_layer(self, name: str) -> bool:
@@ -286,11 +307,13 @@ class JsonBackend(StoreBackend):
 
     # -- L1 ------------------------------------------------------------
     def load_memories(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """主文件 → ``.bak`` 回退 → 都读不出则隔离现场并显式报错（缺陷 N1）。
+        """Main file → ``.bak`` fallback → if neither can be read, quarantine the scene and raise explicitly (defect N1).
 
-        这段回退逻辑原本在 ``VectorStore._load_impl`` 里，搬到 backend 是为了让
-        sqlite 后端也有自己对应的"打不开"处理；json 分支必须**原样保留**
-        ——它是"上次 save 崩在备份与替换之间"的唯一自救路径。
+        This fallback logic originally lived in ``VectorStore._load_impl``; moving it
+        into the backend gives the sqlite backend its own corresponding "cannot
+        open" handling. The json branch must be **preserved as-is** — it is the
+        only self-rescue path for "the last save crashed between backup and
+        replace".
         """
         bak_path = self.memories_path + ".bak"
         data: dict[str, Any] | None = None
@@ -315,7 +338,7 @@ class JsonBackend(StoreBackend):
 
         if data is not None:
             if main_err is not None:
-                # 从备份救回来了：坏的主文件留着，下次 save 会用它盖掉好备份
+                # recovered from the backup: the corrupt main file must not stay in place — the next save would use it to overwrite the good backup
                 q = self._quarantine(self.memories_path)
                 return data, {
                     "kind": "recovered",
@@ -324,7 +347,7 @@ class JsonBackend(StoreBackend):
                 }
             return data, None
 
-        # 两个文件都不存在 = 全新目录（正常首启）
+        # neither file exists = brand-new directory (normal first start)
         if main_err is None and bak_err is None:
             return None, None
 
@@ -349,7 +372,7 @@ class JsonBackend(StoreBackend):
         }
 
     def _quarantine(self, path: str) -> str | None:
-        """把坏文件改名保留现场（不删）。"""
+        """Rename the corrupt file to preserve the scene (do not delete)."""
         if not os.path.isfile(path):
             return None
         dst = f"{path}.corrupt-{int(time.time())}"
@@ -380,10 +403,10 @@ class JsonBackend(StoreBackend):
         raise NotImplementedError("the json backend can only be rewritten as a whole")
 
     def save_meta(self, meta: dict[str, Any]) -> None:
-        # 元数据与记录同文件 ⇒ 只能整份重写；调用方应改走 save_memories_full
+        # metadata lives in the same file as the records ⇒ only a full rewrite is possible; callers should switch to save_memories_full
         raise NotImplementedError("the json backend rewrites metadata together with the records as a whole")
 
-    # -- 向量 ----------------------------------------------------------
+    # -- Vectors ----------------------------------------------------------
     def load_vectors(self) -> dict[str, np.ndarray] | None:
         if not os.path.isfile(self.vectors_path):
             return None
@@ -408,7 +431,7 @@ class JsonBackend(StoreBackend):
 
 
 # ======================================================================
-# SQLite 后端：每库一个 hippocampus.db
+# SQLite backend: one hippocampus.db per library
 # ======================================================================
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -448,15 +471,18 @@ CREATE INDEX IF NOT EXISTS idx_sources_src    ON memory_sources(source_id);
 CREATE INDEX IF NOT EXISTS idx_entities_ent   ON memory_entities(entity_id);
 """
 
-# H4：BM25 索引挪上盘。三个决定都不是随便定的：
-#  1. **trigram 分词**（不是 unicode61）——unicode61 按空格/标点切词，中文
-#     整句没有空格 ⇒ 整段被当成一个 token，召回基本失效。trigram 对中文
-#     （以及子串匹配）才有效，实测 SQLite 3.45 支持。
-#  2. **external content**（content='memories'）——FTS 表不另存正文，省一半
-#     空间，且天然与 memories 表同源。
-#  3. **触发器维护**——写入/更新/删除自动同步索引，调用方不用记得调 sync。
-#     external content 表删除时必须提供**旧值**，所以 ad/au 里要把 old.content
-#     一并塞进 'delete' 命令。
+# H4: moving the BM25 index onto disk. None of the three decisions is arbitrary:
+#  1. **trigram tokenizer** (not unicode61) — unicode61 splits on spaces/punctuation;
+#     a Chinese sentence has no spaces ⇒ a whole paragraph becomes one token and
+#     recall basically dies. trigram works for Chinese (and for substring matching);
+#     verified on SQLite 3.45.
+#  2. **external content** (content='memories') — the FTS table does not store the
+#     body text separately, halving the space, and it is naturally same-source with
+#     the memories table.
+#  3. **Trigger maintenance** — inserts/updates/deletes sync the index automatically;
+#     callers need not remember to call sync.
+#     An external content table requires the **old value** on delete, so the ad/au
+#     triggers must also feed old.content into the 'delete' command.
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
 USING fts5(content, content='memories', content_rowid='rowid',
@@ -478,14 +504,14 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF content ON memories
 END;
 """
 
-#: trigram 分词器要求 term 至少 3 个字符，短于此查不出东西
+#: the trigram tokenizer requires a term of at least 3 characters; shorter terms find nothing
 _FTS_MIN_TERM = 3
-# MATCH 表达式里短语数的上限（长查询 3-gram 展开的封顶）
+# cap on the number of phrases in a MATCH expression (upper bound for long queries' 3-gram expansion)
 _FTS_MAX_TERMS = 32
 
 
 class SqliteBackend(StoreBackend):
-    """单文件 SQLite。事务 + 行级 upsert，取代多文件整份重写。"""
+    """Single-file SQLite. Transactions + row-level upsert, replacing multi-file full rewrites."""
 
     name = "sqlite"
     supports_incremental = True
@@ -497,19 +523,22 @@ class SqliteBackend(StoreBackend):
         os.makedirs(directory, exist_ok=True)
         self._fts = False
         self._fts_tried = False
-        # daemon 模式下同一进程有 N 条连接 = N 个线程共享这一个 backend 实例，
-        # 而 sqlite3 的 Connection 本身不是线程安全的 ⇒ 连接放开线程检查，
-        # 由这把锁把并发串住（与 embeddings.py 的 _ENCODE_LOCK 同一个道理）。
+        # in daemon mode one process holds N connections = N threads sharing this
+        # single backend instance, and sqlite3's Connection is not thread-safe by
+        # itself ⇒ the connection disables the thread check, and this lock
+        # serializes the concurrency (same reasoning as embeddings.py's _ENCODE_LOCK).
         self._lock = threading.RLock()
-        # 事务嵌套深度：brain.save() 会开一个跨 L1 / 派生层的外层事务，
-        # 内部的 upsert 各自也会开事务 —— 只有最外层负责 commit / rollback。
+        # transaction nesting depth: brain.save() opens an outer transaction spanning
+        # L1 / derived layers, and the inner upserts open transactions of their own —
+        # only the outermost level is responsible for commit / rollback.
         self._txn_depth = 0
-        # 写序号：每个写事务提交前 +1，是 sqlite 侧的"磁盘戳"来源
+        # write sequence number: +1 before every write transaction commits; the
+        # source of sqlite's "disk stamp"
         self._seq = 0
         self._conn = None  # type: ignore[assignment]
         self._init_resilient()
 
-    # -- 连接 ----------------------------------------------------------
+    # -- Connection ----------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.db_path,
@@ -517,16 +546,19 @@ class SqliteBackend(StoreBackend):
             check_same_thread=False,
         )
         try:
-            # WAL：读不阻塞写、写串行化。synchronous=NORMAL 在 WAL 下断电只会丢
-            # 最后一个事务，不会损坏库文件（FULL 是每次都 fsync，慢很多）。
+            # WAL: reads do not block writes, writes are serialized. Under WAL,
+            # synchronous=NORMAL loses only the last transaction on power loss and
+            # does not corrupt the library file (FULL fsyncs every time, much slower).
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA foreign_keys=OFF")
         except BaseException:
-            # PRAGMA 阶段抛错时这条连接已经建好了：不关就是每次重试漏一个句柄。
-            # 最典型的就是并发建库时 `journal_mode=WAL` 抛 database is locked
-            # （PRAGMA 不吃 busy_timeout，只能重试）—— 见 `_init_resilient`。
+            # when the PRAGMA stage raises, this connection is already open: not
+            # closing it leaks one handle per retry. The most typical case is
+            # `journal_mode=WAL` raising database is locked during concurrent
+            # first-time creation (PRAGMA does not honor busy_timeout; only retrying
+            # works) —— see `_init_resilient`.
             with contextlib.suppress(Exception):
                 conn.close()
             raise
@@ -537,31 +569,40 @@ class SqliteBackend(StoreBackend):
             self._conn.executescript(_SCHEMA)
 
     def _init_resilient(self) -> None:
-        """连接 + 建表的重试着陆点（Windows 真缺陷，不是抖动）。
+        """The retry landing point for connect + schema creation (a real Windows defect, not jitter).
 
-        现象（全量回归里 `test_g2_sqlite_concurrency` 偶发红，
-        拿到完整堆栈才定位）：两个进程**同时**给一个全新的库目录建库时，后到的
-        那个会撞两种错误之一，两种都发生在**建库阶段**、且堆栈都指向别处：
+        Symptom (sporadic red for `test_g2_sqlite_concurrency` in the full
+        regression; only localized once the full stack was captured): when two
+        processes **simultaneously** create the library in a brand-new directory,
+        the later-arriving one hits one of two errors; both occur in the
+        **creation phase** and both stacks point somewhere else:
 
-        1. `attempt to write a readonly database` —— Windows 上拿不到写句柄时
-           SQLite 不开失败，而是**静默降级成只读连接**；于是报错时机被推迟到
-           **第一次写**，而那次写恰好是事务收尾的 `_bump_seq`：
+        1. `attempt to write a readonly database` —— on Windows, when SQLite cannot
+           get a write handle it does not fail to open; instead it **silently
+           downgrades to a read-only connection**. The error is therefore deferred
+           to the **first write**, and that write happens to be the
+           transaction-finalizing `_bump_seq`:
 
                SqliteBackend.__init__ -> _init_schema -> transaction().__exit__
                -> _bump_seq -> sqlite3.OperationalError
 
-           堆栈里一个"建库"的字样都没有，极易被误判成 flaky 或磁盘问题。
+           Nowhere in the stack does "creating the library" appear, so it is easily
+           misjudged as flaky or a disk problem.
 
-        2. `database is locked` —— 撞在 `_connect` 的
-           `PRAGMA journal_mode=WAL` 上：切 WAL 需要短暂独占，另一个进程正建库
-           时它直接抛，而且 **PRAGMA 不吃 busy_timeout**（所以把 timeout 调大
-           没用，只能重试）。
+        2. `database is locked` —— hits `_connect`'s
+           `PRAGMA journal_mode=WAL`: switching to WAL needs brief exclusivity;
+           when another process is creating the library it raises directly, and
+           **PRAGMA does not honor busy_timeout** (so raising the timeout does not
+           help; only retrying does).
 
-        取舍：**只**对这两类错误重试（判据见 `_is_transient_init_error`），其它
-        错误原样抛出（掩盖真实错误比偶发失败更糟）；每次重试**重开连接**（旧连接
-        已经是只读的 / 已经错过 WAL 窗口，在同一条连接上重试多少次都没用）；
-        次数用尽就把最后一个异常抛给调用方。schema 全是 `IF NOT EXISTS`，
-        重复执行幂等，重开连接不会写坏东西。
+        Trade-offs: retry **only** these two error kinds (criterion in
+        `_is_transient_init_error`); every other error is raised as-is (masking
+        real errors is worse than a sporadic failure); each retry **reopens the
+        connection** (the old one is already read-only / has already missed the WAL
+        window — retrying on the same connection is useless no matter how many
+        times); when retries are exhausted, the last exception goes to the caller.
+        The schema is all `IF NOT EXISTS`; repeated execution is idempotent, and
+        reopening the connection cannot corrupt anything.
         """
         for attempt in range(_INIT_RETRIES):
             try:
@@ -594,23 +635,26 @@ class SqliteBackend(StoreBackend):
         try:
             self._conn.executescript(_FTS_SCHEMA)
             self._conn.executescript(_FTS_TRIGGERS)
-            # 存量回填：FTS 表可能是后建的，此时 memories 里已有数据。
-            # rebuild 是 FTS5 的内置命令，幂等，只在首次建表时真正干活。
+            # backfill for existing rows: the FTS table may have been created later,
+            # when memories already held data. rebuild is an FTS5 built-in command,
+            # idempotent, doing real work only on first table creation.
             self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
             self._conn.commit()
             self._fts = True
         except sqlite3.Error as e:
-            # FTS5 不可用（裁剪版 sqlite 没有该模块）不该让整个库打不开
+            # FTS5 being unavailable (a trimmed-down sqlite lacking the module) must not keep the whole library from opening
             logger.warning("FTS5 unavailable; BM25 still built in memory: %s", e)
             self._fts = False
         return self._fts
 
-    # -- FTS5 全文检索（H4）--------------------------------------------
+    # -- FTS5 full-text search (H4)--------------------------------------------
     def fts5_sync(self, records: list[dict[str, Any]]) -> None:
-        """索引由触发器自动维护，这里只做**可用性与存量回填**检查。
+        """The index is maintained automatically by triggers; this only performs the
+        **availability and backfill** check.
 
-        保留这个方法是因为上层需要一个"我现在能不能用 FTS"的显式入口；
-        它不是同步动作，误以为它是同步动作会导致"写了但没索引"的错觉。
+        The method is kept because the upper layer needs an explicit "can I use FTS
+        right now" entry point; it is not a sync action — mistaking it for one
+        creates the illusion of "written but not indexed".
         """
         if self._fts_ok:
             self._conn.execute(
@@ -619,28 +663,33 @@ class SqliteBackend(StoreBackend):
             self._conn.commit()
 
     def fts5_query_terms(self, query: str) -> str | None:
-        """把用户查询转成 FTS5 MATCH 表达式；**不能用就返回 None**。
+        """Convert a user query into an FTS5 MATCH expression; **return None when unusable**.
 
-        返回 None 的场景必须由调用方回退到内存 BM25，绝不能静默空召回：
-        * trigram 分词器要求 term ≥ 3 字符，短词查不出东西；
-        * 空查询 / 全是短词。
+        When None is returned the caller must fall back to in-memory BM25 — never a
+        silent empty recall:
+        * the trigram tokenizer requires terms ≥ 3 chars; short words find nothing;
+        * empty query / nothing but short words.
 
-        中文 3-gram 展开：中文连续段不再整串当一个短语——
-        无空格整句（`崇祯皇帝煤山自缢`）在库里没有逐字同串 ⇒ FTS 恒 `[]`，
-        而调用方按设计**不回退** ⇒ 字面通道整个丢失。现在把每个含中文的段
-        切成**滑动 3-gram OR 展开**（`煤山自缢` → `"煤山自" OR "山自缢"`），
-        trigram 索引可直接吃；任一 gram 命中即候选，精度由 bm25 排序 +
-        融合打分兜底。纯 ASCII 段保持整段短语（原行为）。2 字中文词依旧
-        进不了 trigram（物理限制），全短词查询仍回退内存 BM25。
+        Chinese 3-gram expansion: a continuous Chinese segment is no longer treated
+        as one whole-string phrase — a space-free sentence (`崇祯皇帝煤山自缢`) has
+        no verbatim identical string in the library ⇒ FTS returns `[]` forever, and
+        the caller by design **does not fall back** ⇒ the literal channel is lost
+        entirely. Now every Chinese-containing segment is cut into a **sliding
+        3-gram OR expansion** (`煤山自缢` → `"煤山自" OR "山自缢"`) that the trigram
+        index can consume directly; any gram hit becomes a candidate, with precision
+        backstopped by bm25 ranking + fusion scoring. Pure-ASCII segments keep the
+        whole-segment phrase (original behavior). 2-char Chinese words still cannot
+        enter trigram (a physical limitation), and all-short-word queries still fall
+        back to in-memory BM25.
         """
         if not query or not self._fts_ok:
             return None
-        # 去掉 FTS5 语法敏感字符，避免用户一句带引号的话直接把查询打成语法错误
+        # strip FTS5 syntax-sensitive characters so a user sentence with quotes does not turn the query into a syntax error outright
         cleaned = "".join(
             ch if (ch.isalnum() or ch.isspace() or "\u4e00" <= ch <= "\u9fff") else " "
             for ch in query
         )
-        # 每个 ≥3 字符的片段产出一组短语；含中文的段做滑动 3-gram 展开。
+        # every segment ≥3 chars produces a group of phrases; Chinese-containing segments get the sliding 3-gram expansion.
         terms: list[str] = []
         seen: set[str] = set()
         for seg in cleaned.split():
@@ -657,21 +706,23 @@ class SqliteBackend(StoreBackend):
                     terms.append(g)
         if not terms:
             return None
-        # 封顶：超长查询的 gram 数线性膨胀，MATCH 表达式太长既慢也无增益
+        # cap: gram counts of over-long queries grow linearly; an over-long MATCH expression is both slow and pointless
         terms = terms[:_FTS_MAX_TERMS]
-        # 每个 term 加引号当短语查（中文整串本身就是一个短语）
+        # quote each term and search it as a phrase (a whole Chinese string is itself a phrase)
         return " OR ".join('"%s"' % t.replace('"', "") for t in terms)
 
     def fts5_search(
         self, query: str, top_n: int = 50
     ) -> list[tuple[str, float]] | None:
-        """全文检索，返回 ``[(memory_id, score), ...]``（按相关度降序）。
+        """Full-text search, returning ``[(memory_id, score), ...]`` (relevance descending).
 
-        **返回值要区分两种情况**，这个区别决定了内存能不能真省下来：
-        * ``None`` = 这条路走不了（未启用 / 词太短 / 语法错误）⇒ 调用方
-          **必须**回退内存 BM25；
-        * ``[]`` = 索引可用、查询合法，就是没有命中 ⇒ 调用方**不要**回退
-          （回退就会去建内存索引，省内存这件事当场作废）。
+        **The return value distinguishes two cases**, and this distinction decides
+        whether memory can actually be saved:
+        * ``None`` = this path is unusable (not enabled / terms too short / syntax
+          error) ⇒ the caller **must** fall back to in-memory BM25;
+        * ``[]`` = the index is usable and the query is legal, just no hits ⇒ the
+          caller must **not** fall back (falling back would build the in-memory
+          index, voiding the memory savings on the spot).
         """
         match = self.fts5_query_terms(query)
         if not match:
@@ -684,19 +735,20 @@ class SqliteBackend(StoreBackend):
                 (match, int(top_n)),
             ).fetchall()
         except sqlite3.Error as e:
-            # 语法/分词器错误不该让召回整条路挂掉：回退内存 BM25
+            # syntax/tokenizer errors must not take down the whole recall path: fall back to in-memory BM25
             logger.warning("FTS5 query failed (falling back to in-memory BM25): %s | %s", query, e)
             return None
-        # bm25() 返回的是**负的**相关度（越小越相关）⇒ 取反还原
+        # bm25() returns **negative** relevance (smaller = more relevant) ⇒ negate to restore
         return [(r[0], -float(r[1])) for r in rows]
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
-        """写事务：``BEGIN IMMEDIATE`` 立刻取写锁，避免升级锁时被动等。
+        """Write transaction: ``BEGIN IMMEDIATE`` takes the write lock right away, avoiding passive waiting on lock upgrade.
 
-        可重入：嵌套调用时不新开事务，交给最外层 commit / rollback —— 这样
-        ``brain.save()`` 才能把 L1（manager.store）与 10 个派生层包进
-        **同一个**事务里，做到"四层同生共死"。
+        Re-entrant: nested calls do not open a new transaction; the outermost level
+        does commit / rollback — this is what lets ``brain.save()`` wrap L1
+        (manager.store) and the 10 derived layers into **one** transaction, making
+        "the four layers live and die together".
         """
         with self._lock:
             if self._txn_depth > 0:
@@ -719,7 +771,7 @@ class SqliteBackend(StoreBackend):
             finally:
                 self._txn_depth = 0
 
-    # -- 派生层 --------------------------------------------------------
+    # -- Derived layers --------------------------------------------------------
     def read_layer(self, name: str) -> Any | None:
         row = self._conn.execute(
             "SELECT data FROM layers WHERE name=?", (name,)
@@ -742,11 +794,11 @@ class SqliteBackend(StoreBackend):
         ).fetchone()
         if row is None:
             return None
-        # 纳秒戳 + 长度，语义对齐 json 的 (mtime_ns, size)
+        # nanosecond stamp + length, semantically aligned with json's (mtime_ns, size)
         return (int(float(row[0]) * 1e9), len(row[1] or ""))
 
     def _bump_seq(self) -> None:
-        """写序号 +1。每个写事务提交前调用一次（读事务不调用）。"""
+        """Write sequence number +1. Called once before each write transaction commits (read transactions do not call it)."""
         self._seq += 1
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES('save_seq', ?) "
@@ -766,13 +818,16 @@ class SqliteBackend(StoreBackend):
         return (seq, int(cnt))
 
     def snapshot_to(self, dst: str) -> None:
-        """``VACUUM INTO``：在一个读事务里产出一致副本，不停服、不用拷文件。
+        """``VACUUM INTO``: produce a consistent copy inside a read transaction, without stopping service or copying files.
 
-        为什么用**独立连接**：``VACUUM`` 不能在活跃事务里执行，而 ``self._conn``
-        此刻可能正被 ``brain.save()`` 的外层事务持有；独立连接还能让读者与写者
-        互不阻塞（WAL 下读不阻塞写）。
+        Why an **independent connection**: ``VACUUM`` cannot run inside an active
+        transaction, and ``self._conn`` may at this moment be held by
+        ``brain.save()``'s outer transaction; an independent connection also lets
+        reader and writer avoid blocking each other (under WAL, reads do not block
+        writes).
 
-        ``dst`` 已存在时 SQLite 会报错 —— 由调用方用时间戳命名避开。
+        SQLite raises when ``dst`` already exists —— callers avoid it by naming
+        with a timestamp.
         """
         conn = sqlite3.connect(self.db_path, timeout=_BUSY_TIMEOUT_MS / 1000)
         try:
@@ -781,7 +836,7 @@ class SqliteBackend(StoreBackend):
             conn.close()
 
     def write_layers(self, layers: dict[str, Any]) -> None:
-        """只写内容变了的层（逐层比对），整批仍在**一个事务**里。"""
+        """Write only the layers whose content changed (compared layer by layer); the whole batch still runs in **one transaction**."""
         now = time.time()
         with self.transaction():
             for name, data in layers.items():
@@ -790,7 +845,7 @@ class SqliteBackend(StoreBackend):
                     "SELECT data FROM layers WHERE name=?", (name,)
                 ).fetchone()
                 if row is not None and row[0] == blob:
-                    continue      # 没变，不写
+                    continue      # unchanged, do not write
                 self._conn.execute(
                     "INSERT INTO layers(name, data, updated_at) VALUES(?,?,?) "
                     "ON CONFLICT(name) DO UPDATE SET data=excluded.data, "
@@ -813,7 +868,7 @@ class SqliteBackend(StoreBackend):
         if not meta and not self._conn.execute(
             "SELECT 1 FROM memories LIMIT 1"
         ).fetchone():
-            return None, None      # 全新库
+            return None, None      # brand-new library
         rows = self._conn.execute("SELECT data FROM memories").fetchall()
         records = []
         for (blob,) in rows:
@@ -881,10 +936,11 @@ class SqliteBackend(StoreBackend):
                     "INSERT OR REPLACE INTO memory_entities(memory_id, entity_id) "
                     "VALUES(?,?)", (rid, eid),
                 )
-        # 🔴 不要在这里手工同步 FTS 索引：memories_fts 是 external content
-        # 表（只有 content 列），索引由 memories_fts_ai/au/ad 三个触发器
-        # 随 memories 的写入自动维护。手工同步既多余又会抛
-        # "no such column: memory_id"。
+        # 🔴 Do not manually sync the FTS index here: memories_fts is an external
+        # content table (the only column is content); the index is maintained
+        # automatically by the three triggers memories_fts_ai/au/ad as memories is
+        # written. Manual syncing is both redundant and raises
+        # "no such column: memory_id".
 
     def upsert_memories(self, records: list[dict[str, Any]]) -> None:
         if not records:
@@ -907,16 +963,17 @@ class SqliteBackend(StoreBackend):
                 self._conn.execute(
                     "DELETE FROM vectors WHERE memory_id=?", (rid,)
                 )
-                # 🔴 FTS 索引**不要**在这里手动删：H4 之后 memories_fts 是
-                # external content 表，列只有 content（没有 memory_id），上面
-                # 那行旧代码会抛 "no such column: memory_id"。索引由
-                # memories_fts_ad 触发器随 memories 的删除自动维护。
+                # 🔴 Do **not** manually delete from the FTS index here: after H4,
+                # memories_fts is an external content table whose only column is
+                # content (no memory_id); the old code line above would raise
+                # "no such column: memory_id". The index is maintained automatically
+                # by the memories_fts_ad trigger as memories rows are deleted.
 
     def save_meta(self, meta: dict[str, Any]) -> None:
         with self.transaction():
             self._write_meta(meta)
 
-    # -- 向量 ----------------------------------------------------------
+    # -- Vectors ----------------------------------------------------------
     def load_vectors(self) -> dict[str, np.ndarray] | None:
         rows = self._conn.execute(
             "SELECT vec_key, blob FROM vectors"
@@ -942,7 +999,7 @@ class SqliteBackend(StoreBackend):
     def _put_vectors(self, arrays: dict[str, np.ndarray]) -> None:
         for key, arr in arrays.items():
             vec = np.asarray(arr, dtype=np.float32)
-            # vec_key 形如 "m0::<id>"（与 npz 的键一致，保证两条路径同构）
+            # vec_key looks like "m0::<id>" (same keys as the npz, keeping the two paths isomorphic)
             memory_id = key.split("::", 1)[1] if "::" in key else key
             slug = key.split("::", 1)[0] if "::" in key else ""
             self._conn.execute(
@@ -964,12 +1021,16 @@ class SqliteBackend(StoreBackend):
                 )
 
     # -- FTS5 ----------------------------------------------------------
-    # 🔴 本类里 FTS5 的**唯一实现在 _fts_ok 之后**（trigram + external
-    # content + 触发器）。这里只留一个可用性查询入口。
-    # 历史上这里还放着一份"手工维护 memory_id 列"的旧实现，它按 unicode61
-    # 建表、手动 delete/insert 索引；因为**后定义覆盖前定义**，那份旧代码
-    # 会把新实现整个盖掉（表现为 trigram 一直不生效、删索引抛
-    # "no such column: memory_id"）。改 FTS5 相关代码时先确认只有一份。
+    # 🔴 In this class, FTS5's **only implementation is the one after _fts_ok**
+    # (trigram + external content + triggers). What remains here is just an
+    # availability query entry point.
+    # Historically an older implementation ("manually maintaining a memory_id
+    # column") also sat here, creating the table with unicode61 and manually
+    # delete/insert-ing the index; because **later definitions override earlier
+    # ones**, that old code would clobber the new implementation entirely
+    # (manifesting as trigram never taking effect and index deletion raising
+    # "no such column: memory_id"). Before touching FTS5-related code, confirm
+    # there is only one implementation.
     def fts5_supported(self) -> bool:
         return self._fts_ok
 
@@ -978,15 +1039,17 @@ class SqliteBackend(StoreBackend):
             self._conn.close()
 
 
-# 进程内按目录缓存。**必须**让 brain 与 manager.store 拿到同一个实例：
-# 否则它们各持一条连接、各开各的事务，"一次 save = 一个事务"就无从
-# 谈起 —— 崩溃时必然出现"L1 写了、派生层没写"这种夹层状态。
+# In-process cache keyed by directory. brain and manager.store **must** get the
+# same instance: otherwise each holds its own connection and opens its own
+# transactions, and "one save = one transaction" becomes impossible — a crash
+# would inevitably produce the sandwich state of "L1 written, derived layers not
+# written".
 _BACKEND_CACHE: dict[str, StoreBackend] = {}
 _CACHE_LOCK = threading.Lock()
 
 
 def reset_backend_cache(directory: str | None = None) -> None:
-    """丢弃缓存（测试用：临时库被删掉重建后必须调，否则会拿到指向已删文件的连接）。"""
+    """Drop the cache (for tests: must be called after a temporary library is deleted and recreated, otherwise you get a connection pointing at deleted files)."""
     with _CACHE_LOCK:
         if directory is None:
             _BACKEND_CACHE.clear()
@@ -995,7 +1058,7 @@ def reset_backend_cache(directory: str | None = None) -> None:
 
 
 def get_backend(directory: str) -> StoreBackend:
-    """按 env 构造后端（同目录复用同一实例）。老库按 sqlite 打开时只 warning。"""
+    """Build the backend per env (the same directory reuses the same instance). Opening an old library as sqlite only warns."""
     key = os.path.abspath(directory)
     with _CACHE_LOCK:
         cached = _BACKEND_CACHE.get(key)

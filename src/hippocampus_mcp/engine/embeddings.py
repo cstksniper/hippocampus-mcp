@@ -1,34 +1,37 @@
 # -*- coding: utf-8 -*-
-"""文本嵌入工具.
+"""Text embedding utilities.
 
-提供两种嵌入器:
-    - SentenceTransformerEmbedder: 基于 sentence-transformers 的语义嵌入器 (推荐).
-      模型名留空时按 ``HIPPOCAMPUS_EMB_MODEL`` → ``all-MiniLM-L6-v2`` 依次回落，
-      回落会告警；中文语料请显式指定 ``BAAI/bge-base-zh-v1.5``。
-    - HashEmbedder: 基于哈希投影的确定性嵌入器 (MVP/后备).
-      无外部依赖, 但无法捕获语义相似性.
+Provides two embedders:
+    - SentenceTransformerEmbedder: semantic embedder based on sentence-transformers (recommended).
+      When the model name is empty, fall back in order along ``HIPPOCAMPUS_EMB_MODEL`` → ``all-MiniLM-L6-v2``;
+      the fallback emits a warning; for Chinese corpora explicitly specify ``BAAI/bge-base-zh-v1.5``.
+    - HashEmbedder: deterministic embedder based on hash projection (MVP/fallback).
+      No external dependencies, but cannot capture semantic similarity.
 
-两者实现统一接口:
-    embed(text)        -> 文档侧嵌入，写入记忆时用
-    embed_query(text)  -> 查询侧嵌入，召回时用（BGE 等模型此处加指令前缀）
-    embed_batch(texts) -> 批量嵌入
-    model_key          -> 多模型向量库的槽位键
+Both implement a unified interface:
+    embed(text)        -> document-side embedding, used when writing memories
+    embed_query(text)  -> query-side embedding, used at recall time (BGE and similar models add an instruction prefix here)
+    embed_batch(texts) -> batch embedding
+    model_key          -> slot key for the multi-model vector store
 
-该接口由 ``create_embedder()`` 强制校验，新增后端缺任何一个方法都会在
-初始化时直接报错，而不是等到召回时抛 AttributeError。
+This interface is enforced by ``create_embedder()``: a new backend missing any
+of these methods errors out at initialization instead of raising AttributeError
+at recall time.
 
-模型缓存目录解析（覆盖报告·阻断 2 的修复）：
-    本地模型目录不再只认 ``<项目>/libs/models``，而是按候选列表依次探测，
-    可用 ``HIPPOCAMPUS_EMB_CACHE`` 环境变量显式覆盖。候选顺序：
+Model cache directory resolution (fix for coverage-report blocker 2):
+    The local model directory no longer only recognizes ``<project>/libs/models``;
+    instead it probes a candidate list, and the ``HIPPOCAMPUS_EMB_CACHE``
+    environment variable can explicitly override it. Candidate order:
 
-        1. ``HIPPOCAMPUS_EMB_CACHE``（若设置，则只认它）
-        2. ``<项目>/libs/models``
-        3. ``<项目上级>/libs/models``   ← 本机 BGE 实际所在处
-        4. ``<项目上级>/libs``
-        5. ``~/.cache/huggingface/hub``（HF 标准缓存，含 cache_folder 结构）
+        1. ``HIPPOCAMPUS_EMB_CACHE`` (if set, only this one is honored)
+        2. ``<project>/libs/models``
+        3. ``<project parent>/libs/models``   ← where BGE actually lives on this machine
+        4. ``<project parent>/libs``
+        5. ``~/.cache/huggingface/hub`` (standard HF cache, with cache_folder structure)
 
-    离线（``HF_HUB_OFFLINE=1``）且全部候选都找不到模型时，**立刻抛出**一份
-    列出已尝试路径的错误，而不是丢给 SentenceTransformer 去联网等超时。
+    When offline (``HF_HUB_OFFLINE=1``) and no candidate contains the model,
+    **raise immediately** with an error listing the attempted paths instead of
+    letting SentenceTransformer go online and wait for a timeout.
 """
 
 from __future__ import annotations
@@ -46,28 +49,32 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# H2：嵌入后端选择（torch / onnx / auto）。这里只导入一个读环境变量的函数，
-# 真正的重依赖（onnxruntime / tokenizers）在 _attach_onnx 里延迟导入 ——
-# 没开 ONNX 的进程不该付任何代价。
+# H2: embedding backend selection (torch / onnx / auto). Only a function that
+# reads env vars is imported here; the real heavy dependencies (onnxruntime /
+# tokenizers) are lazily imported inside _attach_onnx — a process without ONNX
+# enabled should pay no cost for it.
 from .onnx_embedder import (  # noqa: E402
     backend_kind,
     get_shared_onnx,
     onnx_pool_stats,
     shared_embedder_enabled,
 )
-from ..config import load_config  # noqa: E402  （env 读收编 config）
+from ..config import load_config  # noqa: E402  (env reading folded into config)
 
-# 模型生命周期（延迟加载 / 空闲卸载）。放在**独立模块**里是因为它要被
-# torch 侧与 onnx 侧共用，塞进任一方都会绕成环形导入。
+# Model lifecycle (lazy loading / idle unload). It lives in a **separate module**
+# because both the torch side and the onnx side need it; putting it into either
+# one would create a circular import.
 from . import model_lifecycle as _ML
 
 
 def _with_model_use(fn):
-    """给会用到模型的方法包一层「租约」。
+    """Wrap methods that use the model in a "lease".
 
-    租约存在的意义：daemon 是一进程 N 线程共享一个 brain，卸载时若某条请求
-    正跑到一半，它会拿到半截模型。登记之后 :func:`_ML.release_models` 在租约
-    非 0 时会**拒绝执行**并回报持有者，而不是把内存撂给别人收拾。
+    Why the lease exists: the daemon is one process with N threads sharing one
+    brain; if unloading fires while a request is mid-flight, that request ends
+    up with half a model. Once registered, :func:`_ML.release_models` **refuses
+    to run** while the lease count is non-zero and reports the holder, instead
+    of leaving the memory mess for someone else to clean up.
     """
 
     @functools.wraps(fn)
@@ -78,48 +85,56 @@ def _with_model_use(fn):
     return wrapper
 
 
-# 模型加载的**进程级串行锁**（背景见 SentenceTransformerEmbedder._ensure_model）。
-# 用 RLock 而非 Lock：加载若因异常栈重入不会自锁死。
+# **Process-level serial lock** for model loading (background in
+# SentenceTransformerEmbedder._ensure_model).
+# RLock instead of Lock: re-entry from an exception stack must not self-deadlock.
 _MODEL_LOAD_LOCK = threading.RLock()
 
-# 推理（encode）的**进程级串行锁**。
+# **Process-level serial lock** for inference (encode).
 #
-# 为什么要它：``SentenceTransformer.encode`` 每次调用都会走
+# Why it exists: every call to ``SentenceTransformer.encode`` goes through
 # ``tokenization_utils_tokenizers.set_truncation_and_padding`` →
-# ``self._tokenizer.enable_truncation(...)``，这是对 Rust 侧 tokenizer 的
-# **可变借用**。两个线程同时 encode 就会撞上 Rust 的 RefCell 双重借用，抛
+# ``self._tokenizer.enable_truncation(...)``, which is a **mutable borrow** of
+# the Rust-side tokenizer. Two threads encoding concurrently hit Rust's RefCell
+# double-borrow and raise
 #
 #     RuntimeError: Already borrowed
 #
-# 直连 stdio 时一进程一线程，永远不会撞；daemon 化之后一进程 N 个会话
-# = N 个线程共享同一个 embedder，撞车就成了常态。实测（
-# 两连接并发各写 15 条）：随机若干次 ``store_memory`` 抛这个错，工具返回
-# isError，记录静默丢失（30 条里只剩 20~29 条，数量随时序变化）。
+# In direct stdio mode there is one thread per process, so this never happens;
+# after daemonization one process serves N sessions = N threads sharing the
+# same embedder, and collisions become the norm. Measured (two connections
+# concurrently writing 15 records each): several ``store_memory`` calls raised
+# this error at random, the tool returned isError, and records were silently
+# lost (only 20~29 of 30 survived, varying with timing).
 #
-# 代价：并发 encode 被串行。daemon 的目标是省内存而不是提吞吐，
-# 正确性优先；单条 encode 是几十毫秒级，串行不会成为瓶颈。
+# Cost: concurrent encodes are serialized. The daemon's goal is saving memory,
+# not raising throughput; correctness comes first. A single encode takes tens
+# of milliseconds, so serialization will not become a bottleneck.
 _ENCODE_LOCK = threading.RLock()
 
 
 # ==================================================================
-# F6 · 进程级共享池（torch 侧：SentenceTransformer 模型对象）
+# F6 · process-level shared pool (torch side: SentenceTransformer model objects)
 # ==================================================================
-# 池化的是**模型对象**（占 ~400MB 的那一坨），不是嵌入器实例——理由见
-# ``onnx_embedder`` 模块末尾的 F6 段：嵌入器实例身上带 ``model_source``
-# 这种"决策元数据"，共享出去会让第二个库继承第一个库的语义，可能把
-# 「跟随库内模型」判成「显式指定」而直接报错让库起不来。
+# What gets pooled is the **model object** (the ~400MB blob), not the embedder
+# instance — see the F6 section at the end of the ``onnx_embedder`` module for
+# why: an embedder instance carries "decision metadata" such as ``model_source``;
+# sharing it would let a second library inherit the first library's semantics,
+# possibly judging "follow the library's model" as "explicitly specified" and
+# erroring out so the library cannot even start.
 #
-# 值 = ``(model, dim)``：dim 一起存是因为命中池时要跳过 test encode
-# （那份 encode 只是为了探维度，重复跑既慢又会撞 tokenizer 可变借用）。
+# Value = ``(model, dim)``: dim is stored together because a pool hit must skip
+# the test encode (that encode only probes the dimension; rerunning it is slow
+# and risks the tokenizer mutable-borrow collision).
 _MODEL_POOL: "dict[tuple[str, str], tuple[object, int]]" = {}
 _MODEL_POOL_LOCK = threading.Lock()
 
-#: 池上限（同 onnx 侧的 POOL_MAX）
+#: Pool cap (same as the onnx side's POOL_MAX)
 POOL_MAX = 4
 
 
 def reset_model_pool() -> int:
-    """清空 torch 侧模型池（**只给测试用**），返回清掉的份数。"""
+    """Clear the torch-side model pool (**for tests only**); return the number of entries removed."""
     with _MODEL_POOL_LOCK:
         n = len(_MODEL_POOL)
         _MODEL_POOL.clear()
@@ -127,11 +142,12 @@ def reset_model_pool() -> int:
 
 
 def embedder_pool_stats() -> dict:
-    """自曝进程级共享池现状（``brain_stats`` / 测试用）。
+    """Self-report of the process-level shared pool state (``brain_stats`` / tests).
 
-    ``torch_size`` 与 ``onnx_size`` 分开报：只跑 ONNX 的生产进程里
-    ``torch_size`` 恒为 0，看到非 0 就说明这条进程其实还在走 torch
-    回退——这正是"我以为在省内存"那类静默失效的自曝口。
+    ``torch_size`` and ``onnx_size`` are reported separately: in a production
+    process running only ONNX, ``torch_size`` is always 0; a non-zero value means
+    this process is actually still on the torch fallback — exactly the
+    self-report channel for "I thought I was saving memory" style silent failures.
     """
     with _MODEL_POOL_LOCK:
         torch_size = len(_MODEL_POOL)
@@ -145,43 +161,53 @@ def embedder_pool_stats() -> dict:
         "onnx_keys": onnx["keys"],
         "max": POOL_MAX,
     }
-# 环境变量名：此前这个字符串散落在 server.py / brain.py / 各脚本里，
-# 每处各写一遍、各默认一遍，于是"某个入口忘了设"就会静默落到 MiniLM。
+# Env var name: this string used to be scattered across server.py / brain.py /
+# various scripts, each site writing its own copy with its own default, so "one
+# entry point forgot to set it" would silently fall back to MiniLM.
 ENV_MODEL = "HIPPOCAMPUS_EMB_MODEL"
 
-# 允许"显式指定模型与库内向量不符"时强行切换（离线对比不同模型的实验用）。
-# 不设时：不符就**报错并说清怎么办**，绝不静默换模型重算整库。
+# Allows force-switching when "the explicitly specified model mismatches the
+# library's vectors" (for offline experiments comparing different models).
+# Unset: a mismatch **errors out with clear instructions**; never silently swap
+# the model and recompute the whole library.
 ENV_ALLOW_MODEL_SWITCH = "HIPPOCAMPUS_ALLOW_MODEL_SWITCH"
 
-# 应用层默认模型（未显式指定、且库内也没有可跟随的模型时才会用到）。
-# 之所以是 MiniLM：它是英文语义检索的通用基线，且 LoCoMo（英文）评测与
-# Mem0 对比评测都固定用它（见 scripts/eval_mem0_*.py、bench_bge.py）。
-# **中文语料必须显式指定 BGE**——这个默认值不是给中文生产库用的。
+# Application-layer default model (used only when nothing is explicit and the
+# library has no model to follow either).
+# Why MiniLM: it is the common baseline for English semantic retrieval, and both
+# the LoCoMo (English) evaluation and the Mem0 comparison evaluation pinned it
+# (see scripts/eval_mem0_*.py, bench_bge.py).
+# **Chinese corpora must explicitly specify BGE** — this default is not meant
+# for Chinese production libraries.
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 
-#: 中文语料的默认模型（BGE-base-zh-v1.5，768D)。
-#: 语义是**分流**不是替换：英文/其它语言仍走 :data:`DEFAULT_MODEL_NAME`。
-#: 只在「系统语言是中文」且用户**没有**显式配置模型时作为应用默认值生效。
+#: Default model for Chinese corpora (BGE-base-zh-v1.5, 768D).
+#: The semantics are **routing**, not replacement: English and other languages
+#: still go through :data:`DEFAULT_MODEL_NAME`.
+#: Takes effect as the application default only when "the system language is
+#: Chinese" AND the user **did not** explicitly configure a model.
 ZH_DEFAULT_MODEL_NAME = "BAAI/bge-base-zh-v1.5"
 
-#: 关掉「按系统语言自动选默认模型」的开关（默认开）。
-#: 设 ``0/false/no/off`` 关闭 → 恒用 MiniLM。
-#: 显式 ``HIPPOCAMPUS_EMB_MODEL`` 永远优先于本开关，不受影响。
+#: Switch to turn off "pick the default model by system language" (on by default).
+#: Set ``0/false/no/off`` to disable → always MiniLM.
+#: An explicit ``HIPPOCAMPUS_EMB_MODEL`` always takes priority over this switch.
 ENV_MODEL_AUTO = "HIPPOCAMPUS_EMB_MODEL_AUTO"
 
 
 def _default_libs_path() -> str:
-    """从本文件位置推断项目 ``libs/``（与构造函数内的推断口径一致）。"""
+    """Infer the project ``libs/`` from this file's location (same rule as the constructor's inference)."""
     here = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
     return os.path.join(project_root, "libs")
 
 
 def _cache_roots(libs_path: str = "", cache_folder: str = "") -> list[str]:
-    """按优先级返回模型缓存根目录候选（``_resolve_cache_candidates`` 的真相源）。
+    """Return model cache root candidates by priority (source of truth for
+    ``_resolve_cache_candidates``).
 
-    抽到模块级是为了让「按语言选默认模型」能在**不构造嵌入器**的前提下
-    判断中文模型在不在本地（构造嵌入器会牵进 torch / ONNX，代价太高）。
+    Hoisted to module level so "pick the default model by language" can check
+    whether the Chinese model exists locally **without constructing an embedder**
+    (constructing one would drag in torch / ONNX, which is too costly).
     """
     explicit = cache_folder or load_config().emb_cache or ""
     if explicit:
@@ -207,10 +233,11 @@ def _cache_roots(libs_path: str = "", cache_folder: str = "") -> list[str]:
 
 
 def local_model_dir(model_name: str, roots: list[str]) -> str | None:
-    """在 ``roots`` 里找 ``model_name`` 的本地副本，找不到返回 ``None``。
+    """Find the local copy of ``model_name`` under ``roots``; return ``None`` if absent.
 
-    ``SentenceTransformerEmbedder._find_local_model`` 的真相源（后者已改为
-    转调本函数，行为逐位不变）。三种命中形态见该方法的 docstring。
+    Source of truth for ``SentenceTransformerEmbedder._find_local_model`` (the
+    latter now delegates here; behavior is bit-for-bit identical). The three hit
+    shapes are documented in that method's docstring.
     """
     short = model_name.split("/")[-1]
     cls = SentenceTransformerEmbedder
@@ -227,44 +254,47 @@ def local_model_dir(model_name: str, roots: list[str]) -> str | None:
 
 
 def _win_ui_language_id() -> int | None:
-    """Windows 上取「系统 UI 语言」LANGID；非 Windows / 取不到返回 ``None``。
+    """On Windows, get the LANGID of the "system UI language"; return ``None`` on non-Windows or on failure.
 
-    🔴 **不能用 ``LANG`` 判断**：Git Bash 会把 ``LANG`` 设成 ``en_US.UTF-8``，
-    而系统其实是中文 —— 实测本机就是这样。以 env 为准会把中文系统判成英文。
+    🔴 **Do not use ``LANG`` to decide**: Git Bash sets ``LANG`` to
+    ``en_US.UTF-8`` while the system is actually Chinese — measured on this very
+    machine. Trusting the env would misclassify a Chinese system as English.
     """
-    if os.name != "nt":  # pragma: no cover - 非 Windows 走 LANG/locale
+    if os.name != "nt":  # pragma: no cover - non-Windows goes through LANG/locale
         return None
     try:
         import ctypes
 
         return int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
-    except Exception:  # noqa: BLE001 - 检测失败不该连累主流程
+    except Exception:  # noqa: BLE001 - detection failure must not take down the main flow
         return None
 
 
 def _is_zh_language_id(langid: int) -> bool:
-    """LANGID 主语言是否为中文（``LANG_CHINESE == 0x04``，含繁简）。"""
+    """Is the LANGID's primary language Chinese (``LANG_CHINESE == 0x04``, covering Simplified and Traditional)?"""
     return (langid & 0x03FF) == 0x04
 
 
 def _is_zh_locale(tag: str) -> bool:
-    """``zh_CN.UTF-8`` / ``Chinese (Simplified)_China`` / ``zh-TW`` 都算中文。"""
+    """``zh_CN.UTF-8`` / ``Chinese (Simplified)_China`` / ``zh-TW`` all count as Chinese."""
     t = (tag or "").strip().lower()
     return t.startswith("zh") or t.startswith("chinese")
 
 
 def detect_system_language() -> str:
-    """检测系统语言，中文返回 ``"zh"``，其余返回 ``""``。
+    """Detect the system language; return ``"zh"`` for Chinese, ``""`` otherwise.
 
-    探测顺序（先系统级、再进程环境，避免 shell 环境把系统语言盖掉）：
+    Probe order (system level first, then process environment, so a shell's env
+    cannot mask the system language):
 
-        1. Windows ``GetUserDefaultUILanguage()`` 的 LANGID 主语言；
-        2. POSIX 的 ``LC_ALL`` / ``LC_MESSAGES`` / ``LANG``；
-        3. ``locale.getlocale()[0]`` 兜底（Windows 上也能给出
-           ``"Chinese (Simplified)_China"``）。
+        1. Primary language of the Windows ``GetUserDefaultUILanguage()`` LANGID;
+        2. POSIX ``LC_ALL`` / ``LC_MESSAGES`` / ``LANG``;
+        3. ``locale.getlocale()[0]`` as a fallback (on Windows this also yields
+           ``"Chinese (Simplified)_China"``).
 
-    任一步失败都**继续往下试**，全部失败按非中文处理（回落英文基线，
-    这是本函数唯一安全的默认方向）。
+    Any step that fails **continues to the next**; if all fail, treat as
+    non-Chinese (fall back to the English baseline — the only safe default
+    direction for this function).
     """
     langid = _win_ui_language_id()
     if langid is not None:
@@ -283,32 +313,34 @@ def detect_system_language() -> str:
 
 
 def auto_model_selection_enabled() -> bool:
-    """「按系统语言自动选默认模型」开关（默认开；``HIPPOCAMPUS_EMB_MODEL_AUTO=0`` 关闭）。
+    """The "pick the default model by system language" switch (on by default; ``HIPPOCAMPUS_EMB_MODEL_AUTO=0`` disables).
 
-    与 ``onnx_embedder.shared_embedder_enabled`` 同款口径：黑名单语义，
-    只有 ``0/false/off/no`` 才关，未设/空串/怪异值都算开。
+    Same rule as ``onnx_embedder.shared_embedder_enabled``: blacklist semantics —
+    only ``0/false/off/no`` disable; unset/empty/odd values all count as enabled.
     """
     raw = (load_config().emb_model_auto or "").strip().lower()
     return raw not in ("0", "false", "off", "no")
 
 
 def default_model_for_system() -> tuple[str, str]:
-    """按系统语言给出「应用默认模型」，返回 ``(model_name, reason)``。
+    """Return the "application default model" based on system language, as ``(model_name, reason)``.
 
-    **只影响「什么都没配」这条路径**：显式参数 > ``HIPPOCAMPUS_EMB_MODEL``
-    > 本函数。返回的 ``source`` 仍是 ``"default"``（不是 ``"env"``），这一点
-    **不能改** —— ``MemoryManager._sync_embedder_with_store`` 靠 ``source ==
-    "default"`` 判定「可以跟随库内已有模型」，改成 ``"env"`` 会让所有存量
-    中文库在升级后直接抛 :class:`EmbedderModelMismatchError`。
+    **Only affects the "nothing configured at all" path**: explicit argument >
+    ``HIPPOCAMPUS_EMB_MODEL`` > this function. The returned ``source`` is still
+    ``"default"`` (not ``"env"``), and this **must not change** —
+    ``MemoryManager._sync_embedder_with_store`` uses ``source == "default"`` to
+    decide "may follow the library's existing model"; changing it to ``"env"``
+    would make every existing Chinese library raise
+    :class:`EmbedderModelMismatchError` right after upgrading.
 
-    ``reason`` 取值：
+    ``reason`` values:
 
-        * ``auto_off``          —— 开关关闭，恒为英文基线；
-        * ``not_zh``            —— 系统非中文，走英文基线；
-        * ``zh_local``          —— 中文且中文模型本地已有（直接用）；
-        * ``zh_download``       —— 中文且需首次下载（在线，能用但慢）；
-        * ``zh_unavailable``    —— 中文但离线且本地没有 → **回落英文基线**
-          （宁可检索差一点，也不能让服务起不来）。
+        * ``auto_off``          — switch off, always the English baseline;
+        * ``not_zh``            — system is not Chinese, use the English baseline;
+        * ``zh_local``          — Chinese and the Chinese model is present locally (use it directly);
+        * ``zh_download``       — Chinese and a first-time download is needed (online; works but slow);
+        * ``zh_unavailable``    — Chinese but offline with no local copy → **fall back to the English baseline**
+          (slightly worse retrieval beats a service that cannot start).
     """
     if not auto_model_selection_enabled():
         return DEFAULT_MODEL_NAME, "auto_off"
@@ -326,23 +358,27 @@ def default_model_for_system() -> tuple[str, str]:
 
 
 def _emit_warning(msg: str) -> None:
-    """告警同时走 logging 与 stderr。
+    """Send the warning through both logging and stderr.
 
-    MCP 服务是 stdio 协议，日志走 stderr 才不会被当成协议帧；而脚本场景
-    常常只配了 logging。两边都发，保证"这句警告一定有人看见"。
+    An MCP service speaks the stdio protocol: logs must go to stderr or they get
+    mistaken for protocol frames, while script scenarios often configure only
+    logging. Emitting on both sides guarantees "this warning is always seen by
+    someone".
     """
     logging.warning(msg)
     try:
         print(msg, file=sys.stderr, flush=True)
-    except Exception:  # pragma: no cover - stderr 被关掉时不该连累主流程
+    except Exception:  # pragma: no cover - a closed stderr must not take down the main flow
         pass
 
 
 def _warn_default_model(model_name: str) -> None:
-    """回落到应用默认模型时说清「为什么是这个模型」（防"静默用错模型"复发）。
+    """When falling back to the application default model, explain "why this model" (prevents "silently using the wrong model" from recurring).
 
-    reason 由 :func:`default_model_for_system` 现取 —— 警告文案与选型决策
-    共用同一处判断，避免"文案说英文基线、实际跑的是中文模型"这种自相矛盾。
+    The reason is fetched fresh via :func:`default_model_for_system` — the warning
+    text and the selection decision share the same judgment, avoiding a
+    self-contradiction like "the text says English baseline but a Chinese model
+    is actually running".
     """
     _, reason = default_model_for_system()
     if reason == "zh_unavailable":
@@ -374,20 +410,22 @@ def _warn_default_model(model_name: str) -> None:
 
 
 def resolve_embedder_model(explicit: str | None = None) -> tuple[str, str]:
-    """解析生效嵌入模型名，返回 ``(model_name, source)``。
+    """Resolve the effective embedding model name; return ``(model_name, source)``.
 
-    ``source`` 取值：
+    ``source`` values:
 
-        - ``"explicit"`` — 调用方显式传入（参数或 ``--model``）；
-        - ``"env"``      — 来自 :data:`ENV_MODEL` 环境变量；
-        - ``"default"``  — 都没给，落到 :func:`default_model_for_system`：
-          **系统语言为中文且中文模型可用 → BGE-zh，其余 → MiniLM**。
-          不管选中哪个，来源都记 ``"default"``（供"跟随库内模型"判定）。
+        - ``"explicit"`` — passed in explicitly by the caller (argument or ``--model``);
+        - ``"env"``      — from the :data:`ENV_MODEL` environment variable;
+        - ``"default"``  — neither given, falls to :func:`default_model_for_system`:
+          **system language Chinese and the Chinese model available → BGE-zh,
+          otherwise → MiniLM**. Whichever is chosen, the source is recorded as
+          ``"default"`` (for the "follow the library's model" decision).
 
-    **这是解析模型的唯一真相源。** 以前每个入口各写一遍
-    ``os.environ.get("HIPPOCAMPUS_EMB_MODEL", "")`` 再各自默认，
-    漏一处就静默跑成 MiniLM；集中到这里之后，调用方只需要把 source
-    记进日志，"我现在到底在用哪个模型"就再也不需要猜。
+    **This is the single source of truth for model resolution.** Previously each
+    entry point wrote its own ``os.environ.get("HIPPOCAMPUS_EMB_MODEL", "")``
+    with its own default; missing one spot silently ran MiniLM. Centralized here,
+    callers only need to log the source, and "which model am I actually using
+    right now" never needs guessing again.
     """
     name = (explicit or "").strip()
     if name:
@@ -395,45 +433,48 @@ def resolve_embedder_model(explicit: str | None = None) -> tuple[str, str]:
     name = (load_config().emb_model or "").strip()
     if name:
         return name, "env"
-    # 都没有 → 按**系统语言**选应用默认（中文 → BGE-zh，其余 → MiniLM）。
-    # 🔴 source 必须仍标 "default"，不能标 "env"：
-    # MemoryManager._sync_embedder_with_store 靠 `source == "default"` 判定
-    # 「可以跟随库内已有模型」。标成 "env" 会让所有存量中文库（MiniLM 384D）
-    # 在升级后直接抛 EmbedderModelMismatchError —— 也就是说，这个自动选型
-    # 对老库必须"透明"，只对**新建库**生效。
+    # Nothing set → pick the application default by **system language**
+    # (Chinese → BGE-zh, otherwise → MiniLM).
+    # 🔴 source must still be marked "default", not "env":
+    # MemoryManager._sync_embedder_with_store uses `source == "default"` to decide
+    # "may follow the library's existing model". Marking "env" would make every
+    # existing Chinese library (MiniLM 384D) raise EmbedderModelMismatchError right
+    # after upgrading — i.e. this auto-selection must stay "transparent" to old
+    # libraries and only take effect for **newly created** libraries.
     default_name, _reason = default_model_for_system()
     return default_name, "default"
 
 
 # ==================================================================
-# HashEmbedder — 无依赖的后备嵌入器
+# HashEmbedder — dependency-free fallback embedder
 # ==================================================================
 
 class HashEmbedder:
-    """基于哈希投影的确定性文本嵌入器.
+    """Deterministic text embedder based on hash projection.
 
-    无外部依赖, 保证相同文本始终产生相同嵌入.
-    但无法捕获语义相似性, 仅适用于快速测试.
+    No external dependencies; guarantees the same text always produces the same
+    embedding. But it cannot capture semantic similarity and is only suitable
+    for quick tests.
 
     Args:
-        dim: 输出嵌入维度, 默认 32.
-        salt: 哈希盐值, 用于区分不同嵌入空间.
+        dim: output embedding dimension, default 32.
+        salt: hash salt, used to separate different embedding spaces.
     """
 
     def __init__(self, dim: int = 32, salt: str = "hippocampus_mcp") -> None:
         self.dim = dim
         self.salt = salt
-        # 模型标识：作为多模型向量库中的槽位键
+        # Model identifier: serves as the slot key in the multi-model vector store
         self.model_key = f"hash:{salt}:{dim}"
 
     def embed(self, text: str) -> np.ndarray:
-        """将文本嵌入为固定维度的归一化向量.
+        """Embed text into a fixed-dimension normalized vector.
 
         Args:
-            text: 待嵌入的文本.
+            text: text to embed.
 
         Returns:
-            L2 归一化的 numpy 向量, shape = (dim,).
+            L2-normalized numpy vector, shape = (dim,).
         """
         if not text:
             return np.zeros(self.dim, dtype=np.float64)
@@ -472,40 +513,41 @@ class HashEmbedder:
         return vec
 
     def embed_query(self, text: str) -> np.ndarray:
-        """嵌入查询文本.
+        """Embed a query text.
 
-        哈希嵌入器无指令前缀概念, 与 :meth:`embed` 完全等价。此方法的存在
-        是为了满足嵌入器协议——``MemoryManager.recall()`` 一律走
-        ``embed_query``，缺了它回退后端会在召回时直接 ``AttributeError``
-        （覆盖报告 D5，已修）。
+        The hash embedder has no instruction-prefix concept; fully equivalent to
+        :meth:`embed`. This method exists to satisfy the embedder protocol —
+        ``MemoryManager.recall()`` always goes through ``embed_query``; without
+        it the fallback backend would raise ``AttributeError`` at recall time
+        (coverage report D5, fixed).
 
         Args:
-            text: 查询文本.
+            text: query text.
 
         Returns:
-            L2 归一化的 numpy 向量, shape = (dim,).
+            L2-normalized numpy vector, shape = (dim,).
         """
         return self.embed(text)
 
     def embed_batch(self, texts: list[str]) -> np.ndarray:
-        """批量嵌入文本.
+        """Embed texts in batch.
 
         Args:
-            texts: 待嵌入的文本列表.
+            texts: list of texts to embed.
 
         Returns:
-            (N, dim) 的 numpy 矩阵.
+            (N, dim) numpy matrix.
         """
         return np.vstack([self.embed(t) for t in texts])
 
 
     @property
     def max_seq_length(self) -> int:
-        """hash 后端按字符 n-gram 哈希，不看 token，因此没有截断上限（0 = 无上限）。"""
+        """The hash backend hashes character n-grams and never looks at tokens, so there is no truncation cap (0 = no cap)."""
         return 0
 
     def embedding_coverage(self, text: str) -> dict:
-        """hash 后端对整段文本都可见，恒不截断。"""
+        """The hash backend sees the entire text and never truncates."""
         total = len(text or "")
         return {
             "truncated": False,
@@ -517,40 +559,46 @@ class HashEmbedder:
         }
 
 # ==================================================================
-# SentenceTransformerEmbedder — 语义嵌入器 (推荐)
+# SentenceTransformerEmbedder — semantic embedder (recommended)
 # ==================================================================
 
 class SentenceTransformerEmbedder:
-    """基于 sentence-transformers 的语义文本嵌入器.
+    """Semantic text embedder based on sentence-transformers.
 
-    默认 all-MiniLM-L6-v2 (384 维, 英文)。中文场景推荐 BGE 系列:
-        - BAAI/bge-small-zh-v1.5 (512 维, 24M, CPU 快)
-        - BAAI/bge-base-zh-v1.5 (768 维, 102M, CPU 可跑, 中文检索 ndcg@10 ~70)
+    Defaults to all-MiniLM-L6-v2 (384 dims, English). For Chinese, the BGE
+    family is recommended:
+        - BAAI/bge-small-zh-v1.5 (512 dims, 24M, fast on CPU)
+        - BAAI/bge-base-zh-v1.5 (768 dims, 102M, runs on CPU, Chinese retrieval ndcg@10 ~70)
 
-    BGE 系列遵循官方用法: 查询侧加指令前缀, 文档侧不加。
-    embed() = 文档侧 (默认), embed_query() = 查询侧 (自动加前缀)。
+    The BGE family follows the official usage: the query side gets the
+    instruction prefix, the document side does not.
+    embed() = document side (default), embed_query() = query side (prefix added automatically).
 
-    模型会在首次调用 embed() 时懒加载 (避免启动延迟).
-    首次加载需要下载模型权重, 后续从本地缓存加载.
+    The model is lazily loaded on the first embed() call (avoids startup delay).
+    The first load downloads the model weights; afterwards it loads from the
+    local cache.
 
     Args:
-        model_name: 模型名称。**推荐显式传**；留空时依次取
-            ``HIPPOCAMPUS_EMB_MODEL`` 环境变量、再回落 ``all-MiniLM-L6-v2``
-            （回落时会打警告，见 :func:`resolve_embedder_model`）。
-            中文场景建议 "BAAI/bge-base-zh-v1.5" 或 "BAAI/bge-small-zh-v1.5"。
-        cache_folder: 模型缓存目录. 默认为项目 libs/ 下的 models 目录.
-        libs_path: 项目 libs/ 目录路径, 用于添加到 sys.path 以加载依赖.
+        model_name: model name. **Explicitly passing it is recommended**; when
+            empty, take the ``HIPPOCAMPUS_EMB_MODEL`` environment variable, then
+            fall back to ``all-MiniLM-L6-v2`` (a warning is emitted on fallback,
+            see :func:`resolve_embedder_model`).
+            For Chinese, "BAAI/bge-base-zh-v1.5" or "BAAI/bge-small-zh-v1.5" is suggested.
+        cache_folder: model cache directory. Defaults to the models directory under the project libs/.
+        libs_path: project libs/ directory path, added to sys.path to load dependencies.
     """
 
-    # 默认模型和维度。注意：这里是**应用兜底默认值**，不是"中文生产库的推荐值"。
-    # 中文语料请显式指定 BAAI/bge-*-zh-v1.5（见 resolve_embedder_model）。
+    # Default model and dimension. Note: these are the **application fallback
+    # defaults**, not "recommended values for Chinese production libraries".
+    # For Chinese corpora explicitly specify BAAI/bge-*-zh-v1.5 (see
+    # resolve_embedder_model).
     DEFAULT_MODEL = DEFAULT_MODEL_NAME
     DEFAULT_DIM = 384
 
-    # BGE zh 系列官方查询指令前缀 (只加在查询侧)
+    # Official BGE zh query instruction prefix (query side only)
     BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
-    # 已知模型的维度 (用于初始化前预估, 实际维度以模型输出为准)
+    # Known model dimensions (to estimate before init; the model's actual output is authoritative)
     KNOWN_DIMS = {
         "all-MiniLM-L6-v2": 384,
         "BAAI/bge-small-zh-v1.5": 512,
@@ -559,10 +607,10 @@ class SentenceTransformerEmbedder:
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
     }
 
-    # 环境变量：显式指定模型缓存根目录
+    # Env var: explicitly specify the model cache root directory
     ENV_CACHE = "HIPPOCAMPUS_EMB_CACHE"
 
-    # 模型目录的必备文件（用于判定"这个目录真的是一份模型"）
+    # Required files of a model directory (to judge "is this directory really a model")
     _MODEL_MARKERS = ("config.json", "modules.json")
 
     def __init__(
@@ -571,9 +619,10 @@ class SentenceTransformerEmbedder:
         cache_folder: Optional[str] = None,
         libs_path: Optional[str] = None,
     ) -> None:
-        # 未显式指定 → 依次看 env → 默认值，并把**来源**记下来。
-        # `model_source == "default"` 时会大声告警：这条路径就是历史上
-        # "服务静默回落 MiniLM"的入口，必须让它可见。
+        # Not explicitly specified → check env → default in order, and record the
+        # **source**. When `model_source == "default"` a loud warning fires: this
+        # path is the historic entry point of "the service silently fell back to
+        # MiniLM" and must be made visible.
         resolved, source = resolve_embedder_model(model_name)
         self.model_name = resolved
         self.model_source = source
@@ -581,7 +630,7 @@ class SentenceTransformerEmbedder:
         if source == "default":
             _warn_default_model(resolved)
         model_name = resolved
-        # BGE 系列写全名 (BAAI/xxx), 短名兼容
+        # BGE family takes the full name (BAAI/xxx); short names are compatible
         if model_name in ("bge-base-zh-v1.5", "bge-base-zh"):
             model_name = "BAAI/bge-base-zh-v1.5"
         elif model_name in ("bge-small-zh-v1.5", "bge-small-zh"):
@@ -591,64 +640,74 @@ class SentenceTransformerEmbedder:
         self.model_name = model_name
         self.dim = self.KNOWN_DIMS.get(model_name, self.DEFAULT_DIM)
         self._model = None
-        #: 模型**完全就绪**（含维度探测的 test encode 也跑完）才算 True。
-        #: 只有 ``_model`` 非空就放行会让别的线程与未结束的 test encode 并发。
+        #: True only when the model is **fully ready** (including the
+        #: dimension-probing test encode). Letting threads through when ``_model``
+        #: is merely non-empty would let them race with an unfinished test encode.
         self._model_ready = False
         self._cache_folder = cache_folder
         self._libs_path = libs_path
-        # 实际加载用到的模型目录（诊断用：加载后才知道，失败时是 None）
+        # Model directory actually used for loading (diagnostics; known only
+        # after loading, None on failure)
         self.resolved_model_path: str | None = None
 
-        # 模型标识：作为多模型向量库中的槽位键（换模型即换槽位，互不覆盖）
+        # Model identifier: slot key in the multi-model vector store (switching
+        # models switches slots; no cross-overwriting)
         self.model_key = self.model_name
 
-        # BGE 系列在查询侧需要加指令前缀
+        # The BGE family needs the instruction prefix on the query side
         self.is_bge = model_name.startswith("BAAI/bge")
 
-        # 推断默认 libs 路径 (项目根目录/libs)
+        # Infer the default libs path (project root/libs)
         if self._libs_path is None:
-            # 从当前文件位置推断项目根目录
-            # embeddings.py 位于 src/hippocampus_mcp/embeddings.py
+            # Infer the project root from this file's location
+            # embeddings.py sits at src/hippocampus_mcp/embeddings.py
             current_dir = os.path.dirname(os.path.abspath(__file__))
             # src/hippocampus_mcp -> src -> project_root
             project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
             self._libs_path = os.path.join(project_root, "libs")
 
-        # 解析缓存候选目录（缺陷·阻断 2）
+        # Resolve cache candidate directories (defect blocker 2)
         self._cache_candidates = self._resolve_cache_candidates(cache_folder)
-        # 兼容旧属性：默认取第一个候选（存在的优先），供 os.makedirs / 日志用
+        # Back-compat attribute: default to the first candidate (existing ones
+        # preferred), for os.makedirs / logging
         self._cache_folder = next(
             (d for d in self._cache_candidates if os.path.isdir(d)),
             self._cache_candidates[0],
         )
 
-        # H2：ONNX 后端（组合）。挂载成功则本实例退化成薄壳，编码动作全部
-        # 转发给 _onnx，torch / sentence-transformers **一次都不会被 import**
-        # ——这正是省 ~280MB 的机制所在。
+        # H2: ONNX backend (composition). If mounted, this instance becomes a thin
+        # shell and all encoding is forwarded to _onnx; torch / sentence-transformers
+        # are **never imported even once** — that is exactly the ~280MB saving mechanism.
         self._onnx: object | None = None
-        #: F6：本实例的重对象是否来自进程级共享池（同模型的别的库也在用）
+        #: F6: whether this instance's heavy object came from the process-level
+        #: shared pool (other libraries of the same model are using it too)
         self.shared_from_pool = False
         self._attach_onnx()
-        # 登记到进程级生命周期。卸载要知道"该去通知谁"，而这里不能用
-        # 强引用（否则嵌入器永远不会被回收，卸载也就没了意义）。
+        # Register with the process-level lifecycle. Unloading needs to know
+        # "whom to notify", and a strong reference must not be used here
+        # (otherwise the embedder is never collected and unloading is meaningless).
         _ML.register(self)
 
     def release_model(self) -> bool:
-        """卸载模型本体，**保留本实例与它的后端决策**。
+        """Unload the model itself, **keeping this instance and its backend decision**.
 
-        刻意**不**把 ``_onnx`` 置成 None：``_ensure_model`` 的快路径靠
-        ``self._onnx is not None`` 走 ONNX 分支；置空会让下一次加载退回
-        torch 路径（慢且多吃 ~280MB），等于自伤。让 OnnxEmbedder 自己卸掉
-        session/tokenizer、把 ``_model_ready`` 置 False，重载时自然回到原后端。
+        Deliberately **not** setting ``_onnx`` to None: ``_ensure_model``'s fast
+        path relies on ``self._onnx is not None`` to take the ONNX branch; nulling
+        it would make the next load fall back to the torch path (slow and ~280MB
+        heavier), i.e. self-inflicted harm. Let OnnxEmbedder unload its own
+        session/tokenizer and set ``_model_ready`` False; a reload naturally
+        returns to the original backend.
 
         Returns:
-            是否做了「已加载 → 未加载」的状态复位（本来就没加载返回 False）。
+            Whether the "loaded → unloaded" state reset happened (False if it was never loaded).
         """
-        # 🔴 不能用子对象的返回值判断自己要不要复位：共享池里那份可能已经被
-        # 别的嵌入器先卸过一轮（此时它返回 False），于是本实例明明已经没有
-        # 模型，``_model_ready`` 却还停在 True。torch 路径下这就是真事故——
-        # ``embed()`` 的快路径会因为 ``_model is not None and _model_ready``
-        # 不成立而走到 ``self._model.encode(...)``，而 _model 已经是 None。
+        # 🔴 Cannot use the child object's return value to decide whether to reset
+        # self: the copy in the shared pool may already have been unloaded by another
+        # embedder (in which case it returns False), so this instance has no model
+        # left while ``_model_ready`` still sits at True. On the torch path this is
+        # a real accident — ``embed()``'s fast path fails
+        # ``_model is not None and _model_ready`` and falls through to
+        # ``self._model.encode(...)`` while _model is already None.
         was_loaded = bool(
             self._model_ready or self._model is not None
             or self._onnx is not None)
@@ -665,60 +724,69 @@ class SentenceTransformerEmbedder:
         if was_loaded:
             self._model_ready = False
             self.shared_from_pool = False
-            # ⚠️ 别清 resolved_model_path：ONNX 路径下重载走的是
-            # ``_onnx._ensure_model``，不会再进 ``_load_model``，清了就永久
-            # 丢掉"模型实际用的是哪个目录"这条自曝信息。
+            # ⚠️ Do not clear resolved_model_path: on the ONNX path a reload goes
+            # through ``_onnx._ensure_model`` and never re-enters ``_load_model``;
+            # clearing it permanently loses the self-report of "which directory the
+            # model actually came from".
         return bool(was_loaded or released_any)
 
     def _pool_key(self, load_path: str) -> tuple[str, str]:
-        """torch 侧池键 = （后端 kind, 绝对路径/模型名）。
+        """Torch-side pool key = (backend kind, absolute path / model name).
 
-        带 kind 是因为 ``auto`` 回退 torch 与显式 ``torch`` 拿到的是同一份
-        权重，本可共用；但同一进程内 kind 不变，带上它只为让自曝更可读。
+        The kind is included because ``auto`` falling back to torch and explicit
+        ``torch`` get the same weights and could share; but kind never changes
+        within a process, so carrying it only makes the self-report more readable.
         """
         p = os.path.abspath(load_path) if os.path.isdir(load_path) else load_path
         return (backend_kind(), p)
 
     # ------------------------------------------------------------------
-    # 缓存目录解析
+    # Cache directory resolution
     # ------------------------------------------------------------------
     def _resolve_cache_candidates(self, cache_folder: Optional[str]) -> list[str]:
-        """返回按优先级排列的缓存根目录候选列表。
+        """Return the cache root directory candidates ordered by priority.
 
-        显式参数或 ``HIPPOCAMPUS_EMB_CACHE`` 存在时**只认它**（尊重显式配置，
-        避免"我明明指了路却还是去别处找"的困惑）；否则用默认候选链。
+        When the explicit argument or ``HIPPOCAMPUS_EMB_CACHE`` exists, **only it
+        is honored** (respect explicit configuration, avoiding the confusion of
+        "I pointed at a path and it still looked elsewhere"); otherwise use the
+        default candidate chain.
 
-        实现已移到模块级 :func:`_cache_roots`（供"按语言选默认模型"
-        在不构造嵌入器的前提下探测本地模型），本方法保留为薄壳。
+        The implementation moved to module-level :func:`_cache_roots` (so "pick
+        the default model by language" can probe local models without
+        constructing an embedder); this method remains a thin shell.
         """
         return _cache_roots(self._libs_path or "", cache_folder or "")
 
     def _find_local_model(self) -> str | None:
-        """在候选目录里找本地模型目录，找不到返回 ``None``。
+        """Find the local model directory among the candidates; return ``None`` if absent.
 
-        三种命中形态：
-            - ``<候选根>/<短名>``（如 ``libs/models/bge-base-zh-v1.5``）——
-              本机 BGE 就是这个形态；
-            - ``<候选根>`` 本身就是模型目录（basename == 短名，且有 config.json）；
-            - **HF hub 布局** ``<候选根>/models--<org>--<名>/snapshots/<hash>/``
-              —— sentence-transformers 从 HuggingFace 下载后落盘就是这个形态。
-              少了这一条，本机只有 hub 布局的模型（如 all-MiniLM-L6-v2）在离线时
-              会报 FileNotFoundError，而**实际缓存是齐的**，只是没被认出来。
+        Three hit shapes:
+            - ``<candidate root>/<short name>`` (e.g. ``libs/models/bge-base-zh-v1.5``) —
+              the shape BGE has on this machine;
+            - ``<candidate root>`` itself is the model directory (basename == short
+              name, and config.json exists);
+            - **HF hub layout** ``<candidate root>/models--<org>--<name>/snapshots/<hash>/``
+              — what sentence-transformers persists after downloading from
+              HuggingFace. Without this case, a hub-layout-only model on this
+              machine (e.g. all-MiniLM-L6-v2) would raise FileNotFoundError offline
+              even though **the cache is actually complete** — just unrecognized.
         """
         return local_model_dir(self.model_name, self._cache_candidates)
 
     @classmethod
     def _find_hf_snapshot(cls, root: str, short: str) -> str | None:
-        """按 HF hub 布局在 ``root`` 下找模型，返回 snapshot 目录或 ``None``。
+        """Find the model under ``root`` following the HF hub layout; return the snapshot directory or ``None``.
 
-        目标形态：``<root>/models--<org>--<short>/snapshots/<hash>/``。
+        Target shape: ``<root>/models--<org>--<short>/snapshots/<hash>/``.
 
-        从 ``model_name`` 反推 org 不可靠（``"all-MiniLM-L6-v2"`` 根本没带 org，
-        实际目录却叫 ``models--sentence-transformers--all-MiniLM-L6-v2``），
-        所以这里**按目录名后缀模糊匹配**，不构造 org 前缀。
+        Recovering the org from ``model_name`` is unreliable (``"all-MiniLM-L6-v2"``
+        carries no org at all, yet the actual directory is named
+        ``models--sentence-transformers--all-MiniLM-L6-v2``), so this matches the
+        directory-name suffix fuzzily and never constructs an org prefix.
 
-        目录名大小写在 Windows 上不敏感、在 Linux 上敏感，故两端都 lower 比较。
-        多个 snapshot 时取排序最大的一个（并用 ``_looks_like_model`` 滤掉空壳）。
+        Directory-name case is insensitive on Windows and sensitive on Linux, so
+        both sides compare lowercased. With multiple snapshots, take the largest
+        in sorted order (and filter empty shells via ``_looks_like_model``).
         """
         if not os.path.isdir(root):
             return None
@@ -737,39 +805,42 @@ class SentenceTransformerEmbedder:
 
     @classmethod
     def _looks_like_model(cls, path: str) -> bool:
-        """目录里是否有模型必需文件（缺了说明只是个空壳/半截下载）。"""
+        """Does the directory contain the model-required files (missing means it is just an empty shell / half-finished download)?"""
         return os.path.isfile(os.path.join(path, "config.json")) or os.path.isfile(
             os.path.join(path, "modules.json")
         )
 
     def describe_source(self) -> str:
-        """一句话说明"这个嵌入器最终会从哪加载、加载了没"。"""
+        """One-line description of "where this embedder will finally load from and whether it has loaded"."""
         where = self.resolved_model_path or "(not yet loaded)"
         return f"{self.model_name} @ {where}"
 
     def _attach_onnx(self, *, from_store: bool = False) -> bool:
-        """尝试挂载 ONNX 后端，返回**是否挂上**。
+        """Try to mount the ONNX backend; return **whether it mounted**.
 
-        🔴 **调用时机是本方法的全部难点**（修过的一个坑）：
-        构造时 ``self.model_name`` 可能只是**回落的默认值**，而真正生效的
-        模型要到 ``manager._follow_store_model()``（加载库之后）才确定。
-        所以本方法**必须能被重复调用**，且"模型名还没定"时**不许抛错**——
-        否则显式 ``onnx`` 会在装配阶段就炸掉，而 ``auto`` 会静默回退 torch
-        （表现为"我以为在用 ONNX，其实没有"）。
+        🔴 **The call timing is the entire difficulty of this method** (a pit fixed
+        once): at construction time ``self.model_name`` may just be a **fallback
+        default**, while the actually effective model is only settled in
+        ``manager._follow_store_model()`` (after loading the library). So this
+        method **must be callable repeatedly**, and when "the model name is not
+        settled yet" it **must not raise** — otherwise explicit ``onnx`` would blow
+        up during assembly, and ``auto`` would silently fall back to torch
+        (presenting as "I thought I was on ONNX, but I was not").
 
-        三态语义：
+        Three-state semantics:
 
-        * ``torch`` → 直接返回 False（今天的行为，零变化）
-        * ``auto``  → 有产物就用，没有就安静走 torch
-        * ``onnx``  → 缺产物/缺依赖**抛错**，但下面两种情况例外（都不算
-          用户显式指定模型，抛错只会误伤）：
-          - ``model_source == "default"``（模型名是回落出来的）
-          - ``from_store=True``（模型名是跟随库数据来的）
+        * ``torch`` → return False directly (today's behavior, zero change)
+        * ``auto``  → use artifacts if present, quietly go torch otherwise
+        * ``onnx``  → missing artifacts/dependencies **raise**, with two exceptions
+          (neither counts as the user explicitly specifying a model; raising would
+          only cause collateral damage):
+          - ``model_source == "default"`` (the model name came from a fallback)
+          - ``from_store=True`` (the model name came from following the library's data)
         """
         kind = backend_kind()
         if kind == "torch":
             return False
-        # 模型名是否"用户显式指定"：只有显式时才允许严格抛错
+        # Is the model name "explicitly specified by the user": strict raising only when explicit
         strict = kind == "onnx" and not from_store and self.model_source != "default"
         try:
             from .onnx_embedder import OnnxEmbedder, find_onnx_artifacts
@@ -782,7 +853,7 @@ class SentenceTransformerEmbedder:
                 "embedding backend: torch (ONNX dependencies unavailable: %s)", e,
             )
             return False
-        # ONNX 路只认本地目录（它本就不联网、不碰 torch）
+        # The ONNX path only accepts local directories (it never goes online nor touches torch)
         model_dir = self._find_local_model()
         if not model_dir and os.path.isdir(self.model_name):
             model_dir = self.model_name
@@ -810,38 +881,43 @@ class SentenceTransformerEmbedder:
                 ", and the model name is not final yet" if not from_store else "",
             )
             return False
-        # F6：命中共享池就不新建 session / 不重读 tokenizer.json。
-        # ``OnnxEmbedder`` 只装 session + tokenizer，无随库变化的状态，
-        # 可以安全共用；本实例自己的 ``model_source`` / ``model_explicit``
-        # 不受影响（那是"模型名怎么来的"，必须每个库各算各的）。
+        # F6: on a shared-pool hit, do not create a new session / re-read tokenizer.json.
+        # ``OnnxEmbedder`` only holds session + tokenizer, no per-library state,
+        # so sharing is safe; this instance's own ``model_source`` / ``model_explicit``
+        # are unaffected (that is "where the model name came from" and must be
+        # computed per library).
         self._onnx = get_shared_onnx(
             model_dir=model_dir, model_name=self.model_name
         )
         self.shared_from_pool = bool(getattr(self._onnx, "shared_from_pool", False))
         self.dim = getattr(self._onnx, "dim", self.dim)
-        # 池里的实例可能已被别的库加载过；路径自曝取实例自己的（未加载时
-        # 是 None，与"本实例还没 encode"的事实一致）。
+        # The pooled instance may already have been loaded by another library; take
+        # the path self-report from the instance itself (None when not loaded,
+        # consistent with the fact that "this instance has not encoded yet").
         self.resolved_model_path = getattr(self._onnx, "resolved_model_path", None)
         logger.info("embedding backend: ONNX (%s) %s; torch/ST are not loaded at runtime",
                     model_dir, "(reusing the in-process shared instance)" if self.shared_from_pool else "")
         return True
 
     def _ensure_model(self) -> None:
-        """懒加载模型. 首次调用时加载, 后续直接复用.
+        """Lazily load the model. Load on first call, reuse afterwards.
 
-        **必须跨线程串行**（见 ``_MODEL_LOAD_LOCK``）：模型加载会顺带
-        ``import sentence_transformers`` → ``scipy.special`` → 加载
-        ``_ufuncs.pyd`` 这个 C 扩展。两个线程同时导入同一批模块，
-        CPython 的 per-module 锁会让两边互相等（实测：预热线程与工具线程
-        同时进 ``_ensure_model`` 后，两边都停在 importlib 的模块锁上不动）。
-        预热已挪到后台线程，所以这种并发是常态而非边缘情况。
+        **Must be serialized across threads** (see ``_MODEL_LOAD_LOCK``): model
+        loading triggers ``import sentence_transformers`` → ``scipy.special`` →
+        loading the ``_ufuncs.pyd`` C extension. If two threads import the same
+        modules simultaneously, CPython's per-module locks make them wait on each
+        other (measured: the warmup thread and a tool thread both entered
+        ``_ensure_model`` and both stalled on importlib's module locks).
+        Warmup has moved to a background thread, so this concurrency is the norm
+        rather than an edge case.
         """
-        # 快路径：已加载则完全无锁开销。**必须看 _model_ready**：模型对象赋值
-        # 之后还要跑一次 test encode 才算真正可用，只看 _model 会让并发线程
-        # 提前放行（见 _load_model 末尾的注释）。
+        # Fast path: if already loaded, zero lock overhead. **Must check
+        # _model_ready**: after the model object is assigned, a test encode still
+        # has to run before it is truly usable; checking only _model would let
+        # concurrent threads through early (see the comment at the end of _load_model).
         if self._onnx is not None:
-            # ONNX 路：模型就是 session + Rust tokenizer，加载极快，且没有
-            # ST 那个"Rust 可变借用"并发问题。
+            # ONNX path: the model is just session + Rust tokenizer; loading is
+            # very fast and lacks ST's "Rust mutable borrow" concurrency problem.
             self._onnx._ensure_model()
             self.dim = self._onnx.dim
             self._model_ready = True
@@ -850,25 +926,29 @@ class SentenceTransformerEmbedder:
             return
         with _MODEL_LOAD_LOCK:
             if self._model is not None and self._model_ready:
-                return               # 双重检查：等锁期间别人可能已加载完
-            # 加载本身也算"正在使用"：否则刚好跨过空闲阈值的这次加载，
-            # 会被另一边的卸载把 session 抽掉。
+                return               # Double check: another thread may have finished loading while we waited for the lock
+            # Loading also counts as "in use": otherwise this load, which happens
+            # to straddle the idle threshold, would have its session pulled out
+            # from under it by the other side's unload.
             _ML.touch()
             self._load_model()
 
     def _load_model(self) -> None:
-        """真正构造模型（只在持锁状态下被 ``_ensure_model`` 调用）。"""
-        # 使用 HuggingFace 国内镜像避免连接超时
+        """Actually construct the model (called by ``_ensure_model`` only while holding the lock)."""
+        # Use the HuggingFace China mirror to avoid connection timeouts
         if "HF_ENDPOINT" not in os.environ:
             os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-        # 将 libs/ 作为**兜底**追加到 sys.path（不是覆盖系统已装依赖）。
-        # 🔴 2026-11-03 实测：这里原先是 `sys.path.insert(0, libs)`，libs 里
-        # 残留的 `regex`（cp310 的 `_regex.cp310-win_amd64.pyd`）在 3.11 上
-        # 加载失败，抢在 site-packages 之前把好包遮蔽，报出来的却是
-        # "cannot import name '_regex' … circular import"，看上去像依赖没装。
-        # 追加到末尾才是「项目内便携依赖」的正确语义：系统有的先用系统，
-        # 没有才吃项目内——insert(0) 会让一个过期轮子废掉整条嵌入链路。
+        # Append libs/ to sys.path as a **fallback** (not overriding
+        # system-installed dependencies).
+        # 🔴 Measured 2026-11-03: this used to be `sys.path.insert(0, libs)`; a
+        # leftover `regex` in libs (cp310's `_regex.cp310-win_amd64.pyd`) failed to
+        # load on 3.11, shadowing the good package ahead of site-packages, and the
+        # error surfaced as "cannot import name '_regex' … circular import",
+        # looking like missing dependencies.
+        # Appending to the end is the correct semantics for "in-project portable
+        # dependencies": use the system's if present, only then the project's —
+        # insert(0) lets one stale wheel wreck the whole embedding chain.
         if self._libs_path and self._libs_path not in sys.path:
             sys.path.append(self._libs_path)
 
@@ -882,16 +962,17 @@ class SentenceTransformerEmbedder:
                 f"libs_path: {self._libs_path}"
             ) from e
 
-        # 本地目录优先：在候选链里找现成的模型目录
+        # Local directory first: look for a ready model directory along the candidate chain
         load_path = self._find_local_model()
         offline = os.environ.get("HF_HUB_OFFLINE", "") not in ("", "0", "false", "False")
 
         if load_path is None:
             if os.path.isdir(self.model_name):
-                # model_name 本身就是一个目录路径
+                # model_name itself is a directory path
                 load_path = self.model_name
             elif offline:
-                # 离线且本地没有 → 明确报错，别让 SentenceTransformer 去联网等超时
+                # Offline with no local copy → error out explicitly; do not let
+                # SentenceTransformer go online and wait for a timeout
                 tried = "\n".join(f"    - {c}" for c in self._cache_candidates)
                 raise FileNotFoundError(
                     f"离线模式（HF_HUB_OFFLINE=1）下找不到模型 {self.model_name!r} 的本地副本。\n"
@@ -904,7 +985,7 @@ class SentenceTransformerEmbedder:
                     f"  3) 去掉 HF_HUB_OFFLINE 让它可以联网下载。"
                 )
             else:
-                # 在线：交给 SentenceTransformer 按常规方式解析/下载
+                # Online: let SentenceTransformer resolve/download the usual way
                 load_path = self.model_name
 
         if os.path.dirname(load_path):
@@ -912,9 +993,10 @@ class SentenceTransformerEmbedder:
         else:
             os.makedirs(self._cache_folder, exist_ok=True)
 
-        # F6：命中共享池 ⇒ 直接用别人已加载好的模型对象，不 import
-        # sentence_transformers、不读权重、不跑 test encode。多库同时开时
-        # 省下的就是第二份权重（实测 ≈404MB）与第二次 ~30s 加载。
+        # F6: shared-pool hit ⇒ use the model object another library already
+        # loaded; no import of sentence_transformers, no weight reading, no test
+        # encode. With multiple libraries open at once this saves the second copy
+        # of the weights (measured ≈404MB) and a second ~30s load.
         pool_key = self._pool_key(load_path)
         if shared_embedder_enabled():
             with _MODEL_POOL_LOCK:
@@ -930,9 +1012,10 @@ class SentenceTransformerEmbedder:
                 )
                 return
 
-        # 加载模型
-        # 加载要几十秒，先 flush 一行 stderr 状态 —— 让"慢"与"坏"可区分
-        # （stdout 是 JSON-RPC 专用通道，状态只能走 stderr，同 launcher._diag）。
+        # Load the model
+        # Loading takes tens of seconds; flush one stderr status line first —
+        # making "slow" distinguishable from "broken" (stdout is the JSON-RPC-only
+        # channel; status goes to stderr, same as launcher._diag).
         print(f"[hippocampus] loading embedding model: {load_path}"
               f"(tens of seconds of cold start is normal; for repeated hangs check the daemon log)",
               file=sys.stderr, flush=True)
@@ -942,31 +1025,36 @@ class SentenceTransformerEmbedder:
         )
         self.resolved_model_path = load_path
 
-        # H7：_prepare_torch 不再无条件导入 torch（numpy LNN 生产路径零 torch）。
-        # 这条 ST 回退路是 torch 真正进场的另一扇门，单线程限制在这里补上
-        # （Windows 下 OpenMP 多线程偶发 access violation，见 server._prepare_torch）。
+        # H7: _prepare_torch no longer imports torch unconditionally (the numpy
+        # LNN production path has zero torch). This ST fallback path is the other
+        # door through which torch actually enters, so the single-thread limit is
+        # added here (Windows OpenMP multithreading occasionally access-violates;
+        # see server._prepare_torch).
         try:
             import torch as _torch
 
             _torch.set_num_threads(1)
-        except Exception:  # noqa: BLE001 - 线程限制失败不该让模型加载失败
+        except Exception:  # noqa: BLE001 - a failed thread limit must not fail model loading
             pass
 
-        # 更新实际维度 (以防模型与预期不同)。
-        # 同样要过 _ENCODE_LOCK：这次 encode 与任何业务侧 encode 撞上都会抛
-        # "Already borrowed"（Rust tokenizer 的可变借用）。
+        # Update the actual dimension (in case the model differs from expectations).
+        # This encode must also go through _ENCODE_LOCK: colliding with any
+        # business-side encode would raise "Already borrowed" (the Rust
+        # tokenizer's mutable borrow).
         with _ENCODE_LOCK:
             test_vec = self._model.encode("test", normalize_embeddings=True)
         self.dim = len(test_vec)
         print(f"[hippocampus] embedding model ready: {load_path}（{self.dim}D)",
               file=sys.stderr, flush=True)
-        # **最后**才置位：在此之前 ``self._model`` 已经非空，若没有这个标志，
-        # 另一个线程会在 ``_ensure_model`` 的快路径上直接放行，与本线程尚未
-        # 结束的 test encode 并发 —— 实测正是 daemon 首个工具调用就炸的原因。
+        # Set the flag **last**: before this, ``self._model`` is already non-empty;
+        # without this flag another thread would sail through ``_ensure_model``'s
+        # fast path and race with this thread's unfinished test encode — measured
+        # as exactly why the daemon's first tool call blew up.
         self._model_ready = True
 
-        # F6：入池，供同进程内同模型的其它库复用（超过上限就不入池，
-        # 不报错——只是这份不再被复用）。
+        # F6: put into the pool for other libraries of the same model in this
+        # process to reuse (over the cap, skip pooling without erroring — this
+        # copy just will not be reused).
         if shared_embedder_enabled():
             with _MODEL_POOL_LOCK:
                 if len(_MODEL_POOL) < POOL_MAX:
@@ -975,13 +1063,13 @@ class SentenceTransformerEmbedder:
 
     @_with_model_use
     def embed(self, text: str) -> np.ndarray:
-        """将文本嵌入为固定维度的归一化语义向量 (文档侧, 无指令前缀).
+        """Embed text into a fixed-dimension normalized semantic vector (document side, no instruction prefix).
 
         Args:
-            text: 待嵌入的文本.
+            text: text to embed.
 
         Returns:
-            L2 归一化的 numpy 向量, shape = (dim,).
+            L2-normalized numpy vector, shape = (dim,).
         """
         if self._onnx is not None:
             return self._onnx.embed(text)
@@ -991,9 +1079,10 @@ class SentenceTransformerEmbedder:
 
         self._ensure_model()
 
-        # encode 返回 numpy 数组, normalize_embeddings=True 做 L2 归一化。
-        # 加锁原因见 _ENCODE_LOCK：tokenizer 的 enable_truncation 是可变借用，
-        # 并发调用会抛 "Already borrowed"，异常被工具层吃掉后表现为**静默丢记录**。
+        # encode returns a numpy array; normalize_embeddings=True does L2 normalization.
+        # Why the lock: see _ENCODE_LOCK — the tokenizer's enable_truncation is a
+        # mutable borrow; concurrent calls raise "Already borrowed", and after the
+        # tool layer swallows the exception it presents as **silently lost records**.
         with _ENCODE_LOCK:
             vec = self._model.encode(
                 text,
@@ -1004,16 +1093,16 @@ class SentenceTransformerEmbedder:
 
     @_with_model_use
     def embed_query(self, text: str) -> np.ndarray:
-        """嵌入查询文本 (查询侧).
+        """Embed a query text (query side).
 
-        BGE zh 系列官方要求查询加指令前缀, 文档侧不加;
-        其他模型的行为与 embed() 相同.
+        The official BGE zh requirement: queries get the instruction prefix,
+        documents do not; other models behave the same as embed().
 
         Args:
-            text: 查询文本.
+            text: query text.
 
         Returns:
-            L2 归一化的 numpy 向量, shape = (dim,).
+            L2-normalized numpy vector, shape = (dim,).
         """
         if self.is_bge:
             text = self.BGE_ZH_QUERY_PREFIX + text
@@ -1021,13 +1110,13 @@ class SentenceTransformerEmbedder:
 
     @_with_model_use
     def embed_batch(self, texts: list[str]) -> np.ndarray:
-        """批量嵌入文本, 利用 GPU 批处理加速.
+        """Embed texts in batch, exploiting GPU batch acceleration.
 
         Args:
-            texts: 待嵌入的文本列表.
+            texts: list of texts to embed.
 
         Returns:
-            (N, dim) 的 numpy 矩阵, 每行已 L2 归一化.
+            (N, dim) numpy matrix, each row L2-normalized.
         """
         if self._onnx is not None:
             return self._onnx.embed_batch(texts)
@@ -1048,16 +1137,19 @@ class SentenceTransformerEmbedder:
 
     @property
     def max_seq_length(self) -> int:
-        """嵌入模型能吃下的最大 token 数（0 = 取不到，按"未知"处理）。
+        """The maximum number of tokens the embedding model accepts (0 = unavailable, treated as "unknown").
 
-        BGE / MiniLM 一系 transformer 后端是 **512**，这是**模型硬上限**：
-        超出的部分在 encode 时被静默丢掉，对向量**零贡献**。实测（中文库
-        主卡 1374 token）``cos(embed(前600字), embed(全文)) = 1.000000``
-        ——第 600 字之后完全不可检索。写入侧必须拿它做截断自曝，否则
-        "写进去了但检索看不见"这件事永远没有人知道。
+        BGE / MiniLM transformer backends are **512**, a **hard model cap**:
+        anything beyond it is silently dropped at encode time and contributes
+        **zero** to the vector. Measured (a Chinese library's main card at 1374
+        tokens): ``cos(embed(first 600 chars), embed(full text)) = 1.000000`` —
+        nothing after character 600 is retrievable at all. The write side must use
+        it for truncation self-reporting, otherwise "it was written but is
+        invisible to retrieval" would never be known to anyone.
         """
-        # torch 路径下这里会（间接触发）加载模型，也要记租约，否则可能与
-        # 空闲卸载撞上；ONNX 路径只读元数据，包一层开销可忽略。
+        # On the torch path this (indirectly) loads the model, so record a lease
+        # here too, or it may collide with idle unloading; the ONNX path only
+        # reads metadata, so the wrapper overhead is negligible.
         _ML.touch()
         if self._onnx is not None:
             return self._onnx.max_seq_length
@@ -1076,16 +1168,18 @@ class SentenceTransformerEmbedder:
 
     @_with_model_use
     def embedding_coverage(self, text: str) -> dict:
-        """自曝：这段文本**真正进入向量**的可见比例（截断自曝）。
+        """Self-report: the visible fraction of this text that **actually enters the vector** (truncation self-report).
 
-        超过 ``max_seq_length`` 的内容被静默截断——写入成功、回读在库、
-        ``brain_stats`` 正常，**只有检索悄悄差一截**。这里把"到底纳入了多少"
-        显式算出来给调用方看。
+        Content beyond ``max_seq_length`` is silently truncated — the write
+        succeeds, read-back finds it in the library, ``brain_stats`` looks normal,
+        and **only retrieval quietly gets worse**. This computes "how much was
+        actually included" explicitly for the caller.
 
         Returns:
             ``{"truncated": bool, "total_chars": int, "embedded_chars": int,
-             "tokens": int, "max_seq_length": int, "dropped_ratio": float}``。
-            ``truncated`` 为 True 时，``embedded_chars`` 之后的原文**检索不到**。
+             "tokens": int, "max_seq_length": int, "dropped_ratio": float}``.
+            When ``truncated`` is True, original text after ``embedded_chars``
+            is **unretrievable**.
         """
         if self._onnx is not None:
             return self._onnx.embedding_coverage(text)
@@ -1107,11 +1201,11 @@ class SentenceTransformerEmbedder:
             if tok is None:
                 return out
             fast = bool(getattr(tok, "is_fast", False))
-            # 同一把 _ENCODE_LOCK：``tokenizer.__call__`` 内部同样会走
-            # ``set_truncation_and_padding`` → ``enable_truncation``（哪怕
-            # truncation=False 也会），与并发的 encode 撞上就是
-            # "Already borrowed"。自曝绝不能反过来把写入搞挂，更不能把
-            # 别人的写入搞挂。
+            # Same _ENCODE_LOCK: ``tokenizer.__call__`` internally also goes
+            # through ``set_truncation_and_padding`` → ``enable_truncation`` (even
+            # with truncation=False), and colliding with a concurrent encode means
+            # "Already borrowed". Self-reporting must never in turn break the
+            # write, nor break someone else's write.
             with _ENCODE_LOCK:
                 enc = tok(
                     text,
@@ -1134,23 +1228,26 @@ class SentenceTransformerEmbedder:
                 if 0 < end <= total:
                     kept = end
             if kept <= 0:
-                # 拿不到 offset（非 fast 分词器 / 特例 token）→ 按比例估，
-                # 宁可给一个近似值也不要回退成"没截断"。
+                # No offsets available (non-fast tokenizer / special tokens) →
+                # estimate proportionally; better an approximation than falling
+                # back to "not truncated".
                 kept = int(total * limit / max(n, 1))
             out["embedded_chars"] = max(0, min(total, kept))
             out["dropped_ratio"] = round(1.0 - out["embedded_chars"] / total, 4)
-        except Exception as exc:  # 自曝绝不能反过来把写入搞挂
+        except Exception as exc:  # self-reporting must never in turn break the write
             out["error"] = f"{type(exc).__name__}: {exc}"
         return out
 
 
 
 def embedding_coverage(embedder: object, text: str) -> dict:
-    """任意嵌入器的截断自曝。
+    """Truncation self-report for any embedder.
 
-    后端没有实现 ``embedding_coverage`` 时**不静默跳过**，而是返回
-    ``truncated=None`` 的"显式未知"字典——按 B2-1 的同一条判据：
-    静默降级比显式报错危险，调用方必须能分辨"确定没截断"与"没查"。
+    When the backend does not implement ``embedding_coverage`` this does **not
+    silently skip**, but returns an "explicitly unknown" dict with
+    ``truncated=None`` — per the same criterion as B2-1: silent degradation is
+    more dangerous than an explicit error, and the caller must be able to tell
+    "confirmed not truncated" from "not checked".
     """
     fn = getattr(embedder, "embedding_coverage", None)
     if callable(fn):
@@ -1173,7 +1270,7 @@ def embedding_coverage(embedder: object, text: str) -> dict:
     }
 
 # ==================================================================
-# 工厂函数 — 根据配置选择嵌入器
+# Factory function — pick the embedder from configuration
 # ==================================================================
 
 def create_embedder(
@@ -1181,24 +1278,25 @@ def create_embedder(
     dim: int = 384,
     **kwargs,
 ) -> "HashEmbedder | SentenceTransformerEmbedder":
-    """创建嵌入器实例.
+    """Create an embedder instance.
 
     Args:
-        backend: 嵌入后端类型.
-            "sentence_transformer" — 使用 SentenceTransformerEmbedder (推荐).
-            "hash" — 使用 HashEmbedder (无依赖, 快速测试).
-        dim: 嵌入维度 (仅对 HashEmbedder 有效, SentenceTransformerEmbedder
-             维度由模型决定).
-        **kwargs: 传递给嵌入器构造函数的额外参数.
+        backend: embedding backend type.
+            "sentence_transformer" — use SentenceTransformerEmbedder (recommended).
+            "hash" — use HashEmbedder (dependency-free, quick tests).
+        dim: embedding dimension (only effective for HashEmbedder;
+             SentenceTransformerEmbedder's dimension is model-determined).
+        **kwargs: extra arguments passed to the embedder constructor.
 
     Returns:
-        嵌入器实例, 实现 embed/embed_query/embed_batch 接口.
+        An embedder instance implementing the embed/embed_query/embed_batch interface.
 
     Raises:
-        TypeError: 嵌入器缺少协议要求的方法。任何后端都必须同时提供
-            ``embed`` / ``embed_query`` / ``embed_batch`` 与 ``model_key``：
-            ``recall()`` 走的是 ``embed_query``，缺了它只会在**召回时**
-            才炸（覆盖报告 D5），因此这里提前拦截。
+        TypeError: the embedder lacks a protocol-required method. Every backend
+            must provide ``embed`` / ``embed_query`` / ``embed_batch`` and
+            ``model_key`` together: ``recall()`` goes through ``embed_query``,
+            and missing it would only blow up **at recall time** (coverage report
+            D5), hence the early interception here.
     """
     if backend == "sentence_transformer":
         embedder = SentenceTransformerEmbedder(**kwargs)

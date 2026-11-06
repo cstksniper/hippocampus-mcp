@@ -1,34 +1,49 @@
-"""地图索引（L0）与任务相关图全文（L1）的读侧投影。
+"""Read-side projections for the map index (L0) and task-relevant map full
+text (L1).
 
-两个入口都不检索、不引模型、不写盘——纯读侧投影：
+Neither entry point searches, imports models, or writes to disk -- pure
+read-side projections:
 
-- :func:`map_index` 合并两个来源（legacy 保留标签记忆 +
-  ``maps.json`` 侧车），只报名 + 条数 + 新鲜度 + 漂移/冲突计数，
-  不带正文（零正文是「必要信息」与「不能太长」的平衡点）；
-- :func:`map_detail` 用任务 token 命中图的 desc / 条目键，把整图
-  按 cap 递送（L1）。
+- :func:`map_index` merges the two sources (legacy reserved-tag memories +
+  the ``maps.json`` sidecar), reporting only names + entry counts + freshness
+  + drift/conflict counts, with no content (zero content is the balance point
+  between "necessary information" and "must not be too long");
+- :func:`map_detail` uses task tokens to hit a map's desc / entry keys and
+  delivers the whole map within the cap (L1).
 
-**为什么这些能力在 domain**：它们是纯函数投影（输入 records +
-registry，输出 dict），不碰 I/O 也不碰模型。但**读什么**由调用方注入：
+**Why these capabilities live in domain**: they are pure function projections
+(input records + registry, output dict), touching neither I/O nor models. But
+**what is read** is injected by the caller:
 
-- ``records`` / ``registry``：调用方从 store 与 map 侧车取好再传进来
-  ——domain 不准 import store 也不准 import map（arch 矩阵：domain
-  只准依赖 common），「读哪」是装配层的事；
-- ``list_maps``：map 包的行投影函数本体，回调注入；
-- ``limits``：所有阈值 / 保留标签键（``地图`` / ``条目`` / ``状态``）
-  由调用方从 ``map.constants`` 现取——常量放在 map 包，domain 看不见，
-  硬编码一份迟早和 map 包各说各话；
-- ``now`` / ``task_tokens_fn``：时钟与分词器，替身可注（测试钉
-  时间窗、词表行为时不必等真时钟）。
+- ``records`` / ``registry``: the caller fetches them from the store and the
+  map sidecar and passes them in -- domain must not import store nor map (arch
+  matrix: domain may depend only on common); "where to read" is the assembly
+  layer's business;
+- ``list_maps``: the map package's row projection function itself, injected as
+  a callback;
+- ``limits``: all thresholds / reserved tag keys (``地图`` / ``条目`` /
+  ``状态``) are fetched live by the caller from ``map.constants`` -- the
+  constants live in the map package, invisible to domain; a hardcoded copy
+  would sooner or later diverge from the map package;
+- ``now`` / ``task_tokens_fn``: clock and tokenizer, injectable stand-ins
+  (tests can pin time windows and lexicon behavior without waiting on a real
+  clock).
 
-行为口径（与原 brain 方法逐字对齐，parity 探针取证）：
+Behavioral rules (verbatim aligned with the original brain methods, evidenced
+by the parity probe):
 
-- 归档记忆不进索引（consolidate 会归档沉寂条目，继续计数会让索引行虚高）；
-- 双源同键不同状态 ⇒ ``conflicts`` 计数（只进必退同纪律：任一侧改成一致即消失）；
-- 冲突关系不合并计数：drifted（已确认变了）与 mentioned（有人这么说）
-  分开累加、分开渲染——两种可信度；
-- 组号 / newer 之类本模块不涉及（那是并存口径，见 conflict_annotate）；
-- 索引按条数倒序、同条数按名；详情按命中键数倒序、⚠️ 行置顶。
+- Archived memories do not enter the index (consolidate archives dormant map
+  entries; counting them would inflate the index rows);
+- Same key, different states across the two sources => ``conflicts`` count
+  (same "enter-only, must-exit" discipline: it disappears as soon as either
+  side becomes consistent);
+- Conflict relations are not merged into one count: drifted (confirmed
+  changed) and mentioned (someone said so) are accumulated and rendered
+  separately -- two kinds of credibility;
+- Group numbers / newer and the like are out of scope here (that is the
+  coexistence semantics, see conflict_annotate);
+- The index sorts by entry count descending, ties by name; details sort by
+  hit-key count descending, ⚠️ rows pinned on top.
 """
 from __future__ import annotations
 
@@ -40,21 +55,22 @@ from ..common.constants import _now, task_tokens
 
 @dataclass(frozen=True)
 class IndexLimits:
-    """索引行的截断与保留标签键（全部由调用方现取注入）。"""
+    """Index row truncation and reserved tag keys (all injected, fetched live
+    by the caller)."""
 
-    max_maps: int          # MAP_INDEX_MAX：索引行最多带几张图
-    stale_days: int        # MAP_STALE_DAYS：⚠️ 陈旧阈值
-    name_key: str          # MAP_NAME_KEY：这张记忆属于哪张地图
-    entry_key: str         # MAP_ENTRY_KEY：条目键
-    status_key: str        # MAP_STATUS_KEY：条目当前状态
+    max_maps: int          # MAP_INDEX_MAX: at most how many maps an index row carries
+    stale_days: int        # MAP_STALE_DAYS: the ⚠️ staleness threshold
+    name_key: str          # MAP_NAME_KEY: which map this memory belongs to
+    entry_key: str         # MAP_ENTRY_KEY: the entry key
+    status_key: str        # MAP_STATUS_KEY: the entry's current status
 
 
 @dataclass(frozen=True)
 class DetailLimits:
-    """L1 递送的两档 cap（由调用方现取注入）。"""
+    """The two caps for L1 delivery (injected, fetched live by the caller)."""
 
-    max_maps: int          # MAP_DETAIL_MAX_MAPS：一次最多进包几张图
-    max_rows: int          # MAP_DETAIL_MAX_ROWS：每图行数 cap
+    max_maps: int          # MAP_DETAIL_MAX_MAPS: at most how many maps enter the package at once
+    max_rows: int          # MAP_DETAIL_MAX_ROWS: per-map row cap
 
 
 def map_index(
@@ -66,30 +82,35 @@ def map_index(
     archived_state: str = "",
     limits: IndexLimits,
 ) -> dict[str, Any]:
-    """地图索引（L0 递送）：库里有哪几地图、各多少条、多久没更新。
+    """Map index (L0 delivery): which maps the library has, how many entries
+    each has, and how long since each was updated.
 
-    两个来源合并：
+    Two sources merged:
 
-    - **legacy**：带保留标签键的记忆（``{"地图": "合约", "条目":
-      "CN2601", "状态": "验证集"}``），一键一条；
-    - **registry**：``maps.json`` 侧车（map_set 写入的正式地图层）。
+    - **legacy**: memories carrying reserved tag keys (``{"地图": "合约", "条目":
+      "CN2601", "状态": "验证集"}``), one entry per key;
+    - **registry**: the ``maps.json`` sidecar (the formal map layer written by
+      map_set).
 
-    同名图相加（entries 数相加、取最新、来源标 ``both``）——老数据不丢，
-    新数据走新路。纯 O(n) 读既有层，不检索不聚类。
+    Same-named maps add up (entry counts summed, newest taken, source marked
+    ``both``) -- old data is not lost, new data goes the new way. Pure O(n)
+    reading of existing layers; no retrieval, no clustering.
 
-    设计评审后收紧的两点：
+    Two points tightened after design review:
 
-    - **归档条目不进索引**（consolidate 会把沉寂的地图条目记忆归档，
-      继续计条数会让索引行虚高，且归档条目 recall 不可达）；
-    - **双源同键冲突检测**：同一个（图, 条目键）在 legacy 记忆与
-      registry 侧车里状态不一致 ⇒ ``conflicts`` 计数 + 索引行「冲突N」。
-      相加只解决了计数合并，没解决「两条状态竞争」——修复前它可以
-      无声无息地活在 both 图里。
+    - **Archived entries do not enter the index** (consolidate archives
+      dormant map-entry memories; counting them would inflate the index rows,
+      and archived entries are unreachable by recall);
+    - **Dual-source same-key conflict detection**: when the same (map, entry
+      key) has inconsistent states between legacy memories and the registry
+      sidecar => ``conflicts`` count + the index row's "conflicts N".
+      Summing only solved count merging, not "two states competing" -- before
+      the fix it could live silently inside a both map.
     """
     maps: dict[str, dict[str, Any]] = {}
     legacy_keys: dict[str, dict[str, str]] = {}
     registry_keys: dict[str, dict[str, str]] = {}
-    # legacy：标签命名空间
+    # legacy: the tag namespace
     for rec in records:
         if rec.state == archived_state:
             continue
@@ -109,7 +130,7 @@ def map_index(
         if k:
             legacy_keys.setdefault(str(name), {})[k] = \
                 str(tags.get(limits.status_key) or "").strip()
-    # registry：maps.json 侧车
+    # registry: the maps.json sidecar
     data = registry
     if data:
         for item in list_maps(data):
@@ -125,9 +146,11 @@ def map_index(
             m["unmatched"] += item.get("unmatched") or 0
             m["dir_missing"] += item.get("dir_missing") or 0
             m["dir_conflict"] += item.get("dir_conflict") or 0
-            # 提及信号：更新后被提到另一个状态的条目数。
-            # 与 drifted 分开累加、分开渲染，绝不合并成一个数——
-            # 「真相变过」与「有人这么说」是两种可信度。
+            # Mention signal: the number of entries mentioned at another status
+            # after an update. Accumulated and rendered separately from
+            # drifted, never merged into one number --
+            # "the truth changed" and "someone said so" are two kinds of
+            # credibility.
             m["mentioned"] += item.get("mentioned") or 0
             if item.get("mention_state"):
                 m["mention_state"] = item["mention_state"]
@@ -145,8 +168,9 @@ def map_index(
     out = []
     for name, m in maps.items():
         age = int((now_ts - m["newest"]) // 86400) if m["newest"] else None
-        # 双源同键不同状态 = 冲突（legacy 旧值 vs registry 新值）。
-        # 只进必退同纪律：任一侧改成一致即消失。
+        # Same key, different states across the two sources = conflict (legacy
+        # old value vs registry new value). Same "enter-only, must-exit"
+        # discipline: it disappears as soon as either side becomes consistent.
         lk = legacy_keys.get(name) or {}
         rk = registry_keys.get(name) or {}
         conflict_keys = sorted(k for k in set(lk) & set(rk)
@@ -187,11 +211,13 @@ def map_detail(
     task_tokens_fn: Callable[[str, list[str] | None], list[str]] = task_tokens,
     limits: DetailLimits,
 ) -> dict[str, Any]:
-    """任务相关地图的全文投影（L1 递送）。纯读侧车，不检索不引模型。
+    """Full-text projection of task-relevant maps (L1 delivery). Pure sidecar
+    reading; no retrieval, no models.
 
-    token = 任务正文 + tp 里的锚点实体名（与任务概况卡 task_profile
-    同一个 :func:`task_tokens`；**不重新检索**）。命中判据：
-    某张图的 desc 含任一 token，或其任一条目键含任一 token。
+    token = the task text + the anchor entity names in tp (the same
+    :func:`task_tokens` as the task profile card; **no re-retrieval**). Hit
+    criterion: a map's desc contains any token, or any of its entry keys
+    contains a token.
     """
     if not (task or "").strip():
         return {"task": "", "maps": [], "maps_total": 0, "hidden": 0,
@@ -230,9 +256,10 @@ def map_detail(
             if extra_bits:
                 row += "（%s）" % "；".join(extra_bits)
             if e.get("drift") or e.get("mention"):
-                # 提及漂移也进 ⚠️ 前缀。它的方向
-                # 与 drift 相反（「可能过期」而不是「已确认变了」），
-                # 但递送动作一样是「这条要看一眼」，证据在 mention 里。
+                # Mentioned drift also gets the ⚠️ prefix. Its direction
+                # is the opposite of drift ("possibly stale" rather than
+                # "confirmed changed"), but the delivery action is the same
+                # "take a look at this one"; the evidence is in mention.
                 row = "⚠️" + row
             rows.append(row[:80])
         rows.sort(key=lambda r: r.startswith("⚠️"), reverse=True)

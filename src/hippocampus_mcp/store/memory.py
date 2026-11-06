@@ -1,7 +1,8 @@
-"""记忆数据模型。
+"""Memory data model.
 
-定义单条记忆记录 ``MemoryRecord`` 以及记忆类型枚举 ``MemoryType``。
-本模块不依赖任何外部嵌入模型，嵌入向量由调用方提供。
+Defines the single memory record ``MemoryRecord`` and the memory type
+enum ``MemoryType``. This module depends on no external embedding model;
+embedding vectors are supplied by the caller.
 """
 
 from __future__ import annotations
@@ -11,30 +12,40 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-# 旧格式（单向量）的迁移槽位标识。
-# 早期版本的 memories.json 每条只存一个 ``embedding``，且不记录来自哪个模型；
-# 加载时统一归入该槽位，等用户显式认领（reembed --assume-model）或由当前模型重新嵌入。
+# Migration slot marker for the old format (single vector).
+# Early versions of memories.json stored one ``embedding`` per record with no
+# record of which model produced it; on load they are all filed into this
+# slot, awaiting explicit user claim (reembed --assume-model) or re-embedding
+# by the current model.
 LEGACY_MODEL_KEY = "__legacy__"
 
-# 重要性钉住线：importance >= 该值的记忆豁免时间衰减（bigeye: importance>=7 不衰减）。
-# 这是**唯一**的阈值定义处——MemoryRecord.__post_init__ 与 VectorStore.update
-# 都必须引用它，否则新建与更新两条路径会给出不一致的 pin（缺陷 D4）。
+# Importance pin line: memories with importance >= this value are exempt from
+# time decay (bigeye: importance>=7 does not decay). This is the **only**
+# place the threshold is defined -- MemoryRecord.__post_init__ and
+# VectorStore.update must both reference it, otherwise the create and update
+# paths would produce inconsistent pins (defect D4).
 PIN_IMPORTANCE = 0.7
 
 
 def _as_f32_vector(value: Any) -> array:
-    """向量统一存 ``array('f')``（双存修复）。
+    """Vectors are uniformly stored as ``array('f')`` (double-storage fix).
 
-    此前向量以 **Python float list** 存进 ``record.embeddings``：768 维 ≈
-    24.6KB/条，真库 9859 条实测 **240.9MB**——与检索矩阵（npz → 惰性
-    `_active_matrix`）同内容**双存**。
-    ``array('f')`` 每维 4B ≈ 3.1KB/条（**−87%**），且消费方全兼容：
+    Previously vectors were stored in ``record.embeddings`` as a **Python
+    float list**: 768 dims ≈ 24.6KB per record; measured on a real library
+    of 9859 records: **240.9MB** -- duplicate storage of the same content as
+    the retrieval matrix (npz → lazy ``_active_matrix``).
+    ``array('f')`` is 4B per dim ≈ 3.1KB per record (**−87%**), and all
+    consumers stay compatible:
 
-    * ``np.asarray(v)`` 直接吃（检索矩阵 / 相似度数学零改动）；
-    * ``list(v)`` / ``v.tolist()`` 照旧出 JSON（``to_dict`` 兼容不变）；
-    * npz / sqlite blob 保存路径都是 ``np.asarray`` 后序列化，无感。
+    * ``np.asarray(v)`` takes it directly (zero changes to the retrieval
+      matrix / similarity math);
+    * ``list(v)`` / ``v.tolist()`` still produce JSON as before (``to_dict``
+      compatibility unchanged);
+    * the npz / sqlite blob save paths all serialize via ``np.asarray``,
+      no perceptible change.
 
-    接受 list / tuple / np.ndarray / array('f')（f 型原样返回避免复制）。
+    Accepts list / tuple / np.ndarray / array('f') (the 'f' type is returned
+    as-is to avoid a copy).
     """
     if isinstance(value, array) and value.typecode == "f":
         return value
@@ -44,11 +55,13 @@ def _as_f32_vector(value: Any) -> array:
 def merge_id_lists(
     old: list[str] | None, new: list[str] | None
 ) -> list[str]:
-    """把两组 id 合并为**有序并集**（去重，旧值在前、新值按序追加）。
+    """Merge two id lists into an **ordered union** (dedup; old values
+    first, new values appended in order).
 
-    去重合并（dedup）时用来累积 ``source_ids`` / ``entity_ids``：
-    直接覆盖会让新来的 L0 原文失去回指（审计链断裂）、让新提到的实体
-    与这条记忆失去关联（缺陷 D3）。
+    Used to accumulate ``source_ids`` / ``entity_ids`` during dedup merges:
+    direct overwrite would leave the newly arrived L0 originals without a
+    back-reference (broken audit chain) and would disconnect newly
+    mentioned entities from this memory (defect D3).
     """
     merged = list(old or [])
     seen = set(merged)
@@ -62,13 +75,15 @@ def merge_id_lists(
 def merge_tag_dicts(
     old: dict[str, Any] | None, new: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """合并两组结构化标签。
+    """Merge two structured tag dicts.
 
-    键冲突时**保留既存值**：命中去重意味着两条内容近乎相同（>= dedup 阈值），
-    标签几乎总是同值；真出现不同值，说明这条记录确实横跨两个取值
-    （如内容同时涉及 ch43 与 ch44），此时任取其一都会让"按章过滤"给出
-    半对的结果——保留既存值至少是**确定性**的，且合并结果会写进
-    ingest 的返回里，调用方看得见。
+    On key conflict the **existing value is kept**: a dedup hit means the
+    two contents are near-identical (>= dedup threshold), so tags almost
+    always agree; if values genuinely differ, the record really spans two
+    values (e.g. the content involves both ch43 and ch44), and picking
+    either one would give "filter by 章" a half-right result -- keeping the
+    existing value is at least **deterministic**, and the merged result is
+    written into ingest's return, visible to the caller.
     """
     merged = dict(new or {})
     merged.update(old or {})
@@ -76,63 +91,75 @@ def merge_tag_dicts(
 
 
 class MemoryType(str, Enum):
-    """记忆类型枚举。
+    """Memory type enum.
 
-    继承 ``str`` 使其既能作为枚举使用，也可直接当作字符串参与序列化与比较。
+    Inherits ``str`` so it works both as an enum and directly as a string
+    in serialization and comparison.
     """
 
-    EPISODIC = "episodic"      # 情节记忆：具体事件 / 经历
-    SEMANTIC = "semantic"      # 语义记忆：事实 / 知识
-    PROCEDURAL = "procedural"  # 程序记忆：技能 / 流程
-    GENERAL = "general"        # 通用记忆：默认类型
+    EPISODIC = "episodic"      # episodic memory: concrete events / experiences
+    SEMANTIC = "semantic"      # semantic memory: facts / knowledge
+    PROCEDURAL = "procedural"  # procedural memory: skills / workflows
+    GENERAL = "general"        # general memory: the default type
 
 
 class MemoryState(str, Enum):
-    """记忆生命周期状态（借鉴 bigeye relation_store 的事实状态机）。"""
+    """Memory lifecycle states (modeled on bigeye relation_store's fact state machine)."""
 
-    ACTIVE = "active"          # 当前有效
-    SUPERSEDED = "superseded"  # 已被更新的记忆取代（保留，不删除）
-    ARCHIVED = "archived"      # 长期未调用，已归档（仍在库，不进默认召回）
+    ACTIVE = "active"          # currently valid
+    SUPERSEDED = "superseded"  # superseded by an updated memory (kept, not deleted)
+    ARCHIVED = "archived"      # long uncalled, archived (still in the library, excluded from default recall)
 
 
 class CognitiveType(str, Enum):
-    """认知类型：记忆的认识论来源，用于反幻觉引用。"""
+    """Cognitive types: the epistemic origin of a memory, for anti-hallucination citation."""
 
-    EXPERIENCE = "experience"  # 亲历 / 一起做过的事
-    WORLD = "world"            # 客观事实（可外部验证）
-    OPINION = "opinion"        # 主观看法 / 判断
+    EXPERIENCE = "experience"  # personally lived / things done together
+    WORLD = "world"            # objective facts (externally verifiable)
+    OPINION = "opinion"        # subjective views / judgments
 
 
 @dataclass
 class MemoryRecord:
-    """单条记忆记录的数据模型（v0.4：向量与模型解耦）。
+    """Data model for a single memory record (v0.4: vectors decoupled from models).
 
     Attributes:
-        id: 记忆唯一标识。
-        content: 记忆的文本内容（记忆本体，与嵌入模型无关）。
-        timestamp: 记忆创建 / 发生的时间戳（单位：秒）。
-        embeddings: 模型标识 -> 该模型产出的嵌入向量。
-            **向量是可重建的派生物**：切换嵌入模型时无需重新导入文档，
-            只需为当前模型补算向量（旧模型向量可保留用于横向对比）。
-        importance: 记忆重要程度，取值范围通常为 [0, 1]，默认 0.5。
-        recall_count: 被回忆 / 检索命中的次数，默认 0。
-        memory_type: 记忆类型字符串，默认 "general"。
-        state: 生命周期状态，默认 active。
-        cognitive_type: 认知类型（experience/world/opinion），默认 world。
-        source_ids: L0 原始层回指 id 列表（保证"核对原话"能力）。
-        entity_ids: 关联实体 id 列表（索引层用）。
-        superseded_by: 若被取代，指向取代者的记忆 id。
-        last_recalled_at: 最近一次被召回的时间戳。
-        pin: 是否钉住（豁免时间衰减）。importance>=0.7 自动为真。
-        source: 来源标签（文件名 / 相对路径 / 会话标识）。
-            批量导入场景下是"这条记忆出自哪个 md 文件"，让 recall 命中的
-            结果能直接回指原始文档（覆盖报告·高 3：此前只存 L0 id，
-            回查不到原文件，按文件审计与增量重导都做不了）。
-        tags: 结构化标签（zcode 需求 A1）。强约束写作项目的检索大多是
-            **条件检索**：按章号、按年份月份、按单源文件，靠语义匹配碰运气。
-            tags 让这类查询从"猜"变成"查"。
-            与实体的分工：tags 放**结构化硬约束**（章/卷/年/文件），
-            人物/专名继续走实体倒排索引——两套重复造会互相打架。
+        id: unique memory id.
+        content: the memory's text content (the memory itself, independent
+            of the embedding model).
+        timestamp: creation / occurrence timestamp (unit: seconds).
+        embeddings: model key -> the embedding vector that model produced.
+            **Vectors are a rebuildable derivative**: switching embedding
+            models requires no document re-import, just computing vectors
+            for the current model (old model vectors may be kept for side
+            comparison).
+        importance: memory importance, usually in [0, 1], default 0.5.
+        recall_count: number of times recalled / hit by retrieval, default 0.
+        memory_type: memory type string, default "general".
+        state: lifecycle state, default active.
+        cognitive_type: cognitive type (experience/world/opinion), default world.
+        source_ids: back-reference id list into the L0 raw layer (keeps the
+            "check the original wording" ability).
+        entity_ids: associated entity id list (used by the index layer).
+        superseded_by: if superseded, the id of the superseding memory.
+        last_recalled_at: timestamp of the most recent recall.
+        pin: whether pinned (exempt from time decay). Automatically true
+            when importance>=0.7.
+        source: source label (file name / relative path / session id).
+            In bulk-import scenarios this is "which md file this memory came
+            from", letting recall hits point straight back at the original
+            document (coverage report, High 3: previously only the L0 id was
+            stored, the original file could not be traced, and per-file
+            audit and incremental re-import were both impossible).
+        tags: structured tags (zcode requirement A1). Retrieval in a
+            strongly-constrained writing project is mostly **conditional
+            retrieval**: by chapter number, by year/month, by single source
+            file -- semantic matching alone is a gamble. tags turn such
+            queries from "guessing" into "looking up".
+            Division of labor with entities: tags hold **structured hard
+            constraints** (章/卷/年/文件), while characters/proper nouns
+            keep using the entity inverted index -- duplicating both would
+            make them fight each other.
     """
 
     id: str
@@ -148,34 +175,46 @@ class MemoryRecord:
     entity_ids: list[str] | None = None
     superseded_by: str | None = None
     last_recalled_at: float = 0.0
-    # 检索强度：成功被召回（进结果集）或被重放强化时累加，
-    # 打分按 +w_strength·log1p(强度) 加权——生物侧"检索即巩固"（测试效应）
-    # 的最小实现。与 recall_count 的分工见 engine/manager.reinforce 的
-    # docstring：recall_count 记候选集（多样性惩罚用），本字段记结果集。
+    # Retrieval strength: accumulated when successfully recalled (into the
+    # result set) or reinforced by replay; scoring weights it by
+    # +w_strength·log1p(strength) -- a minimal implementation of the
+    # biological "retrieval as consolidation" (testing effect). For the
+    # division of labor with recall_count see engine/manager.reinforce's
+    # docstring: recall_count tracks the candidate set (used by the
+    # diversity penalty), this field tracks the result set.
     recall_strength: float = 0.0
     pin: bool = False
     source: str = ""
     tags: dict[str, Any] = field(default_factory=dict)
-    # D2a 写侧隔离：True = 待审（非家工作区经 user 豁免通道的直写）。
-    # 不进召回池（recall_flow）、不进 user_scope 槽（user_scope.select）；
-    # drift_audit 过目后经受管通道转正（判据单一真相见
-    # domain/write_quarantine.should_quarantine）。默认 False = 存量库
-    # 零变化；序列化**稀疏**（False 不落键），旧库加载零迁移。
+    # D2a write-side quarantine: True = pending review (direct writes from a
+    # non-home workspace via the user exemption channel). Excluded from the
+    # recall pool (recall_flow) and from the user_scope slot
+    # (user_scope.select); after drift_audit review, promoted via the
+    # managed channel (single source of truth for the criterion:
+    # domain/write_quarantine.should_quarantine). Default False = zero
+    # change for existing libraries; serialization is **sparse** (False
+    # emits no key), so loading old libraries needs zero migration.
     quarantine: bool = False
-    # D1 隐私打标：空串 = 未打（存量库态）；"personal" /
-    # "sensitive:类别1+类别2"。打标是提示不是执法（漏检常态，见
-    # domain/sensitive.classify_sensitivity docstring）；消费方是 D2b
-    # 读侧 masked 档过滤与 drift_audit 复审分组。
+    # D1 privacy labeling: empty string = unlabeled (existing-library state);
+    # "personal" / "sensitive:category1+category2". Labeling is a hint, not
+    # enforcement (misses are the norm, see
+    # domain/sensitive.classify_sensitivity docstring); consumers are the
+    # D2b read-side masked-tier filtering and drift_audit review grouping.
     sensitivity: str = ""
-    # P0-1 写入凭据（Super-agent 适配）：{session, task, surface}，
-    # 由 common/write_origin.build_origin 在工具边界构造、原样搬运到这里。
-    # **只写不筛**——recall 不读它（先攒真库取值分布，再接检索过滤；
-    # 写路径与检索路径同时改是 G 段的教训）。稀疏序列化：空 dict 不落键，
-    # 存量卡逐字节不变。
+    # P0-1 write credentials (Super-agent adaptation): {session, task, surface},
+    # built by common/write_origin.build_origin at the tool boundary and
+    # carried here verbatim. **Write-only, never filtered on** -- recall does
+    # not read it (first accumulate the real library's value distribution,
+    # then wire up retrieval filtering; changing the write and retrieval
+    # paths at the same time is the lesson of phase G). Sparse serialization:
+    # an empty dict emits no key, existing cards stay byte-identical.
     origin: dict[str, str] = field(default_factory=dict)
-    # P0-2 幂等键：宿主声明的「这是同一次请求」（重试 / 重放 / resume 后重跑）。
-    # 真相源是 store/idem.py 的进程内倒排，本字段是它**落盘后的重建依据**
-    # ——索引是派生物，不另开 sidecar 文件。空串 = 未声明幂等（默认）。
+    # P0-2 idempotency key: the host's declaration that "this is the same
+    # request" (retry / replay / re-run after resume). The source of truth
+    # is store/idem.py's in-process inverted index; this field is what that
+    # index is **rebuilt from after persisting to disk** -- the index is a
+    # derivative, no separate sidecar file. Empty string = no idempotency
+    # declared (default).
     idem: str = ""
     # Provenance of the pin: "auto" (importance threshold), "manual"
     # (caller supplied pin=True), "legacy" (record written before this
@@ -183,9 +222,17 @@ class MemoryRecord:
     # construction of existing fields is unchanged.  "legacy" is never
     # serialized, keeping old cards byte-identical on disk.
     pin_source: str = ""
+    # V1 repair provenance: L0 raw ids this record CITED but which were lost
+    # before ever persisting (the 2026-11-06 dangling audit: L1 rows landed
+    # while their raw did not).  Set ONLY by scripts/repair_l0_dangling.py
+    # when it strips dead references, so a record carrying lost_sources reads
+    # as "was traceable, provenance lost" — distinct from records that never
+    # had sources.  Sparse serialization (empty list never emits the key):
+    # existing cards stay byte-identical.  Declared LAST.
+    lost_sources: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        # importance >= PIN_IMPORTANCE 自动钉住（bigeye: importance>=7 不衰减）
+        # importance >= PIN_IMPORTANCE pins automatically (bigeye: importance>=7 does not decay)
         if self.importance >= PIN_IMPORTANCE:
             self.pin = True
         if self.pin_source != "legacy":
@@ -194,21 +241,24 @@ class MemoryRecord:
                     "auto" if self.importance >= PIN_IMPORTANCE else "manual")
             if not self.pin:
                 self.pin_source = ""
-        # H8 双存修复：所有构造路径（from_dict / 直接构造 / 测试）统一归一化成
-        # array('f')——只在这里和 set_vector 转换，消费方（np 数学 / json / npz
-        # / sqlite blob）全部无感。
+        # H8 double-storage fix: every construction path (from_dict / direct
+        # construction / tests) normalizes uniformly to array('f') --
+        # converted only here and in set_vector; consumers (np math / json /
+        # npz / sqlite blob) notice nothing.
         if self.embeddings:
             self.embeddings = {
                 k: _as_f32_vector(v) for k, v in self.embeddings.items()
             }
 
     def sync_pin(self) -> None:
-        """按当前 ``importance`` 重算 ``pin``。
+        """Recompute ``pin`` from the current ``importance``.
 
-        ``__post_init__`` 只在**构造**时生效，而 ``VectorStore.update`` 走的是
-        ``setattr``，会绕过它——于是"提升 importance 自动钉住"只在新建路径成立，
-        合并（dedup）路径提升 importance 时 pin 依然是 False（缺陷 D4）。
-        任何改动 importance 的地方都应调用本方法（显式设置 pin 时除外）。
+        ``__post_init__`` only fires on **construction**, while
+        ``VectorStore.update`` goes through ``setattr`` and bypasses it --
+        so "raising importance pins automatically" only held on the creation
+        path; when the merge (dedup) path raised importance, pin stayed
+        False (defect D4). Any place that changes importance should call
+        this method (except when setting pin explicitly).
         """
         self.pin = self.importance >= PIN_IMPORTANCE
         if self.pin and self.pin_source in ("", "legacy"):
@@ -217,45 +267,47 @@ class MemoryRecord:
             self.pin_source = ""
 
     def is_live(self) -> bool:
-        """是否参与默认召回（archived 不参与）。"""
+        """Whether it participates in default recall (archived does not)."""
         return self.state != MemoryState.ARCHIVED.value
 
     # ------------------------------------------------------------------
-    # 向量读写（按模型标识存取，模型无关）
+    # Vector read/write (keyed by model key, model-agnostic)
     # ------------------------------------------------------------------
     def vector_for(self, model_key: str) -> array | None:
-        """取指定模型的向量（``array('f')``；``np.asarray`` 可直接吃）。
+        """Get the vector for the given model (``array('f')``; ``np.asarray`` takes it directly).
 
-        该模型未算过则返回 ``None``（触发补算）。
+        Returns ``None`` if that model has none yet (triggering a recompute).
         """
         return self.embeddings.get(model_key)
 
     def has_vector(self, model_key: str) -> bool:
-        """是否已有指定模型的向量。"""
+        """Whether a vector for the given model already exists."""
         return model_key in self.embeddings
 
     def set_vector(self, model_key: str, vector: Any) -> None:
-        """写入 / 覆盖指定模型的向量（统一归一化为 ``array('f')``）。"""
+        """Write / overwrite the vector for the given model (normalized uniformly to ``array('f')``)."""
         self.embeddings[model_key] = _as_f32_vector(vector)
 
     def drop_vectors(self, keep: set[str]) -> int:
-        """丢弃不在 ``keep`` 中的模型向量，返回丢弃个数。"""
+        """Drop model vectors not in ``keep``, returning how many were dropped."""
         drop = [k for k in self.embeddings if k not in keep]
         for k in drop:
             del self.embeddings[k]
         return len(drop)
 
     def model_keys(self) -> list[str]:
-        """返回本条记忆已有向量的模型标识列表。"""
+        """Return the list of model keys this memory already has vectors for."""
         return list(self.embeddings.keys())
 
     def to_dict(self, with_embeddings: bool = False) -> dict[str, Any]:
-        """将记录序列化为可 JSON 化的字典。
+        """Serialize the record into a JSON-friendly dict.
 
         Args:
-            with_embeddings: 是否把向量一并写入 JSON。默认 ``False``——
-                向量体积大（768 维 float64 序列化后约 15KB/条），
-                统一由 ``VectorStore`` 写入二进制 .npz 文件。
+            with_embeddings: whether to write the vectors into the JSON as
+                well. Default ``False`` -- vectors are large (768-dim
+                float64 is about 15KB per record after serialization); they
+                are uniformly written by ``VectorStore`` into a binary .npz
+                file.
         """
         data: dict[str, Any] = {
             "id": self.id,
@@ -275,33 +327,40 @@ class MemoryRecord:
             "source": self.source,
             "tags": dict(self.tags or {}),
         }
-        # D2a/D1 两字段**稀疏**序列化：默认值不落键——存量卡逐字节不变，
-        # 只有真被隔离/打标的卡才多出这两个键；旧版本代码读到多出的键也
-        # 安全（from_dict 对缺键取默认，未知键本就不读）。
+        # D2a/D1: both fields serialize **sparsely** -- default values emit no
+        # key, so existing cards stay byte-identical; only cards actually
+        # quarantined/labeled gain these two keys. Older code reading the
+        # extra keys is also safe (from_dict takes defaults for missing keys
+        # and never reads unknown ones).
         if self.quarantine:
             data["quarantine"] = True
         if self.sensitivity:
             data["sensitivity"] = self.sensitivity
-        # P0-1/P0-2 同样稀疏：存量卡不加键，旧版本代码读到多出的键也不读
+        # P0-1/P0-2 likewise sparse: existing cards gain no key, and old code reading the extra keys ignores them
         if self.origin:
             data["origin"] = dict(self.origin)
         if self.idem:
             data["idem"] = self.idem
         if self.pin_source and self.pin_source != "legacy":
             data["pin_source"] = self.pin_source
+        if self.lost_sources:
+            data["lost_sources"] = list(self.lost_sources)
         if with_embeddings:
             data["embeddings"] = {k: list(v) for k, v in self.embeddings.items()}
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
-        """从字典反序列化构建 ``MemoryRecord``。
+        """Build a ``MemoryRecord`` from a deserialized dict.
 
-        兼容三种历史形态：
-            - v0.4: ``embeddings`` 多模型字典；
-            - v0.3 及更早: 单个 ``embedding`` 列表（归入 ``__legacy__`` 槽位）；
-            - 完全没有向量字段（由 VectorStore 从 .npz 另行注入）。
-        缺失的可选字段使用默认值，保证向前兼容。
+        Compatible with three historical shapes:
+            - v0.4: ``embeddings`` as a multi-model dict;
+            - v0.3 and earlier: a single ``embedding`` list (filed into the
+              ``__legacy__`` slot);
+            - no vector field at all (injected separately by VectorStore
+              from .npz).
+        Missing optional fields take default values, preserving forward
+        compatibility.
         """
         if "embeddings" in data and isinstance(data["embeddings"], dict):
             embeddings = {
@@ -329,20 +388,21 @@ class MemoryRecord:
             entity_ids=list(data.get("entity_ids") or []),
             superseded_by=data.get("superseded_by"),
             last_recalled_at=float(data.get("last_recalled_at", 0.0)),
-            # 旧库/半截数据没有该字段 → 0.0（无强度，与新建记录同态）
+            # Old libraries / partial data lack this field → 0.0 (no strength, same state as a new record)
             recall_strength=float(data.get("recall_strength") or 0.0),
             pin=bool(data.get("pin", False)),
             source=str(data.get("source") or ""),
-            # 旧库没有这个字段 → 空 dict，过滤时不匹配任何 tag 条件（安全默认）
+            # Old libraries lack this field → empty dict, matching no tag condition when filtering (safe default)
             tags=dict(data["tags"]) if isinstance(data.get("tags"), dict) else {},
-            # D2a/D1：旧库/旧代码写的卡没有这两个键 → False/""（与新建默认同态）
+            # D2a/D1: cards written by old libraries/old code lack these keys → False/"" (same state as creation defaults)
             quarantine=bool(data.get("quarantine", False)),
             sensitivity=str(data.get("sensitivity") or ""),
-            # P0-1/P0-2：旧库没有这两个键 → 空 dict / 空串（与新建默认同态）
+            # P0-1/P0-2: old libraries lack these keys → empty dict / empty string (same state as creation defaults)
             origin=(
                 {str(k): str(v) for k, v in data["origin"].items()}
                 if isinstance(data.get("origin"), dict) else {}
             ),
             idem=str(data.get("idem") or ""),
             pin_source=str(data.get("pin_source") or "legacy"),
+            lost_sources=[str(s) for s in (data.get("lost_sources") or [])],
         )

@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""server.py 头部基础设施（sys.path 兜底 / 日志配置 / stdout 护栏）。
+"""Header infrastructure for server.py (sys.path fallback / logging setup / stdout guard).
 
-这里实现：``sys.path`` 兜底（libs 目录 append + src 目录 insert）、
-日志配置（stderr 流 handler + 级别）、stdio 传输的 stdout 护栏类
-``_ThreadAwareStdout``。
+Implemented here: the ``sys.path`` fallback (append the libs dir + insert the src dir),
+logging setup (stderr stream handler + level), and the stdio-transport stdout guard
+class ``_ThreadAwareStdout``.
 
-server.py 侧按 import 名原样再导出 ``_ThreadAwareStdout``（tests/test_warmup.py
-直调实例化），``logger`` 由 :func:`configure_logging` 返回。
+server.py re-exports ``_ThreadAwareStdout`` under the same import name
+(tests/test_warmup.py instantiates it directly); ``logger`` is returned by
+:func:`configure_logging`.
 """
 from __future__ import annotations
 
@@ -18,10 +19,11 @@ from typing import Any
 
 
 def ensure_paths(server_file: str) -> None:
-    """``sys.path`` 兜底（调用方传 server.py 的 ``__file__``）。
+    """``sys.path`` fallback (caller passes server.py's ``__file__``).
 
-    libs 目录只作兜底（append 不遮蔽正常安装的包；libs 内是 py3.10 编译的
-    老包，放前面会遮蔽 site-packages 导致 "无法导入 sentence_transformers"）。
+    The libs dir is fallback-only (appending does not shadow properly installed packages;
+    what is inside libs are old packages compiled for py3.10, and putting them first would
+    shadow site-packages, causing "cannot import sentence_transformers").
     """
     _LIBS_DIR = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(server_file)))),
@@ -30,14 +32,14 @@ def ensure_paths(server_file: str) -> None:
     if _LIBS_DIR not in sys.path:
         sys.path.append(_LIBS_DIR)
 
-    # 确保 src 目录在路径中
+    # Make sure the src dir is on the path
     _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(server_file)))
     if _SRC_DIR not in sys.path:
         sys.path.insert(0, _SRC_DIR)
 
 
 def configure_logging() -> logging.Logger:
-    """日志配置：stderr 流 handler + 配置级别。"""
+    """Logging setup: stderr stream handler + configured level."""
     logger = logging.getLogger("hippocampus_mcp")
     if not logger.handlers:
         _handler = logging.StreamHandler(sys.stderr)
@@ -56,16 +58,18 @@ def configure_logging() -> logging.Logger:
 
 
 class _ThreadAwareStdout:
-    """stdio 传输下的 stdout 护栏。
+    """stdout guard for the stdio transport.
 
-    MCP stdio 模式里 fd 1 **只能**承载 JSON-RPC。但第三方库（transformers /
-    tqdm / spaCy）在首次加载时可能 print 到标准输出——原先预热在握手前完成，
-    顶多难看；现在预热跑到后台线程，正好与客户端的 tools/list 并发，
-    一旦插进协议流，宿主就会解析失败（表现为"连上了但没工具"）。
+    In MCP stdio mode fd 1 may **only** carry JSON-RPC. But third-party libraries
+    (transformers / tqdm / spaCy) may print to stdout on first load -- previously warmup
+    finished before the handshake, so at worst it was ugly; now warmup runs on a
+    background thread, concurrently with the client's tools/list, and once anything slips
+    into the protocol stream the host fails to parse (symptom: "connected, but no tools").
 
-    这里把**非主线程**写往 stdout 的内容改道 stderr，主线程（＝写协议的正主）
-    不受影响。注意不能用 ``contextlib.redirect_stdout``：它改的是全局
-    ``sys.stdout``，会把主线程的协议输出也一起带到 stderr。
+    Here writes to stdout from **non-main threads** are rerouted to stderr; the main
+    thread (= the legitimate protocol writer) is unaffected. Note that
+    ``contextlib.redirect_stdout`` cannot be used: it swaps the global ``sys.stdout``,
+    which would drag the main thread's protocol output to stderr as well.
     """
 
     def __init__(self, real: Any) -> None:
@@ -73,8 +77,8 @@ class _ThreadAwareStdout:
 
     @staticmethod
     def _sink(real: Any) -> Any:
-        # 主线程 → 真 stdout（协议流）；其他线程 → stderr。
-        # 注意不能返回 sys.stdout：安装后它就指向本代理，会无限递归。
+        # Main thread -> real stdout (protocol stream); other threads -> stderr.
+        # Must not return sys.stdout: once installed it points at this proxy, which would recurse forever.
         return real if threading.current_thread() is threading.main_thread() else sys.stderr
 
     def write(self, s: str) -> int:

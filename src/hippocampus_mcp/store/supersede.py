@@ -1,24 +1,34 @@
-"""写侧取代检测：新记忆含更新标记 + 与旧记忆高度相似 + 共享实词 → 取代最相似的一条。
+"""Write-side supersede detection: a new memory carries an update marker +
+is highly similar to an old memory + shares content words -> supersede the
+most similar one.
 
-从 ``brain/core.py`` 的 ``_detect_supersede`` 提取。
+Extracted from ``brain/core.py``'s ``_detect_supersede``.
 
-三重条件缺一不可：更新标记 + 相似度阈值 + （共同实体 或 高实词重叠），
-防止「花生过敏」这类无关长期事实被「现在养猫」误标为已取代。
+All three conditions are required: update marker + similarity threshold +
+(shared entities OR high content-word overlap), preventing unrelated long
+-term facts like "peanut allergy" from being mislabeled as superseded by "now
+keeping cats".
 
-落点理由：**库存记录上的查询组合 + 状态机写回**——与
-``contradictions.py`` 同族（复用 ``store`` 的 ``get`` / ``iter_records`` /
-``update`` 与 ``MemoryState``）。domain 受依赖矩阵约束碰不到
-``store.memory.MemoryState``，故落 store 侧。
+Placement rationale: **query composition over stock records + state machine
+write-back** -- the same family as ``contradictions.py`` (reusing ``store``'s
+``get`` / ``iter_records`` / ``update`` and ``MemoryState``). Constrained by
+the dependency matrix, domain cannot touch
+``store.memory.MemoryState``, hence it lands on the store side.
 
-纪律同上：本模块**不 import vector_store / brain**——store 实例由调用
-方注入（brain 包装层传 ``self.manager.store``），向量查询 ``vector_of`` 与
-判据 ``is_restatement`` 同样是注入的**可调用对象**（不是调用结果）：
+Same discipline as above: this module **does not import vector_store /
+brain** -- the store instance is injected by the caller (the brain wrapper
+passes ``self.manager.store``); the vector query ``vector_of`` and the
+criterion ``is_restatement`` are likewise injected **callables** (not call
+results):
 
-* ``vector_of`` 只在「含更新标记」的新记忆上才问，标记过滤在前——不给
-  没有更新标记的写入付嵌入查询的代价；
-* ``is_restatement`` 不 import 是为了保住测试对 ``brain._is_restatement``
-  的 monkeypatch 面，同时也让读侧（``domain.conflict_annotate``）与写侧
-  共用同一份判据（各写一套阈值迟早自相矛盾）。
+* ``vector_of`` is only consulted for new memories that "carry an update
+  marker"; marker filtering comes first -- never pay the embedding query cost
+  for writes without an update marker;
+* ``is_restatement`` is not imported in order to preserve the test
+  monkeypatch surface on ``brain._is_restatement``, and also so the read side
+  (``domain.conflict_annotate``) and the write side share one criterion
+  (separately written thresholds would sooner or later contradict each
+  other).
 """
 
 from __future__ import annotations
@@ -41,33 +51,42 @@ def detect_supersede(
     is_restatement: Callable[..., bool],
     update_markers: tuple[str, ...] = UPDATE_MARKERS,
 ) -> list[dict[str, str]]:
-    """在 ``ts`` 之前入库的 active 记忆里，找被 ``new_memory_ids`` 取代的那些。
+    """Among the active memories stored before ``ts``, find those superseded
+    by ``new_memory_ids``.
 
     Args:
-        new_memory_ids: 本次新写入的记忆 id。
-        ts: 本次写入的时间戳；**``>= ts`` 的候选一律跳过**（只取代更旧的，
-            同批写入之间互不取代）。
-        store: 库存记录存储（需 ``get`` / ``iter_records`` / ``update``）。
-        vector_of: 记录 → 向量（``None`` 表示这条没算过向量，跳过）。
-        is_restatement: 同一事实判据，签名见
-            ``domain.policies.is_restatement``。
-        update_markers: 更新标记词表。
+        new_memory_ids: the memory ids newly written this time.
+        ts: this write's timestamp; **candidates with ``>= ts`` are always
+            skipped** (only older ones are superseded; same-batch writes never
+            supersede each other).
+        store: the stock record storage (needs ``get`` / ``iter_records`` /
+            ``update``).
+        vector_of: record -> vector (``None`` means this record has no
+            computed vector; skip).
+        is_restatement: the same-fact criterion; signature in
+            ``domain.policies.is_restatement``.
+        update_markers: the update marker lexicon.
 
     Returns:
-        每个取代一条：``old_id`` / ``new_id`` / ``sim`` / ``old`` / ``new``
-        （后两个是内容前 60 字，仅供回显）。
+        One entry per supersede: ``old_id`` / ``new_id`` / ``sim`` / ``old`` /
+        ``new`` (the last two are the first 60 characters of content, for echo
+        only).
 
-    副作用：把被取代的那条改成 ``state=superseded`` 并挂 ``superseded_by``
-    ——这是本函数**唯一**的写操作，找不到就不写。R2: it also clears
+    Side effect: the superseded record is set to ``state=superseded`` with
+    ``superseded_by`` attached -- this is the function's **only** write
+    operation; if nothing is found, nothing is written. R2: it also clears
     ``pin``; a superseded card must not keep occupying a pinned slot.
 
-    预存行为（与原实现逐条对齐，不要「顺手修好」）：
+    Preserved behavior (aligned with the original implementation item by
+    item; do not "fix it in passing"):
 
-    * 只取代**最相似**的那一条（``sim > best_sim`` 严格大于 ⇒ 同分时
-      先遇到的胜出），避免误伤无关记忆；
-    * 新记忆自己（``rec.id == nid``）、非 active、``timestamp >= ts``
-      的一律不作候选；
-    * 缺向量的新记忆**整体跳过**（不进内层循环）；缺向量的候选只跳过该候选。
+    * only the **most similar** one is superseded (``sim > best_sim`` strict
+      inequality => on ties the first encountered wins), to avoid collateral
+      damage to unrelated memories;
+    * the new memory itself (``rec.id == nid``), non-active records, and those
+      with ``timestamp >= ts`` are never candidates;
+    * a vectorless new memory is **skipped entirely** (never enters the inner
+      loop); a vectorless candidate skips only that candidate.
     """
     out: list[dict[str, str]] = []
     for nid in new_memory_ids:
@@ -92,8 +111,10 @@ def detect_supersede(
                 continue
             denom = (np.linalg.norm(q) * np.linalg.norm(v)) or 1e-12
             sim = float(q @ v / denom)
-            # 判据统一走 is_restatement（读侧的并存冲突标注用同一个），
-            # 两边各写一套阈值迟早会自相矛盾。
+            # The criterion uniformly goes through is_restatement (the read
+            # side's coexistence-conflict annotation uses the same one);
+            # writing a separate threshold set on each side would sooner or
+            # later contradict itself.
             if sim > best_sim and is_restatement(
                 sim, new_rec.content, rec.content, new_ents, rec.entity_ids
             ):

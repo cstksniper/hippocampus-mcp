@@ -1,1 +1,1 @@
-"""domain 子包。"""
+"""domain subpackage."""

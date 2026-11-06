@@ -1,83 +1,101 @@
-"""代码开关图全自动 verify（信息地图层）。
+"""Fully automatic verify of code-switch maps (the information-map layer).
 
-一句话：此前的 verify 要人记得调，auto verify 把它挂到信号上——真相文件
-签名变了才重读、重比，结果仍只落 ``drift`` / ``auto_state``，**不 auto-fix**
-（改地图是有语义的决定，仍走 map_set）。
+One sentence: previously verify required a human to remember to call it; auto verify
+hooks it onto signals — only when a truth file's signature changes does it re-read
+and re-compare, and the result still only lands in ``drift`` / ``auto_state``,
+**no auto-fix** (changing the map is a semantic decision that still goes through
+map_set).
 
-图级配方（``maps.json`` 里那张图的 ``auto`` 键；单条或列表都合法）::
+Map-level recipe (the map's ``auto`` key in ``maps.json``; a single entry or a list
+are both legal)::
 
     "auto": {
       "kind": "code_flag",
-      "source": "CMakeLists.txt",   # 相对 file_registry root
-      "extract": "cmake_option",    # 提取器
-      "extract_args": {},           # regex 用 pattern / yaml_path 用 path
-      "normalize": {"ON": "开"}     # 可选：配置值 → 地图用词
+      "source": "CMakeLists.txt",   # relative to the file_registry root
+      "extract": "cmake_option",    # extractor
+      "extract_args": {},           # regex uses pattern / yaml_path uses path
+      "normalize": {"ON": "开"}     # optional: config value → map wording
     }
 
-提取器（**只认静态字面量**）：
+Extractors (**static literals only**):
 
 ===============  ==========================================  ==================
-extract          读什么                                      例子
+extract          what it reads                               example
 ===============  ==========================================  ==================
 cmake_option     ``option(NAME ON/OFF)`` / ``set(NAME ON)``   option(USE_AVX2 ON)
 c_define         ``#define NAME 0/1`` / ``#define NAME``      config.h
-regex            自定义正则，命名组 key/value                 Makefile ``?= 1``
-yaml_path        yaml/json 路径取值（``{key}`` 占位）          build.avx2
+regex            custom regex with named groups key/value    Makefile ``?= 1``
+yaml_path        yaml/json path lookup (``{key}`` placeholder)  build.avx2
 ===============  ==========================================  ==================
 
-四条「不猜」纪律（每条都对应一个真实的假 clean 场景）：
+The four "no guessing" disciplines (each one corresponds to a real false-clean scenario):
 
-1. **动态值跳过**：变量插值 ``${BASE}``、非字面量值、未知 status 词——
-   标 extract_failed，既不判 clean 也不判 drift（判 clean 是漏报、判
-   drift 是假报，两种都比「说不清」更糟）。
-2. **被动态块遮蔽不许退回静态声明**：``option(USE_AVX2 ON)`` 后面跟着
-   ``if(WIN32) set(USE_AVX2 OFF) endif()``，只取静态 ON 会在 Windows 上
-   报 clean；规则是某名字在动态块内出现过 ⇒ 该条目 extract_failed。
-   staleness 系统最重的事故不是漏报，是**假保证**。
-3. **同名多声明取最后一个无条件声明**（CMake/Make 既有语义）；中途被
-   动态块遮蔽过就整体 failed，不许实现随意选 first/last。
-4. **根不猜**：``source`` 相对 **file_registry root** 解析；没建档 root
-   时只接受 ``auto.root`` 的**绝对路径**，否则拒绝执行并 note——daemon
-   的 cwd 是启动目录，回落 cwd 会解析到另一个 CMakeLists.txt 并给出
-   貌似合法的结论。
+1. **Dynamic values are skipped**: variable interpolation ``${BASE}``, non-literal
+   values, unknown status words — marked extract_failed, judged neither clean nor
+   drift (judging clean is an under-report, judging drift is a false report; both
+   are worse than "cannot say").
+2. **When shadowed by a dynamic block, falling back to the static declaration is not
+   allowed**: ``option(USE_AVX2 ON)`` followed by ``if(WIN32) set(USE_AVX2 OFF)
+   endif()`` — taking only the static ON would report clean on Windows; the rule is:
+   a name ever appeared inside a dynamic block ⇒ that entry is extract_failed.
+   The staleness system's worst incident is not an under-report, it is a **false
+   guarantee**.
+3. **Same-name multiple declarations take the last unconditional declaration**
+   (existing CMake/Make semantics); if it was ever shadowed by a dynamic block in
+   between, the whole thing fails — the implementation may not freely pick
+   first/last.
+4. **The root is not guessed**: ``source`` resolves relative to the **file_registry
+   root**; when there is no registered root, only an **absolute path** in
+   ``auto.root`` is accepted, otherwise execution is refused with a note — the
+   daemon's cwd is the startup directory, and falling back to cwd would resolve to a
+   different CMakeLists.txt and produce a seemingly valid conclusion.
 
-哈希仲裁：source 的 (size, mtime_ns) 没变 ⇒ 零读取直接用上次
-结论（``res["reused"]``）；签名变或首次才读文件提取。总墙钟预算默认 1s，
-超了标 ``incomplete`` 自曝。
+Hash arbitration: if the source's (size, mtime_ns) is unchanged ⇒ zero reads, reuse
+the last conclusion (``res["reused"]``); the file is read and extracted only when
+the signature changed or on first run. The total wall-clock budget defaults to 1s;
+when exceeded, mark ``incomplete`` to self-report.
 
-目录对账（同一个模块）::
+Directory reconciliation (same module)::
 
     "auto": {
       "kind": "dir_reconcile",
-      "root": "data/",                 # 对账目录，相对建档 root（默认=项目根）
-      "key_pattern": "CN[0-9]+",       # fullmatch；有 (?P<key>...) 取组内容
-      "status_map": {"训练集": "train"},  # 可选：status → 应住的子目录
-      "file_ext": ".fastq"             # 可选：只数这类文件
+      "root": "data/",                 # reconciliation directory, relative to the registered root (default = project root)
+      "key_pattern": "CN[0-9]+",       # fullmatch; with (?P<key>...) the group content is taken
+      "status_map": {"训练集": "train"},  # optional: status → the subdirectory it should live in
+      "file_ext": ".fastq"             # optional: count only this kind of file
     }
 
-与 C1 的根本差别是**信息方向**：C1 答「真相文件里的值变了没」（地图→源），
-C2 多了一路「目录里多了地图不知道的东西」（源→地图）——后者 truth_source
-结构上抓不到，因为它只能答「真相变了地图跟上没」。四路输出：
+The fundamental difference from C1 is the **direction of information**: C1 answers
+"did the value in the truth file change" (map→source); C2 adds a second channel,
+"the directory holds things the map does not know about" (source→map) — the latter
+is structurally unreachable by truth_source, which can only answer "did the truth
+change and did the map keep up". Four output channels:
 
 ====================  ============================================  ==========
-方向                  判据                                          结果
+Direction             Criterion                                     Result
 ====================  ============================================  ==========
-地图→目录              条目键在对账目录下没有任何对应目录/文件        dir_missing
-地图→目录（配了 map）  status 应住的子目录 ≠ 实际所在子目录          dir_conflict
-目录→地图              目录里有键、地图没这条                        unmatched
-恢复                   上两种情况的原因消失                          drift 清空
+map→directory         the entry key has no corresponding directory/file under  dir_missing
+                      the reconciliation directory
+map→directory (w/ map)  the subdirectory the status should live in ≠ the     dir_conflict
+                      subdirectory it actually sits in
+directory→map         the directory has the key, the map lacks the entry      unmatched
+recovery              the cause of either of the two cases disappeared        drift cleared
 ====================  ============================================  ==========
 
-三条实现纪律：
-1. **零重复 IO**：不扫盘，直接在 file_registry 已建档的 ``files`` 上做集合
-   运算（对账只读侧车；``auto.root`` 是否存在的``isdir`` 那一次除外，用来
-   区分「目录被改名」与「条目全丢」）。
-2. **消费建档产物有前提**：没有 file_registry 侧车就**拒绝执行**（不降级
-   现扫、不回落 cwd）——降级现扫会造出与建档口径不同的第二份目录快照，
-   两套答案会打架。
-3. **建档扫描不完整（``scan_complete=false``）时不判缺失/漏登**：截断区域
-   里的键本来就没被看到，判 missing 是纯误报（与 file_registry 自己同一
-   纪律）。此时图标 ``incomplete`` 自曝，条目落 failed 而不是 clean。
+Three implementation disciplines:
+1. **Zero repeated IO**: no disk scanning; set operations run directly on the
+   already-registered ``files`` of file_registry (reconciliation only reads the
+   sidecar; the single ``isdir`` on whether ``auto.root`` exists is the exception,
+   used to distinguish "the directory was renamed" from "all entries are gone").
+2. **Consuming registry output has preconditions**: without the file_registry
+   sidecar, **refuse to execute** (no degraded live scan, no cwd fallback) — a
+   degraded live scan would create a second directory snapshot inconsistent with
+   the registry's account, and the two sets of answers would fight each other.
+3. **When the registered scan is incomplete (``scan_complete=false``), do not judge
+   missing/unregistered**: keys in the truncated region were never seen in the
+   first place; judging missing is a pure false positive (the same discipline as
+   file_registry itself). In that case the map is flagged ``incomplete`` to
+   self-report, and entries land in failed rather than clean.
 """
 
 from __future__ import annotations
@@ -92,12 +110,13 @@ from .constants import (
     MAP_AUTO_MAX_SOURCE_BYTES,
 )
 
-# status 与配置值各自的归一化词表（设计 §8 C1：只有这 4+4 个词算确定，
-# 其余一律 failed——「启用」「部分」这类词判 clean 是猜，判 drift 也是猜）
+# Normalization word lists for status and config values respectively (design §8 C1:
+# only these 4+4 words count as certain; everything else is failed — judging clean
+# from words like 「启用」 (enabled) / 「部分」 (partial) is guessing, and so is judging drift)
 ON_WORDS = {"开", "on", "true", "1"}
 OFF_WORDS = {"关", "off", "false", "0"}
 
-# 提取器认的 cmake 字面量（大小写不敏感）；不在表里 ⇒ 非字面量 ⇒ 动态
+# CMake literals the extractor accepts (case-insensitive); not in the table ⇒ non-literal ⇒ dynamic
 _CMAKE_LITERALS = {"ON", "OFF", "TRUE", "FALSE", "1", "0", "YES", "NO"}
 _CMAKE_OPEN = {"if", "foreach", "while", "function", "macro", "block"}
 _CMAKE_CLOSE = {"endif", "endforeach", "endwhile", "endfunction", "endmacro",
@@ -105,10 +124,10 @@ _CMAKE_CLOSE = {"endif", "endforeach", "endwhile", "endfunction", "endmacro",
 _C_LITERALS = {"0", "1", "true", "false", "TRUE", "FALSE"}
 
 
-# ── 归一化 ──────────────────────────────────────────────────────
+# ── Normalization ──────────────────────────────────────────────────────
 
 def norm_flag(value: object) -> str | None:
-    """把词归一成 ``"on"`` / ``"off"``；认不出返回 None（调用方判 failed）。"""
+    """Normalize a word into ``"on"`` / ``"off"``; return None when unrecognized (the caller judges it failed)."""
     v = "" if value is None else str(value).strip().lower()
     if v in ON_WORDS:
         return "on"
@@ -118,10 +137,11 @@ def norm_flag(value: object) -> str | None:
 
 
 def apply_normalize(value: str, normalize: dict | None) -> str:
-    """图级 ``normalize`` 先作用于**配置侧**取值（``{"ON": "开"}``）。
+    """The map-level ``normalize`` applies first to the **config-side** value (``{"ON": "开"}``).
 
-    方向是设计 §8 C1 钉死的：配置值 → 地图用词；与 C2 的 status_map
-    （status → 目录名）方向相反。大小写不敏感兜底，避免 ``"on"`` 漏配。
+    The direction is pinned by design §8 C1: config value → map wording; opposite to
+    C2's status_map (status → directory name). A case-insensitive fallback avoids
+    missing an ``"on"`` that was not configured.
     """
     s = "" if value is None else str(value)
     if not normalize:
@@ -132,16 +152,18 @@ def apply_normalize(value: str, normalize: dict | None) -> str:
     return str(low.get(s.strip().lower(), s))
 
 
-# ── 提取器（返回 (values, error, lookup)） ──────────────────────
+# ── Extractors (return (values, error, lookup)) ──────────────────────
 #
-# values: {name: (value|None, dynamic_reason|None)}——None+reason 即
-#         「这个名字出现过但说不清」，绝不当成没出现。
-# lookup: yaml_path 这类「路径里带 {key}」的提取器用，按条目键现算。
+# values: {name: (value|None, dynamic_reason|None)} — None+reason means
+#         "this name appeared but cannot be pinned down", never treated as absent.
+# lookup: used by extractors like yaml_path whose "path carries {key}", computed
+#         per entry key on the fly.
 
 def _record(vals: dict, name: str, value: str | None,
             reason: str | None) -> None:
-    """登记一次声明：动态一旦出现就永不被后续静态值冲掉（纪律 2）；
-    静态则**后写覆盖前写**——同名多声明取最后一个（纪律 3）。"""
+    """Record one declaration: once a dynamic appears it is never washed away by later
+    static values (discipline 2); for statics, **later writes overwrite earlier
+    writes** — same-name multiple declarations take the last one (discipline 3)."""
     cur = vals.get(name)
     if cur is not None and cur[1]:
         return
@@ -175,7 +197,7 @@ def _cmake_strip_comment(line: str) -> str:
 
 
 def _cmake_statements(text: str):
-    """切「命令名 + 参数」：处理续行 ``\\`` 与跨行括号（if 块内是常态）。"""
+    """Split into "command name + args": handles line continuations ``\\`` and multi-line parentheses (the norm inside if blocks)."""
     buf: list[str] = []
     for raw in text.splitlines():
         line = _cmake_strip_comment(raw).rstrip()
@@ -218,8 +240,8 @@ def extract_cmake(text: str, args: dict) -> tuple[dict, str | None, None]:
         if not parts:
             continue
         name = parts[0]
-        # option(NAME "help" ON) 的值是最后一个参数；set(NAME VALUE ...)
-        # 的值是第二个（后面可能跟 CACHE BOOL "help"）
+        # option(NAME "help" ON)'s value is the last argument; set(NAME VALUE ...)'s
+        # value is the second (CACHE BOOL "help" may follow)
         value = parts[-1] if cmd == "option" else (
             parts[1] if len(parts) > 1 else "")
         reason = None
@@ -291,7 +313,7 @@ def extract_regex(text: str, args: dict) -> tuple[dict, str | None, None]:
 
 
 def _load_struct(text: str) -> tuple[object, str | None]:
-    """先按 JSON 解；不是 JSON 再试 PyYAML（本仓不新增依赖，没有就报）。"""
+    """Parse as JSON first; if not JSON, try PyYAML (this repo adds no new dependencies — report when absent)."""
     try:
         return json.loads(text), None
     except ValueError:
@@ -303,7 +325,7 @@ def _load_struct(text: str) -> tuple[object, str | None]:
                       "or switch to the regex extractor")
     try:
         return yaml.safe_load(text), None
-    except Exception as exc:  # noqa: BLE001 —— 第三方解析器异常类型不定
+    except Exception as exc:  # noqa: BLE001 —— third-party parser exception types are unpredictable
         return None, "yaml parse failed: %s" % exc
 
 
@@ -321,7 +343,7 @@ def extract_yaml_path(text: str, args: dict):
             if isinstance(cur, dict) and seg in cur:
                 cur = cur[seg]
             else:
-                return None, None          # 路径不存在 ⇒ 该键「没出现」
+                return None, None          # path does not exist ⇒ the key "did not appear"
         if isinstance(cur, (dict, list)):
             return None, "path %s is a container, not a flag value" % path
         if cur is None:
@@ -340,23 +362,24 @@ EXTRACTORS = {
     "yaml_path": extract_yaml_path,
 }
 
-# 两种图级配方：C1 值级比对（读真相文件）/ C2 目录对账（读建档产物）
+# Two map-level recipe kinds: C1 value-level comparison (reads truth files) / C2 directory reconciliation (reads registry output)
 KINDS = ("code_flag", "dir_reconcile")
 
-# 目录对账自己写的 drift 原因（清理时只清这两种，别碰手写地图的 changed/missing
-# 与源校验的 value_changed——三条链路共用 ent["drift"] 这一个通道）
+# drift reasons written by directory reconciliation itself (cleanup clears only these
+# two; never touch the hand-written map's changed/missing or the source verification's
+# value_changed — all three channels share the single ent["drift"] channel)
 RECONCILE_REASONS = ("dir_missing", "dir_conflict")
 
 
 def _kind(rule: dict) -> str:
-    """配方类型（缺省 code_flag，与 validate_rule 同默认）。"""
+    """Recipe kind (defaults to code_flag, the same default as validate_rule)."""
     return str((rule or {}).get("kind") or "code_flag").strip()
 
 
-# ── 配置校验（CLI 写 auto 时用） ────────────────────────────────
+# ── Config validation (used when the CLI writes auto) ────────────────────────────────
 
 def _validate_reconcile(out: dict) -> dict:
-    """C2 配方校验（用法错误抛 ValueError——配错了就是假的 clean）。"""
+    """C2 recipe validation (usage errors raise ValueError — a mis-configuration is a fake clean)."""
     for dead in ("source", "extract", "extract_args", "normalize"):
         if out.get(dead):
             raise ValueError("dir_reconcile does not need %s (reconciliation consumes file_registry "
@@ -393,7 +416,7 @@ def _validate_reconcile(out: dict) -> dict:
 
 
 def validate_rule(rule: dict) -> dict:
-    """校验并按默认值补全一条 auto 配方；用法错误抛 ValueError。"""
+    """Validate one auto recipe and complete it with defaults; usage errors raise ValueError."""
     if not isinstance(rule, dict):
         raise ValueError("the auto recipe must be a JSON object")
     out = dict(rule)
@@ -428,7 +451,7 @@ def validate_rule(rule: dict) -> dict:
 
 
 def _rules(auto: object) -> list[dict]:
-    """``auto`` 单条或列表 ⇒ 规则列表（无 kind 的脏数据直接忽略）。"""
+    """``auto`` single entry or list ⇒ list of rules (dirty data without kind is ignored outright)."""
     if isinstance(auto, dict):
         return [auto] if auto.get("kind") else []
     if isinstance(auto, list):
@@ -436,10 +459,10 @@ def _rules(auto: object) -> list[dict]:
     return []
 
 
-# ── 主流程 ──────────────────────────────────────────────────────
+# ── Main flow ──────────────────────────────────────────────────────
 
 def _base_root(rule: dict, registry_root: str | None) -> str | None:
-    """根解析：建档 root > ``auto.root``（必须绝对）> None（= 不猜，拒绝执行）。"""
+    """Root resolution: registered root > ``auto.root`` (must be absolute) > None (= no guessing, refuse to execute)."""
     if registry_root:
         return registry_root
     r = str(rule.get("root") or "").strip()
@@ -478,7 +501,7 @@ def _mark_failed(ent: dict, now: float, reason: str, **extra) -> None:
 def _verify_flags(mname: str, m: dict, rules: list[dict],
                   registry_root: str | None, res: dict, now: float,
                   force: bool, deadline: float, state: dict) -> None:
-    """C1：逐条比对真相文件里的配置值（state 由调用方建好并落回图上）。"""
+    """C1: compare the config values in the truth file entry by entry (state is created by the caller and written back onto the map)."""
     bases = {}
     for rule in rules:
         base = _base_root(rule, registry_root)
@@ -499,7 +522,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
         if sig is None:
             src_err[src] = "source file does not exist"
 
-    # 哈希仲裁快路径：源签名没变 ⇒ 零读取，用上次结论（同纪律）
+    # Hash-arbitration fast path: source signature unchanged ⇒ zero reads, reuse the last conclusion (same discipline)
     prev = state.get("source_sigs")
     if (not force) and prev and prev == sigs and state.get("checked"):
         res["reused"] += 1
@@ -526,8 +549,9 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
     for key, ent in (m.get("entries") or {}).items():
         if not isinstance(ent, dict):
             continue
-        # 逐条查预算（不是逐图）：一张图可能几百个开关，条目循环也不是
-        # 免费；超了就地停，已核的算数、剩下的留给下轮
+        # Check the budget per entry (not per map): one map may hold hundreds of switches,
+        # and the entry loop is not free either; when exceeded, stop in place — the ones
+        # already checked count, the rest are left for the next round
         if time.perf_counter() > deadline:
             res["incomplete"] = True
             break
@@ -573,7 +597,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
             failed += 1
             errs = [e for _, _, e, _ in extracted if e]
             if errs and len(errs) == len(extracted):
-                # 所有源都读不了：报源错误本身，比「没找到」有用
+                # All sources failed to read: report the source errors themselves, more useful than "not found"
                 reason = "；".join(dict.fromkeys(errs))
             else:
                 reason = ("the flag was not found in the source (%s)"
@@ -588,7 +612,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
             clean += 1
             ent["auto_state"] = {"state": "clean", "observed": got_raw,
                                  "source": src_used, "at": now}
-            # 只清自己写的漂移（truth_source 的 changed/missing 归基础巡检管）
+            # only clear the drift we wrote ourselves (truth_source's changed/missing is handled by the base patrol)
             if (ent.get("drift") or {}).get("reason") == "value_changed":
                 ent["drift"] = None
             continue
@@ -596,7 +620,7 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
         drifted += 1
         since = now
         if (ent.get("drift") or {}).get("reason") == "value_changed":
-            since = (ent.get("drift") or {}).get("since") or now   # 只进必退
+            since = (ent.get("drift") or {}).get("since") or now   # 只进必退: since is set on first entry and not reset while the condition persists
         ent["drift"] = {"reason": "value_changed", "since": since,
                         "observed": got_raw, "expect": ent.get("status"),
                         "source": src_used}
@@ -610,12 +634,14 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
     state.update({"source_sigs": sigs, "at": now, "checked": checked,
                   "clean": clean, "drifted": drifted, "failed": failed,
                   "source_errors": src_err,
-                  # 预算超限也算「这轮没核完」——不标的话索引行与收尾
-                  # 都看不到，等于把一次截断悄悄当成全 clean
+                  # exceeding the budget also counts as "this round did not finish checking" —
+                  # without the flag, neither the index row nor the session-end sees it,
+                  # silently treating a truncated round as all-clean
                   "incomplete": bool(src_err) or bool(res.get("incomplete"))})
     if src_err:
-        # 部分源解析失败 ⇒ 图整体标 incomplete（设计 §8 规格修订 2），
-        # 不当「部分通过」——报 clean 的图必须每个源都读到了
+        # some sources failed to parse ⇒ mark the whole map incomplete (design §8 spec
+        # revision 2), not "partially passed" — a map reporting clean must have read
+        # every source
         state["error"] = "；".join("%s: %s" % (k, v) for k, v in src_err.items())
     else:
         state.pop("error", None)
@@ -623,17 +649,18 @@ def _verify_flags(mname: str, m: dict, rules: list[dict],
     res["clean"] += clean
 
 
-# ── C2：数据目录对账 ────────────────────────────────────────────
+# ── C2: data directory reconciliation ────────────────────────────────────────────
 
 def _add_error(state: dict, msg: str) -> None:
-    """图上错误是**累积**的（源错误 / 无建档 / 对账目录不存在）：
-    后到的不能把先到的抹掉，否则收尾只看到最后一条。"""
+    """Errors on the map are **accumulative** (source errors / not registered / the
+    reconciliation directory does not exist): later arrivals must not wipe out
+    earlier ones, otherwise the session-end only sees the last one."""
     old = str(state.get("error") or "")
     state["error"] = msg if (not old or msg in old) else "%s；%s" % (old, msg)
 
 
 def _norm_rel(p: object) -> str:
-    """相对路径规范化：``\\``→``/``、去 ``./`` 与首尾斜杠；根目录 → ``""``。"""
+    """Normalize a relative path: ``\\``→``/``, strip ``./`` and leading/trailing slashes; root directory → ``""``."""
     s = str(p or "").strip().replace("\\", "/")
     while s.startswith("./"):
         s = s[2:]
@@ -642,11 +669,12 @@ def _norm_rel(p: object) -> str:
 
 
 def _match_key(rx: re.Pattern, name: str) -> str | None:
-    """从单个路径段抽键：命名组 ``(?P<key>...)`` 取组内容，否则取整串。
+    """Extract a key from a single path segment: with the named group ``(?P<key>...)`` take the group content, otherwise take the whole string.
 
-    **一律 fullmatch**（设计 §8 规格修订 6）：``^CN[0-9]+`` 配 ``CN2601_old``
-    不许抽出 CN2601（那样删除的合约会显示「还在」，missing 漏报）；要抽取
-    就写命名组，要相等就整串——没有第三种语义词。
+    **Always fullmatch** (design §8 spec revision 6): ``^CN[0-9]+`` matching
+    ``CN2601_old`` must not extract CN2601 (that would make a deleted contract show
+    as "still there", an under-reported missing); to extract, write a named group;
+    to mean equality, use the whole string — there is no third semantic.
     """
     mt = rx.fullmatch(name)
     if not mt:
@@ -659,17 +687,19 @@ def _match_key(rx: re.Pattern, name: str) -> str | None:
 
 def _scan_keys(files: dict, prefix: str, rx: re.Pattern,
                file_ext: str | None) -> dict[str, set[str]]:
-    """在**已建档产物**上抽键（零磁盘 IO）：``{key: {所在子目录}}``。
+    """Extract keys over the **already-registered output** (zero disk IO): ``{key: {subdirectories it sits in}}``.
 
-    目录键与文件键都认：``训练集/CN2601/raw/a.fastq`` 里 CN2601 是目录键，
-    ``训练集/CN2601.fastq`` 里 CN2601 是文件键。``所在子目录`` = 键实体的
-    父目录（相对对账目录），供 status_map 判「该住在哪个子目录」。
+    Both directory keys and file keys are recognized: in ``训练集/CN2601/raw/a.fastq``
+    CN2601 is a directory key; in ``训练集/CN2601.fastq`` it is a file key.
+    "Subdirectory it sits in" = the parent directory of the key entity (relative to
+    the reconciliation directory), for status_map to judge "which subdirectory it
+    should live in".
     """
     found: dict[str, set[str]] = {}
     pre = prefix + "/" if prefix else ""
     for rel, ent in (files or {}).items():
         if not isinstance(ent, dict) or ent.get("status") == "missing":
-            continue              # 建档已判 missing ⇒ 磁盘上确实没有
+            continue              # the registry already judged it missing ⇒ truly absent on disk
         r = str(rel).replace("\\", "/")
         if pre:
             if not r.startswith(pre):
@@ -683,9 +713,9 @@ def _scan_keys(files: dict, prefix: str, rx: re.Pattern,
         base = segs[-1]
         if file_ext:
             if not base.lower().endswith(file_ext):
-                continue          # 只数这类文件
+                continue          # count only this kind of file
             base = base[:len(base) - len(file_ext)]
-        # 中间每一段都是「目录键」候选（目录键的所在子目录 = 它的父目录）
+        # every intermediate segment is a "directory key" candidate (a directory key's subdirectory = its parent directory)
         for i, seg in enumerate(segs[:-1]):
             k = _match_key(rx, seg)
             if k:
@@ -703,7 +733,7 @@ def _fmt_locs(locs: set[str]) -> str:
 
 
 def _reconcile_root(rule: dict, base: str) -> tuple[str, str | None]:
-    """对账目录解析：``auto.root`` 相对**建档 root**；绝对路径必须在其下。"""
+    """Reconciliation-directory resolution: ``auto.root`` is relative to the **registered root**; absolute paths must sit under it."""
     raw = str(rule.get("root") or "").strip()
     if not raw:
         return "", None
@@ -721,14 +751,16 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
                       registry_root: str | None, res: dict, now: float,
                       deadline: float, state: dict,
                       registry: dict | None) -> None:
-    """C2：地图条目 ↔ 数据目录双向对账（只读建档产物，只产信号）。
+    """C2: two-way reconciliation between map entries ↔ data directories (reads only registry output, produces only signals).
 
-    四路输出见模块 docstring 的表；核心判断顺序是**先「在不在」再「在哪」**
-    ——文件根本不在时谈子目录没意义，而 status_map 缺失时只做前者
-    （降级安全，设计 §8 规格修订 7）。
+    The four output channels are in the module docstring's table; the core judgment
+    order is **"is it there" first, "where is it" second** — when the file is not
+    there at all, talking about subdirectories is meaningless; and when status_map is
+    missing, only the former is done (safe degradation, design §8 spec revision 7).
     """
-    # 只认**建档侧车本身**：只有 registry_root 字符串不够（拿不到 files 就
-    # 等于没有对账数据源）。缺了就拒绝执行，不降级现扫、不回落 cwd。
+    # Only the **registered sidecar itself** counts: the bare registry_root string is not
+    # enough (without files there is no reconciliation data source). If missing, refuse
+    # to execute — no degraded live scan, no cwd fallback.
     if not isinstance(registry, dict) \
             or not isinstance(registry.get("files"), dict):
         _add_error(state, "not registered (no file_registry sidecar), not verifying -- "
@@ -767,8 +799,10 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
             continue
         target = os.path.join(base, prefix) if prefix else base
         if not os.path.isdir(target):
-            # 目录整枝不在：报「对账目录不存在」而不是让每个条目都 missing
-            # ——后者会把一次改名说成 N 条数据丢失（假告警比漏报更伤信任）
+            # The whole reconciliation subtree is absent: report "the reconciliation
+            # directory does not exist" instead of letting every entry go missing —
+            # the latter would narrate one rename as N data losses (a false alarm
+            # erodes trust more than an under-report)
             err = "reconciliation directory does not exist: %s (relative to registered root %s)" % (prefix or ".", base)
             _add_error(state, err)
             res["bad_root"].append({"map": mname, "error": err})
@@ -798,7 +832,7 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
         locs = merged.get(str(key))
         if not locs:
             if not complete:
-                # 截断区域里的键本来就没被看到：判 missing 是纯误报
+                # keys in the truncated region were never seen in the first place: judging missing is a pure false positive
                 failed += 1
                 reason = ("registered scan incomplete (scan_complete=false) -- not scanned "
                           "does not mean absent; missing-entries are not judged")
@@ -850,7 +884,7 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
                 "observed": _fmt_locs(locs),
                 "expect": status,
                 "source": "file_registry", "at": now}
-            # 只清自己写的漂移（手写地图 changed/missing、源 value_changed 不碰）
+            # only clear the drift we wrote ourselves (the hand-written map's changed/missing and the source's value_changed are untouched)
             if (ent.get("drift") or {}).get("reason") in RECONCILE_REASONS:
                 ent["drift"] = None
             continue
@@ -873,18 +907,21 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
                                "observed": _fmt_locs(locs),
                                "source": "file_registry"})
 
-    # 计数用**独立键**（rec_*）：C1 的快路径会整轮复用上次结论、不改计数，
-    # 两套计数共用同名键时，复用轮次会把上一轮的数再加一遍（虚高）。条目级
-    # 结论本来就写在每条 ent["auto_state"] 里，这里只是给 CLI/诊断看的汇总。
+    # Counts use **independent keys** (rec_*): C1's fast path reuses the last conclusion
+    # for the whole round without touching counters; with both counter sets sharing the
+    # same keys, a reused round would add the previous round's numbers again (inflated).
+    # Entry-level conclusions are already written into each ent["auto_state"]; this is
+    # just the summary for the CLI/diagnostics.
     state.update({"rec_checked": checked, "rec_clean": clean,
                   "rec_drifted": drifted, "rec_failed": failed})
     state["at"] = now
     res["checked"] += checked
     res["clean"] += clean
 
-    # 目录→地图：多出来的键（truth_source 结构上抓不到的那个方向）。
-    # 扫描不完整 / 预算截断时**不写**这组数（宁可没有数，也不给半个数），
-    # 并把 unmatched_complete 置 False 让读侧知道上一轮的数是历史。
+    # directory→map: the extra keys (the direction truth_source structurally cannot see).
+    # When the scan is incomplete / truncated by budget, **do not write** this set of
+    # numbers (rather no numbers than half numbers), and set unmatched_complete to False
+    # so the read side knows the previous round's numbers are history.
     if complete and not truncated:
         extra = sorted(k for k in merged if k not in entries)
         state["unmatched"] = extra[:20]
@@ -898,8 +935,9 @@ def _verify_reconcile(mname: str, m: dict, rules: list[dict],
         state["unmatched"] = []
         state["unmatched_total"] = 0
         state["unmatched_complete"] = False
-        # 整轮结论只是「已扫到的那部分」：run 级也要自曝，否则调用方看到
-        # res["incomplete"]=False 会把它当完整一轮
+        # The whole round's conclusion covers only "the part already scanned": self-report
+        # at the run level too, otherwise a caller seeing res["incomplete"]=False will
+        # treat it as a complete round
         res["incomplete"] = True
         state["incomplete"] = True
         if not complete:
@@ -911,7 +949,7 @@ def _verify_map(mname: str, m: dict, rules: list[dict],
                 registry_root: str | None, res: dict, now: float,
                 force: bool, deadline: float,
                 registry: dict | None = None) -> None:
-    """按配方类型分派：C1 值级比对 / C2 目录对账，共用同一份 ``auto_state``。"""
+    """Dispatch by recipe kind: C1 value-level comparison / C2 directory reconciliation, sharing the same ``auto_state``."""
     prev_state = m.get("auto_state")
     state: dict = dict(prev_state) if isinstance(prev_state, dict) else {}
     m["auto_state"] = state
@@ -926,9 +964,10 @@ def _verify_map(mname: str, m: dict, rules: list[dict],
 
 
 def needs_registry(data: dict) -> bool:
-    """有没有 dir_reconcile 配方（决定要不要读 file_registry 侧车）。
+    """Whether there is a dir_reconcile recipe (decides whether the file_registry sidecar needs reading).
 
-    brain 侧用它避免为 C1-only 的库白读一份几 MB 的建档 JSON。
+    The brain side uses it to avoid pointlessly reading a multi-MB registry JSON for
+    C1-only libraries.
     """
     for m in (data.get("maps") or {}).values():
         for rule in _rules((m or {}).get("auto")):
@@ -940,11 +979,13 @@ def needs_registry(data: dict) -> bool:
 def run(data: dict, registry_root: str | None = None,
         budget_s: float | None = None, force: bool = False,
         now: float | None = None, registry: dict | None = None) -> dict:
-    """跑一遍所有带 ``auto`` 配方的图。**只改 data（内存）**，落盘由调用方管。
+    """Run over every map carrying an ``auto`` recipe. **Only modifies data (in memory)**; persisting to disk is the caller's job.
 
-    返回计数 + 三态清单；``incomplete`` 表示预算超限或建档扫描不完整
-    （不静默降级成全 clean）。``registry`` 只在图里有 dir_reconcile 配方时
-    需要（传 file_registry 的侧车 dict，C2 零重复 IO 全靠它）。
+    Returns counts + the three-state lists; ``incomplete`` means the budget was
+    exceeded or the registered scan is incomplete (no silent degradation to
+    all-clean). ``registry`` is needed only when some map has a dir_reconcile recipe
+    (pass the file_registry sidecar dict; C2's zero repeated IO depends entirely on
+    it).
     """
     now = time.time() if now is None else now
     budget = MAP_AUTO_BUDGET_S if budget_s is None else float(budget_s)

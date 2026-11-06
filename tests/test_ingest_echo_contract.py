@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
-"""写入侧回显契约：合并警示必须在返回体首位。
+"""Write-side echo contract: the merge warning must lead the payload.
 
-背景：命中 0.85 去重阈值时，本次写入**不会新建条目**，内容被并入既有记忆。
-这是宿主最该先看到的事——实测后果是「燕行日程·约二千余里」这类带新数字的卡片
-被整条吞掉，宿主却毫无察觉（只能靠改写措辞降相似度来救）。
+Background: when the 0.85 dedup threshold is hit, the write **creates no new
+record**; the content is folded into the existing memory. This is what the
+host most needs to see first -- in practice, cards carrying new numbers like
+「燕行日程·约二千余里」 got swallowed whole while the host never noticed
+(the only rescue was rewording to lower similarity).
 
-此前 `merged_into` 排在返回体倒数第二，被 raw_id / memory_ids 挤到末尾；
-宿主只看开头几个字段时等于没看见。**JSON 保序，所以字段顺序就是优先级。**
+Previously `merged_into` sat second-to-last in the payload, squeezed to the
+end behind raw_id / memory_ids; a host reading only the first few fields saw
+nothing. **JSON preserves order, so field order is priority.**
 
-覆盖：
-    A1 ingest 返回体首键 = merged_into
-    A2 ingest_batch 返回体首键 = merged_into
-    A3 命中去重时 merged_into 非空，且本次确实没新建（memory_ids 并入既有 id）
-    A4 未命中去重时 merged_into 为空、新建了条目
+Coverage:
+    A1 first key of the ingest payload = merged_into
+    A2 first key of the ingest_batch payload = merged_into
+    A3 on a dedup hit, merged_into is non-empty and nothing new was created (memory_ids fold into the existing id)
+    A4 on no dedup hit, merged_into is empty and a new record is created
 
-用法：
+Usage:
     <py311> tests/test_ingest_echo_contract.py
 """
 from __future__ import annotations
@@ -57,31 +60,31 @@ def main() -> int:
 
     text = "燕行日程往返约二千余里"
 
-    # A1 / A3：重复写入触发去重
+    # A1 / A3: duplicate write triggers dedup
     b = _new_brain()
     r1 = b.ingest(text)
-    check("A3 首次写入新建了条目", len(r1["memory_ids"]) == 1, str(r1["memory_ids"]))
+    check("A3 first write creates a record", len(r1["memory_ids"]) == 1, str(r1["memory_ids"]))
     first_id = r1["memory_ids"][0]
 
     r2 = b.ingest(text)
     keys = list(r2.keys())
-    check("A1 ingest 返回体首键 = merged_into", keys[0] == "merged_into", str(keys[:3]))
-    check("A3 命中去重时 merged_into 非空", bool(r2["merged_into"]), str(r2["merged_into"])[:120])
-    check("A3 本次并入既有 id（未新建）",
+    check("A1 ingest payload first key = merged_into", keys[0] == "merged_into", str(keys[:3]))
+    check("A3 merged_into non-empty on dedup hit", bool(r2["merged_into"]), str(r2["merged_into"])[:120])
+    check("A3 folded into the existing id (nothing new created)",
           r2["memory_ids"] == [first_id], f"{r2['memory_ids']} vs {[first_id]}")
 
-    # A2：批写
+    # A2: batch write
     b2 = _new_brain()
     b2.ingest(text)
     out = b2.ingest_batch([text, text])
     keys = list(out.keys())
-    check("A2 ingest_batch 返回体首键 = merged_into", keys[0] == "merged_into", str(keys[:3]))
+    check("A2 ingest_batch payload first key = merged_into", keys[0] == "merged_into", str(keys[:3]))
 
-    # A4：未命中去重
+    # A4: no dedup hit
     b3 = _new_brain()
     r = b3.ingest("一条完全独立的新内容，与其他条目都不相似")
-    check("A4 未命中时 merged_into 为空", r["merged_into"] == [], str(r["merged_into"])[:120])
-    check("A4 未命中时新建了条目", len(r["memory_ids"]) >= 1, str(r["memory_ids"]))
+    check("A4 merged_into empty on no dedup hit", r["merged_into"] == [], str(r["merged_into"])[:120])
+    check("A4 new record created on no dedup hit", len(r["memory_ids"]) >= 1, str(r["memory_ids"]))
 
     print("=" * 70)
     print(f"结果：{_PASS}/{_PASS + _FAIL} 通过")

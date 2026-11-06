@@ -46,6 +46,7 @@ __all__ = [
     "TreePrivacyError",
     "aggregate",
     "is_user_library",
+    "l0_health",
     "library_kind",
     "render_html",
     "render_markdown",
@@ -232,6 +233,31 @@ def _entities_index(layers: dict) -> tuple[list[dict], dict[str, list[str]]]:
 
 
 # ------------------------------------------------------------- aggregation
+def l0_health(snapshot: dict[str, Any]) -> dict[str, int]:
+    """L0 citation health over ALL records (library-level facts, read-only).
+
+    The same numbers ``scripts/audit_l0_dangling.py`` reports: raw ids cited
+    by L1 but absent from the raw layer (dangling), how many memories they
+    affect, and orphan raws (present but never cited — the opposite drift).
+    """
+    layers = snapshot.get("layers") or {}
+    refs = snapshot.get("refs") or {}
+    raw_layer = layers.get(RAW_LAYER) or []
+    raw_ids = ({str(r.get("id")) for r in raw_layer
+                if isinstance(r, dict) and r.get("id")}
+               if isinstance(raw_layer, list) else set())
+    referenced = {sid for sids in refs.values() for sid in sids}
+    dangling = {sid for sids in refs.values()
+                for sid in sids if sid not in raw_ids}
+    affected = sum(1 for sids in refs.values()
+                   if any(sid not in raw_ids for sid in sids))
+    return {"l0_raw_total": len(raw_ids),
+            "refs_total": sum(len(v) for v in refs.values()),
+            "dangling_ids": len(dangling),
+            "affected_memories": affected,
+            "orphan_raw": len(raw_ids - referenced)}
+
+
 def aggregate(
     snapshot: dict[str, Any],
     *,
@@ -313,15 +339,7 @@ def aggregate(
         group["by_type"] = dict(group["by_type"])
 
     # L0 health (library-level facts, computed over ALL records like the audit)
-    raw_layer = layers.get(RAW_LAYER) or []
-    raw_ids = {str(r.get("id")) for r in raw_layer
-               if isinstance(r, dict) and r.get("id")} \
-        if isinstance(raw_layer, list) else set()
-    referenced = {sid for sids in refs.values() for sid in sids}
-    dangling_ids = {sid for sids in refs.values()
-                    for sid in sids if sid not in raw_ids}
-    affected = sum(1 for sids in refs.values()
-                   if any(sid not in raw_ids for sid in sids))
+    l0 = l0_health(snapshot)
 
     ps = pin_stats([SimpleNamespace(**{k: r.get(k)
                                        for k in ("state", "pin", "importance",
@@ -374,11 +392,11 @@ def aggregate(
             "pin": {k: ps.get(k) for k in
                     ("pinned_total", "pinned_ratio", "suspected_auto_pinned",
                      "pin_source_breakdown", "level")},
-            "l0_raw_total": len(raw_ids),
-            "refs_total": sum(len(v) for v in refs.values()),
-            "dangling_ids": len(dangling_ids),
-            "affected_memories": affected,
-            "orphan_raw": len(raw_ids - referenced),
+            "l0_raw_total": l0["l0_raw_total"],
+            "refs_total": l0["refs_total"],
+            "dangling_ids": l0["dangling_ids"],
+            "affected_memories": l0["affected_memories"],
+            "orphan_raw": l0["orphan_raw"],
             "first_seen": min(dated) if dated else None,
             "last_seen": max(dated) if dated else None,
         },

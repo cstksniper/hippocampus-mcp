@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""legacy ``lnn_state.pt`` → npz 一次性迁移（在**独立子进程**里跑）.
+"""One-shot migration of a legacy ``lnn_state.pt`` → npz (run in a **separate subprocess**).
 
-为什么是子进程：读 ``.pt`` 必须有 torch；主进程（MCP server）的目标是
-**零 torch 常驻**。本模块只被 ``StateCheckpoint._load_legacy_pt`` 以
-``python -m hippocampus_mcp.lnn.pt_migrate <src.pt> <dst.npz>`` 方式拉起，
-读完即退，torch 永不进入主进程。
+Why a subprocess: reading ``.pt`` requires torch; the main process (the MCP
+server) aims for **zero resident torch**. This module is spawned only by
+``StateCheckpoint._load_legacy_pt`` as
+``python -m hippocampus_mcp.lnn.pt_migrate <src.pt> <dst.npz>``; it exits
+right after reading, and torch never enters the main process.
 
-迁移语义与内存格式无关：``hx`` 会随权重漂移（历史库权重每次重启随机），
-本迁移只是**保底把状态搬过来**；读不出来就安全重置，不影响任何记忆数据。
+The migration semantics are independent of the in-memory format: ``hx`` drifts
+with the weights (historical libraries' weights are randomized on every
+restart), so this migration merely **brings the state over as a safety net**;
+if it cannot be read, reset safely — no memory data is affected.
 """
 
 from __future__ import annotations
@@ -15,8 +18,10 @@ from __future__ import annotations
 import faulthandler
 import sys
 
-# 子进程若在父进程（server）特定上下文里意外卡住，30s 后把自身线程栈
-# 打到 stderr（父进程 capture_output 会收到），现场自暴露，不再黑盒猜。
+# If the subprocess gets unexpectedly stuck in some parent-process (server)
+# context, dump its own thread stacks to stderr after 30s (the parent's
+# capture_output will receive them) — the scene self-exposes, no more
+# black-box guessing.
 faulthandler.dump_traceback_later(30, exit=False)
 
 
@@ -37,8 +42,9 @@ def main(argv: list[str]) -> int:
     from .checkpoint import payload_from_state
 
     state = dict(data or {})
-    # get_state 之外的键（step_count / reference_time 等）payload_from_state
-    # 会收进 scalars_json；hx/last_output/window 转数组。
+    # Keys outside get_state (step_count / reference_time, etc.) are collected
+    # into scalars_json by payload_from_state; hx/last_output/window become
+    # arrays.
     try:
         payload = payload_from_state(state)
         import numpy as np

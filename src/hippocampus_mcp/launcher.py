@@ -1,34 +1,42 @@
 # -*- coding: utf-8 -*-
-"""launcher：极薄的启动器（**纯标准库**，不 import torch / 模型）。
+"""launcher: an extremely thin launcher (**pure standard library**, imports no torch / model).
 
-为什么需要它：现在每个 MCP 子进程都要自己加载一份嵌入模型，
-**单进程固定开销 755 MB**（与记忆条数无关）。N 个会话 = N 份。launcher 只做
-三件事，加载完就变成一根管子：
+Why it exists: today every MCP subprocess loads its own copy of the embedding
+model, a **fixed 755 MB overhead per process** (independent of memory item
+count). N sessions = N copies. The launcher does only three things, then turns
+into a pipe:
 
-    1. 算出「这个库 + 这个模型」的 daemon key
-    2. 找 daemon：活着就接上；不在就拉起一个
-    3. 把自己变成 stdio ↔ daemon socket 的**双向字节泵**
+    1. Compute the daemon key for "this library + this model"
+    2. Find the daemon: connect if alive; spawn one if absent
+    3. Turn itself into a **bidirectional byte pump** between stdio and the daemon socket
 
-设计约束（改动前就定死，别在过程中漂移）：
+Design constraints (fixed before any change; do not let them drift):
 
-- **纯标准库**。launcher 自己不能 import 重库，否则省下的内存又被它吃掉。
-- **默认不启用**。``HIPPOCAMPUS_LAUNCHER=1`` 才走 daemon 路径；为 0 / 未设
-  就退化成"直接跑 server"，行为与今天**逐位一致**。
-- **daemon 拉不起来必须静默退化**，绝不能让宿主连不上 MCP —— 可用性优先于省内存。
-- **多个会话共用一个 daemon**（只要 key 相同）。早期注释这里写的是"一条连接
-  一个 daemon、不复用"，那是错的：``ensure_daemon`` 注册表命中就会复用，
-  而复用正是"模型 N→1"的全部意义。会话分路靠的是 daemon 里**每条连接一个
-  线程 + 独立的 ``asyncio.run``**（``session_ctx`` 的 ``conn-N``），
-  不是靠"每个会话一个进程"。
+- **Pure standard library**. The launcher itself must not import heavy libraries,
+  or it would eat the memory it just saved.
+- **Disabled by default**. Only ``HIPPOCAMPUS_LAUNCHER=1`` takes the daemon path;
+  with 0 / unset it falls back to "run the server directly", **bit-for-bit
+  identical** to today's behavior.
+- **If the daemon cannot be started, degrade silently** -- never leave the host
+  unable to connect to MCP. Availability beats memory savings.
+- **Multiple sessions share one daemon** (whenever the key matches). An early
+  comment here said "one daemon per connection, no reuse" -- that was wrong:
+  ``ensure_daemon`` reuses on a registry hit, and reuse is the entire point of
+  "N models -> 1". Session isolation comes from **one thread per connection +
+  an independent ``asyncio.run``** inside the daemon (``session_ctx``'s
+  ``conn-N``), not from "one process per session".
 
-  🔴 复用会带来串库（已修）：daemon 的默认库原本是**进程级**常量，
-  后到的工作区会写进先到那个的库。现在 launcher 连上后先发一行带外握手
-  （``session_ctx.HELLO_PREFIX``）声明自己的库，daemon 按连接记住它。
-  改这条链路前先看 ``tests/test_f9_4e_conn_library.py``。
+  🔴 Reuse introduced cross-library contamination (fixed): the daemon's default
+  library used to be a **process-level** constant, so a later workspace would
+  write into the earlier workspace's library. Now, upon connecting, the launcher
+  first sends an out-of-band handshake line (``session_ctx.HELLO_PREFIX``)
+  declaring its library, and the daemon remembers it per connection.
+  Before changing this path, read ``tests/test_f9_4e_conn_library.py``.
 """
 
-# 豁免登记：本文件的 env 直读属启动拓扑 plumbing（launcher 开关 /
-# 就绪超时 / announce 透传），封闭清单见 config.py「根层豁免清单」。
+# Exemption registry: this file's direct env reads are startup-topology plumbing
+# (launcher switch / readiness timeout / announce passthrough); the closed list
+# is in config.py's "root-level exemption list".
 from __future__ import annotations
 
 import hashlib
@@ -41,26 +49,30 @@ import threading
 import time
 from typing import Any
 
-try:  # 纯标准库，零成本；但 launcher 绝不能因为 import 失败而起不来
+try:  # pure stdlib, zero cost; but the launcher must never fail to start over an import error
     from hippocampus_mcp.common.session_ctx import HELLO_PREFIX
-except Exception:  # noqa: BLE001 —— 拿不到就退回字面量（与 session_ctx 同值）
+except Exception:  # noqa: BLE001 -- fall back to the literal if unavailable (same value as session_ctx)
     HELLO_PREFIX = "HIPPO-HELLO "
 
-# 启动器开关。默认关 —— 省内存是收益，连不上是事故，先保后者。
+# Launcher switch. Off by default -- memory savings are a benefit, being unable
+# to connect is an incident; protect the latter first.
 ENV_LAUNCHER = "HIPPOCAMPUS_LAUNCHER"
-# daemon 注册表目录（默认系统临时目录下的 hippocampus_mcp）
+# daemon registry directory (default: hippocampus_mcp under the system temp dir)
 ENV_RUNTIME_DIR = "HIPPOCAMPUS_RUNTIME_DIR"
-# 记忆库目录。launcher 不解释它的语义，但**可写性**要在启动前兜一遍：
-# 写不进的库等于所有记忆写入静默丢失，那不是"降级可用"，是"看起来可用"。
+# Memory library directory. The launcher does not interpret its semantics, but
+# **writability** must be probed before startup: a library that cannot be
+# written means every memory write is silently lost -- not "degraded
+# availability" but "apparent availability".
 ENV_PERSIST = "HIPPOCAMPUS_PERSIST_DIR"
-# 等 daemon 就绪的上限（秒）。模型加载是分钟级，给足但必须有上限。
+# Upper limit (seconds) for waiting until the daemon is ready. Model loading
+# takes minutes; be generous but bounded.
 DAEMON_READY_TIMEOUT = float(os.environ.get("HIPPOCAMPUS_DAEMON_READY_TIMEOUT", "180"))
-# 字节泵单次读取的块大小
+# Chunk size for a single read of the byte pump
 RELAY_CHUNK = 65536
 
 
 def runtime_dir() -> str:
-    """daemon 注册表落点。"""
+    """Where the daemon registry lives."""
     d = os.environ.get(ENV_RUNTIME_DIR, "").strip()
     if not d:
         import tempfile
@@ -73,14 +85,17 @@ def launcher_enabled() -> bool:
 
 
 def daemon_key(library: str = "", model: str = "", version: str = "") -> str:
-    """daemon 身份 = 库路径 + 模型 + 代码版本。三者任一不同就是不同的 daemon。
+    """Daemon identity = library path + model + code version. Any one differing
+    means a different daemon.
 
-    模型必须进 key：库里存的向量是某个模型算出来的，换了模型就得换进程，
-    否则 daemon 里那份权重与磁盘向量不是一回事，检索会静默变差。
+    The model must be part of the key: the vectors stored in the library were
+    computed by one specific model; change the model and you must change the
+    process, otherwise the weights in the daemon and the vectors on disk are not
+    the same thing and recall silently degrades.
     """
     try:
         lib = os.path.normcase(os.path.abspath(library)) if library else ""
-    except Exception:  # noqa: BLE001 —— 路径异常不该让启动器起不来
+    except Exception:  # noqa: BLE001 -- a path error must not keep the launcher from starting
         lib = str(library or "")
     raw = "|".join([lib, model or "", version or ""])
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]
@@ -91,11 +106,11 @@ def registry_path(key: str) -> str:
 
 
 def read_registry(key: str) -> dict[str, Any] | None:
-    """读 daemon 登记。读不出 / 不是 dict / 没 port → None。"""
+    """Read the daemon registry entry. Unreadable / not a dict / no port -> None."""
     try:
         with open(registry_path(key), "r", encoding="utf-8") as f:
             info = json.load(f)
-    except Exception:  # noqa: BLE001 —— 读不到就是"没有 daemon"
+    except Exception:  # noqa: BLE001 -- unreadable means "no daemon"
         return None
     if not isinstance(info, dict):
         return None
@@ -111,10 +126,13 @@ def write_registry(key: str, info: dict[str, Any]) -> bool:
     except OSError:
         return False
     path = registry_path(key)
-    # tmp 名字带上 pid：两个 daemon 并发 announce 时（例如宿主先杀一个、
-    # 第二个紧接着补位，或单飞锁被陈旧接管后放进来），共用一个 `.tmp` 会
-    # 让其中一个在打开/替换阶段 OSError ⇒ announce 返回 False ⇒ daemon 直接
-    # 退出且不打 banner —— 死得比"多起一个"更隐蔽（负向对照实测过）。
+    # Include the pid in the tmp name: when two daemons announce concurrently
+    # (e.g. the host kills one and a second immediately takes its place, or one
+    # enters after the singleflight lock is taken over as stale), sharing one
+    # `.tmp` makes one of them hit OSError at the open/replace stage => announce
+    # returns False => the daemon exits outright without printing a banner --
+    # dying more stealthily than "spawning an extra one" (verified by negative
+    # experiment).
     tmp = path + f".{os.getpid()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -213,7 +231,8 @@ def warn_daemon_stale(info: dict[str, Any]) -> list[str]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """只读探测（与 brain.pid_alive 同口径，这里独立实现以保持纯标准库）。"""
+    """Read-only liveness probe (same semantics as brain.pid_alive; implemented
+    independently here to stay pure standard library)."""
     if pid <= 0:
         return False
     if pid == os.getpid():
@@ -237,52 +256,62 @@ def _pid_alive(pid: int) -> bool:
 
 
 def try_connect(port: int, timeout: float = 1.0) -> socket.socket | None:
-    """探一下 daemon 端口通不通（连得上就算活着）。
+    """Probe whether the daemon port is reachable (connectable counts as alive).
 
-    🔴 **连上之后必须把超时清掉**：``create_connection(timeout=...)`` 会把这个
-    超时留在 socket 上，而这个 socket 随后要交给 :func:`relay` 当**长连接**用。
-    留着超时的后果是：只要 daemon 处理一条消息的时间超过 ``timeout``（工具
-    调用动辄几秒到几十秒，比如现场加载嵌入模型），``sock.recv()`` 就会抛
-    ``socket.timeout``，被 ``_pump`` 的 ``except Exception: pass`` **静默吞掉**，
-    整条 daemon→stdout 的回程泵当场死掉 —— 宿主看到的就是"请求发出去了、
-    响应永远不回来"，**没有任何报错**。
+    🔴 **The timeout must be cleared after connecting**: ``create_connection(timeout=...)``
+    leaves the timeout on the socket, and this socket is then handed to
+    :func:`relay` as a **long-lived connection**. If the timeout stays: whenever
+    the daemon takes longer than ``timeout`` to handle one message (tool calls
+    routinely take seconds to tens of seconds, e.g. loading the embedding model
+    on the spot), ``sock.recv()`` raises ``socket.timeout``, which ``_pump``'s
+    ``except Exception: pass`` **silently swallows**, killing the whole
+    daemon->stdout return pump on the spot -- the host sees "the request went
+    out, the response never comes back", **with no error at all**.
 
-    这是实测撞出来的第二个 bug（两个 launcher 子进程连同一 daemon）：
-    握手与 ``tools/list`` 都在超时内返回所以正常，第一条 ``tools/call``
-    因为要先加载模型而超出超时，回程就此断掉。
+    This is the second bug found in real testing (two launcher subprocesses
+    connected to the same daemon): the handshake and ``tools/list`` both
+    returned within the timeout and looked fine; the first ``tools/call``
+    exceeded the timeout because the model had to load first, and the return
+    path died there.
     """
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
     except OSError:
         return None
     try:
-        s.settimeout(None)          # 交给 relay 后是长连接，不再要超时
+        s.settimeout(None)          # a long-lived connection once handed to relay; no more timeout
     except OSError:
         pass
     return s
 
 
 def _daemon_creationflags() -> tuple[int, int]:
-    """Windows 子进程创建标志：``(base_flags, breakaway_flag)``。
+    """Windows subprocess creation flags: ``(base_flags, breakaway_flag)``.
 
-    ⚠️ **修订：最初写下的前提是错的，代码保留但不再当"治根"手段。**
+    ⚠️ **Revision: the premise originally written down was wrong; the code stays
+    but is no longer treated as the root fix.**
 
-    最初认为"宿主 Job 带 ``KILL_ON_JOB_CLOSE``，回收时连坐杀掉 daemon"，依据是把
-    读到的 ``LimitFlags=0x2400`` 解读成 ``KILL_ON_JOB_CLOSE=True``。**位掩码用错了**：
-    winnt.h 的真实值是 ``BREAKAWAY_OK=0x200`` / ``SILENT_BREAKAWAY_OK=0x400`` /
-    ``KILL_ON_JOB_CLOSE=0x800`` —— 按正确值 ``0x2400 = JOB_MEMORY | SILENT_BREAKAWAY_OK``，
-    含义近乎相反（行为实验验证过）。
+    The original belief was "the host's Job has ``KILL_ON_JOB_CLOSE`` and kills
+    the daemon along with the host during cleanup", based on reading the
+    observed ``LimitFlags=0x2400`` as ``KILL_ON_JOB_CLOSE=True``. **The bitmask
+    was misread**: the real values in winnt.h are ``BREAKAWAY_OK=0x200`` /
+    ``SILENT_BREAKAWAY_OK=0x400`` / ``KILL_ON_JOB_CLOSE=0x800`` -- by the correct
+    values, ``0x2400 = JOB_MEMORY | SILENT_BREAKAWAY_OK``, a nearly opposite
+    meaning (verified by behavioral experiment).
 
-    仍然保留这个 flag，有两个理由：
-    1. 它是一枚**探针**：能否 breakaway 直接反映宿主 Job 策略，失败告警本身有价值；
-    2. 若将来宿主放宽 Job 策略（例如在内层 Job 上放开 ``BREAKAWAY_OK``），这里自动生效。
+    The flag is still kept, for two reasons:
+    1. It is a **probe**: whether breakaway succeeds directly reflects the host
+       Job policy, so the failure warning is valuable in itself;
+    2. If the host ever relaxes its Job policy (e.g. allows ``BREAKAWAY_OK`` on
+       the inner Job), this takes effect automatically.
 
-    但**不要指望它治根**。真因：
-    daemon 是被**外部终止**的（日志里 0 条孤儿回收、0 条崩溃痕迹），触发点是宿主
-    空闲约 5 分钟后的 dispose；launcher 自身从不杀 daemon（无 atexit / terminate）。
+    But **do not expect it to fix the root cause**. The real cause: the daemon
+    was terminated **externally** (0 orphan reclaims, 0 crash traces in the
+    logs), triggered by the host's dispose after roughly 5 minutes idle; the
+    launcher itself never kills the daemon (no atexit / terminate).
 
-    抽成独立函数是为了让测试能直接断言那一位 flag 还在
-    （``tests/test_f9_6_process_tree.py`` 的 T1），防止后人把它删掉。
+    It is a separate function so tests can directly assert that flag bit still
+    exists (T1 in ``tests/test_f9_6_process_tree.py``), preventing later removal.
     """
     base = 0
     breakaway = 0
@@ -296,20 +325,25 @@ def _daemon_creationflags() -> tuple[int, int]:
 def spawn_daemon(key: str, library: str = "", model: str = "",
                  extra_env: dict[str, str] | None = None,
                  cwd: str = "") -> dict[str, Any] | None:
-    """拉起 daemon 并等它把登记写好。失败返回 None（调用方负责退化）。
+    """Spawn the daemon and wait for it to write its registry entry. Returns
+    None on failure (the caller handles the fallback).
 
-    ``cwd``：daemon 的工作目录，空则取调用方的 cwd。
-    🔴 **预热场景必须显式指定**：``library`` 为空时 daemon 是按**自己的 cwd**
-    定位库的，cwd 错了会起来一个指向别处的 daemon —— 它照样能起、照样写登记、
-    照样被 launcher 复用，只是**库是错的**，且不会报任何错。
+    ``cwd``: the daemon's working directory; empty means the caller's cwd.
+    🔴 **Must be given explicitly in the prewarm scenario**: when ``library`` is
+    empty the daemon locates the library by **its own cwd**; a wrong cwd spawns
+    a daemon pointed at the wrong place -- it still starts, still writes the
+    registry, still gets reused by launchers, except the **library is wrong**,
+    and nothing reports an error.
     """
     env = dict(os.environ)
     run_cwd = cwd or os.getcwd()
     env["HIPPOCAMPUS_DAEMON"] = "1"
-    # 🔴 输出必须**无缓冲**：daemon 是被宿主强杀、被总线杀、或 native 崩溃时死的，
-    # 块缓冲里的东西一句都留不下 —— 表现在事故现场就是「daemon 无声消失、
-    # 一行 traceback 都没有」。这条比"把 stderr 落盘"更靠前：落了盘但没 flush，
-    # 等于写了封信塞进信封直接烧掉。
+    # 🔴 Output must be **unbuffered**: the daemon dies when the host force-kills
+    # it, the bus kills it, or a native crash occurs; nothing in the block buffer
+    # survives -- the incident scene shows "the daemon vanished silently, not one
+    # line of traceback". This matters even more than "persisting stderr to
+    # disk": written to disk but never flushed is like sealing a letter in an
+    # envelope and burning it.
     env.setdefault("PYTHONUNBUFFERED", "1")
     env["HIPPOCAMPUS_DAEMON_KEY"] = key
     env[ENV_RUNTIME_DIR] = runtime_dir()
@@ -322,8 +356,9 @@ def spawn_daemon(key: str, library: str = "", model: str = "",
     cmd = [sys.executable, "-m", "hippocampus_mcp.daemon"]
     base_flags, breakaway_flag = _daemon_creationflags()
     creationflags = base_flags | breakaway_flag
-    # daemon 的 stdout/stderr 必须落盘，不能 DEVNULL：它是唯一常驻重进程，
-    # 崩溃 traceback 一旦进黑洞就永远无法归因（真宿主首验时踩过）。
+    # The daemon's stdout/stderr must go to a file, not DEVNULL: it is the only
+    # long-lived heavy process; a crash traceback that enters a black hole can
+    # never be attributed (hit during the first real-host verification).
     log_path = os.path.join(runtime_dir(), f"daemon-{key}.log")
     try:
         if os.path.exists(log_path) and os.path.getsize(log_path) > 2 * 1024 * 1024:
@@ -353,10 +388,10 @@ def spawn_daemon(key: str, library: str = "", model: str = "",
         except OSError as exc:
             proc = _spawn_without_breakaway(
                 cmd, env, log_fh, base_flags, breakaway_flag, exc, run_cwd)
-    except Exception:  # noqa: BLE001 —— 起不来必须退化，不能让宿主连不上
+    except Exception:  # noqa: BLE001 -- must degrade if spawn fails; never leave the host unable to connect
         proc = None
     finally:
-        # 子进程已持有自己的句柄副本，父进程这份用完即关
+        # The child process holds its own handle copy; close the parent's copy when done
         if log_fh is not None:
             log_fh.close()
     if proc is None:
@@ -364,7 +399,7 @@ def spawn_daemon(key: str, library: str = "", model: str = "",
     deadline = time.time() + DAEMON_READY_TIMEOUT
     while time.time() < deadline:
         if proc.poll() is not None:
-            return None                       # 起不来：别干等
+            return None                       # spawn failed: do not just keep waiting
         info = read_registry(key)
         if info and info.get("pid") == proc.pid:
             s = try_connect(int(info["port"]))
@@ -375,34 +410,42 @@ def spawn_daemon(key: str, library: str = "", model: str = "",
     return None
 
 
-# ── spawn 单飞（singleflight）────────────────────────────────────────
-# 由来：两个 launcher 相隔 5 秒各自发现「没有 daemon」，
-# 于是各自 spawn ⇒ **双 daemon 竞写同一注册表**，前者没来得及
-# 初始化 brain 就无声死亡。那一轮靠 idle 回收自愈成单 daemon，但代价是
-# 两个 ~1GB 进程同框、注册表被后写者覆盖（谁服务谁是随机的）。
-SPAWN_LOCK_TTL = 120.0      # 锁的最大持有时长（秒）；超时当作持有者已死
-#: 「刚创建、内容残缺」的宽限期（秒）。见 :func:`_spawn_lock_stale` —— 这段时间内
-#: 不把残缺的锁文件当成陈旧锁，否则会把正在创建锁的邻居一把拍死。
+# ── spawn singleflight ────────────────────────────────────────────────
+# Origin: two launchers 5 seconds apart each discover "no daemon" and each
+# spawn => **two daemons race-writing the same registry**, and the first one
+# dies silently before it even initializes its brain. That round self-healed
+# into a single daemon via idle reclamation, at the cost of two ~1GB processes
+# side by side and the registry overwritten by the later writer (who serves
+# whom is random).
+SPAWN_LOCK_TTL = 120.0      # max lock hold time (seconds); past it, the holder is presumed dead
+#: Grace period (seconds) for "just created, content incomplete". See
+#: :func:`_spawn_lock_stale` -- during this window an incomplete lock file must
+#: not be treated as stale, or you would squash the neighbor that is mid-creation.
 SPAWN_LOCK_CREATE_GRACE = 5.0
-SPAWN_WAIT_TIMEOUT = 60.0   # 抢不到锁时，跟随别人 spawn 的最长等待（秒）
-#: 「登记里有活 pid，但端口还没接客」时最多等多久（秒）。
+SPAWN_WAIT_TIMEOUT = 60.0   # when the lock is taken, max wait following another's spawn (seconds)
+#: How long at most (seconds) to wait when "the registry has a live pid but the
+#: port is not serving yet".
 #:
-#: 这段时间**不是**"没有 daemon"，而是"那一个还没就绪"：``Daemon.bind()``
-#: 在 ``announce()`` 之前就 listen 了，所以正常启动时这个窗口很短；它变长只
-#: 有一个原因 —— 那个进程正在收尾（socket 已关、pid 还活着）。等满仍未就绪
-#: 就放弃 spawn，让调用方退化成 inline server：**宁可这一会话重一点，也不
-#: 叠出第二个 ~1GB daemon 去竞写同一个注册表**。
+#: During this window it is **not** "no daemon" but "that one is not ready yet":
+#: ``Daemon.bind()`` listens before ``announce()``, so on a normal start this
+#: window is short; it grows for exactly one reason -- that process is shutting
+#: down (socket closed, pid still alive). After waiting the full window without
+#: readiness, give up spawning and let the caller fall back to the inline
+#: server: **rather keep this session a bit heavier than stack up a second
+#: ~1GB daemon racing on the same registry**.
 READY_WAIT_WHEN_ALIVE = SPAWN_WAIT_TIMEOUT
 
 
 def _spawn_without_breakaway(cmd, env, log_fh, base_flags: int,
                              breakaway_flag: int, exc: OSError,
                              cwd: str = ""):
-    """带 BREAKAWAY 的 spawn 失败时，退回旧 flags 重试。
+    """When the spawn with BREAKAWAY fails, retry with the old flags.
 
-    🔴 **退回必须吼出来**。静默退回等于把"daemon 仍在宿主进程树里"这个事实
-    藏起来 —— 下一次宿主回收时会再死一次，而现场依旧是"15 个 daemon 一行
-    traceback 都没留下"。可用性优先没错，但**诊断信息不许跟着一起降级**。
+    🔴 **The fallback must be shouted out**. A silent fallback hides the fact
+    that "the daemon remains in the host process tree" -- the next host cleanup
+    kills it again, and the scene still looks like "15 daemons, not one line of
+    traceback". Availability first is right, but **diagnostic information must
+    not be degraded along with it**.
     """
     if not breakaway_flag:
         return None
@@ -430,7 +473,7 @@ def spawn_lock_path(key: str) -> str:
 
 
 def _read_spawn_lock(key: str) -> dict[str, Any] | None:
-    """读锁内容 ``{pid, ts}``。读不出 / 格式不对 ⇒ 当没人持锁。"""
+    """Read the lock content ``{pid, ts}``. Unreadable / wrong format => treat as unlocked."""
     try:
         with open(spawn_lock_path(key), "r", encoding="utf-8") as f:
             info = json.load(f)
@@ -442,19 +485,23 @@ def _read_spawn_lock(key: str) -> dict[str, Any] | None:
 
 
 def _spawn_lock_stale(key: str, info: dict[str, Any] | None) -> bool:
-    """锁是否可以抢占。
+    """Whether the lock can be preempted.
 
-    刻意**不用**阻塞式互斥：持有者是另一个独立进程，它可能连同宿主会话
-    一起被杀（34280 就是一句话没留下死的）。任何阻塞锁都会在那之后把
-    后面所有 launcher 一起堵死 ⇒ 一律「有时限 + 可接管」。
+    Deliberately **no** blocking mutex: the holder is another independent
+    process that may be killed together with its host session (34280 died
+    without leaving a single word). Any blocking lock would then block every
+    later launcher behind it => always "time-limited + takeable".
 
-    🔴 **读不出内容 ≠ 没人持锁**。旧实现的洞就在这：别人刚用
-    ``O_CREAT|O_EXCL`` 建出**空文件**、还没来得及写 JSON 时，这边
-    ``json.load`` 失败 ⇒ 得到 None ⇒ 判"可抢占" ⇒ 把那把还没写完的锁 rm 掉，
-    然后自己也去抢 —— 两个 launcher 同时认为自己持锁，两个 ~1GB daemon 同框
-    （双 daemon 事故就是这个形态）。
+    🔴 **Unreadable content != nobody holds the lock**. The old implementation's
+    hole was right here: when the other side had just created an **empty file**
+    with ``O_CREAT|O_EXCL`` and not yet written the JSON, our ``json.load``
+    failed => None => judged "preemptible" => rm the lock that was not written
+    yet, then grab it ourselves -- two launchers both believing they hold the
+    lock, two ~1GB daemons side by side (the double-daemon incident had exactly
+    this shape).
 
-    守住它：文件存在但内容残缺时，按 mtime 给它一个"写完的宽限期"。
+    Guarding it: when the file exists but its content is incomplete, give it a
+    "finish-writing grace period" based on mtime.
     """
     if info:
         ts = float(info.get("ts", 0))
@@ -468,38 +515,46 @@ def _spawn_lock_stale(key: str, info: dict[str, Any] | None) -> bool:
     try:
         age = time.time() - os.stat(spawn_lock_path(key)).st_mtime
     except OSError:
-        return True                       # 文件不存在 ⇒ 确实没人持锁
+        return True                       # file does not exist => genuinely unlocked
     return age > SPAWN_LOCK_CREATE_GRACE
 
 
-# 进程内抢锁串行锁。
+# In-process serialization lock for lock acquisition.
 #
-# 🔴 为什么还需要它（os.link 已经原子了）：原子的只是**发布**，不是
-# 「判断陈旧 → 删除陈旧锁」这一步。同进程 8 个线程对齐起跑时，全都看到
-# 「锁不存在」⇒ 都判可抢占；先到者 link 成功，慢一步的那个随后执行
-# os.remove(lock)，**把刚发布好的新锁删掉**，再自己 link 成功 ⇒ 两个赢家。
-# 这正是 test_f9_6 T6 在 Linux 上偶发 wins=[True,...,True] 的成因，也是
-# 「两个 ~1GB daemon 同框」的同一种形态。
+# 🔴 Why it is still needed (os.link is already atomic): only the **publish**
+# step is atomic, not the "judge stale -> delete stale lock" step. When 8
+# threads in one process start in lockstep, all see "no lock" => all judge it
+# preemptible; the first one's link succeeds, and the slower one then runs
+# os.remove(lock), **deleting the freshly published new lock**, then links
+# successfully itself => two winners. This is exactly why test_f9_6 T6
+# occasionally got wins=[True,...,True] on Linux, the same shape as
+# "two ~1GB daemons side by side".
 #
-# 作用域说明：这把锁只在**本进程内**生效；跨进程互斥仍由 os.link 的原子性
-# 保证（别人发布的是完整 JSON，后来的 stale 判定会读到新鲜内容而让行）。
-# 跨进程那条更窄的「检查—删除」窗口仍在，若要彻底封死需改成原子认领协议。
+# Scope note: this lock is effective **within this process only**; cross-process
+# mutual exclusion is still guaranteed by os.link's atomicity (others publish
+# complete JSON, so a later stale check reads fresh content and yields). The
+# narrower cross-process "check-delete" window remains; fully closing it would
+# require an atomic claim protocol.
 _SPAWN_LOCK_MUTEX = threading.Lock()
 
 
 def acquire_spawn_lock(key: str) -> bool:
-    """抢占 spawn 锁。抢到返回 True。
+    """Acquire the spawn lock. Returns True when acquired.
 
-    🔴 **锁文件必须"一出现就是完整的"**。旧实现用 ``O_CREAT|O_EXCL`` 先建出
-    **空文件**再往里写 JSON，中间那个窗口正是 :func:`_spawn_lock_stale` 注释里
-    说的双 daemon 成因（早年代码注释自己也承认了这个窗口，现在补掉）。
+    🔴 **The lock file must be "complete the moment it appears"**. The old
+    implementation created an **empty file** with ``O_CREAT|O_EXCL`` and only
+    then wrote the JSON into it; the window in between is exactly the
+    double-daemon cause described in :func:`_spawn_lock_stale`'s comment (the
+    old code comment itself admitted this window; now it is closed).
 
-    修法：**先在临时文件里写完整 + fsync，再用 ``os.link`` 原子地挂到锁路径**。
-    硬链接创建是原子的，且目标已存在时必然失败 —— 互斥语义一点没丢，
-    半吊子窗口彻底消失。
+    Fix: **write the complete content to a temp file + fsync first, then attach
+    it to the lock path atomically with ``os.link``**. Hard-link creation is
+    atomic and necessarily fails when the target exists -- mutual exclusion
+    semantics fully preserved, the half-baked window gone entirely.
 
-    再加一层 :data:`_SPAWN_LOCK_MUTEX`：把「判断陈旧 → 清锁 → 写临时文件 →
-    原子发布」整段串成进程内临界区，封住上面说的 TOCTOU 竞态。
+    On top of that, :data:`_SPAWN_LOCK_MUTEX` serializes the whole "judge stale
+    -> clear lock -> write temp file -> atomic publish" sequence into an
+    in-process critical section, closing the TOCTOU race described above.
     """
     try:
         os.makedirs(runtime_dir(), exist_ok=True)
@@ -510,7 +565,7 @@ def acquire_spawn_lock(key: str) -> bool:
         if not _spawn_lock_stale(key, _read_spawn_lock(key)):
             return False
         try:
-            os.remove(lock)               # 确认陈旧之后才清
+            os.remove(lock)               # cleared only after confirming staleness
         except OSError:
             pass
         tmp = f"{lock}.tmp.{os.getpid()}.{threading.get_ident()}"
@@ -526,12 +581,12 @@ def acquire_spawn_lock(key: str) -> bool:
                 pass
             return False
         try:
-            os.link(tmp, lock)            # 原子发布：目标已存在 ⇒ 失败 ⇒ 让行
+            os.link(tmp, lock)            # atomic publish: target exists => failure => yield
             return True
         except FileExistsError:
-            return False                  # 正常竞争输给别人
+            return False                  # lost a normal race to someone else
         except OSError:
-            return _acquire_lock_legacy(lock)  # 文件系统不支持硬链接 ⇒ 退化
+            return _acquire_lock_legacy(lock)  # filesystem without hardlink support => fall back
         finally:
             try:
                 os.remove(tmp)
@@ -540,11 +595,13 @@ def acquire_spawn_lock(key: str) -> bool:
 
 
 def _acquire_lock_legacy(lock: str) -> bool:
-    """``os.link`` 不可用时的退化路径（例如不支持硬链接的文件系统）。
+    """Fallback path when ``os.link`` is unavailable (e.g. a filesystem without
+    hardlink support).
 
-    仍是旧的 ``O_CREAT|O_EXCL`` 语义，**半吊子窗口还在**，由
-    :func:`_spawn_lock_stale` 的宽限期兜着 —— 对方有
-    :data:`SPAWN_LOCK_CREATE_GRACE` 秒把内容写完。
+    Still the old ``O_CREAT|O_EXCL`` semantics, **the half-baked window
+    remains**, backstopped by :func:`_spawn_lock_stale`'s grace period -- the
+    other side gets :data:`SPAWN_LOCK_CREATE_GRACE` seconds to finish writing
+    the content.
     """
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -565,20 +622,25 @@ def _acquire_lock_legacy(lock: str) -> bool:
 
 
 def _open_daemon_log(log_path: str):
-    """打开 daemon 日志，返回 ``(句柄, 实际路径)``。
+    """Open the daemon log and return ``(handle, actual path)``.
 
-    🔴 **失败时绝不能悄悄退回 DEVNULL** —— 那等于把这一份 daemon 的所有输出
-    （含崩溃 traceback）扔进黑洞，事后表现为"daemon 无声死亡、毫无线索"。
-    此前两次"无声死亡"就有这个嫌疑。
+    🔴 **On failure, never quietly fall back to DEVNULL** -- that throws all of
+    this daemon's output (including crash tracebacks) into a black hole, showing
+    up afterwards as "the daemon died silently, zero clues". Both earlier
+    "silent deaths" are under this suspicion.
 
-    **Windows 实测**：两个进程并发 ``open(path, "ab")`` 同一个文件时，其中一个抛
-    ``PermissionError [Errno 13]``（探针 ``_probe_out/_append_concurrency_probe_20260929.py``）。
-    更要命的是 daemon 会**长期持有**继承来的句柄 ⇒ **后到**的 launcher 有很大
-    概率撞上它，这正是当年双 daemon 竞写的同一时间窗。
+    **Measured on Windows**: when two processes concurrently ``open(path, "ab")``
+    the same file, one of them raises ``PermissionError [Errno 13]`` (probe
+    ``_probe_out/_append_concurrency_probe_20260929.py``). Worse, the daemon
+    **holds the inherited handle long-term** => a **later** launcher is quite
+    likely to hit it -- the same time window as the old double-daemon
+    race-writing.
 
-    处置顺序：重试若干次（瞬时冲突）→ 仍失败就退到**带 pid 的备用文件**
-    （这一份输出照样留得下，只是不在主文件里）→ 连备用都打不开才交给 DEVNULL，
-    且两处降级都在启动器自己的 stderr 留一行，巡检时看得见。
+    Handling order: retry a few times (transient conflict) -> if still failing,
+    fall back to a **pid-suffixed alternate file** (this daemon's output still
+    survives, just not in the main file) -> only if even the alternate cannot be
+    opened, hand over to DEVNULL; both degradations print a line to the
+    launcher's own stderr so inspections can see them.
     """
     last_err: BaseException | None = None
     for _ in range(3):
@@ -601,10 +663,11 @@ def _open_daemon_log(log_path: str):
 
 
 def release_spawn_lock(key: str) -> None:
-    """释放锁：**只删自己这把**。
+    """Release the lock: **remove only our own**.
 
-    无差别 ``os.remove`` 会把别人刚刚抢到的新锁一起删掉 —— 那是双 daemon 的
-    另一条路，而 S4 那条测试只看"用完无残留"，恰恰看不出这个区别。
+    A blanket ``os.remove`` would also delete a new lock someone else just
+    acquired -- another path to the double-daemon incident, and the S4 test
+    (which only checks "no residue after use") cannot distinguish this at all.
     """
     path = spawn_lock_path(key)
     info = _read_spawn_lock(key)
@@ -619,7 +682,7 @@ def release_spawn_lock(key: str) -> None:
 
 
 def _registry_usable(info: dict[str, Any] | None) -> bool:
-    """注册表条目能否连上（pid 活着 + 端口可握手）。"""
+    """Whether a registry entry is connectable (pid alive + port handshakes)."""
     if not info:
         return False
     pid = info.get("pid")
@@ -634,11 +697,14 @@ def _registry_usable(info: dict[str, Any] | None) -> bool:
 
 
 def _registry_has_live_pid(info: dict[str, Any] | None) -> bool:
-    """登记里的那个 pid 还活着吗（端口接不接客不管）。
+    """Is the pid recorded in the registry still alive (regardless of whether
+    the port is serving)?
 
-    🔴 这个判断补的是一个**语义错误**，不是竞态：旧代码只问"端口连得上吗"，
-    连不上就当"没有 daemon"，于是又 spawn 一个。可"连不上"有两种来源 ——
-    没人、或**有人但还没就绪**，旧代码把后者也算进了前者。
+    🔴 This check fixes a **semantic error**, not a race: the old code only asked
+    "is the port connectable", and treated a failure as "no daemon", then spawned
+    another one. But "not connectable" has two sources -- nobody there, or
+    **someone there but not ready yet**; the old code counted the latter as the
+    former.
     """
     if not info:
         return False
@@ -648,11 +714,13 @@ def _registry_has_live_pid(info: dict[str, Any] | None) -> bool:
 
 def _wait_until_ready(key: str, info: dict[str, Any] | None,
                       limit: float) -> dict[str, Any] | None:
-    """等一个「活着但还没接客」的 daemon 就绪。
+    """Wait for a "alive but not serving yet" daemon to become ready.
 
-    只要 pid 一死、或登记被清（正常退出路径会清），立刻返回 None —— 由调用方
-    自己 spawn，一秒都不多等。等满 ``limit`` 仍未就绪也返回 None：那时它要么
-    在收尾、要么卡死，两种情况下再 spawn 一个都只会让局面更糟。
+    The moment the pid dies or the registry entry is cleared (the normal exit
+    path clears it), return None immediately -- the caller spawns its own, not
+    one second more. If ``limit`` elapses without readiness, also return None:
+    by then it is either shutting down or hung; spawning another in either case
+    only makes things worse.
     """
     end = time.time() + max(0.0, float(limit))
     while time.time() < end:
@@ -666,15 +734,19 @@ def _wait_until_ready(key: str, info: dict[str, Any] | None,
 
 
 def ensure_daemon(key: str, library: str = "", model: str = "") -> dict[str, Any] | None:
-    """找到或拉起 daemon —— **同一时刻只有一个 launcher 会真去 spawn**。
+    """Find or spawn the daemon -- **at any moment only one launcher actually
+    spawns**.
 
-    四条路径：
-      ① 注册表可用 → 直接返回（最常见，零等待）
-      ② 拿到 spawn 锁，且登记里**没有活着的 pid** → double-check 后真 spawn
-         （拿锁期间别人可能刚起好）
-      ③ 拿到 spawn 锁，但登记里的 pid **还活着**（端口没接客）→ 等它就绪，
-         **绝不另起一个**；它死了才由这一轮 spawn
-      ④ 抢不到锁 → 跟牌等待（持锁者死了或窗超时，回到 ② 自己尝试）
+    Four paths:
+      ① Registry usable -> return directly (most common, zero wait)
+      ② Got the spawn lock and the registry has **no live pid** -> double-check,
+         then spawn for real (someone may have finished starting while we held
+         the lock)
+      ③ Got the spawn lock but the registry pid is **still alive** (port not
+         serving) -> wait for it to become ready, **never start another**; only
+         if it dies does this round spawn
+      ④ Could not get the lock -> follow and wait (if the lock holder dies or
+         the window times out, back to ② to try ourselves)
     """
     deadline = time.time() + DAEMON_READY_TIMEOUT
     while time.time() < deadline:
@@ -686,9 +758,11 @@ def ensure_daemon(key: str, library: str = "", model: str = "") -> dict[str, Any
                 info = read_registry(key)          # double-check
                 if _registry_usable(info):
                     return info
-                # ③ 有人活着但还没接客 ⇒ 等它，**不是**再起一个。
-                #    4 路并发下这条分支实测 1/4 会叠出第二个 daemon（两条不同
-                #    pid 的 banner，注册表被后来者覆盖，谁服务谁是随机的）。
+                # ③ Someone is alive but not serving => wait for it, **not**
+                #    start another. Under 4-way concurrency this branch
+                #    measurably stacked a second daemon 1/4 of the time (two
+                #    banners with different pids, the registry overwritten by
+                #    the later arrival, who serves whom is random).
                 if _registry_has_live_pid(info):
                     ready = _wait_until_ready(
                         key, info,
@@ -697,28 +771,30 @@ def ensure_daemon(key: str, library: str = "", model: str = "") -> dict[str, Any
                     if ready is not None:
                         return ready
                     if _registry_has_live_pid(read_registry(key)):
-                        return None               # 还活着却不接客：宁可退化成 inline
+                        return None               # alive but not serving: prefer degrading to inline
                 return spawn_daemon(key, library=library, model=model)
             finally:
                 release_spawn_lock(key)
-        # ④ 别人在 spawn：跟随，盯着注册表也盯着锁（防止跟着死等）
+        # ④ Someone else is spawning: follow, watching both the registry and the lock (to avoid waiting on a corpse)
         wait_until = min(time.time() + SPAWN_WAIT_TIMEOUT, deadline)
         while time.time() < wait_until:
             time.sleep(0.2)
             info = read_registry(key)
             if _registry_usable(info):
                 return info
-            # 登记行还在但 pid 已经死了，同样是"跟着一个不存在的人"：早点破，
-            # 不必耗满 SPAWN_WAIT_TIMEOUT 才轮到自己去 spawn。
+            # The registry entry is still there but the pid is dead -- equally
+            # "following someone who no longer exists": break out early instead
+            # of burning the full SPAWN_WAIT_TIMEOUT before our own spawn.
             if not _registry_has_live_pid(info) and _spawn_lock_stale(
                     key, _read_spawn_lock(key)):
-                break                              # 持锁者没了且 daemon 没起 ⇒ 自己上
+                break                              # lock holder gone and daemon not up => do it ourselves
     return None
 
 
-#: 转发字节流调试开关（``HIPPOCAMPUS_LAUNCHER_DEBUG=1``）。
-#: 开着会在 stderr 上打每一段转发的方向与长度 —— 排查"请求发出去了但响应
-#: 不回来"这类无报错的挂起时，这是唯一能看清双向流的东西。
+#: Debug switch for the relayed byte stream (``HIPPOCAMPUS_LAUNCHER_DEBUG=1``).
+#: When on, every relayed segment's direction and length go to stderr -- for
+#: diagnosing silent hangs like "the request went out but the response never
+#: returns", this is the only way to see the bidirectional flow.
 _RELAY_DEBUG = os.environ.get("HIPPOCAMPUS_LAUNCHER_DEBUG", "") == "1"
 
 
@@ -731,22 +807,25 @@ def _name(obj: Any) -> str:
 
 
 def _pump(src, dst, chunk: int = RELAY_CHUNK) -> None:
-    """单向字节泵。任一端关了就停，不抛。
+    """One-way byte pump. Stops when either end closes, never raises.
 
-    🔴 **必须用 ``read1`` 而不是 ``read``**：``BufferedReader.read(n)`` 的语义是
-    "读满 n 字节或到 EOF 才返回"，对管道/stdio 意味着**宿主写一行 JSON-RPC
-    之后会被永久阻塞**——MCP over stdio 的帧通常只有几百字节，远不到 64KB，
-    于是宿主的 initialize 永远等不到响应，表现为"工具数为 0 / 服务不可用"，
-    且**没有任何报错**。``read1(n)`` 只做一次底层读、有多少返回多少，才是
-    字节泵该用的接口。
+    🔴 **Must use ``read1`` rather than ``read``**: ``BufferedReader.read(n)``'s
+    semantics are "return only when n bytes are read or EOF is hit", which for
+    pipes/stdio means **the host is blocked forever after writing one JSON-RPC
+    line** -- MCP over stdio frames are usually only a few hundred bytes, far
+    below 64KB, so the host's initialize never gets a response, showing up as
+    "tool count 0 / service unavailable", **with no error at all**.
+    ``read1(n)`` does exactly one underlying read and returns whatever is
+    available -- that is the interface a byte pump should use.
 
-    这个坑是实测撞出来的（两个 launcher 子进程直连同一库）：daemon
-    已经起好、注册表也写了，但会话 1 的握手 180 秒都等不到一个字节。
+    This pitfall was found in real testing (two launcher subprocesses connected
+    to the same library): the daemon was up and the registry written, yet
+    session 1's handshake could not get a single byte within 180 seconds.
     """
     try:
         while True:
             if hasattr(src, "read1"):
-                data = src.read1(chunk)      # 有多少给多少，绝不读满才返回
+                data = src.read1(chunk)      # return whatever is available, never wait to fill
             elif hasattr(src, "read"):
                 data = src.read(chunk)
             else:
@@ -759,7 +838,7 @@ def _pump(src, dst, chunk: int = RELAY_CHUNK) -> None:
             dst.write(data) if hasattr(dst, "write") else dst.sendall(data)
             if hasattr(dst, "flush"):
                 dst.flush()
-    except Exception:  # noqa: BLE001 —— 管道断开是正常的收尾方式
+    except Exception:  # noqa: BLE001 -- a broken pipe is the normal way this ends
         pass
     try:
         if hasattr(dst, "close"):
@@ -769,14 +848,17 @@ def _pump(src, dst, chunk: int = RELAY_CHUNK) -> None:
 
 
 def _send_hello(sock: socket.socket) -> bool:
-    """转发任何 MCP 流量之前，先告诉 daemon「这条连接属于哪个库」。
+    """Before relaying any MCP traffic, tell the daemon "which library this
+    connection belongs to".
 
-    🔴 没有这一步就会串库：daemon 的默认库是**进程级**
-    常量（server 模块导入时按当时那个 launcher 的 env/cwd 算出）。两个工作区
-    复用同一个 daemon（key 相同 —— 这正是省内存的目的）时，后到的工作区会
-    写进先到那个的库，且不报错。
+    🔴 Without this step, libraries get crossed: the daemon's default library is
+    a **process-level** constant (computed at server module import time from
+    whatever launcher's env/cwd came first). When two workspaces reuse the same
+    daemon (same key -- which is exactly the point of saving memory), the later
+    workspace writes into the earlier one's library, with no error.
 
-    必须**先于**所有客户端字节发出，daemon 侧才能用一次 peek 干净地吃掉它。
+    It must be sent **before** all client bytes so the daemon can consume it
+    cleanly with a single peek.
     """
     payload = {
         "library": os.environ.get("HIPPOCAMPUS_PERSIST_DIR", ""),
@@ -788,81 +870,99 @@ def _send_hello(sock: socket.socket) -> bool:
         sock.sendall(line.encode("utf-8"))
         return True
     except OSError:
-        # 发不出去不能让会话起不来：daemon 会回落到进程级默认库（旧行为）
+        # Failing to send must not keep the session from starting: the daemon falls back to the process-level default library (old behavior)
         return False
 
 
 # ══════════════════════════════════════════════════════════════════════
-# stdio ↔ daemon 的中继：**行分帧 + 断线自愈**
+# stdio <-> daemon relay: **line framing + self-healing on disconnect**
 # ══════════════════════════════════════════════════════════════════════
-# 这一段是真宿主事故逼出来的重写。旧实现是两个
-# **裸字节泵**：``_pump(stdin, sock)``（主线程）+ ``_pump(sock, stdout)``
-# （另一线程）。daemon 被宿主回收时，这两个方向的行为**不对称**，事故
-# 于是分两步发生：
+# This section is a rewrite forced by a real-host incident. The old
+# implementation was two **bare byte pumps**: ``_pump(stdin, sock)`` (main
+# thread) + ``_pump(sock, stdout)`` (another thread). When the daemon was
+# reclaimed by the host, the two directions behaved **asymmetrically**, and the
+# incident unfolded in two steps:
 #
-#   ① 回程泵收到 EOF ⇒ 退出 ⇒ 走到 ``_pump`` 的 finally ⇒ **close(stdout)**。
-#      宿主读到 EOF，判定 MCP server 已下线，打点 ``mcp.server.closed``。
-#   ② 去程泵正阻塞在 ``stdin.read1()`` 上，对面死了它一无所知 ⇒ launcher
-#      **进程存活**、攥着一条死管道 ⇒ 僵尸态。宿主既不重连也不重启，
-#      因为它已经给这条连接判了死刑。
+#   ① The return pump got EOF => exited => reached ``_pump``'s finally =>
+#      **close(stdout)**. The host read EOF, judged the MCP server offline,
+#      and logged ``mcp.server.closed``.
+#   ② The outbound pump was blocked in ``stdin.read1()`` and knew nothing of the
+#      peer's death => the launcher **process stayed alive** holding a dead pipe
+#      => zombie state. The host neither reconnected nor restarted, because it
+#      had already pronounced this connection dead.
 #
-# 此后会话里每一次 hippo 调用都是 22~33 ms 的 ``Connection closed``。
-# 注意：**没有一次走到了网络层** —— 连接是我们自己关的。
+# Every hippo call in later sessions returned ``Connection closed`` in 22~33 ms.
+# Note: **not one of them reached the network layer** -- we closed the
+# connection ourselves.
 #
-# 换成行分帧之后，三件事才第一次成立：
-#   · **原子**：一整条 JSON-RPC 要么完整到达 daemon，要么没发；不会有半帧。
-#   · **可计数**：按 JSON-RPC 语义记录 in-flight 的 request id。
-#   · **可重连**：断在帧边界上，换一条新 socket 就能接着跑，
-#     **宿主全程不需要知道发生过断连**。
+# With line framing, three things became true for the first time:
+#   · **Atomic**: a whole JSON-RPC message either fully reaches the daemon or is
+#     not sent at all; no half frames.
+#   · **Countable**: in-flight request ids are recorded per JSON-RPC semantics.
+#   · **Reconnectable**: breaks happen at frame boundaries, so a fresh socket can
+#     pick up where things stopped, **with the host never needing to know a
+#     disconnect happened**.
 #
-# daemon 侧天然配合得了：``bridge.py`` 的 ``sock_reader`` 本来就按 ``\n``
-# 切帧，且对非法帧是"跳过并吼一句"而不是杀连接（见 bridge.py 111-119 行）。
+# The daemon side cooperates naturally: ``bridge.py``'s ``sock_reader`` already
+# splits frames on ``\n``, and for illegal frames it "skips and shouts" rather
+# than killing the connection (see bridge.py lines 111-119).
 #
-# 自检清单（改这里之前先看 ``tests/test_f9_5_relay_reconnect.py``）：
-#   1. **回程线程绝不许 close(stdout)** —— 那等于替宿主判死刑；
-#   2. 自愈不了就**明确失败**（关 stdout + 非 0 退出），不许停在僵尸态；
-#   3. 重连后必须在**新 daemon 上重建 MCP 会话**（重放 initialize），
-#      否则后续 tools/call 会因"未 initialize"被拒；
-#   4. 未决请求必须拿到一个**明确交代**（合成 error），不许挂死。
+# Self-check list (read ``tests/test_f9_5_relay_reconnect.py`` before changing
+# this):
+#   1. **The return thread must never close(stdout)** -- that pronounces the
+#      death sentence on the host's behalf;
+#   2. If self-healing fails, **fail explicitly** (close stdout + non-zero exit),
+#      never stay in a zombie state;
+#   3. After reconnecting, the **MCP session must be rebuilt on the new daemon**
+#      (replay initialize), otherwise later tools/call are rejected with "not
+#      initialized";
+#   4. Pending requests must get an **explicit settlement** (synthesized error),
+#      never left hanging.
 
-#: 自愈开关。``HIPPOCAMPUS_LAUNCHER_RECONNECT=0`` 退回旧的单程字节泵行为，
-#: 只用于 A/B 对照与测试里的**负对照**。别在生产关掉它。
+#: Self-healing switch. ``HIPPOCAMPUS_LAUNCHER_RECONNECT=0`` reverts to the old
+#: one-way byte pump behavior, only for A/B comparison and as the **negative
+#: control** in tests. Do not turn it off in production.
 ENV_RECONNECT = "HIPPOCAMPUS_LAUNCHER_RECONNECT"
-#: 诊断输出开关（写 stderr，不碰 stdout）。
+#: Diagnostic output switch (writes stderr, never stdout).
 ENV_DIAG = "HIPPOCAMPUS_LAUNCHER_DIAG"
-#: 一次断线的重连尝试次数上限。
+#: Max reconnect attempts per disconnection.
 RECONNECT_MAX_ATTEMPTS = 3
-#: 一次断线的修复总预算（秒）。daemon 冷起要加载嵌入模型（实测 ~13-35s），
-#: 给足，但要小于宿主常见的工具调用超时。
+#: Total repair budget (seconds) per disconnection. A cold daemon start loads
+#: the embedding model (~13-35s measured); be generous, but keep it below the
+#: host's typical tool-call timeout.
 RECONNECT_DEADLINE = 90.0
-#: 重连失败后的退避基数（秒），按 attempt 线性放大。
+#: Backoff base (seconds) after a failed reconnect, scaled linearly by attempt.
 RECONNECT_BACKOFF = 0.5
-#: 重连后重放 initialize 时，等待其响应的上限（秒）。
+#: Upper limit (seconds) for waiting for the response when replaying initialize
+#: after a reconnect.
 HANDSHAKE_REPLAY_TIMEOUT = 60.0
 
-#: 未决请求的交代文案。**必须说清"结果未知"**——不许暗示成功或失败，
-#: 调用方（尤其是写类操作的调用方）全靠这句话决定要不要重试。
+#: The message used to account for pending requests. **It must state clearly
+#: that "the result is unknown"** -- never imply success or failure; callers
+#: (especially of write operations) rely entirely on this sentence to decide
+#: whether to retry.
 ERR_DAEMON_LOST = (
     "HippoMCP daemon connection was interrupted and could not recover immediately: the result of this request is UNKNOWN"
     " (it may have executed, or may never have reached the daemon). Idempotent operations may be safely retried; "
     "for non-idempotent writes (ingest / update_memory / forget), read back before retrying."
 )
 
-#: main() 在开跑前填好 —— _Relay 靠它知道"该重连到哪个 key"。
+#: Filled in by main() before running -- _Relay relies on it to know "which key to reconnect to".
 _SESSION_PARAMS: dict[str, str] = {"key": "", "library": "", "model": ""}
 
 
 def _diag(msg: str) -> None:
-    """诊断只能走 stderr。
+    """Diagnostics may only go to stderr.
 
-    stdout 是 **JSON-RPC 专用通道**，写脏一个字节整条 MCP stdio 会话就废了
-    （``server.py`` 的 ``_ThreadAwareStdout`` 护栏是同一个原因）。
+    stdout is the **JSON-RPC-only channel**; dirtying a single byte ruins the
+    whole MCP stdio session (``server.py``'s ``_ThreadAwareStdout`` guard exists
+    for the same reason).
     """
     if os.environ.get(ENV_DIAG, "1") == "0":
         return
     try:
         print(f"[launcher] {msg}", file=sys.stderr, flush=True)
-    except Exception:  # noqa: BLE001 —— 诊断永远不许影响主链路
+    except Exception:  # noqa: BLE001 -- diagnostics must never affect the main path
         pass
 
 
@@ -871,15 +971,16 @@ def reconnect_enabled() -> bool:
 
 
 def _id_key(rid: Any) -> str:
-    """把 JSON-RPC 的 id（str / int / None）压成稳定的 dict key。"""
+    """Compress a JSON-RPC id (str / int / None) into a stable dict key."""
     return json.dumps(rid, sort_keys=True, default=str)
 
 
 def _request_key(line: bytes) -> str | None:
-    """这一帧是不是一条**需要应答的 request**？是就返回它的 key。
+    """Is this frame a **request that needs a response**? If so, return its key.
 
-    notification（有 method 无 id）不需要应答，因此也不进未决账
-    —— 把它记进来会让 ``_fail_inflight`` 给它合成一个没人认领的 error。
+    Notifications (method without id) need no response and therefore stay out of
+    the pending ledger -- recording them would have ``_fail_inflight``
+    synthesize an error nobody will ever claim.
     """
     try:
         obj = json.loads(line.decode("utf-8", "replace"))
@@ -893,17 +994,18 @@ def _request_key(line: bytes) -> str | None:
 
 
 class _RelayLost(Exception):
-    """daemon 连接不可恢复 —— 必须终止这条 stdio，绝不停在僵尸态。"""
+    """The daemon connection is unrecoverable -- this stdio must be terminated, never left in a zombie state."""
 
 
 class _Relay:
-    """stdio ↔ daemon socket 的行分帧中继。
+    """Line-framed relay between stdio and the daemon socket.
 
-    线程模型（与旧的双泵不同）：
-      · 主线程只做 stdin → daemon（**逐行**）
-      · 每条 daemon 连接派生一个回程线程做 daemon → stdout（**逐行**）
-      · 回程线程**不拥有** stdout 的生命期；stdout 只在宿主关掉 stdin
-        或明确放弃自愈时才关。
+    Thread model (different from the old double pump):
+      · The main thread only does stdin -> daemon (**line by line**)
+      · Each daemon connection gets a return thread doing daemon -> stdout
+        (**line by line**)
+      · The return thread does **not own** stdout's lifetime; stdout closes only
+        when the host closes stdin or self-healing is explicitly abandoned.
     """
 
     def __init__(self, key: str, library: str = "", model: str = "") -> None:
@@ -915,26 +1017,27 @@ class _Relay:
         self._sock_lock = threading.Lock()
         self._stdout_lock = threading.Lock()
         self._reseat_lock = threading.Lock()
-        self._inflight: dict[str, str] = {}     # id_key -> 原始请求帧
+        self._inflight: dict[str, str] = {}     # id_key -> original request frame
         self._inflight_lock = threading.Lock()
-        self._handshake: list[bytes] = []       # 缓存的 initialize/initialized
+        self._handshake: list[bytes] = []       # cached initialize/initialized
         self._initialized = False
         self._sock_dead = threading.Event()
         self._stopped = threading.Event()
         self._stdout = None
         self._stdin = None
 
-    # ── 主循环 ──────────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────────
     def run(self, sock: socket.socket) -> int:
-        """返回 0＝宿主正常关闭；4＝自愈失败，已明确断开。"""
+        """Returns 0 = host closed normally; 4 = self-healing failed, disconnected explicitly."""
         try:
             self._stdout = sys.stdout.buffer
             self._stdin = sys.stdin.buffer
         except Exception:  # noqa: BLE001
             return 2
-        # 🔴 必须在转发任何 MCP 字节**之前**声明这条连接属于哪个库，否则串库
-        # （见 :func:`_send_hello` 的注释）。重连路径由 ``_connect_fresh``
-        # 各自负责，这里只管首发这条。
+        # 🔴 Must declare which library this connection belongs to **before**
+        # relaying any MCP bytes, or libraries get crossed (see :func:`_send_hello`'s
+        # comment). The reconnect path is handled by ``_connect_fresh`` separately;
+        # only the first connection is handled here.
         _send_hello(sock)
         if not self._install(sock):
             return 3
@@ -949,45 +1052,51 @@ class _Relay:
         return 0
 
     def _pump_stdin(self) -> None:
-        """主线程：宿主 stdio → daemon，一次一行。
+        """Main thread: host stdio -> daemon, one line at a time.
 
-        🔴 用 ``readline`` 而不是 ``read``/``read1`` 是有意的：这里要的正是
-        「读到行尾就返回」的语义。``BufferedReader.read(n)`` 会等到读满 n 字节
-        或 EOF（``read1`` 是为了治这个才引入的，见 :func:`_pump` 的注释），
-        而 ``readline`` 天然按行返回，不存在这个问题。别把它"优化"回
-        ``read1`` + 自己攒缓冲 —— 那是在重造 BufferedReader。
+        🔴 Using ``readline`` instead of ``read``/``read1`` is deliberate: what is
+        wanted here is exactly the "return at end of line" semantics.
+        ``BufferedReader.read(n)`` waits until n bytes are read or EOF
+        (``read1`` was introduced to fix exactly that; see :func:`_pump`'s
+        comment), while ``readline`` naturally returns per line and has no such
+        problem. Do not "optimize" it back to ``read1`` + a hand-rolled buffer --
+        that is reinventing BufferedReader.
         """
         while True:
             if self._stopped.is_set():
                 return
             line = self._stdin.readline()
             if not line:
-                return                              # 宿主关了 stdin：正常收尾
+                return                              # host closed stdin: normal shutdown
             line = line.strip()
             if not line:
                 continue
             self._deliver(line)
 
-    # ── 宿主 → daemon ───────────────────────────────────────────────
+    # ── host → daemon ───────────────────────────────────────────────
     def _deliver(self, line: bytes) -> None:
-        """投递一整帧。发不出去就自愈（重连 + 补发这一帧）。"""
+        """Deliver one whole frame. If it cannot be sent, self-heal (reconnect + retransmit this frame)."""
         self._remember_handshake(line)
-        # 登记必须**先于**发送：响应可能在 sendall 返回的那一刻就回来了，
-        # 先发后记会把这条勾销漏过去。
+        # Registration must happen **before** sending: the response may come back
+        # the instant sendall returns; registering after sending would miss this
+        # frame's settlement.
         self._register_inflight(line)
 
-        # 🔴 先查 ``_sock_dead`` 再发：回程线程通常比去程更早知道对面死了。
-        # 少了这一步，sendall 会**成功写进内核缓冲**（对端已关闭时第一次写
-        # 往往不报错），于是我们以为发出去了、宿主从此挂等到超时 ——
-        # 这比立刻自愈糟得多。
+        # 🔴 Check ``_sock_dead`` before sending: the return thread usually learns
+        # the peer died earlier than the send path. Without this step, sendall
+        # **successfully writes into the kernel buffer** (the first write to a
+        # closed peer often does not error), so we believe it went out and the
+        # host hangs until timeout -- far worse than self-healing immediately.
         if not self._sock_dead.is_set() and self._send(line):
             return
 
-        # 🔴 **这里故意不撤销登记**。这一帧接下来只有两种归宿：被 ``_reseat``
-        # 补发成功，或补发失败时由 ``_replay_pending`` 撤销。中途撤销会让它
-        # 从账上人间蒸发 —— ``_fail_inflight`` 看不见它，宿主永远等不到这条
-        # 应答，只能挂到超时（自测撞到的记账 bug，第一版正是这么
-        # 写的：日志里能看到「记入未决 id=13 在途=2」，最后却只交代了 1 条）。
+        # 🔴 **Registration is deliberately not undone here**. This frame has only
+        # two destinies: retransmitted successfully by ``_reseat``, or canceled by
+        # ``_replay_pending`` when retransmission fails. Canceling midway makes it
+        # vanish from the ledger -- ``_fail_inflight`` never sees it, the host
+        # waits forever for this response and hangs until timeout (an accounting
+        # bug hit in self-testing; the first version did exactly this: the log
+        # showed "registered pending id=13 in-flight=2", yet only 1 was settled).
         if self._reseat(pending=line):
             return
         n = self._fail_inflight(ERR_DAEMON_LOST)
@@ -1006,14 +1115,15 @@ class _Relay:
             self._sock_dead.set()
             return False
 
-    # ── daemon → 宿主 ───────────────────────────────────────────────
+    # ── daemon → host ───────────────────────────────────────────────
     def _pump_sock(self, sock: socket.socket, gen: int) -> None:
-        """回程：按 ``\\n`` 切帧写一整行到 stdout。
+        """Return path: split frames on ``\\n`` and write whole lines to stdout.
 
-        🔴 **这个函数绝对不许 close(stdout)**。旧实现的回程泵在 finally 里
-        关了 stdout，宿主因此读到 EOF 并判定 server 下线 —— 事故
-        的第一张多米诺骨牌就是它。只要宿主还没关 stdin，这条 MCP 连接就
-        还有效，我们就得留着这条 stdout。
+        🔴 **This function must never close(stdout)**. The old implementation's
+        return pump closed stdout in its finally block; the host read EOF and
+        judged the server offline -- the first domino of the incident. As long as
+        the host has not closed stdin, this MCP connection is still valid and we
+        must keep this stdout.
         """
         buf = b""
         try:
@@ -1027,7 +1137,7 @@ class _Relay:
                 with self._sock_lock:
                     stale = self._gen != gen or self._sock is not sock
                 if stale:
-                    return                       # 已被换代的旧连接：安静退出
+                    return                       # superseded connection of an older generation: exit quietly
                 buf += data
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
@@ -1035,27 +1145,30 @@ class _Relay:
                     self._write_stdout(raw + b"\n")
         finally:
             if buf.strip():
-                # 断在半帧上：这一帧永远不完整，只能丢。要吼一句 —— 静默丢帧
-                # 在以后的事故里会被当成"daemon 没回"。
+                # Broke mid-frame: this frame can never be complete, so it must be
+                # dropped. Say so loudly -- a silently dropped frame will be read
+                # as "the daemon did not respond" in some future incident.
                 _diag(f"Discarded partial frame {len(buf)}B (connection broke at a non-frame boundary)")
             with self._sock_lock:
                 current = self._gen == gen and self._sock is sock
             if current and not self._stopped.is_set():
                 self._sock_dead.set()
                 if reconnect_enabled():
-                    # 主动预热：与其等下一条请求来时才拉 daemon（冷起 ~13-35s，
-                    # 很可能顶穿宿主的调用超时），不如现在就在后台补。
+                    # Proactive prewarm: rather than spawn the daemon only when the
+                    # next request arrives (cold start ~13-35s, likely to blow
+                    # through the host's call timeout), refill it in the background now.
                     threading.Thread(
                         target=self._reseat, kwargs={"pending": b""},
                         daemon=True).start()
 
-    # ── 重连 ────────────────────────────────────────────────────────
+    # ── Reconnect ────────────────────────────────────────────────────
     def _reseat(self, pending: bytes = b"") -> bool:
-        """换一条 daemon 连接；成功时负责把 ``pending`` 补发出去。
+        """Swap in a new daemon connection; on success, retransmit ``pending``.
 
-        全程持 ``_reseat_lock``：回程线程的后台预热与主线程的请求投递可能
-        同时到达这里，不串行就会出现两个 launcher 各拉一个 daemon（正是
-        那个 ~1GB ×2 的双 daemon 事故）。
+        Holds ``_reseat_lock`` throughout: the return thread's background prewarm
+        and the main thread's request delivery can arrive here concurrently;
+        without serialization, two launchers each spawn a daemon (exactly that
+        ~1GB x2 double-daemon incident).
         """
         if not reconnect_enabled():
             return False
@@ -1068,7 +1181,7 @@ class _Relay:
                 with self._sock_lock:
                     alive = not self._sock_dead.is_set()
                 if alive:
-                    return self._replay_pending(pending)   # 别人已经修好了
+                    return self._replay_pending(pending)   # someone else already fixed it
                 attempt += 1
                 if attempt > RECONNECT_MAX_ATTEMPTS:
                     break
@@ -1086,11 +1199,13 @@ class _Relay:
             self._reseat_lock.release()
 
     def _replay_pending(self, pending: bytes) -> bool:
-        """补发重连前没能发出去的那一帧。
+        """Retransmit the frame that failed to send before the reconnect.
 
-        🔴 这一帧此前已经登记过，这里**不再重复登记**，只在确认发出去不通时
-        才撤销 —— 记账的唯一入口是 ``_deliver``，否则同一个 id 会被两处
-        互相覆盖/撤销，最后谁也说不清它到底发没发出去。
+        🔴 This frame was already registered earlier; do **not** register it again
+        here, and cancel it only once sending is confirmed failed -- ``_deliver``
+        is the sole entry point to the ledger, otherwise the same id gets
+        overwritten/canceled from two places and nobody can say whether it was
+        ever sent.
         """
         if not pending:
             return True
@@ -1118,7 +1233,7 @@ class _Relay:
         return s
 
     def _install(self, sock: socket.socket, replay_handshake: bool = False) -> bool:
-        """接管一条新连接（并起它的回程线程）。"""
+        """Take over a new connection (and start its return thread)."""
         if replay_handshake and not self._replay_handshake(sock):
             _diag("Failed to rebuild MCP session after reconnect; trying another connection")
             try:
@@ -1142,15 +1257,16 @@ class _Relay:
         return True
 
     def _replay_handshake(self, sock: socket.socket) -> bool:
-        """在新 daemon 上把宿主的握手重做一遍。
+        """Redo the host's handshake on the new daemon.
 
-        🔴 **这一步不能省**：新 daemon 上是一条全新的 MCP 会话，而不重放的
-        话，宿主后续发来的 ``tools/list`` / ``tools/call`` 会因为"未完成
-        initialize"被拒。而宿主自己是认这段历史的（它早就 initialize 过了），
-        绝不会重来一次 ⇒ 这段只能由 launcher 替它补。
+        🔴 **This step cannot be skipped**: on the new daemon this is a brand new
+        MCP session; without replay, the host's subsequent ``tools/list`` /
+        ``tools/call`` are rejected with "initialize not completed". The host
+        itself considers that history done (it initialized long ago) and will
+        never redo it => only the launcher can fill it in on the host's behalf.
 
-        initialize 的响应必须**自己吃掉**，不能再转发给宿主 —— 否则同一个
-        id 会出现第二个响应。
+        The initialize response must be **consumed here**, not forwarded to the
+        host -- otherwise the same id would get a second response.
         """
         if not self._initialized or not self._handshake:
             return True
@@ -1176,7 +1292,7 @@ class _Relay:
 
     @staticmethod
     def _drink(sock: socket.socket) -> bool:
-        """读走一整行并丢弃。"""
+        """Read one whole line and discard it."""
         try:
             sock.settimeout(HANDSHAKE_REPLAY_TIMEOUT)
             buf = b""
@@ -1205,7 +1321,7 @@ class _Relay:
             except OSError:
                 pass
 
-    # ── 握手历史 / in-flight 记账 ───────────────────────────────────
+    # ── Handshake history / in-flight ledger ─────────────────────────
     def _remember_handshake(self, line: bytes) -> None:
         try:
             obj = json.loads(line.decode("utf-8"))
@@ -1215,7 +1331,7 @@ class _Relay:
             return
         method = obj.get("method")
         if method == "initialize":
-            # 只记最新一条 initialize：宿主重启会话时握手会重来。
+            # Keep only the newest initialize: the host redoes the handshake when it restarts the session.
             self._handshake = [line.strip()]
             self._initialized = False
         elif method == "notifications/initialized":
@@ -1224,7 +1340,7 @@ class _Relay:
             self._initialized = True
 
     def _register_inflight(self, line: bytes) -> str | None:
-        """登记未决请求。只有 **request**（有 method 且有 id）才需要应答。"""
+        """Register a pending request. Only a **request** (has both method and id) needs a response."""
         k = _request_key(line)
         if k is None:
             return None
@@ -1236,7 +1352,7 @@ class _Relay:
         return k
 
     def _rollback_inflight(self, line: bytes) -> None:
-        """**确认这一帧最终没能发出去**才撤销登记。"""
+        """Cancel the registration only after **confirming this frame ultimately failed to send**."""
         k = _request_key(line)
         if k is None:
             return
@@ -1246,7 +1362,7 @@ class _Relay:
             print(f"[relay] xx canceled pending id={k}", file=sys.stderr, flush=True)
 
     def _settle_inflight(self, line: bytes) -> None:
-        """应答到达，勾销未决。"""
+        """A response arrived; settle the pending entry."""
         try:
             obj = json.loads(line.decode("utf-8"))
         except Exception:  # noqa: BLE001
@@ -1254,8 +1370,8 @@ class _Relay:
         if not isinstance(obj, dict) or "id" not in obj:
             return
         if "method" in obj:
-            # daemon 主动发来的 request（sampling / elicitation 之类），
-            # 不是对宿主请求的应答 —— 不能拿来勾销。
+            # A request initiated by the daemon (sampling / elicitation etc.),
+            # not a response to a host request -- must not be used for settlement.
             return
         with self._inflight_lock:
             removed = self._inflight.pop(_id_key(obj["id"]), None)
@@ -1264,13 +1380,15 @@ class _Relay:
                   file=sys.stderr, flush=True)
 
     def _fail_inflight(self, reason: str) -> int:
-        """给所有未决请求一个**明确交代**。
+        """Give every pending request an **explicit settlement**.
 
-        为什么是 error 而不是留在那儿：留在那儿等于让宿主从今往后每一条
-        请求都挂到超时，用户看到一个没有上下文的"工具调用失败"。
-        为什么不自动重放：我们不知道这一帧是否已被 daemon 执行过 ——
-        重放 ``ingest`` 就会静默写入两份。把"结果未知"如实告诉调用方，
-        让**知道语义的上层**决定重不重试，是本分。
+        Why an error instead of leaving them there: leaving them means every
+        future host request hangs until timeout and the user sees a context-free
+        "tool call failed". Why not replay automatically: we do not know whether
+        this frame was already executed by the daemon -- replaying ``ingest``
+        would silently write duplicates. Telling the caller "the result is
+        unknown" honestly and letting the **semantics-aware upper layer** decide
+        whether to retry is the proper duty.
         """
         with self._inflight_lock:
             items = list(self._inflight.items())
@@ -1290,7 +1408,8 @@ class _Relay:
         return len(items)
 
     def _write_stdout(self, data: bytes) -> None:
-        # 回程线程与主线程（合成 error）可能同时写 ⇒ 必须串行 + 整帧写完。
+        # The return thread and the main thread (synthesized error) may write
+        # concurrently => must serialize + write whole frames.
         with self._stdout_lock:
             try:
                 self._stdout.write(data)
@@ -1299,11 +1418,14 @@ class _Relay:
                 self._stopped.set()
 
     def _abandon(self) -> None:
-        """自愈不了就明确放弃 —— 关 stdout + 非 0 退出。
+        """If self-healing is impossible, give up explicitly -- close stdout +
+        exit non-zero.
 
-        旧行为最坏的地方不是死，是**不死**：launcher 进程活着、stdout 已关、
-        宿主任为连接还开着，于是每一次调用都打进空气里，22~33ms 返回一个
-        毫无信息量的 ``Connection closed``。要么能用，要么明确地断。
+        The worst part of the old behavior was not dying, it was **not dying**:
+        the launcher process alive, stdout closed, the host believing the
+        connection open, so every call fired into the void and returned a
+        content-free ``Connection closed`` in 22~33ms. Either work, or
+        disconnect explicitly.
         """
         self._stopped.set()
         self._drop_sock()
@@ -1318,9 +1440,10 @@ class _Relay:
 
 
 def relay(sock: socket.socket) -> int:
-    """把这条 daemon 连接接入宿主的 stdio，直到会话结束。
+    """Bridge this daemon connection into the host's stdio until the session ends.
 
-    返回码：0＝宿主关了 stdin（正常）；2/3＝起不来；4＝自愈失败已断开。
+    Return codes: 0 = host closed stdin (normal); 2/3 = could not start; 4 =
+    self-healing failed, disconnected.
     """
     return _Relay(
         _SESSION_PARAMS.get("key", ""),
@@ -1330,30 +1453,36 @@ def relay(sock: socket.socket) -> int:
 
 
 def run_server_inline(argv: list[str] | None = None) -> int:
-    """退化路径：直接跑原 server（与今天完全一致）。
+    """Fallback path: run the original server directly (identical to today).
 
-    server 入口零参（``entry.run_main`` 不读命令行），argv 无处转发：
-    形参保留只为回退分支的调用现场不动。
+    The server entry takes zero arguments (``entry.run_main`` does not read the
+    command line), so argv has nowhere to go: the parameter exists only to keep
+    the fallback branch's call site unchanged.
     """
-    from .server import main as _server_main   # 惰性：这里才 import 重库
+    from .server import main as _server_main   # lazy: the heavy libraries are imported only here
     return _server_main() or 0
 
 
 def preflight_persist_dir() -> int | None:
-    """启动前对库目录做一次 fail-fast 探测。
+    """A fail-fast probe of the library directory before startup.
 
-    与"任何一步出问题都退回 inline"的总原则**刻意相反**的一处：退化哲学
-    护的是「launcher 自己的机制坏了，服务仍要能起」；而库目录不可写是
-    **配置本身坏了** —— 服务照样起得来，只是每次写入都无声丢失，用户要
-    等到"记不住任何东西"才发现。与其挂到宿主超时、被静默标记 failed，
-    不如现在带明确 stderr 退出，把修复路径直接写在报错里。
+    The one place **deliberately opposite** to the overall "degrade to inline on
+    any failure" principle: the degradation philosophy protects "the launcher's
+    own mechanism broke, yet the service must still start"; an unwritable
+    library directory is **the configuration itself being broken** -- the
+    service still starts, but every write is silently lost and the user only
+    discovers it when "nothing can be remembered". Rather than hang until the
+    host times out and get silently marked failed, exit now with a clear stderr
+    message that states the fix path directly.
 
-    返回 None = 继续；返回 int = 以该码退出。
+    Returns None = continue; returns int = exit with that code.
     """
     lib = os.environ.get(ENV_PERSIST, "").strip()
     if not lib:
-        # 未设不算错（人工裸跑 launcher 调试是合法场景），但要自曝：
-        # 此刻的默认库很可能不是用户以为的那个库 —— 串库从不报错。
+        # Unset is not an error (manually running the launcher for debugging is a
+        # legitimate scenario), but it must self-report: the default library at
+        # this moment is probably not the one the user thinks -- cross-library
+        # use never errors.
         print(f"[launcher] ⚠ {ENV_PERSIST} is not set; this run will use the default library. "
               f"If launched by a host, the host probably did not read its config. "
               f"Run `python -m hippocampus_mcp.cli doctor --host <host>` for a verdict.",
@@ -1378,10 +1507,11 @@ def preflight_persist_dir() -> int | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """launcher 入口。
+    """Launcher entry point.
 
-    任何一步出问题都退回 ``run_server_inline``——可用性 > 省内存。
-    例外是库目录不可写：那是配置坏了，fail-fast（见 preflight_persist_dir）。
+    Any failure falls back to ``run_server_inline`` -- availability > memory
+    savings. The exception is an unwritable library directory: that is broken
+    configuration, fail fast (see preflight_persist_dir).
     """
     fail = preflight_persist_dir()
     if fail:
@@ -1393,10 +1523,11 @@ def main(argv: list[str] | None = None) -> int:
         model = os.environ.get("HIPPOCAMPUS_EMB_MODEL", "")
         version = os.environ.get("HIPPOCAMPUS_DAEMON_VERSION", "")
         key = daemon_key(library, model, version)
-        # 「慢」与「坏」必须可区分：这一段最长要等 DAEMON_READY_TIMEOUT（默认
-        # 180s，首次要加载嵌入模型），期间 stderr 一个字都没有的话，宿主与
-        # 用户都只能判定为"挂了"，然后按"坏了"处理（杀进程 / 改配置）。
-        # 先 flush 一行状态，让等待可被识别为等待。
+        # "Slow" and "broken" must be distinguishable: this stretch can wait up to
+        # DAEMON_READY_TIMEOUT (default 180s; the first start loads the embedding
+        # model), and if stderr says nothing meanwhile, host and user can only
+        # conclude "hung", then treat it as "broken" (kill the process / change
+        # config). Flush a status line first so the wait is recognizable as a wait.
         _diag(f"Connecting to shared daemon (first start loads the embedding model; tens of seconds is normal; "
               f"after {DAEMON_READY_TIMEOUT:.0f}s without readiness, falls back to direct server)")
         info = ensure_daemon(key, library=library, model=model)
@@ -1408,7 +1539,7 @@ def main(argv: list[str] | None = None) -> int:
         if sock is None:
             _diag("Daemon registry is ready but its port is unreachable; falling back to direct server")
             return run_server_inline(argv)
-        # _Relay 靠它知道"断了该往哪个 key 重连"
+        # _Relay relies on this to know "which key to reconnect to after a break"
         _SESSION_PARAMS["key"] = key
         _SESSION_PARAMS["library"] = library
         _SESSION_PARAMS["model"] = model
@@ -1416,7 +1547,7 @@ def main(argv: list[str] | None = None) -> int:
         if rc == 4:
             _diag("stdio disconnected deliberately; surface an explicit failure to the host instead of leaving a zombie connection")
         return rc
-    except Exception:  # noqa: BLE001 —— 启动器不能因为任何原因让宿主连不上
+    except Exception:  # noqa: BLE001 -- the launcher must never, for any reason, leave the host unable to connect
         return run_server_inline(argv)
 
 

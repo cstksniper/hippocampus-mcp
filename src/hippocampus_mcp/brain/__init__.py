@@ -1,30 +1,31 @@
 # -*- coding: utf-8 -*-
-"""brain 子包：记忆编排层。
+"""brain subpackage: the memory orchestration layer.
 
-``from hippocampus_mcp.brain import HippoBrain`` 是包外脚本与测试的既定契约
-（60+ 个文件在用），所以本模块必须保持**搬迁前的命名空间等价**：
+``from hippocampus_mcp.brain import HippoBrain`` is the established contract for
+out-of-package scripts and tests (60+ files use it), so this module must keep
+**namespace equivalence with the pre-split layout**:
 
-* ``..common.constants`` 的 ``import *`` 走它自己的 ``__all__``，包含
-  ``_now`` / ``_nid`` / ``_env_int`` 这类下划线符号 —— ``import *`` 默认
-  不导出下划线名字，靠 ``__all__`` 才能带出来，漏了就是只在某些代码路径上
-  炸的 NameError；
-* ``.core`` 的 ``import *`` 补齐 ``HippoBrain`` 及其余公共符号 —— 与原
-  ``brain.py`` 不定义 ``__all__`` 时的导出行为一致。
+* the ``import *`` from ``..common.constants`` goes through its own ``__all__``, which includes
+  underscore names like ``_now`` / ``_nid`` / ``_env_int`` — ``import *`` by default
+  does not export underscore names; only ``__all__`` brings them through, and missing one
+  is a NameError that explodes only on certain code paths;
+* the ``import *`` from ``.core`` completes ``HippoBrain`` and the remaining public symbols —
+  matching the export behavior of the original ``brain.py`` when it defined no ``__all__``.
 
-两个 ``import *`` 都带 noqa：这是刻意的再导出（re-export），不是多余的导入。
+Both ``import *`` lines carry noqa: this is a deliberate re-export, not a redundant import.
 
-⚠️ **可调常量的真身在 ``brain.core``**：``import *`` 只是把名字复制进包命名空间
-的一份快照。``hippocampus_mcp.brain.UPDATE_TAGS_CONFIRM_ABOVE = 2`` 这种写法只改
-包副本，``core`` 里的函数读的是 ``core`` 自己的全局 —— 模块级全局的 patch 只对
-**定义并使用它的那个模块**生效。要调参请改 ``hippocampus_mcp.brain.core.XXX``，
-读也请从 ``.core`` 读。两个测试里原有的 patch 已按此修正（j1_update_tags /
-s2_tag_ops_undo），这是包化带来的唯一语义边界。
+⚠️ **The real tunable constants live in ``brain.core``**: ``import *`` merely copies the names
+into the package namespace as a snapshot. Writing ``hippocampus_mcp.brain.UPDATE_TAGS_CONFIRM_ABOVE = 2`` only changes
+the package copy; functions in ``core`` read ``core``'s own globals — a module-level global patch
+only takes effect in **the module that both defines and uses it**. To tune a parameter, change ``hippocampus_mcp.brain.core.XXX``,
+and read from ``.core`` too. The pre-existing patches in two tests have been fixed accordingly
+(j1_update_tags / s2_tag_ops_undo); this is the only semantic boundary introduced by the packaging.
 
-模块职责：
-* ``core``    —— ``HippoBrain`` 主类（原 ``brain.py``，约 6300 行）
-* ``pure``    —— 无状态 mixin（原 ``brain_pure.py``）
-* ``entity``  —— 实体词典 mixin（原 ``brain_entity.py``）
-* ``session`` —— 会话续接 mixin（原 ``brain_session.py``）
+Module responsibilities:
+* ``core``    — the ``HippoBrain`` main class (the original ``brain.py``, ~6300 lines)
+* ``pure``    — the stateless mixin (the original ``brain_pure.py``)
+* ``entity``  — the entity lexicon mixin (the original ``brain_entity.py``)
+* ``session`` — the session-resume mixin (the original ``brain_session.py``)
 """
 
 from ..common.constants import *  # noqa: F401,F403

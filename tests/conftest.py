@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""pytest 公共配置：把 `src/` 与仓库根注入 sys.path。
+"""pytest shared configuration: inject `src/` and the repo root into sys.path.
 
-tests/ 下的用例自带相对路径的 `sys.path.insert(..., "src")`，所以
-`python tests/test_xxx.py` 单跑就能工作。但 pytest 的执行上下文不同
-（rootdir / import mode 都可能变），这里再显式兜一次，保证两种跑法行为一致：
+Test cases under tests/ already carry their own relative-path `sys.path.insert(..., "src")`,
+so `python tests/test_xxx.py` works standalone. But pytest's execution context differs
+(rootdir / import mode may both change), so this file adds an explicit safety net to keep both run styles consistent:
 
-    python tests/test_forget.py      # 单跑
-    python scripts/run_all_tests.py  # 零依赖跑全套
-    pytest tests/                    # 装了 pytest 的环境
+    python tests/test_forget.py      # standalone run
+    python scripts/run_all_tests.py  # full suite with zero dependencies
+    pytest tests/                    # environments with pytest installed
 
-本文件只用标准库，不 import pytest —— 所以零依赖 runner 也不会因为它而失败。
+This file uses only the standard library and does not import pytest — so the zero-dependency runner never fails because of it.
 """
 
 from __future__ import annotations

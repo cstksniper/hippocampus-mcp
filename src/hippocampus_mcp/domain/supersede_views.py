@@ -1,21 +1,29 @@
-"""并存口径读侧视图族：取代列表 / 误杀恢复 / 标签覆盖。
+"""Read-side view family for coexisting versions: supersede list / false-kill recovery / tag coverage.
 
-从 ``brain.core`` 整搬三件。与 ``store/supersede.py``（写侧取代
-检测状态机）同名不同物：这里是**读侧/修复侧视图**。零 import，
-store 能力与状态常量由壳**调用时现取**注入。
+Three pieces moved wholesale from ``brain.core``. Same names as
+``store/supersede.py`` (the write-side supersede-detection state machine) but
+different things: these are **read-side / repair-side views**. Zero imports;
+store capabilities and state constants are injected by the shell, **fetched
+live at call time**.
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (changing any one is a behavior change; parity
+will catch it):
 
-  * list_superseded：只列 ``state == superseded``；``source`` 非 None
-    才过滤（全等，记录侧 ``or ""`` 兜底）；``superseded_by_content``
-    查不到时兜底空串；按 timestamp 降序后 ``[:limit]``——**limit<=0
-    没有特殊语义**（``[:0]`` 空、``[:-1]`` 真截尾），切片怪癖原样保留；
-  * un_supersede：三路范围一个都不给 ⇒ 返回 error 而不是动库；
-    ``memory_ids`` 假值（含空列表）视作"未指定"；预览 ``content[:80]``；
-    恢复 = ``state→active`` + ``superseded_by=None``，**有目标才 save**
-    （惰性回调，预览零写零存）；
-  * tag_coverage：``tags`` 假值视作无标签；键分布 top 15（按计数降序、
-    同分按键名升序）；``coverage`` 空**库**返回 ``0.0`` 而不是除零。
+  * list_superseded: lists only ``state == superseded``; filters on
+    ``source`` only when it is not None (exact equality, with the record
+    side's ``or ""`` fallback); falls back to an empty string when
+    ``superseded_by_content`` cannot be found; sorts by timestamp descending
+    then ``[:limit]`` — **limit<=0 has no special semantics** (``[:0]`` is
+    empty, ``[:-1]`` truly truncates the tail); the slicing quirks are kept
+    as-is;
+  * un_supersede: none of the three scoping options given ⇒ return error
+    instead of touching the library; falsy ``memory_ids`` (including an
+    empty list) counts as "unspecified"; previews ``content[:80]``; restore
+    = ``state→active`` + ``superseded_by=None``, **saves only when there
+    are targets** (lazy callback; previews do zero writes and zero saves);
+  * tag_coverage: falsy ``tags`` counts as no tags; key distribution top 15
+    (count descending, ties by key name ascending); ``coverage`` returns
+    ``0.0`` for an empty **library** instead of dividing by zero.
 """
 from __future__ import annotations
 
@@ -30,10 +38,11 @@ def list_superseded(
     limit: int,
     source: str | None = None,
 ) -> list[dict[str, Any]]:
-    """列出被标记为 superseded（已被取代）的记忆，含"被谁取代"。
+    """List memories marked superseded (already superseded), including "superseded by whom".
 
-    批量导入被误杀时用它做审计：覆盖报告·高 4 实测 28 对，绝大多数是
-    把两条各自的真事实判成了更新关系。
+    Use it for audits when batch imports were falsely killed: coverage report
+    · high-4 measured 28 pairs, the vast majority being two records' own
+    genuine facts judged into an update relation.
     """
     out: list[dict[str, Any]] = []
     for r in records:
@@ -62,18 +71,21 @@ def un_supersede(
     superseded_state: str,
     active_state: str,
     memory_ids: list[str] | None = None,
-    all: bool = False,  # noqa: A002 - 与 CLI 语义对齐，保留此名
+    all: bool = False,  # noqa: A002 - aligned with the CLI semantics; keep this name
     source: str | None = None,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """把误判为"已被取代"的记忆恢复为 active（解除 superseded_by）。
+    """Restore memories misjudged as "already superseded" to active (clearing superseded_by).
 
-    误杀修复用（覆盖报告·高 4 的附带项）：``_detect_supersede`` 曾因实词
-    重叠门槛过松，把 28 对无关/独立事实判成更新关系。恢复后它们重新参与
-    默认召回，原取代者不受影响。
+    For false-kill repair (the companion item of coverage report · high-4):
+    ``_detect_supersede`` once judged 28 pairs of unrelated/independent facts
+    into update relations because the content-word overlap gate was too
+    loose. After restoration they rejoin default recall; the original
+    superseder is unaffected.
 
-    必须显式指定范围（``memory_ids`` / ``all=True`` / ``source``），
-    避免一条命令把全库状态改掉。默认 ``dry_run=True`` 只预览。
+    A scope must be given explicitly (``memory_ids`` / ``all=True`` /
+    ``source``), to avoid one command flipping the whole library's state.
+    Default ``dry_run=True`` previews only.
     """
     if not memory_ids and not all and source is None:
         return {
@@ -108,10 +120,13 @@ def un_supersede(
 
 
 def tag_coverage(records: Iterable[Any]) -> dict[str, Any]:
-    """库级标签覆盖率与键分布（验收判据）。
+    """Library-level tag coverage and key distribution (acceptance criterion).
 
-    「有多少条带了域标签」此前只能靠导出整个库自己数——没有自曝，宿主就
-    只能凭感觉说"好像大部分都有"。键分布只回 top 键，避免大库返回体爆炸。
+    "How many records carry domain tags" previously could only be counted by
+    exporting the whole library yourself — without self-reporting, the host
+    could only go on a feeling of "seems like most have them". The key
+    distribution returns only the top keys, keeping large libraries from
+    blowing up the response body.
     """
     total = 0
     tagged = 0

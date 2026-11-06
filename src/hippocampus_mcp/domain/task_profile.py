@@ -1,44 +1,56 @@
 # -*- coding: utf-8 -*-
-"""任务级「问题概况」投影（从 brain/core.py 提取）。
+"""Task-level "question profile" projection (extracted from brain/core.py).
 
-纯派生、不检索、不引模型。锚点是 session_start **已经算好的**
-``task_hits``（预召回跑过一次，这里绝不重新检索——热路径纪律与全貌卡
-同族）：
+Pure derivation; no retrieval, no models. The anchor is the ``task_hits``
+session_start **already computed** (pre-recall ran once; this never
+re-searches -- the same hot-path discipline family as the overview card):
 
-* **知识点**：主题 ``member_ids`` 与锚点记忆 id 求交，按交集大小排序。
-  同一个 id 空间，精确，无阈值可调；
-* **实体**：实体 ``memory_ids`` 与锚点求交，同频按 mention_count；
-* **待办**：``status=open`` 且文本含任一词 token 的 intent（与
-  ``resolve_intent`` 的 keyword-in-text 同族语义）；
-* **miss 缺口**：近 ``miss_days`` 天且 query 含任一词 token 的留痕——
-  「这个领域最近反复缺什么」，比状态卡的 7 天窗口长。
+* **Knowledge points**: intersect topic ``member_ids`` with anchor memory
+  ids, sorted by intersection size. Same id space, exact, no tunable
+  threshold;
+* **Entities**: intersect entity ``memory_ids`` with the anchor, ties broken
+  by mention_count;
+* **Open intents**: intents with ``status=open`` whose text contains any word
+  token (same semantic family as ``resolve_intent``'s keyword-in-text);
+* **Miss gaps**: traces within the last ``miss_days`` days whose query
+  contains any word token -- "what this domain has repeatedly lacked
+  recently"; longer than the status card's 7-day window.
 
-token = 任务正文切词 + 锚点标签值 + 锚点实体名（后两者来自锚点本身，
-不是新检索）。**task 为空（或纯空白）时整体返回空概况**——"问题概况"
-presupposes 一个有待解决的问题，与 session_start 的 ``bool(task)`` gate
-同一口径（双轨不分裂：块空 ⟺ 结构化空）。
+token = task text word-split + anchor tag values + anchor entity names (the
+latter two come from the anchors themselves, not a new retrieval). **An empty
+(or whitespace-only) task returns an entirely empty profile** -- a "question
+profile" presupposes a question to be solved, the same rule as session_start's
+``bool(task)`` gate (the two tracks never split: block-empty <=> structurally
+empty).
 
-为什么放 domain/：这里只做「派生层数据 → 结构化投影」，切词
-（``task_tokens``）本就在 common，零 I/O、零模型、零配置读数。brain 只留
-薄包装，把四个派生层、参考时钟、主题层开关与五个上限常量在调用时绑好
-注入。
+Why domain/: this only does "derived-layer data -> structured projection";
+word splitting (``task_tokens``) already lives in common; zero I/O, zero
+models, zero config reads. brain keeps only a thin wrapper that binds the four
+derived layers, the reference clock, the topic-layer switch, and the five cap
+constants at call time and injects them.
 
-🔴 **主题口径走注入，不 import** ``domain.topic``：arch G1 的依赖矩阵是
-``domain → 仅 common``，**同层互引都不在允许关系里**（``store`` / ``map``
-那种显式同层白名单是特批）。所以 ``ordered`` 与归档状态值由包装层传进来
-——顺带保住了 monkeypatch 面（测试 patch ``topic_mod.STATUS_ARCHIVED``
-仍然生效）。
+🔴 **The topic semantics go through injection, not import** of
+``domain.topic``: arch G1's dependency matrix is ``domain -> common only``,
+and **same-layer mutual imports are not among the allowed relations** (the
+explicit same-layer whitelists like ``store`` / ``map`` are specially
+approved). So ``ordered`` and the archived status value are passed in by the
+wrapper -- which incidentally preserves the monkeypatch surface (tests
+patching ``topic_mod.STATUS_ARCHIVED`` keep working).
 
-端口纪律：
+Port discipline:
 
-* **不 import Config 也不读 env**。主题层开关 ``topic_layer_enabled`` 由
-  包装层从 ``_topic_defaults()`` 现取后传入（教训：做成 import-time
-  快照会让 ``HIPPOCAMPUS_TOPIC_LAYER=0`` 静默失效）；
-* 五个上限（``TASK_TOPIC_MAX`` / ``TASK_ENTITY_MAX`` / ``TASK_INTENT_MAX``
-  / ``TASK_MISS_MAX`` / ``TASK_MISS_DAYS``）打包成 :class:`Limits` 由包装层
-  **调用时**从 core 命名空间现取（arch 冻结常量名在 core，monkeypatch 面）；
-* 时钟 ``ref_time`` 为 None 时才回落 ``_now()``（``manager._reference_time``
-  是测试注入的参考钟，与本项目双钟纪律同源）。
+* **No Config import and no env reads**. The topic-layer switch
+  ``topic_layer_enabled`` is fetched live by the wrapper from
+  ``_topic_defaults()`` and passed in (lesson: making it an import-time
+  snapshot would let ``HIPPOCAMPUS_TOPIC_LAYER=0`` silently stop working);
+* The five caps (``TASK_TOPIC_MAX`` / ``TASK_ENTITY_MAX`` /
+  ``TASK_INTENT_MAX`` / ``TASK_MISS_MAX`` / ``TASK_MISS_DAYS``) are packed
+  into :class:`Limits`, fetched live by the wrapper from the core namespace
+  **at call time** (arch freezes the constant names in core; monkeypatch
+  surface);
+* The clock falls back to ``_now()`` only when ``ref_time`` is None
+  (``manager._reference_time`` is the test-injected reference clock, same
+  origin as this project's dual-clock discipline).
 """
 from __future__ import annotations
 
@@ -50,7 +62,8 @@ from ..common.constants import _now, task_tokens
 
 @dataclass(frozen=True)
 class Limits:
-    """概况卡的四档截断 + miss 时间窗（全部由调用方现取注入）。"""
+    """The profile card's four truncation caps + the miss time window (all
+    injected, fetched live by the caller)."""
 
     topic_max: int
     entity_max: int
@@ -74,7 +87,7 @@ def task_profile(
     archived_status: str,
     now: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
-    """任务触及的结构投影（设计文档 §6）。"""
+    """Structural projection of what the task touches (design doc §6)."""
     if not (task or "").strip():
         return {
             "task": "", "topics": [], "topics_total": 0,
@@ -86,7 +99,7 @@ def task_profile(
     hits = [h for h in (task_hits or []) if h.get("memory_id")]
     anchor = {h["memory_id"] for h in hits}
 
-    # ── 知识点：member_ids ∩ 锚点 ──
+    # ── Knowledge points: member_ids ∩ anchor ──
     topics: list[dict[str, Any]] = []
     if topic_layer_enabled:
         for t in ordered_topics(knowledge):
@@ -104,7 +117,7 @@ def task_profile(
             })
     topics.sort(key=lambda x: (-x["hits"], x["title"]))
 
-    # ── 实体：memory_ids ∩ 锚点 ──
+    # ── Entities: memory_ids ∩ anchor ──
     ent_rows: list[dict[str, Any]] = []
     for ent in entities.values():
         mem = ent.get("memory_ids") or []
@@ -118,7 +131,7 @@ def task_profile(
         })
     ent_rows.sort(key=lambda x: (-x["hits"], -x["mentions"], x["name"]))
 
-    # ── 匹配 token：任务词 + 锚点标签值 + 锚点实体名 ──
+    # ── Matching tokens: task words + anchor tag values + anchor entity names ──
     tag_values: list[str] = []
     for h in hits:
         for v in (h.get("tags") or {}).values():
@@ -126,7 +139,7 @@ def task_profile(
             tag_values.extend(str(x) for x in vals if x is not None)
     tokens = task_tokens(task, tag_values + [e["name"] for e in ent_rows])
 
-    # ── 待办：开放 + 文本含 token ──
+    # ── Open intents: open + text contains a token ──
     intent_rows: list[dict[str, Any]] = []
     for it in intents:
         if str(it.get("status") or "") != "open":
@@ -140,7 +153,7 @@ def task_profile(
                 "due": str(it.get("due") or ""),
             })
 
-    # ── miss 缺口：时间窗内 + query 含 token ──
+    # ── Miss gaps: within the time window + query contains a token ──
     cutoff = (ref_time if ref_time is not None
               else (now or _now)()) - limits.miss_days * 86400
     miss_rows: list[dict[str, Any]] = []
@@ -169,5 +182,5 @@ def task_profile(
         "misses_total": len(miss_rows),
         "miss_days": limits.miss_days,
         "anchor_hits": len(anchor),
-        "tokens": tokens[:12],  # 截断只为回显可读，匹配用的是全量
+        "tokens": tokens[:12],  # truncation is for echo readability only; matching uses the full set
     }

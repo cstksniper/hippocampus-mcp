@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
-"""应用层：用例编排。
+"""Application layer: use-case orchestration.
 
-五个用例服务：Write + Bootstrap（14 工具）、Recall（11 工具）、
-Organize（10 工具）、Maintain 5 + LibraryAdmin 5
-（原 Maintain 11 因**是否绑定单一 brain**拆成两个类，见
-``library_admin_service`` 模块 docstring）。三条纪律：
+Five use-case services: Write + Bootstrap (14 tools), Recall (11 tools),
+Organize (10 tools), Maintain 5 + LibraryAdmin 5 (the original Maintain 11
+was split into two classes by **whether bound to a single brain**; see the
+``library_admin_service`` module docstring). Three disciplines:
 
-1. **不 import brain**：``brain/core.py`` 是大门面类，runtime
-   由组合根（server.py 的 ``_write_service`` / ``_bootstrap_service``
-   工厂）构造注入，服务内只以 ``Any`` 持有——import 图上这条边恒为零。
-   brain 的方法体将来上收进各 Service 时，本包 API 不变，包外无感。
-2. **不碰 I/O**：``open()`` / ``sqlite3`` / ``store._records`` 不出现在
-   本包；存储访问经注入的 runtime 公开 API（端口纪律）。
-3. **信封自产**：写类返回体的 ``library`` 首键（库自曝）由服务组装，
-   工具只 ``json.dumps``——响应组装归用例层。
+1. **Do not import brain**: ``brain/core.py`` is the big facade class; the
+   runtime is constructed and injected by the composition root (server.py's
+   ``_write_service`` / ``_bootstrap_service`` factories), and services hold
+   it only as ``Any`` -- on the import graph this edge is always zero. When
+   brain's method bodies are later lifted into the Services, this package's
+   API is unchanged and outsiders notice nothing.
+2. **No I/O**: ``open()`` / ``sqlite3`` / ``store._records`` do not appear
+   in this package; storage access goes through the injected runtime's
+   public API (ports discipline).
+3. **Envelopes are self-produced**: the write-family return body's ``library``
+   first key (library self-exposure) is assembled by the service; tools only
+   ``json.dumps`` -- response assembly belongs to the use-case layer.
 
-依赖方向：application → common /
-domain / store / map / engine / retrieval / lnn / library，**不准 → brain**。
+Dependency direction: application -> common / domain / store / map / engine
+/ retrieval / lnn / library, **never -> brain**.
 """
 from __future__ import annotations
 

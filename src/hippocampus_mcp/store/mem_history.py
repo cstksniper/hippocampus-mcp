@@ -1,30 +1,42 @@
 # -*- coding: utf-8 -*-
-"""L1 改写历史账本（mem_history.jsonl，形态逐字镜像 tag_ops.py）。
+"""L1 rewrite history ledger (mem_history.jsonl, shape mirrors tag_ops.py verbatim).
 
-定位：**append-only 流水** sidecar，不参与层合并、不进检索、不进 5 槽位/
-画像/主题层、不进默认 ``to_dict``（返回面零变化）。记录两类改写的前值：
+Positioning: an **append-only log** sidecar; it takes no part in layer
+merging, is not searched, does not enter the 5 slots / profile / topic
+layers, and does not enter the default ``to_dict`` (zero change to the
+return surface). It records the prior values of two kinds of rewrites:
 
-- ``kind="update"``：``update_memory`` 改 content/importance（state 单独
-  变更不记——supersede/归档路径的旧记录本身保留，状态机已承担留痕）；
-- ``kind="merge"``：dedup 合并被吞一方的文本（含"新长旧短"与"旧长新短"
-  两态；内容完全相同不记——没有任何东西丢失）。
+- ``kind="update"``: ``update_memory`` changing content/importance
+  (state-only changes are not recorded -- the old record itself is kept on
+  the supersede/archive paths, and the state machine already handles the
+  audit trail);
+- ``kind="merge"``: the text of the side swallowed by a dedup merge (both
+  "new long, old short" and "old long, new short"; identical contents are
+  not recorded -- nothing was lost).
 
-生物学对应（再巩固）：改写后旧痕迹"不可访问但可追溯"——账本就是"可追溯"；
-"可访问旧版"由 supersede 状态机承担，不在本账本职责内。
+Biological counterpart (reconsolidation): after a rewrite the old trace is
+"inaccessible but traceable" -- the ledger is the "traceable" part;
+"accessible old versions" are handled by the supersede state machine, not
+this ledger's job.
 
-为什么放 store/ 而不是 brain：纯持久化设施（JSONL 读写 + 环裁剪），零领域
-逻辑；与 tag_ops/save_ledger 同构（仓库第三套账本，形态收敛）。本模块
-**不 import 任何 Config/常量旋钮**，只认显式参数（ring/trim_at 由调用方
-传入）；唯一 import 的常量是文件名（全仓无 monkeypatch 先例，同
-TAG_OPS_FILE 例外）。
+Why store/ and not brain: pure persistence plumbing (JSONL read/write +
+ring trimming), zero domain logic; isomorphic with tag_ops/save_ledger
+(the repo's third ledger, shapes converging). This module **imports no
+Config/constants knobs**, honoring only explicit parameters (ring/trim_at
+are passed in by the caller); the only imported constant is the file name
+(no monkeypatch precedent in the repo; same exception as TAG_OPS_FILE).
 
-状态语义（与 tag_ops 逐字一致）：
-- ``last_seq`` 先自增再落盘 ⇒ 写失败也不复用 id；
-- ``lines`` 落盘成功才 +1；裁剪失败（OSError）时 lines 保持原值；
-- 账本写失败**不能吞**（logger.warning）：一期虽无 undo，"改之前是什么"
-  从此无处可查这件事本身必须让运维看见；
-- ⚠️ ``ring=0`` 时切片是**全量**（Python ``[-0:]`` 语义）——与 tag_ops
-  同款怪癖，刻意保留，调用方（config 默认 200）不会传 0。
+State semantics (verbatim identical to tag_ops):
+- ``last_seq`` is incremented before persisting ⇒ ids are not reused even
+  when the write fails;
+- ``lines`` increments only after a successful write; on trim failure
+  (OSError) lines keeps its original value;
+- ledger write failures **must not be swallowed** (logger.warning): phase
+  one has no undo, and "what it was before the change" becoming forever
+  unanswerable is something ops must see;
+- ⚠️ with ``ring=0`` the slice is **everything** (Python's ``[-0:]``
+  semantics) -- same quirk as tag_ops, deliberately kept; the caller
+  (config default 200) never passes 0.
 """
 from __future__ import annotations
 
@@ -39,13 +51,13 @@ logger = logging.getLogger(__name__)
 
 
 def history_path(persist_dir: str | None) -> str | None:
-    """账本文件路径；无持久化目录（纯内存 brain）返回 None。"""
+    """Ledger file path; returns None when there is no persist dir (pure in-memory brain)."""
     return (os.path.join(persist_dir, MEM_HISTORY_FILE)
             if persist_dir else None)
 
 
 def read_history(persist_dir: str | None) -> list[dict[str, Any]]:
-    """读全部账本条目（坏行跳过——账本不该让审计用不了）。"""
+    """Read all ledger entries (bad lines skipped -- the ledger must not break auditing)."""
     path = history_path(persist_dir)
     if not path or not os.path.isfile(path):
         return []
@@ -59,7 +71,7 @@ def read_history(persist_dir: str | None) -> list[dict[str, Any]]:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    continue  # 半行（崩溃在 append 中间）直接跳过
+                    continue  # Half line (crash mid-append): skip outright
                 if isinstance(rec, dict):
                     out.append(rec)
     except OSError:
@@ -68,7 +80,7 @@ def read_history(persist_dir: str | None) -> list[dict[str, Any]]:
 
 
 def scan_history(persist_dir: str | None) -> tuple[int, int]:
-    """启动/首写前扫一遍账本：返回 (行数, 末条 seq)。"""
+    """Scan the ledger once at startup / before first write: returns (line count, last seq)."""
     entries = read_history(persist_dir)
     last = 0
     for rec in entries:
@@ -85,12 +97,13 @@ def append_history(persist_dir: str | None,
                    lines: int,
                    ring: int,
                    trim_at: int) -> tuple[str | None, int, int]:
-    """追加一条账本（ring buffer 裁剪）。
+    """Append one ledger entry (ring buffer trimming).
 
     Returns:
-        ``(op_id, last_seq, lines)``——状态三元组，调用方据此更新自身。
-        op_id 为 None = 没落盘（无目录或写失败）；写失败时 last_seq
-        **也已自增**（防 id 复用，同 tag_ops）。
+        ``(op_id, last_seq, lines)`` -- the state triple, which the caller
+        uses to update itself. op_id None = not persisted (no directory or
+        write failure); on write failure last_seq **has already been
+        incremented** (prevents id reuse, same as tag_ops).
     """
     path = history_path(persist_dir)
     if not path:
@@ -111,10 +124,12 @@ def append_history(persist_dir: str | None,
 
 
 def trim_history(persist_dir: str | None, ring: int, lines: int) -> int:
-    """裁剪到 ring 大小（保留最新的）。返回裁剪后的行数。
+    """Trim down to the ring size (keeping the newest). Returns the line count after trimming.
 
-    行数不超 ring、无目录、裁剪失败（OSError）时原样返回 ``lines``。
-    ``ring=0`` 的切片怪癖见模块 docstring（与 tag_ops 同款，刻意保留）。
+    Returns ``lines`` unchanged when the count does not exceed the ring,
+    there is no directory, or trimming fails (OSError). The ``ring=0``
+    slice quirk is documented in the module docstring (same as tag_ops,
+    deliberately kept).
     """
     path = history_path(persist_dir)
     if not path:

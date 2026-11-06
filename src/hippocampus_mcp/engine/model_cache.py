@@ -1,31 +1,46 @@
-"""本地嵌入模型缓存的自省与回收（只读扫描 + 显式回收）。
+"""Introspection and reclamation of the local embedding-model cache
+(read-only scanning + explicit reclamation).
 
-**为什么需要这个模块**：模型缓存是本项目唯一会持续变大的东西。一个中文
-引擎连权重带 ONNX 产物能到 1.3 GB，而其中往往有一大半是**永远读不到**的
-冗余（见下）。用户既不该手工去 ``~/.cache/huggingface`` 里删目录（删错
-就起不来），也不该为了省空间去猜哪个文件能删。
+**Why this module is needed**: the model cache is the only thing in this
+project that keeps growing. A Chinese engine, weights plus ONNX
+artifacts, can reach 1.3 GB, and often more than half of that is
+redundancy that is **never read** (see below). Users should neither
+delete directories by hand in ``~/.cache/huggingface`` (delete the wrong
+one and nothing starts) nor guess which file is deletable to save space.
 
-**四条纪律**（每条都对应一次真实的误删风险）：
+**Four disciplines** (each corresponds to one real mis-deletion risk):
 
-1. **只读优先**：:func:`scan_models` 只统计、不改盘；:func:`plan_prune`
-   只出计划。真正删盘要显式调 :func:`apply_prune`，且路径必须落在缓存
-   根之内、目录名必须是 ``models--*``。
-2. **被引用的模型不删**：任何 ``library.json`` 的 ``embedder_model`` 指向
-   的模型一律保护。删掉它，那个库下次启动就加载不了模型（离线时没有任何
-   补救办法，向量维度还对不上）。空字符串表示"没钉死"，不算引用。
-3. **当前默认模型不删**：否则下次启动要联网重下，离线环境直接起不来。
-4. **冗余分档**：``onnx_int8/`` 是 ``scripts/export_onnx.py`` 的量化产物，
-   **运行时代码从不读它**（``ONNX_SUBDIR`` 只有 ``"onnx"``）⇒ 纯冗余，
-   任何情况下可删；``onnx/`` 是 ONNX 快路径，``auto`` 后端会用，只有显式
-   ``HIPPOCAMPUS_EMB_BACKEND=torch`` 时才算冗余。
+1. **Read-only first**: :func:`scan_models` only measures, never touches
+   the disk; :func:`plan_prune` only produces a plan. Actual deletion
+   requires explicitly calling :func:`apply_prune`, and the path must
+   lie inside a cache root and the directory name must be ``models--*``.
+2. **Referenced models are not deleted**: any model pointed to by an
+   ``embedder_model`` in any ``library.json`` is protected. Delete it
+   and that library cannot load the model on next startup (offline there
+   is no remedy, and the vector dims would not match either). An empty
+   string means "not pinned", not a reference.
+3. **The current default model is not deleted**: otherwise the next
+   startup needs to re-download it online; offline environments simply
+   cannot start.
+4. **Redundancy tiers**: ``onnx_int8/`` is the quantized output of
+   ``scripts/export_onnx.py``; **runtime code never reads it**
+   (``ONNX_SUBDIR`` only accepts ``"onnx"``) ⇒ pure redundancy,
+   deletable in any case; ``onnx/`` is the ONNX fast path, used by the
+   ``auto`` backend, and is redundant only when
+   ``HIPPOCAMPUS_EMB_BACKEND=torch`` is set explicitly.
 
-**体积为什么不是仓库标称值**：``BAAI/bge-base-zh-v1.5`` 仓库 410 MB，本地
-却常是 1.3 GB —— 差额全在 ``onnx/``(389 MB) 与 ``onnx_int8/``(558 MB)。
-前者是 ONNX 快路径的代价（实测编码快 2.3x、冷启动快 7x），后者纯属白占。
+**Why the size is not the repo's nominal value**: the
+``BAAI/bge-base-zh-v1.5`` repo is 410 MB, yet locally it is often
+1.3 GB -- the entire difference is in ``onnx/`` (389 MB) and
+``onnx_int8/`` (558 MB). The former is the price of the ONNX fast path
+(measured 2.3x faster encoding, 7x faster cold start); the latter is
+pure dead weight.
 
-符号链接要当心：HF 缓存把 ``snapshots/<rev>/xxx`` 链到 ``blobs/<hash>``，
-两边都算一遍会把体积翻倍。所以统计时**按 realpath 去重**，且先走
-``snapshots``（那里才有 ``onnx/`` 这类有语义的路径）、再走剩余文件。
+Watch out for symlinks: the HF cache links ``snapshots/<rev>/xxx`` to
+``blobs/<hash>``; counting both sides doubles the size. So measurement
+**deduplicates by realpath**, walking ``snapshots`` first (only there
+are semantically meaningful paths like ``onnx/``), then the remaining
+files.
 """
 
 from __future__ import annotations
@@ -34,13 +49,13 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-#: HF 缓存里每个模型的目录前缀（``org/name`` → ``models--org--name``）
+#: Directory prefix of each model in the HF cache (``org/name`` → ``models--org--name``)
 MODEL_DIR_PREFIX = "models--"
 
-#: 权重类文件后缀。用于把 blobs 里的孤儿文件也归到「权重」档。
+#: Weight-like file suffixes. Used to also classify orphan files in blobs into the 「weights」 tier.
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".h5", ".msgpack", ".ckpt", ".npz")
 
-#: 回收动作种类
+#: Kinds of reclamation action
 KIND_MODEL = "model"
 KIND_ONNX_INT8 = "onnx_int8"
 KIND_ONNX = "onnx"
@@ -48,16 +63,16 @@ KIND_ONNX = "onnx"
 
 @dataclass(frozen=True)
 class CachedModel:
-    """缓存里的一个模型目录。
+    """A model directory in the cache.
 
     Attributes:
-        model_id: ``org/name`` 形式（由目录名反推）。
-        path: 模型目录绝对路径。
-        total_bytes: 该目录总占用（去重后）。
-        weight_bytes: 权重文件（``.bin`` / ``.safetensors`` …）。
-        onnx_bytes: ``onnx/`` 下的 ONNX 产物（快路径，``auto`` 会用）。
-        int8_bytes: ``onnx_int8/`` 下的量化产物（**运行时从不读**）。
-        other_bytes: 其余零碎（配置、词表、README…）。
+        model_id: in ``org/name`` form (recovered from the directory name).
+        path: absolute path of the model directory.
+        total_bytes: total occupancy of the directory (after dedup).
+        weight_bytes: weight files (``.bin`` / ``.safetensors`` ...).
+        onnx_bytes: ONNX artifacts under ``onnx/`` (fast path, used by ``auto``).
+        int8_bytes: quantized artifacts under ``onnx_int8/`` (**never read at runtime**).
+        other_bytes: the remaining odds and ends (configs, vocab, README...).
     """
 
     model_id: str
@@ -70,15 +85,16 @@ class CachedModel:
 
     @property
     def engine_bytes(self) -> int:
-        """真正会被加载进内存的那部分（权重 + ONNX 快路径）。"""
+        """The part that actually gets loaded into memory (weights + ONNX fast path)."""
         return self.weight_bytes + self.onnx_bytes
 
 
 @dataclass(frozen=True)
 class PruneAction:
-    """一条待执行的回收动作。
+    """One pending reclamation action.
 
-    ``kind`` 为 :data:`KIND_MODEL` 时删整个模型目录，否则删其下的子目录。
+    When ``kind`` is :data:`KIND_MODEL`, the whole model directory is
+    deleted; otherwise a subdirectory under it.
     """
 
     kind: str
@@ -90,7 +106,7 @@ class PruneAction:
 
 @dataclass
 class PrunePlan:
-    """回收计划：可执行动作 + 被保护而跳过的说明。"""
+    """Reclamation plan: executable actions + notes on what was skipped as protected."""
 
     actions: list[PruneAction] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -101,20 +117,21 @@ class PrunePlan:
 
 
 # ======================================================================
-# 一、体积统计
+# 1. Size accounting
 # ======================================================================
 def _slug_to_model_id(slug: str) -> str:
-    """``models--org--name`` → ``org/name``。
+    """``models--org--name`` → ``org/name``.
 
-    HF 只用 ``--`` 替换 ``/``，所以反向替换即可；但必须**只剥一次前缀**，
-    否则名字里本来就带 ``--`` 的模型会被改写。
+    HF only replaces ``/`` with ``--``, so the reverse replacement
+    suffices; but the prefix must be **stripped only once**, otherwise
+    models whose names inherently contain ``--`` would be rewritten.
     """
     body = slug[len(MODEL_DIR_PREFIX):] if slug.startswith(MODEL_DIR_PREFIX) else slug
     return body.replace("--", "/")
 
 
 def _categorize(rel_path: str) -> str:
-    """按相对路径判档：onnx_int8 > onnx > 权重后缀 > 其他。"""
+    """Tier by relative path: onnx_int8 > onnx > weight suffix > other."""
     norm = rel_path.replace("\\", "/").lower()
     parts = norm.split("/")
     if "onnx_int8" in parts:
@@ -127,14 +144,14 @@ def _categorize(rel_path: str) -> str:
 
 
 def _iter_files(root_dir: str):
-    """递归列出文件（不跟随目录符号链接）。"""
+    """List files recursively (does not follow directory symlinks)."""
     for dirpath, _dirnames, filenames in os.walk(root_dir, followlinks=False):
         for name in filenames:
             yield os.path.join(dirpath, name)
 
 
 def scan_model_dir(path: str) -> CachedModel:
-    """统计单个模型目录的占用构成（按 realpath 去重，不跟随目录链接）。"""
+    """Measure the occupancy breakdown of a single model directory (dedup by realpath; does not follow directory links)."""
     buckets = {"weight": 0, "onnx": 0, "int8": 0, "other": 0}
     seen: set[str] = set()
 
@@ -146,18 +163,18 @@ def scan_model_dir(path: str) -> CachedModel:
         if real in seen:
             return
         try:
-            size = os.path.getsize(file_path)      # 跟随符号链接取目标大小
+            size = os.path.getsize(file_path)      # follows symlinks to take the target's size
         except OSError:
             return
         seen.add(real)
         buckets[_categorize(rel)] += size
 
-    # 先走 snapshots：只有那里的路径带 onnx/ onnx_int8/ 语义
+    # Walk snapshots first: only paths there carry onnx/ onnx_int8/ semantics
     snapshots = os.path.join(path, "snapshots")
     if os.path.isdir(snapshots):
         for f in _iter_files(snapshots):
             _add(f, os.path.relpath(f, path))
-    # 再走其余（blobs / refs / trees）。被上面链过的文件 realpath 已去重。
+    # Then the rest (blobs / refs / trees). Files linked above are already deduped by realpath.
     sep_snap = os.sep + "snapshots" + os.sep
     for f in _iter_files(path):
         if sep_snap in f:
@@ -177,10 +194,13 @@ def scan_model_dir(path: str) -> CachedModel:
 
 
 def scan_models(cache_roots: list[str]) -> list[CachedModel]:
-    """扫描多个缓存根，返回按体积降序的模型列表（**只读**）。
+    """Scan multiple cache roots, returning the model list sorted by size
+    descending (**read-only**).
 
-    同一个模型在多个根下出现时按 ``(model_id, path)`` 各自记账 —— 它们
-    确实是两份磁盘占用，合并显示反而会让人误判能省多少。
+    When the same model appears under multiple roots, account for each
+    ``(model_id, path)`` separately -- they really are two disk
+    occupancies; merging the display would mislead about how much can be
+    saved.
     """
     out: list[CachedModel] = []
     seen_paths: set[str] = set()
@@ -205,7 +225,7 @@ def scan_models(cache_roots: list[str]) -> list[CachedModel]:
 
 
 # ======================================================================
-# 二、回收计划（纯函数，不碰盘）
+# 2. Reclamation plan (pure function, never touches disk)
 # ======================================================================
 def plan_prune(
     models: list[CachedModel],
@@ -214,17 +234,20 @@ def plan_prune(
     protected: set[str] | None = None,
     keep_onnx: bool = True,
 ) -> PrunePlan:
-    """算出能安全回收什么。
+    """Work out what can be safely reclaimed.
 
     Args:
-        models: :func:`scan_models` 的结果。
-        in_use: ``model_id → 库名列表``，来自各库 ``library.json``。
-        protected: 即便没人引用也要留着的模型（当前默认 / 显式 env 指定）。
-        keep_onnx: True = 保留 ``onnx/``（``auto``/``onnx`` 后端要用它）。
-            False（仅当显式 ``torch`` 后端）才把 ``onnx/`` 也算冗余。
+        models: the result of :func:`scan_models`.
+        in_use: ``model_id → list of library names``, from each library's
+            ``library.json``.
+        protected: models to keep even when unreferenced (current default /
+            explicitly specified via env).
+        keep_onnx: True = keep ``onnx/`` (the ``auto``/``onnx`` backends
+            need it). False (only with an explicit ``torch`` backend)
+            counts ``onnx/`` as redundant too.
 
     Returns:
-        :class:`PrunePlan`。**只描述，不执行。**
+        :class:`PrunePlan`. **Describes only; does not execute.**
     """
     in_use = in_use or {}
     protected = protected or set()
@@ -234,7 +257,7 @@ def plan_prune(
         refs = in_use.get(m.model_id) or []
         is_protected = m.model_id in protected
 
-        # int8 产物运行时不读，无论该模型是否在用都可回收
+        # int8 artifacts are never read at runtime; reclaimable whether or not the model is in use
         if m.int8_bytes:
             int8_dirs = _subdirs(m.path, "onnx_int8")
             plan.actions.append(PruneAction(
@@ -245,9 +268,11 @@ def plan_prune(
                 reason="onnx_int8/ is not read at runtime (ONNX_SUBDIR only accepts onnx; the quantized artifact is an export intermediate)",
             ))
 
-        # 注意：这里用标志位而不是在分支里 continue —— 被引用的模型仍然
-        # 可能该删 onnx/（显式 torch 后端时），提前 continue 会把那条路
-        # 整个跳过，表现为「明明设了 torch 却一分空间都不回收」。
+        # Note: a flag is used here instead of continue inside the branch --
+        # a referenced model may still warrant deleting onnx/ (with an
+        # explicit torch backend); an early continue would skip that path
+        # entirely, presenting as 「torch was set yet not a byte is
+        # reclaimed」.
         keep_model = bool(refs) or is_protected
         if refs:
             plan.notes.append(
@@ -257,7 +282,7 @@ def plan_prune(
                 f"{m.model_id}: current default / explicitly specified model; kept whole")
 
         if keep_model:
-            # 保留的模型才谈得上「onnx 是否冗余」
+            # Only for kept models is 「whether onnx is redundant」 even a question
             if m.onnx_bytes and not keep_onnx:
                 onnx_dirs = _subdirs(m.path, "onnx")
                 plan.actions.append(PruneAction(
@@ -269,7 +294,7 @@ def plan_prune(
                 ))
             continue
 
-        # 既没人引用、也不是默认 ⇒ 整目录可删
+        # Neither referenced nor the default ⇒ the whole directory is deletable
         plan.actions.append(PruneAction(
             kind=KIND_MODEL,
             model_id=m.model_id,
@@ -283,7 +308,7 @@ def plan_prune(
 
 
 def _subdirs(model_path: str, name: str) -> list[str]:
-    """找 ``snapshots/*/<name>`` 下的实体目录（可能多版本）。"""
+    """Find real directories under ``snapshots/*/<name>`` (possibly multiple revisions)."""
     out: list[str] = []
     snapshots = os.path.join(model_path, "snapshots")
     if not os.path.isdir(snapshots):
@@ -296,13 +321,15 @@ def _subdirs(model_path: str, name: str) -> list[str]:
 
 
 # ======================================================================
-# 三、执行（唯一会改盘的地方）
+# 3. Execution (the only place that touches disk)
 # ======================================================================
 def _is_safe_target(path: str, cache_roots: list[str]) -> bool:
-    """删盘前的护栏：必须落在某个缓存根之内，且最外层的模型目录名合规。
+    """Guard rail before deletion: the path must lie inside one of the
+    cache roots, and the outermost model directory name must be compliant.
 
-    这道检查的意义是把「手滑传了个空串 / 传了个上级目录」变成显式错误，
-    而不是一次 ``rmtree`` 把整个 ``~/.cache`` 清掉。
+    The point of this check is to turn 「accidentally passing an empty
+    string / a parent directory」 into an explicit error, instead of one
+    ``rmtree`` wiping the entire ``~/.cache``.
     """
     target = os.path.abspath(path)
     if not target or not os.path.isdir(target):
@@ -321,10 +348,11 @@ def _is_safe_target(path: str, cache_roots: list[str]) -> bool:
 
 
 def apply_prune(actions: list[PruneAction], cache_roots: list[str]) -> tuple[int, list[str]]:
-    """执行回收，返回 ``(释放字节数, 错误列表)``。
+    """Execute reclamation, returning ``(bytes freed, error list)``.
 
-    单个动作失败**不中断**其余动作：一次删不干净比全都不删更常见
-    （Windows 上文件被占用就会 PermissionError），逐条报告才好处理。
+    A single action failing **does not abort** the rest: partial deletion
+    is more common than none at all (on Windows, an occupied file raises
+    PermissionError); per-item reporting is the only way to handle it.
     """
     freed = 0
     errors: list[str] = []
@@ -358,13 +386,14 @@ def _dir_size(path: str) -> int:
 
 
 # ======================================================================
-# 四、展示
+# 4. Display
 # ======================================================================
 def human_size(n: int) -> str:
-    """人类可读体积（1 KB = 1024 B，与 ``du`` 口径接近）。
+    """Human-readable size (1 KB = 1024 B, close to ``du``'s convention).
 
-    字节不带小数，KB 起统一一位小数 —— 混着来（``2 KB`` 旁边跟着
-    ``2.0 MB``）看着像两套口径。
+    Bytes carry no decimals; from KB up, always one decimal place --
+    mixing them (``2 KB`` next to ``2.0 MB``) looks like two different
+    conventions.
     """
     size = float(max(0, n))
     if size < 1024:
@@ -384,7 +413,7 @@ def format_report(
     protected: set[str] | None = None,
     cache_roots: list[str] | None = None,
 ) -> str:
-    """渲染一张人看的清单（宽度控制在 78 列内）。"""
+    """Render a human-readable report (width kept within 78 columns)."""
     in_use = in_use or {}
     protected = protected or set()
     lines: list[str] = []
@@ -418,7 +447,7 @@ def format_report(
 
 
 def format_plan(plan: PrunePlan) -> str:
-    """渲染回收计划（``--yes`` 之前的最后一道确认）。"""
+    """Render the reclamation plan (the last confirmation before ``--yes``)."""
     if not plan.actions and not plan.notes:
         return "Nothing reclaimable."
     lines: list[str] = []

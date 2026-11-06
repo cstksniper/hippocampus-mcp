@@ -1,23 +1,31 @@
-"""宿主 MCP 配置的**通用**发现与分类（sync / doctor 共用引擎）。
+"""**Generic** discovery and classification of host MCP configs (shared engine
+of sync / doctor).
 
-**为什么要有这个模块**：MCP 协议只规定传输与 JSON-RPC，没规定配置文件
-放哪、顶层键叫什么。逐宿主硬编码路径是一张永远追不完的表（本项目的
-``cli._HOSTS`` 只登记了 4 家）；但各家的文件名其实是**社区公共约定**
-（``mcp.json`` / ``mcp_config.json`` / ``mcp_settings.json`` /
-``claude_desktop_config.json``…），顶层键位总共就几种形态。所以这里
-不维护「宿主 → 路径」表，改维护「**文件名约定 + 形态嗅探**」：
+**Why this module exists**: the MCP protocol only specifies transport and
+JSON-RPC; it does not say where config files live or what the top-level key
+is called. Hardcoding paths per host is a table that can never be fully
+chased down (this project's ``cli._HOSTS`` registers only 4 hosts); but the
+various file names are actually **community conventions**
+(``mcp.json`` / ``mcp_config.json`` / ``mcp_settings.json`` /
+``claude_desktop_config.json``...), and the top-level key shapes come in
+only a few forms. So instead of maintaining a "host -> path" table, we
+maintain "**filename conventions + shape sniffing**":
 
-1. **有界扫描**：家目录 dot-dir（深度≤3）、平台配置根一层子目录、
-   工作区 dot-dir（深度≤2）——只在这些角落里找约定文件名。
-2. **形态嗅探**：JSON 能解析 + 顶层能找到「server 条目容器」
-   （``mcpServers`` / ``mcp.servers`` / ``servers``，兜底「值是含
-   command/url 的 dict」的通用形态）才算数。
-3. **绝不新建**：只对**已存在**的文件做候选，新建文件走 ``setup
-   --file``——sync 写错地方的代价是污染宿主配置，宁缺勿滥。
+1. **Bounded scan**: home dot-dirs (depth<=3), one level of subdirectories
+   under platform config roots, workspace dot-dirs (depth<=2) -- convention
+   file names are only sought in these corners.
+2. **Shape sniffing**: it counts only if the JSON parses + a "server entry
+   container" can be found at the top (``mcpServers`` / ``mcp.servers`` /
+   ``servers``, falling back to the generic shape "a value that is a dict
+   with command/url").
+3. **Never create**: only **existing** files become candidates; creating
+   files goes through ``setup --file`` -- sync writing to the wrong place
+   costs a polluted host config; better to miss than to misfire.
 
-安全纪律与 setup 同源：坏 JSON 停手不写、只动自己那条、写前必备份、
-写后即验。分类结论（mine/new/suspect/broken/skip）由 ``classify``
-给出，写入决策在 ``cli.cmd_sync``。
+Safety discipline is shared with setup: stop on bad JSON without writing,
+touch only our own entry, always back up before writing, verify after
+writing. The classification verdicts (mine/new/suspect/broken/skip) come
+from ``classify``; the write decision is in ``cli.cmd_sync``.
 """
 
 from __future__ import annotations
@@ -27,33 +35,40 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-#: 我方条目在宿主配置里的默认名字（与 cli.SERVER_NAME_DEFAULT 同值；
-#: 这里不能反向 import cli —— cli 依赖本模块，反向会成环）。
+#: Default name of our entry in host configs (same value as
+#: cli.SERVER_NAME_DEFAULT; this module must not import cli in reverse --
+#: cli depends on this module, so reversing would create a cycle).
 ENTRY_NAME_DEFAULT = "hippocampus"
 
-#: 文件名约定的两类：任何位置都认的（*mcp*.json / claude 专用名），
-#: 和只在 dot-dir 下一层才认的（settings.json 太通用，必须限定目录）。
+#: Two classes of filename convention: recognized anywhere (*mcp*.json /
+#: claude's dedicated name), and recognized only one level under a dot-dir
+#: (settings.json is too generic; it must be directory-limited).
 CONVENTION_GLOBS = ("*mcp*.json", "claude_desktop_config.json")
 DOTDIR_ONLY_GLOBS = ("settings.json",)
 
-#: 「仅凭文件名推断」的精确名单（低置信写入用）。发现用的 glob 故意宽
-#: （*mcp*.json 能接住不知道的宿主），但**没有结构证据**就动手写时必须
-#: 收紧 —— 否则 mcp-tool-list.json 这类同名缓存文件会被误写。
+#: The exact list for "inferred from filename alone" (used for low-confidence
+#: writes). Discovery globs are deliberately broad (*mcp*.json catches
+#: unknown hosts), but writing **without structural evidence** must tighten
+#: -- otherwise same-named cache files like mcp-tool-list.json get wrongly
+#: written.
 EXACT_NAME_SUSPECTS = ("mcp.json", "mcp_config.json", "mcp_settings.json",
                        "claude_desktop_config.json")
 
-#: 键位探测顺序：空容器也算命中（新装宿主常见 {"mcpServers": {}}）。
+#: Key-probe order: an empty container also counts as a hit (freshly
+#: installed hosts commonly have {"mcpServers": {}}).
 _KEY_PROBES: tuple[tuple[str, ...], ...] = (
     ("mcpServers",), ("mcp", "servers"), ("servers",), ("mcp",),
 )
 
 
 def load_json_config(path: Path) -> tuple[dict | None, str]:
-    """读一份 JSON 宿主配置。返回 ``(配置, "")`` 或 ``(None, 失败原因)``。
+    """Read one JSON host config. Returns ``(config, "")`` or ``(None, failure reason)``.
 
-    坏文件**返回错误而不抛异常**——发现式扫描要逐个试文件，一个坏的
-    不该打断整轮；需要「停手不写」语义的调用方（setup）自己升级成
-    SystemExit。文件不存在视为空配置（与 setup 既有口径一致）。
+    A bad file **returns an error instead of raising** -- discovery-style
+    scanning tries files one by one; a single bad one must not interrupt the
+    whole round. Callers needing "stop, do not write" semantics (setup)
+    escalate to SystemExit themselves. A missing file counts as an empty
+    config (consistent with setup's existing convention).
     """
     if not path.exists():
         return {}, ""
@@ -71,14 +86,14 @@ def load_json_config(path: Path) -> tuple[dict | None, str]:
 
 
 def _looks_like_server_entry(value: object) -> bool:
-    """一个 dict 值长得像 server 条目吗（command=本地 / url=远端）。"""
+    """Does a dict value look like a server entry (command=local / url=remote)?"""
     return (isinstance(value, dict)
             and (isinstance(value.get("command"), str)
                  or isinstance(value.get("url"), str)))
 
 
 def _container_shape(node: object) -> bool:
-    """dict 是否长得像「server 条目容器」：空（新装）或装着条目。"""
+    """Does the dict look like a "server entry container": empty (fresh install) or holding entries?"""
     if not isinstance(node, dict):
         return False
     if not node:
@@ -87,13 +102,16 @@ def _container_shape(node: object) -> bool:
 
 
 def find_container(cfg: dict) -> tuple[str, ...] | None:
-    """在配置里找到 server 条目容器的键路径；找不到返回 None。
+    """Find the key path of the server entry container in the config; None
+    when not found.
 
-    先按已知键位探测（``_KEY_PROBES`` 顺序即优先级），**两遍取值**：
-    先取装着条目的键位、都空才取空容器——否则 ``{"mcp": {}}`` 这种
-    空壳会抢在 ``mcp.servers`` 之前被命中。已知键位全空再兜底扫
-    「顶层 / 二层里装着 server 条目的 dict」——兜底是为了不认识的
-    宿主改了键名也能接上。
+    First probe known key positions (the ``_KEY_PROBES`` order is the
+    priority), **two passes**: first take the key position holding entries;
+    only if all are empty take the empty container -- otherwise an empty
+    shell like ``{"mcp": {}}`` would be hit before ``mcp.servers``. If all
+    known key positions are empty, fall back to scanning "a dict at the top
+    / second level holding server entries" -- the fallback exists so a host
+    we do not know that renamed keys can still be caught.
     """
     probed: list[tuple[bool, tuple[str, ...]]] = []
     for key_path in _KEY_PROBES:
@@ -106,10 +124,10 @@ def find_container(cfg: dict) -> tuple[str, ...] | None:
         for has_entries, key_path in probed:
             if has_entries == want_entries:
                 return key_path
-    for key, value in cfg.items():                    # 兜底：顶层
+    for key, value in cfg.items():                    # fallback: top level
         if key not in {p[0] for p in _KEY_PROBES} and _container_shape(value):
             return (key,)
-    for key, value in cfg.items():                    # 兜底：二层
+    for key, value in cfg.items():                    # fallback: second level
         if not isinstance(value, dict):
             continue
         for key2, value2 in value.items():
@@ -126,11 +144,13 @@ def _dig(cfg: dict, key_path: tuple[str, ...]) -> dict | None:
 
 
 def _convention_name(path: Path) -> bool:
-    """文件名是否值得「无结构证据也动手写」——精确名单，收紧口径。
+    """Is the file name worth "writing even without structural evidence" --
+    an exact list, tightening the criterion.
 
-    发现用的 glob（``CONVENTION_GLOBS``）故意宽；这里决定的是写入
-    侧的低置信判定，宽了会把 mcp-tool-list.json 之类同名缓存写脏。
-    settings.json 仍只在 dot-dir 下一层才认（太通用）。
+    The discovery globs (``CONVENTION_GLOBS``) are deliberately broad; what
+    is decided here is the write-side low-confidence verdict -- too broad
+    and same-named caches like mcp-tool-list.json get dirtied. settings.json
+    is still only recognized one level under a dot-dir (too generic).
     """
     name = path.name.lower()
     if name == "settings.json":
@@ -140,24 +160,28 @@ def _convention_name(path: Path) -> bool:
 
 @dataclass
 class Candidate:
-    """一个候选配置文件的判定结果。"""
+    """Verdict for one candidate config file."""
     path: Path
-    origin: str                        # user / project（来自哪次扫描）
+    origin: str                        # user / project (which scan produced it)
     kind: str                          # mine / new / suspect / broken / skip
-    key_path: tuple[str, ...] | None   # 容器键路径（写入位置）
+    key_path: tuple[str, ...] | None   # container key path (write location)
     reason: str = ""
-    entry: dict | None = None          # 我方既有条目（kind=mine 时）
+    entry: dict | None = None          # our existing entry (when kind=mine)
 
 
 def classify(path: Path, origin: str,
              entry_name: str = ENTRY_NAME_DEFAULT) -> Candidate:
-    """按「能解析 + 有容器 + 有没有我方条目」给一份配置下结论。
+    """Give a config a verdict along "parses + has a container + has our entry
+    or not".
 
-    - ``mine``：已有我方条目 —— sync 的更新目标；
-    - ``new``：有**别的** server 条目 —— 活的宿主配置，新增需确认；
-    - ``suspect``：容器为空或仅靠文件名推断 —— 新增需确认（低置信）；
-    - ``broken``：文件名像 MCP 配置但解析失败 —— 点名，绝不写；
-    - ``skip``：既无形又无名 —— 不提。
+    - ``mine``: already has our entry -- sync's update target;
+    - ``new``: has **other** server entries -- a live host config; adding
+      needs confirmation;
+    - ``suspect``: container empty, or inferred from the filename alone --
+      adding needs confirmation (low confidence);
+    - ``broken``: filename looks like an MCP config but parsing failed --
+      named explicitly, never written;
+    - ``skip``: neither shape nor name matches -- not mentioned.
     """
     cfg, err = load_json_config(path)
     if cfg is None:
@@ -183,8 +207,9 @@ def classify(path: Path, origin: str,
 
 
 def _walk_names(root: Path, globs: tuple[str, ...], max_depth: int):
-    """在 root 下按约定文件名找文件，深度 ≤ max_depth（只报真实文件）。"""
-    for depth in range(max_depth):          # 中间层数 0..max_depth-1
+    """Find files by convention file names under root, depth <= max_depth
+    (only real files are reported)."""
+    for depth in range(max_depth):          # intermediate levels 0..max_depth-1
         prefix = "*/" * depth
         for pattern in globs:
             for hit in root.glob(prefix + pattern):
@@ -193,11 +218,13 @@ def _walk_names(root: Path, globs: tuple[str, ...], max_depth: int):
 
 
 def _platform_roots() -> list[Path]:
-    """平台配置根（一层子目录里找约定名）。
+    """Platform config roots (convention names sought one level of
+    subdirectories below).
 
-    Windows 的 ``%APPDATA%`` 与 macOS 的 ``~/Library/Application Support``
-    各家桌面宿主扎堆；两层子目录只探 VS Code 扩展（globalStorage）与
-    「<宿主>/User/」这两个公认层级，不再往下。
+    Windows' ``%APPDATA%`` and macOS' ``~/Library/Application Support`` are
+    where the desktop hosts cluster; two levels of subdirectories only probe
+    the two recognized layers -- VS Code extensions (globalStorage) and
+    "<host>/User/" -- and no deeper.
     """
     roots: list[Path] = []
     appdata = os.environ.get("APPDATA", "")
@@ -212,19 +239,20 @@ def _platform_roots() -> list[Path]:
 def discover_configs(workspace: Path, *, entry_name: str = ENTRY_NAME_DEFAULT,
                      home: Path | None = None,
                      platform_roots: list[Path] | None = None) -> list[Candidate]:
-    """有界扫描出所有候选宿主配置并逐个分类。
+    """Bounded scan for all candidate host configs, classifying each one.
 
-    ``home`` / ``platform_roots`` 是**测试注入口**：不传用真值（生产
-    路径），测试传 tmp 路径 / 空列表即可与本机真实配置完全隔离。
+    ``home`` / ``platform_roots`` are **test injection points**: omitted,
+    real values are used (production path); tests pass tmp paths / empty
+    lists to fully isolate from this machine's real configs.
     """
     home = Path(home) if home is not None else Path.home()
-    found: dict[str, tuple[Path, str]] = {}   # 规范化路径 → (原路径, origin)
+    found: dict[str, tuple[Path, str]] = {}   # normalized path -> (original path, origin)
 
     def record(path: Path, origin: str) -> None:
         key = os.path.normcase(str(path.resolve()))
         found.setdefault(key, (path, origin))
 
-    # 家目录 dot-dir：*mcp* 深度≤3；settings.json / claude 名深度≤2
+    # Home dot-dirs: *mcp* depth<=3; settings.json / claude name depth<=2
     if home.is_dir():
         for child in sorted(home.iterdir()):
             if not (child.is_dir() and child.name.startswith(".")):
@@ -234,7 +262,8 @@ def discover_configs(workspace: Path, *, entry_name: str = ENTRY_NAME_DEFAULT,
             for hit in _walk_names(child, DOTDIR_ONLY_GLOBS, 2):
                 record(hit, "user")
 
-    # 平台配置根：一层子目录 + VS Code 扩展 + <宿主>/User/ 两个公认层级
+    # Platform config roots: one level of subdirs + VS Code extensions + the
+    # two recognized layers <host>/User/
     for root in (platform_roots if platform_roots is not None
                  else _platform_roots()):
         if not root.is_dir():
@@ -251,8 +280,9 @@ def discover_configs(workspace: Path, *, entry_name: str = ENTRY_NAME_DEFAULT,
             if hit.is_file():
                 record(hit, "user")
 
-    # 工作区：根上只认 .mcp.json；dot-dir 深度≤2（含 config.json ——
-    # 这个名字在家目录里太吵，只在工作区 dot-dir 里认）
+    # Workspace: at the root only .mcp.json is recognized; dot-dirs depth<=2
+    # (including config.json -- that name is too noisy in the home directory,
+    # recognized only in workspace dot-dirs)
     ws = Path(workspace)
     if ws.is_dir():
         direct = ws / ".mcp.json"

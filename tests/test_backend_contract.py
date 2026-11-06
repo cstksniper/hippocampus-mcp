@@ -1,51 +1,62 @@
 # -*- coding: utf-8 -*-
-"""嵌入器协议 与 存储后端契约 回归测试。
+"""Embedder protocol and storage-backend contract regression tests.
 
-背景（两条支线）：
+Background (two threads):
 
-**支线一 · 回退嵌入器缺方法，召回直接崩**
-    `MemoryManager.recall()` 一律走 `embedder.embed_query()`（BGE 等模型需要查询侧
-    指令前缀）。但 `HashEmbedder` 只有 `embed` / `embed_batch`，没有 `embed_query`。
-    于是：用 hash 后端建好库之后**任何一次召回**都是
-    `AttributeError: 'HashEmbedder' object has no attribute 'embed_query'`。
-    这不是边角场景——hash 后端正是无依赖的快速验证路径，也是若干回归脚本使用的后端。
+**Thread 1 · fallback embedder missing a method, recall crashes outright**
+    `MemoryManager.recall()` always goes through `embedder.embed_query()`
+    (BGE-style models need a query-side instruction prefix). But `HashEmbedder`
+    only has `embed` / `embed_batch`, no `embed_query`. So: once a library is
+    built on the hash backend, **every single recall** dies with
+    `AttributeError: 'HashEmbedder' object has no attribute 'embed_query'`.
+    This is not an edge case -- the hash backend is exactly the
+    dependency-free fast validation path, and the backend several regression
+    scripts use.
 
-**支线二 · ChromaStore 是一条"看起来能用"的半成品后路**
-    `MemoryManager(backend="chroma")` 能构造成功、能写入、能检索，但它与 numpy 后端
-    有五处未对齐的语义，其中最严重的一条会**静默用错向量**：
+**Thread 2 · ChromaStore is a half-finished fallback that "looks usable"**
+    `MemoryManager(backend="chroma")` constructs, writes and retrieves fine,
+    but it diverges from the numpy backend in five unaligned semantics, the
+    worst of which **silently uses the wrong vectors**:
 
-      用嵌入空间 A 建库 → 换成空间 B 重启 → `_load_from_chroma()` 把读出的
-      A 空间向量统统记到 B 名下 → `missing_ids()` 返回空 → 补算永不触发 →
-      检索拿 A 向量配 B 查询向量，全程无任何报错。
-      （对照实验：VectorStore 同场景保留原槽位名，`missing_ids()` 正确返回全部 3 条。）
+      build the library in embedding space A -> restart in space B ->
+      `_load_from_chroma()` books every A-space vector it reads under B ->
+      `missing_ids()` returns empty -> backfill never fires -> retrieval pairs
+      A vectors with a B query vector, no error anywhere along the way.
+      (Control experiment: VectorStore keeps the original slot names in the
+      same scenario, and `missing_ids()` correctly returns all 3 records.)
 
-    其余四条：save/load 往返丢 `source_ids` / `entity_ids`（L0 审计链与实体索引断裂）、
-    `update()` 不同步 pin、无损坏隔离与 `last_load_issue`、构造即自动加载的时序不一致。
+    The other four: save/load round-trip drops `source_ids` / `entity_ids`
+    (L0 audit chain and entity index broken), `update()` does not sync pin,
+    no corruption isolation and no `last_load_issue`, and auto-load at
+    construction has inconsistent ordering.
 
-    处理方式：**实现已删除，拒绝保留**。
-    `backend != "numpy"` 仍在构造阶段直接报错，并把上述缺陷写进错误信息——
-    让"想用它的人"立刻拿到原因，而不是拿到一个会丢数据的库。
+    Resolution: **the implementation was deleted; keeping it was refused.**
+    `backend != "numpy"` still raises right at construction time, with the
+    defects above written into the error message -- anyone who wants it gets
+    the reason immediately, instead of a library that loses data.
 
-    为什么删掉而不是留着：留一份"明确不能用"的实现对新用户是纯困惑源——
-    它出现在 `store/__init__.py` 的导出里、出现在代码地图里，
-    而 6 处缺陷本来就得全部重写，留着并不省事。
-    **拒绝原因保留在 `MemoryManager` 的错误信息里，历史决策没有丢。**
+    Why delete rather than keep: a "known unusable" implementation is a pure
+    source of confusion for new users -- it shows up in `store/__init__.py`
+    exports and in the code map, and all 6 defects would need a full rewrite
+    anyway, so keeping it saves nothing.
+    **The refusal reason lives on in `MemoryManager`'s error message; the
+    historical decision is not lost.**
 
-覆盖：
-    A1 两种嵌入器都满足完整协议（embed / embed_query / embed_batch / model_key）
-    A2 HashEmbedder.embed_query 与 embed 等价（哈希无指令前缀）
-    A3 hash 后端能走完整 recall（修前 AttributeError）
-    A4 hash 后端能走 brain 的 get_memory_context（5 槽位路径）
-    A5 工厂守卫拦住残缺后端：缺方法 → TypeError（不是等召回时才炸）
-    A6 未知后端 → ValueError（修前会静默退化成 hash）
-    A7 model_key 稳定、随维度与盐变化（多模型槽位的身份依据）
-    B1 backend="numpy" 正常可用
-    B2 backend="chroma" 在构造阶段显式报错，且信息含原因与补齐清单
-    B3 其他未知 backend 也报错（不再静默走 numpy）
-    B4 报错是"干净的失败"：不留下半个 store、不创建目录
-    B5 chroma 后端已移除：模块不可导入、包不再导出，但拒绝原因仍在错误信息里
+Coverage:
+    A1 both embedders satisfy the full protocol (embed / embed_query / embed_batch / model_key)
+    A2 HashEmbedder.embed_query equals embed (hash has no instruction prefix)
+    A3 hash backend runs a full recall (AttributeError before the fix)
+    A4 hash backend runs brain's get_memory_context (5-slot path)
+    A5 factory guard rejects an incomplete backend: missing method -> TypeError (not a delayed crash at recall time)
+    A6 unknown backend -> ValueError (before the fix it silently degraded to hash)
+    A7 model_key stable, varies with dim and salt (identity basis for multi-model vector slots)
+    B1 backend="numpy" works normally
+    B2 backend="chroma" rejected explicitly at construction, message carries the reason and the completion checklist
+    B3 other unknown backends also raise (no more silent numpy fallback)
+    B4 the rejection is a "clean failure": no half-built store left, no directory created
+    B5 chroma backend removed: module not importable, no package export, but the refusal reason lives on in the error message
 
-用法：
+Usage:
     <python> tests/test_backend_contract.py
 """
 from __future__ import annotations
@@ -82,28 +93,28 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 # ======================================================================
-# A 组 · 嵌入器协议（支线一）
+# Group A · embedder protocol (thread 1)
 # ======================================================================
 def test_a1_protocol_complete() -> None:
     print("\n[A1] 嵌入器协议完整性")
     required = ("embed", "embed_query", "embed_batch", "model_key")
     emb = HashEmbedder(dim=16)
     missing = [n for n in required if not hasattr(emb, n)]
-    check("A1 HashEmbedder 具备全部协议方法", not missing, f"缺少 {missing}")
-    check("A1 HashEmbedder 有 model_key 且可读",
+    check("A1 HashEmbedder has all protocol methods", not missing, f"缺少 {missing}")
+    check("A1 HashEmbedder has a readable model_key",
           isinstance(getattr(emb, "model_key", None), str), repr(emb.model_key))
 
-    # SentenceTransformerEmbedder 实例化会加载模型（慢），这里做静态检查：
-    # 三个方法能查到类属性；model_key 依赖 model_name，只能在 __init__ 里赋值。
+    # Instantiating SentenceTransformerEmbedder would load a model (slow); static checks here:
+    # the three methods resolve on the class; model_key depends on model_name, __init__-only.
     import inspect
 
     from hippocampus_mcp.engine.embeddings import SentenceTransformerEmbedder as ST
     st_missing = [n for n in ("embed", "embed_query", "embed_batch")
                   if not hasattr(ST, n)]
-    check("A1 SentenceTransformerEmbedder 具备全部协议方法",
+    check("A1 SentenceTransformerEmbedder has all protocol methods",
           not st_missing, f"缺少 {st_missing}")
     init_src = inspect.getsource(ST.__init__)
-    check("A1 其 __init__ 里确实设置了 model_key",
+    check("A1 its __init__ really does set model_key",
           "model_key" in init_src, "未在 __init__ 中赋值 model_key")
 
 
@@ -111,11 +122,11 @@ def test_a2_query_equals_embed_for_hash() -> None:
     print("\n[A2] HashEmbedder.embed_query 语义")
     emb = HashEmbedder(dim=32)
     text = "用户在杭州工作，负责跨境电商供应链。"
-    check("A2 embed_query 与 embed 完全一致",
+    check("A2 embed_query identical to embed",
           np.allclose(emb.embed_query(text), emb.embed(text)))
-    check("A2 输出已 L2 归一化",
+    check("A2 output is L2-normalized",
           abs(float(np.linalg.norm(emb.embed_query(text))) - 1.0) < 1e-9)
-    check("A2 空串不崩、返回零向量",
+    check("A2 empty string does not crash and returns a zero vector",
           float(np.linalg.norm(emb.embed_query(""))) == 0.0)
 
 
@@ -130,14 +141,14 @@ def test_a3_hash_recall_works() -> None:
         crashed = False
     except AttributeError as ex:      # noqa: BLE001
         crashed = True
-        check("A3 recall 不抛 AttributeError", False, str(ex))
+        check("A3 recall does not raise AttributeError", False, str(ex))
     except Exception as ex:           # noqa: BLE001
         crashed = True
-        check("A3 recall 正常返回", False, f"{type(ex).__name__}: {ex}")
+        check("A3 recall returns normally", False, f"{type(ex).__name__}: {ex}")
     if not crashed:
-        check("A3 recall 不抛 AttributeError", True)
-        check("A3 recall 返回结果列表", isinstance(hits, list), type(hits).__name__)
-        check("A3 recall 命中 >= 1 条", len(hits) >= 1, f"{len(hits)} 条")
+        check("A3 recall does not raise AttributeError", True)
+        check("A3 recall returns a result list", isinstance(hits, list), type(hits).__name__)
+        check("A3 recall hits >= 1 record", len(hits) >= 1, f"{len(hits)} 条")
 
 
 def test_a4_brain_context_works() -> None:
@@ -152,11 +163,11 @@ def test_a4_brain_context_works() -> None:
             crashed = False
         except Exception as ex:       # noqa: BLE001
             crashed = True
-            check("A4 get_memory_context 不抛异常", False,
+            check("A4 get_memory_context raises nothing", False,
                   f"{type(ex).__name__}: {ex}")
         if not crashed:
             text = ctx.get("text", "") if isinstance(ctx, dict) else str(ctx)
-            check("A4 get_memory_context 返回非空文本", bool(text.strip()),
+            check("A4 get_memory_context returns non-empty text", bool(text.strip()),
                   text[:80])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -167,7 +178,7 @@ def test_a5_guard_rejects_incomplete_backend() -> None:
     import hippocampus_mcp.engine.embeddings as E
 
     class _Broken:
-        """故意只实现 embed —— 复刻"回退嵌入器缺 embed_query"的形状。"""
+        """Deliberately implements only embed -- replicating the "fallback embedder missing embed_query" shape."""
         model_key = "broken"
         def embed(self, text): return np.zeros(4)
 
@@ -189,11 +200,11 @@ def test_a5_guard_rejects_incomplete_backend() -> None:
     try:
         try:
             E.create_embedder("_broken_test")
-            check("A5 残缺后端被拦截", False, "未报错")
+            check("A5 incomplete backend rejected", False, "未报错")
         except TypeError as ex:
             msg = str(ex)
-            check("A5 残缺后端被拦截为 TypeError", True)
-            check("A5 错误信息点名缺失的方法",
+            check("A5 incomplete backend rejected as TypeError", True)
+            check("A5 error message names the missing methods",
                   "embed_query" in msg and "embed_batch" in msg, msg)
     finally:
         E.create_embedder = orig
@@ -203,13 +214,13 @@ def test_a6_unknown_backend_raises() -> None:
     print("\n[A6] 未知嵌入后端不再静默退化为 hash")
     try:
         create_embedder("bge-typo")
-        check("A6 未知后端抛 ValueError", False, "未报错，静默返回了嵌入器")
+        check("A6 unknown backend raises ValueError", False, "未报错，静默返回了嵌入器")
     except ValueError as ex:
-        check("A6 未知后端抛 ValueError", True)
-        check("A6 错误信息列出受支持的后端",
+        check("A6 unknown backend raises ValueError", True)
+        check("A6 error message lists supported backends",
               "sentence_transformer" in str(ex) and "hash" in str(ex), str(ex))
     except Exception as ex:           # noqa: BLE001
-        check("A6 未知后端抛 ValueError", False,
+        check("A6 unknown backend raises ValueError", False,
               f"抛的是 {type(ex).__name__}: {ex}")
 
 
@@ -219,15 +230,15 @@ def test_a7_model_key_identity() -> None:
     a2 = HashEmbedder(dim=32, salt="s")
     b = HashEmbedder(dim=32, salt="other")
     c = HashEmbedder(dim=64, salt="s")
-    check("A7 同参数 → 同 key", a1.model_key == a2.model_key, a1.model_key)
-    check("A7 不同盐 → 不同 key", a1.model_key != b.model_key,
+    check("A7 same params -> same key", a1.model_key == a2.model_key, a1.model_key)
+    check("A7 different salt -> different key", a1.model_key != b.model_key,
           f"{a1.model_key} vs {b.model_key}")
-    check("A7 不同维度 → 不同 key", a1.model_key != c.model_key,
+    check("A7 different dim -> different key", a1.model_key != c.model_key,
           f"{a1.model_key} vs {c.model_key}")
 
 
 # ======================================================================
-# B 组 · 存储后端契约（支线二）
+# Group B · storage backend contract (thread 2)
 # ======================================================================
 def test_b1_numpy_backend_works() -> None:
     print("\n[B1] backend='numpy' 正常可用")
@@ -235,14 +246,14 @@ def test_b1_numpy_backend_works() -> None:
     try:
         mgr = MemoryManager(persist_dir=tmp, embedder_backend="hash",
                             embedding_dim=32, backend="numpy")
-        check("B1 store 是 VectorStore",
+        check("B1 store is VectorStore",
               type(mgr.store).__name__ == "VectorStore", type(mgr.store).__name__)
         mgr.store_memory("B1 记忆一条。")
         mgr.save()
         mgr2 = MemoryManager(persist_dir=tmp, embedder_backend="hash",
                              embedding_dim=32, backend="numpy")
         mgr2.load(auto_backfill=False)
-        check("B1 往返条数一致", mgr2.store.count() == 1, mgr2.store.count())
+        check("B1 round-trip record count matches", mgr2.store.count() == 1, mgr2.store.count())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -254,16 +265,16 @@ def test_b2_chroma_backend_rejected() -> None:
         try:
             MemoryManager(persist_dir=tmp, embedder_backend="hash",
                           embedding_dim=32, backend="chroma")
-            check("B2 chroma 后端被拒绝", False, "竟然构造成功了")
+            check("B2 chroma backend rejected", False, "竟然构造成功了")
         except ValueError as ex:
             msg = str(ex)
-            check("B2 chroma 后端抛 ValueError", True)
-            check("B2 信息说明not wired up", "not wired up" in msg, msg[:120])
-            check("B2 信息点明最严重的缺陷（换模型静默污染）",
+            check("B2 chroma backend raises ValueError", True)
+            check("B2 message says not wired up", "not wired up" in msg, msg[:120])
+            check("B2 message names the worst defect (silent pollution on model swap)",
                   "静默污染" in msg or "missing_ids" in msg, msg[:200])
-            check("B2 信息给出补齐后可放开的口径", "Once all five" in msg, msg[:200])
+            check("B2 message gives the criteria for lifting the ban once completed", "Once all five" in msg, msg[:200])
         except Exception as ex:       # noqa: BLE001
-            check("B2 chroma 后端抛 ValueError", False,
+            check("B2 chroma backend raises ValueError", False,
                   f"抛的是 {type(ex).__name__}: {ex}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -274,11 +285,11 @@ def test_b3_unknown_backend_rejected() -> None:
     try:
         MemoryManager(persist_dir=None, embedder_backend="hash",
                       embedding_dim=32, backend="sqlite")
-        check("B3 未知存储后端抛 ValueError", False, "未报错，静默走了 numpy")
+        check("B3 unknown storage backend raises ValueError", False, "未报错，静默走了 numpy")
     except ValueError:
-        check("B3 未知存储后端抛 ValueError", True)
+        check("B3 unknown storage backend raises ValueError", True)
     except Exception as ex:           # noqa: BLE001
-        check("B3 未知存储后端抛 ValueError", False,
+        check("B3 unknown storage backend raises ValueError", False,
               f"抛的是 {type(ex).__name__}: {ex}")
 
 
@@ -288,7 +299,7 @@ def test_b4_failure_is_clean() -> None:
     orig = M.VectorStore
 
     class _Spy:
-        """若被调用即证明"先建 store 再报错"，那不算干净失败。"""
+        """If called, that proves "store built before the error" -- not a clean failure."""
         called = False
         def __init__(self, *a, **kw):
             _Spy.called = True
@@ -301,7 +312,7 @@ def test_b4_failure_is_clean() -> None:
                           embedding_dim=32, backend="chroma")
         except ValueError:
             pass
-        check("B4 校验发生在构造 store 之前", not _Spy.called)
+        check("B4 validation happens before the store is constructed", not _Spy.called)
     finally:
         M.VectorStore = orig
 
@@ -313,49 +324,52 @@ def test_b4_failure_is_clean() -> None:
                           embedding_dim=32, backend="chroma")
         except ValueError:
             pass
-        check("B4 未创建持久化目录", not os.path.exists(probe), probe)
+        check("B4 persist directory not created", not os.path.exists(probe), probe)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
 def test_b5_chroma_removed_but_reason_kept() -> None:
-    """ChromaStore 已从代码库删除，但"为什么不能用"必须还在。
+    """ChromaStore is gone from the codebase, but the "why it is unusable" must remain.
 
-    这条断言防的是两种退化：
-      - 有人把半成品后端加回来却没补齐 6 处缺陷（模块又能导入了 = 红灯）；
-      - 有人只删文件不删原因，用户传 `backend="chroma"` 只收到一句
-        "不支持"，于是以为是我们没做，而不是做过、测过、发现会丢数据。
+    This assertion guards against two kinds of regression:
+      - someone re-adds the half-finished backend without fixing the 6 defects
+        (the module becomes importable again = red light);
+      - someone deletes the file but not the reason, so a user passing
+        `backend="chroma"` only gets a bare "unsupported" and concludes we
+        never built it -- rather than having built it, tested it, and found
+        it loses data.
     """
     print("\n[B5] chroma 后端已移除，但拒绝原因保留")
 
-    # 1. 模块不可导入
+    # 1. module not importable
     try:
         import hippocampus_mcp.store.chroma_store  # noqa: F401
-        check("B5 chroma_store 模块已不存在", False, "模块仍可导入")
+        check("B5 chroma_store module no longer exists", False, "模块仍可导入")
     except ImportError:
-        check("B5 chroma_store 模块已不存在", True)
+        check("B5 chroma_store module no longer exists", True)
     except Exception as ex:           # noqa: BLE001
-        check("B5 chroma_store 模块已不存在", False, f"{type(ex).__name__}: {ex}")
+        check("B5 chroma_store module no longer exists", False, f"{type(ex).__name__}: {ex}")
 
-    # 2. 包层面不再导出
+    # 2. no longer exported at package level
     import hippocampus_mcp.store as store_pkg
     exported = getattr(store_pkg, "__all__", [])
-    check("B5 store 包不再导出 ChromaStore", "ChromaStore" not in exported,
+    check("B5 store package no longer exports ChromaStore", "ChromaStore" not in exported,
           str(exported))
-    check("B5 store 包不再挂 ChromaStore 属性",
+    check("B5 store package no longer carries a ChromaStore attribute",
           not hasattr(store_pkg, "ChromaStore"))
 
-    # 3. 拒绝原因仍然完整：不是一句干巴巴的"不支持"
+    # 3. the refusal reason is still complete: not a bare "unsupported"
     try:
         MemoryManager(persist_dir=None, embedder_backend="hash",
                       embedding_dim=32, backend="chroma")
-        check("B5 backend='chroma' 仍被拒绝", False, "居然构造成功了")
+        check("B5 backend='chroma' still rejected", False, "居然构造成功了")
     except ValueError as ex:
         msg = str(ex)
-        check("B5 backend='chroma' 仍被拒绝", True)
-        check("B5 错误信息说明了会静默损坏数据的原因", "silently" in msg, msg[:120])
+        check("B5 backend='chroma' still rejected", True)
+        check("B5 error message explains it would silently corrupt data", "silently" in msg, msg[:120])
     except Exception as ex:           # noqa: BLE001
-        check("B5 backend='chroma' 仍被拒绝", False, f"{type(ex).__name__}: {ex}")
+        check("B5 backend='chroma' still rejected", False, f"{type(ex).__name__}: {ex}")
 
 
 def main() -> int:

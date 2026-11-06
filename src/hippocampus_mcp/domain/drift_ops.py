@@ -1,29 +1,41 @@
-"""杂项纯逻辑族：实体补挂编排 + 停用词三层展开。
+"""Miscellaneous pure-logic family: entity relink orchestration +
+three-layer stopword expansion.
 
-本模块收的是没有更合适归属的两件纯逻辑（``source_drift`` /
-``forget_by_query`` 在基线上已是既有薄壳，分别由
-``store.source_sig.drift_audit`` 与 ``domain/forget_flow`` 承接，
-无可抽内联逻辑），实抽 ``relink_entities`` 与 ``_stop_grams`` 两件。
+This module collects the two pieces of pure logic without a better home
+(``source_drift`` / ``forget_by_query`` were already existing thin
+shells on the baseline, carried respectively by
+``store.source_sig.drift_audit`` and ``domain/forget_flow``, with no
+inlinable logic), actually extracting ``relink_entities`` and
+``_stop_grams``.
 
-零项目内 import（架构约束：domain → 仅 common）。两件的外部能力全部由壳注入：
+Zero in-project imports (architecture constraint: domain → common
+only). Both pieces' external capabilities are injected by the shell:
 
-  * ``relink_entities``：``extract_fn`` / ``link_fn``（brain 的实体抽取
-    与挂链，惰性注入——不开关、逐记录现调）、``merge_fn``（store 层的
-    id 列表并集，domain 不许 import store）、``update_fn``（store 写回）、
-    ``archived_state``（state 字符串值，未 patch 常量按值传）；
-  * ``stop_grams``：``lexicon_path``（词库路径值）、``load_lexicon``
-    （词文件读取回调）、``builtin_stop``（内置停用词值）、``exclude``
-    （本次排除项）。
+  * ``relink_entities``: ``extract_fn`` / ``link_fn`` (brain's entity
+    extraction and linking, lazily injected -- no switch, called live
+    per record), ``merge_fn`` (the store layer's id-list union; domain
+    may not import store), ``update_fn`` (store write-back),
+    ``archived_state`` (state string value; unpatchable constants
+    passed by value);
+  * ``stop_grams``: ``lexicon_path`` (lexicon path value),
+    ``load_lexicon`` (lexicon-file read callback), ``builtin_stop``
+    (built-in stopword values), ``exclude`` (this call's exclusions).
 
-逐字保留的语义（动一个就是行为变化，parity 会抓）：
+Semantics preserved verbatim (changing any one is a behavior change;
+parity will catch it):
 
-  * relink：``list(records)`` 先物化再遍历（循环内会写回 store，防迭代
-    器失效）；archived 跳过；``only_ids`` 假值视作不限定；空 origins
-    跳过；``set(merged) != set(rec.entity_ids or [])`` 才写回——计数
-    分别是「动了几条」与「新增了几个链接」（并集减旧集）；
-  * stop_grams：三层只增不覆盖（内置 ∪ 词库文件 ∪ exclude），词与文件
-    词统一 ``lower()``；子串展开是**全前缀**（长度 1..len 全部切片），
-    登记一条完整短语即压掉它的全部切片；计数分母带各层条数。
+  * relink: ``list(records)`` materialized before iterating (the loop
+    writes back to the store; guards against iterator invalidation);
+    archived skipped; a falsy ``only_ids`` means unrestricted; empty
+    origins skipped; write-back only when
+    ``set(merged) != set(rec.entity_ids or [])`` -- the counts are
+    「how many records were touched」 and 「how many links were added」
+    (union minus old set);
+  * stop_grams: three layers add-only, never overwrite (builtin ∪
+    lexicon file ∪ exclude); lexicon and file words are uniformly
+    ``lower()``; substring expansion is **all prefixes** (all slices of
+    length 1..len); registering one full phrase suppresses all of its
+    slices; the count denominators carry each layer's entry count.
 """
 from __future__ import annotations
 
@@ -41,11 +53,15 @@ def relink_entities(
     archived_state: str,
     only_ids: list[str] | None = None,
 ) -> dict[str, int]:
-    """对已有记忆重跑实体抽取并**补挂**（词库扩充的必要配套）。
+    """Re-run entity extraction on existing memories and **relink**
+    (the necessary companion of lexicon expansion).
 
-    词库新增词后，存量记忆的 ``entity_ids`` 不会自动变化。不重挂就是
-    "加了词却查不到"，词库扩充闭环断在最后一环。补挂用并集，不覆盖
-    已有的实体关联（与 ingest 的合并语义一致）。
+    After new words enter the lexicon, existing memories'
+    ``entity_ids`` do not change automatically. Without relinking it is
+    "added the words but nothing is found" -- the lexicon-expansion
+    loop broken at its last link. Relinking merges by union and does
+    not overwrite existing entity associations (same merge semantics as
+    ingest).
     """
     only = set(only_ids) if only_ids else None
     touched = 0
@@ -74,13 +90,18 @@ def stop_grams(
     builtin_stop: Iterable[str],
     exclude: list[str] | None = None,
 ) -> tuple[set[str], set[str], dict[str, int]]:
-    """停用词三层 → ``(原词集合, 展开后的子串集合, 各层条数)``。
+    """Three stopword layers → ``(original-word set, expanded substring
+    set, per-layer entry counts)``.
 
-    三层**只增不覆盖**：① 内置通用行话 ∪ ② 项目停用词文件
-    ``<词库同目录>/entity_lexicon_stop.txt`` ∪ ③ 本次 ``exclude``。
+    The three layers **add only, never overwrite**: ① built-in generic
+    jargon ∪ ② the project stopword file
+    ``<lexicon dir>/entity_lexicon_stop.txt`` ∪ ③ this call's
+    ``exclude``.
 
-    "展开成子串集合"是为了让**登记一条完整短语即压掉它的全部切片**
-    （写"用户定案"同时挡掉"户定案"），不必手工枚举前缀碎片。
+    "Expanding into a substring set" exists so that **registering one
+    full phrase suppresses all of its slices** (writing 「用户定案」
+    also blocks 「户定案」), with no need to hand-enumerate prefix
+    fragments.
     """
     stop: set[str] = {t.lower() for t in builtin_stop}
     file_stop: set[str] = set()
