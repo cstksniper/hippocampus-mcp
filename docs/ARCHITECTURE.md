@@ -272,6 +272,8 @@ model_key           多模型向量库的槽位键
 
 ## 十、代码地图
 
+> 关键文件导览（**非全量**）：每层只列入口与核心文件；完整文件清单以 `src/hippocampus_mcp/` 目录为准。
+
 ```
 src/hippocampus_mcp/
 │
@@ -339,7 +341,7 @@ src/hippocampus_mcp/
 │
 └─ benchmarks/           评测框架（LoCoMo 加载 / 指标 / 多基线）
 
-scripts/    维护脚本扁平命名空间：demo / 冒烟 / 导入 / 换嵌入模型 / 体检 / 修复
+scripts/    维护脚本扁平命名空间（见「`scripts/` 保持扁平」一节的完整清单）
 docs/       ARCHITECTURE.md（本文）与 README 配图
 ```
 
@@ -366,10 +368,21 @@ docs/       ARCHITECTURE.md（本文）与 README 配图
 
 ### ⚠️ `scripts/` 保持扁平
 
-公开的维护脚本（demo / 冒烟 / 导入 / 换嵌入模型 / 体检 / 修复）保持扁平命名空间，
-角色由文件名自解释。唯一的共用模块是 `_lib_access.py`
-（库目录判定 / 读取的统一入口，后端无关），其余脚本彼此独立；
-`run_all_tests.py` 是回归的唯一入口（跑 `tests/` 全量），CI 与本地都用它。
+公开的维护脚本保持扁平命名空间，角色由文件名自解释：
+
+| 脚本 | 角色 |
+|---|---|
+| `reembed.py` | 换嵌入模型入口：查看 / 补齐 / 认领 / 裁剪多模型向量（不重切片、不重导入） |
+| `import_md.py` | Markdown 文档批量导入（切片 / 结构化标签 / 断点续跑 / 幂等） |
+| `demo_brain.py` | 核心能力演示 |
+| `mcp_smoke.py` | MCP 协议冒烟 |
+| `verify_onnx.py` | ONNX 后端验证 |
+| `verify_install_e2e.py` | 安装链路端到端验收（CI 引用） |
+| `judge_client.py` | 评测 LLM-as-judge 客户端 |
+| `run_all_tests.py` | 回归唯一入口（跑 `tests/` 全量，CI 与本地都用它） |
+
+唯一的共用模块是 `_lib_access.py`（库目录判定 / 读取的统一入口，后端无关；
+`reembed.py` 硬依赖它），其余脚本彼此独立。
 
 ---
 

@@ -268,12 +268,24 @@ entities, topic layers, information maps, consolidation, administration, and mul
 The default profile exposes only 12 high-frequency tools; hidden tools remain available through
 `hippo_help` and `hippo_extra`. Set `HIPPOCAMPUS_TOOL_PROFILE=full` to expose the full surface.
 
+### Maintenance commands
+
+| Command | Purpose |
+|---|---|
+| `hippocampus-mcp doctor` | Health check for the installation and libraries |
+| `hippocampus-mcp models` / `--fetch` / `--prune` | Inspect, download, and reclaim embedding-model caches |
+| `python scripts/reembed.py --all` | Backfill vectors after switching the embedding model |
+| `python scripts/import_md.py --dir <md dir> --project <name>` | Bulk-import Markdown documentation into a library |
+
+See [`docs/INTEGRATION.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/INTEGRATION.md)
+section 10 for model selection rules and the full switching procedure.
+
 See the dedicated guides for deeper evaluation and operation:
 
 | Document | Contents |
 |---|---|
 | [`docs/SELECTION.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/SELECTION.md) | Fit, non-goals, and verification checklist |
-| [`docs/INTEGRATION.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/INTEGRATION.md) | Host setup, lifecycle, compaction recovery, and fallback |
+| [`docs/INTEGRATION.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/INTEGRATION.md) | Host setup, model selection, lifecycle, compaction recovery, and fallback |
 | [`docs/PRIVACY.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/PRIVACY.md) | Storage, network, user scope, and deletion |
 | [`docs/BENCHMARKS.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/BENCHMARKS.md) | Current measurement conditions and limits |
 

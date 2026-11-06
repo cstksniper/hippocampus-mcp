@@ -201,8 +201,61 @@ hippocampus-mcp models --prune
 ```
 
 `models --prune` previews reclaimable model files. Add `--yes` only after reviewing the list.
-For Chinese corpora, prefer `BAAI/bge-base-zh-v1.5`; for English corpora, the MiniLM baseline is
-usually sufficient. Do not set `HF_HUB_OFFLINE=1` before the model has been downloaded.
+Do not set `HF_HUB_OFFLINE=1` before the model has been downloaded.
+
+### 10.1 Embedding model selection
+
+If `HIPPOCAMPUS_EMB_MODEL` is unset, the model is chosen automatically by the operating
+system language at install/startup time:
+
+| System language | Model | Dimensions |
+|---|---|---|
+| Chinese | `BAAI/bge-base-zh-v1.5` | 768 |
+| Everything else | `sentence-transformers/all-MiniLM-L6-v2` | 384 |
+
+- Setting `HIPPOCAMPUS_EMB_MODEL` explicitly always wins over the automatic choice.
+- Set `HIPPOCAMPUS_EMB_MODEL_AUTO=0` to disable automatic selection and always use the
+  MiniLM baseline.
+- Existing libraries follow the model already stored inside them: an explicit model that
+  mismatches the library errors out; the default never silently re-embeds an old library.
+
+### 10.2 Switching the embedding model
+
+Memories (text + structure) are model-independent; vectors are rebuildable derivatives.
+Switching models therefore does **not** require re-importing anything — only recomputing
+vectors:
+
+```bash
+# 1. Point the host (and this shell) at the new model
+export HIPPOCAMPUS_EMB_MODEL=BAAI/bge-base-zh-v1.5
+
+# 2. Backfill vectors for every library under data/ (recomputes vectors only;
+#    no LLM, no re-chunking, interruptible)
+python scripts/reembed.py --all
+
+# 3. Restart the host so the MCP server picks up the new model
+```
+
+`reembed.py` also supports single libraries (`--dir <lib>`), inspecting inventory without
+writing (`--dry-run` is the default action with `--dir`), adopting legacy single-model
+vectors (`--assume-model`), and pruning non-active model vectors to reclaim disk
+(`--prune`). It refuses to guess a model: pass `--model` or set the env var. On Windows,
+use `set` / `$env:` instead of `export`.
+
+### 10.3 Bulk-importing Markdown documents
+
+`scripts/import_md.py` imports existing .md documentation (conventions, logs, notes) into
+a library: chunks by headings/paragraphs/sentences, keeps code blocks as procedural
+records, extracts structured tags, and is resumable and idempotent (already-imported
+files are skipped):
+
+```bash
+python -u scripts/import_md.py --dir <md dir> --project <project> --dry-run  # preview
+python -u scripts/import_md.py --dir <md dir> --project <project>            # import
+```
+
+Import and serving must use the same model: the script prints the effective model and
+warns when it is not the BGE Chinese model while the server is configured for one.
 
 ## 11. Uninstall or move a library
 
