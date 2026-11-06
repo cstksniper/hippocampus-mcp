@@ -22,7 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -415,6 +415,12 @@ class MemoryManager:
         # 当前会话已处理的步数（进程级累计，供 auto_save 与 checkpoint 用；
         # 分路之后各路还有自己的 step_count，见 LnnContext）
         self._step_count: int = 0
+
+        # 「L1 落盘前先刷 L0」钩子（R2 / L0 不变式，语义见 :meth:`save`）。
+        # 为什么挂在 manager 而不让 engine 认识 L0：auto_save / save_state /
+        # retry_save / session_end 四个入口最后都汇到 save()，钩子挂这里
+        # 一处覆盖全部路径——按路径逐个补，等于同一个 bug 补四次。
+        self._pre_persist: Callable[[], None] | None = None
 
         # LNN 隐状态分路容器。未署名调用全部落在 DEFAULT_LNN_KEY，
         # 因此**不接线时行为与改造前逐位一致**。
@@ -1404,7 +1410,25 @@ class MemoryManager:
         随机，才没人察觉）。实时状态活在默认路的 ctx 里，从那里取；其余具名
         路由不落盘（历史边界不变：checkpoint 只承载默认会话的时序状态）。
         H7 权重固定化之后 hx 的持久化首次有了真实意义。
+
+        🔴 前置钩子（``_pre_persist``）：在动 L1 **之前**先把待落 L0 刷下去，
+        保证「盘上任何一条 L1 的 source_ids，都能在盘上 L0 找到」。顺序是
+        有意的：先 L0 后 L1，被杀最多留下「有 raw 无人引用」（无害）；
+        先 L1 后 L0 则留下「引用指向不存在的 raw」（不可恢复——实测某库
+        近一成条目中招，修复上线后仍在新增）。
         """
+        # 契约边界：**钩子抛异常 = 前置失败，但绝不阻断本次落盘**。
+        # 阻断等于"连 L1 也不存了"，比"L1 在、L0 缺"更糟；错误留到结尾
+        # 重新写回 last_save_error —— 否则末尾那句 `= None` 会把 L0 的失败
+        # 静默吞掉，而"静默失败"正是这次事故拖到被外部项目发现的原因。
+        pre_error: str | None = None
+        hook = self._pre_persist
+        if hook is not None:
+            try:
+                hook()
+            except Exception as e:  # noqa: BLE001 —— 见上方契约
+                pre_error = f"L0 前置落盘失败：{type(e).__name__}: {e}"
+                logger.warning("[save] %s", pre_error)
         self.store.save()
         if self._checkpoint is not None:
             state = self.memory_core.get_state()
@@ -1421,8 +1445,18 @@ class MemoryManager:
             state["reference_time"] = self._reference_time
             self._checkpoint.save_with_backup(state)
             self._save_meta()
-        # 落盘成功 → 清掉此前的失败痕迹（保留累计计数，供审计）
-        self.last_save_error = None
+        # 落盘成功 → 清掉此前的失败痕迹（保留累计计数，供审计）；
+        # 但**前置 L0 失败不清**：那是一笔还没还上的账，得留着让人看见。
+        self.last_save_error = pre_error
+
+    def set_pre_persist_hook(self, hook: Callable[[], None] | None) -> None:
+        """注册「落盘前先刷 L0」钩子（调用点与语义见 :meth:`save`）。
+
+        为什么用钩子而不是让 manager 直接持有 brain：engine 层不认识 L0
+        （它只认识 store / checkpoint）。钩子把「层的先后顺序」这条**业务
+        不变式**留在 brain，engine 只负责在正确的时机调用。
+        """
+        self._pre_persist = hook
 
     def retry_save(self) -> dict[str, Any]:
         """并发冲突后重试保存：**先取磁盘最新版本，再只补磁盘上没有的增量**。

@@ -878,6 +878,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("-" * 60)
     print("Note: this command performs static checks only and does not load models (so it is fast).")
     print("      Actual availability is what library_whoami reports in the host session.")
+    print("      workspace=undeclared means a direct connection without a HELLO "
+          "declaration; it is normal, not a fault.")
     return 0
 
 
@@ -1094,6 +1096,80 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_daemon_key() -> str:
+    """Recompute the key exactly as launcher.main() does."""
+    from .launcher import daemon_key
+    library = os.environ.get("HIPPOCAMPUS_DAEMON_LIBRARY", "")
+    model = os.environ.get("HIPPOCAMPUS_EMB_MODEL", "")
+    version = os.environ.get("HIPPOCAMPUS_DAEMON_VERSION", "")
+    return daemon_key(library, model, version)
+
+
+def _clear_stop_marker(key: str) -> None:
+    from .launcher import stop_request_path
+    try:
+        os.remove(stop_request_path(key))
+    except OSError:
+        pass
+
+
+def cmd_stop(args) -> int:
+    """Cooperative stop: write a marker and wait for a graceful, saved exit.
+
+    Killing the process directly would discard the in-memory tail (see the
+    step-based autosave window).  The daemon picks the marker up in its
+    maintenance thread and runs its normal ``stop()`` path instead.
+    """
+    from . import launcher
+    key = _cli_daemon_key()
+    info = launcher.read_registry(key)
+    if not info:
+        print(f"No running daemon for key={key}.")
+        _clear_stop_marker(key)
+        return 0
+    pid = int(info["pid"])
+    marker = launcher.stop_request_path(key)
+    try:
+        os.makedirs(launcher.runtime_dir(), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "ts": time.time(), "reason": "cli stop"}, f)
+    except OSError as exc:
+        print(f"Failed to write stop marker: {exc}", file=sys.stderr)
+        return 1
+    timeout = float(getattr(args, "timeout", 30) or 30)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not launcher._pid_alive(pid) or launcher.read_registry(key) is None:
+            print(f"Daemon pid={pid} stopped gracefully (state saved).")
+            _clear_stop_marker(key)
+            return 0
+        time.sleep(0.5)
+    print(f"Daemon pid={pid} did not exit within {timeout:.0f}s; marker left at "
+          f"{marker}. Check the daemon log before retrying.", file=sys.stderr)
+    return 1
+
+
+def cmd_restart(args) -> int:
+    """Stop the old daemon, then start a fresh one with current code/config."""
+    from . import launcher
+    rc = cmd_stop(args)
+    if rc:
+        return rc
+    key = _cli_daemon_key()
+    # A daemon killed before it could clean up leaves the marker behind; a new
+    # daemon would read it and exit immediately.
+    _clear_stop_marker(key)
+    library = os.environ.get("HIPPOCAMPUS_DAEMON_LIBRARY", "")
+    model = os.environ.get("HIPPOCAMPUS_EMB_MODEL", "")
+    info = launcher.ensure_daemon(key, library=library, model=model)
+    if not info:
+        print("Failed to start a new daemon; the next host session will spawn one.",
+              file=sys.stderr)
+        return 1
+    print(f"New daemon pid={info.get('pid')} port={info.get('port')} key={key}.")
+    return 0
+
+
 # --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -1211,6 +1287,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Embedding model component of the daemon key (defaults to env "
                          "HIPPOCAMPUS_EMB_MODEL or the built-in default)")
     cx.set_defaults(func=cmd_context)
+    sp_stop = sub.add_parser(
+        "stop", help="Gracefully stop the shared daemon (saves state before exit)")
+    sp_stop.add_argument("--timeout", type=float, default=30.0,
+                         help="Seconds to wait for a graceful exit (default 30)")
+    sp_stop.set_defaults(func=cmd_stop)
+
+    sp_restart = sub.add_parser(
+        "restart", help="Stop the stale daemon and start one with current code/config")
+    sp_restart.add_argument("--timeout", type=float, default=30.0,
+                            help="Seconds to wait for the old daemon to exit (default 30)")
+    sp_restart.set_defaults(func=cmd_restart)
+
     return p
 
 

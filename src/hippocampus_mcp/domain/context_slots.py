@@ -173,9 +173,25 @@ def memory_context(
         "block_5_open_topics": [t["text"] for t in open_topics[-3:]] or ["(No open topics)"],
     }
     text = render_blocks(blocks, token_budget, item_max_chars)
+    # Self-report per-item clipping.  Numeric tails (amounts, counts,
+    # thresholds) often live at the end of a line, so a silent 200-char
+    # cut destroys the payload.  Callers can pass item_max_chars=0.
+    truncated_items: list[dict] = []
+    if item_max_chars > 0:
+        for slot, values in blocks.items():
+            for idx, value in enumerate(values or []):
+                if isinstance(value, str) and len(value) > item_max_chars:
+                    truncated_items.append({
+                        "slot": slot, "index": idx,
+                        "chars": len(value),
+                        "kept_chars": item_max_chars,
+                        "dropped_chars": len(value) - item_max_chars,
+                    })
     return {
         "blocks": blocks,
         "text": text,
         "hits": hits,
         "token_estimate": len(text) // 2,
+        "truncated_items": truncated_items,
+        "truncated_count": len(truncated_items),
     }

@@ -136,6 +136,110 @@ def _topic_defaults() -> topic_mod.TopicDefaults:
         layer_enabled=c.topic_layer, low_info=c.topic_low_info)
 
 
+def _health_snapshot(brain) -> dict:
+    """Compact, opt-out health bill shown at every session_end.
+
+    Reuses projections that already exist; no new scan pipeline and no new
+    tool.  Governance debt was invisible between manual review batches, so it
+    is surfaced here as five numbers rather than a prose reminder.
+    """
+    import os as _os
+    out: dict = {}
+    try:
+        ledger = brain.save_ledger_view()
+        out["unsaved_seconds"] = ledger.get("interval_s")
+        out["unsaved_layers"] = len(ledger.get("pending_layers") or [])
+        out["l1_dirty"] = bool(ledger.get("l1_dirty"))
+        out["save_level"] = ledger.get("level")
+    except Exception as exc:  # noqa: BLE001 -- health is a gift, not a failure
+        out["save_level"] = "unknown:%s" % type(exc).__name__
+    try:
+        pin = brain._pin_stats()
+        out["pinned_ratio"] = pin.get("pinned_ratio")
+        out["pin_quota_warning"] = bool(pin.get("quota_warning"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        kinds = brain.knowledge_stats().get("summary_kinds") or {}
+        out["knowledge_stale"] = int(kinds.get("host_stale") or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..domain import stats_projection
+        raw_ids = {r.get("id") for r in brain.raw_log}
+        dangling, recs = stats_projection.dangling_report(
+            brain.manager.store.iter_records(), raw_ids)
+        out["l0_dangling_ids"] = len(dangling)
+        out["l0_dangling_memories"] = recs
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["open_topics"] = len(brain.open_topics)
+    except Exception:  # noqa: BLE001
+        pass
+    out["enabled"] = _os.environ.get(
+        "HIPPOCAMPUS_HEALTH_REPORT", "1").strip().lower() not in (
+            "0", "false", "no", "off")
+    return out
+
+
+#: ``session_start`` 的 L0 健康行阈值（悬空记忆条数）。0 = 有任何一条就报。
+L0_HEALTH_DANGLING_THRESHOLD = 0
+
+
+def _l0_health_line(brain) -> dict | None:
+    """Opening-pack L0 health bill — **only when it is actually off**.
+
+    A field nobody reads is not observability: the dangling refs in a
+    7000-record library were found by an external project, not by us.
+    Returns ``None`` when healthy so the default opening pack stays
+    byte-identical (its key order is pinned by golden tests); set
+    ``HIPPOCAMPUS_L0_HEALTH=0`` to silence it entirely.
+
+    两个信号，都只在**确实异常**时出现：
+      * ``dangling_memories > 0``：已有 L1 引用盘上不存在的 raw（不可恢复）；
+      * ``l0_pending`` 达到自动落盘阈值却还没落：说明那条路被堵住或关掉了
+        （阈值以下的 pending 是正常中间态，报出来只是噪声）。
+    """
+    import os as _os
+    if _os.environ.get("HIPPOCAMPUS_L0_HEALTH", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    pending = int(getattr(brain, "_l0_pending", 0) or 0)
+    every = int(getattr(brain, "_l0_autosave_every", 0) or 0)
+    dangling_ids = 0
+    dangling_memories = 0
+    try:
+        from ..domain import stats_projection
+        raw_ids = {r.get("id") for r in brain.raw_log}
+        dangling, dangling_memories = stats_projection.dangling_report(
+            brain.manager.store.iter_records(), raw_ids)
+        dangling_ids = len(dangling)
+    except Exception:  # noqa: BLE001 —— 体检失败不该拦住开场
+        dangling_memories = 0
+    pending_stuck = bool(pending) and (
+        every <= 0 or pending >= every)
+    if dangling_memories <= L0_HEALTH_DANGLING_THRESHOLD and not pending_stuck:
+        return None
+    notes = []
+    if dangling_memories > 0:
+        notes.append(
+            f"{dangling_memories} memories cite {dangling_ids} raw entries that "
+            f"are missing from this library's L0 (source text unrecoverable)")
+    if pending_stuck:
+        notes.append(
+            f"{pending} raw entries are memory-only (autosave threshold "
+            f"{every} not reached or failed)")
+    return {
+        "level": "warn",
+        "l0_pending": pending,
+        "dangling_ids": dangling_ids,
+        "dangling_memories": dangling_memories,
+        "note": ("; ".join(notes) + ". Run scripts/audit_l0_dangling.py "
+                 "--persist-dir <library> for the breakdown."),
+    }
+
+
 class _SessionMixin:
     """B2-3 P3：会话与写入者簇"""
 
@@ -519,6 +623,11 @@ class _SessionMixin:
                     "(full recovery protocol in the session instructions)."),
             },
         }
+        l0_health = _l0_health_line(self)
+        if l0_health:
+            # 只在**确实有欠账/悬空**时出现：健康状态下零痕迹，键序与
+            # 基线逐字一致（既有 golden 断言依赖这一点）。
+            out["l0_health"] = l0_health
         if us_n > 0:
             # D4：三个返回键 + 两个 receipt 键只在"开"时出现（关态零痕迹）。
             # 放返回体末尾——关态的键序与基线逐字节一致是硬约束，
@@ -1030,6 +1139,11 @@ class _SessionMixin:
         # B（验证反馈 2026-11-01）：层级明细。saved 仍是"没抛异常"，
         # 失败细节看 failed 层 + save_error；skipped 是合法优化如实回显。
         out["saved_layers"] = dict(getattr(self, "last_save_layers", {}) or {})
+        # R2: passive health bill; opt out with HIPPOCAMPUS_HEALTH_REPORT=0
+        import os as _os
+        if _os.environ.get("HIPPOCAMPUS_HEALTH_REPORT", "1").strip().lower() not in (
+                "0", "false", "no", "off"):
+            out["health"] = _health_snapshot(self)
         return out
 
 

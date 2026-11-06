@@ -177,11 +177,23 @@ class MemoryRecord:
     # 真相源是 store/idem.py 的进程内倒排，本字段是它**落盘后的重建依据**
     # ——索引是派生物，不另开 sidecar 文件。空串 = 未声明幂等（默认）。
     idem: str = ""
+    # Provenance of the pin: "auto" (importance threshold), "manual"
+    # (caller supplied pin=True), "legacy" (record written before this
+    # field existed), or "" (not pinned).  Declared LAST so positional
+    # construction of existing fields is unchanged.  "legacy" is never
+    # serialized, keeping old cards byte-identical on disk.
+    pin_source: str = ""
 
     def __post_init__(self) -> None:
         # importance >= PIN_IMPORTANCE 自动钉住（bigeye: importance>=7 不衰减）
         if self.importance >= PIN_IMPORTANCE:
             self.pin = True
+        if self.pin_source != "legacy":
+            if self.pin and not self.pin_source:
+                self.pin_source = (
+                    "auto" if self.importance >= PIN_IMPORTANCE else "manual")
+            if not self.pin:
+                self.pin_source = ""
         # H8 双存修复：所有构造路径（from_dict / 直接构造 / 测试）统一归一化成
         # array('f')——只在这里和 set_vector 转换，消费方（np 数学 / json / npz
         # / sqlite blob）全部无感。
@@ -199,6 +211,10 @@ class MemoryRecord:
         任何改动 importance 的地方都应调用本方法（显式设置 pin 时除外）。
         """
         self.pin = self.importance >= PIN_IMPORTANCE
+        if self.pin and self.pin_source in ("", "legacy"):
+            self.pin_source = "auto"
+        elif not self.pin:
+            self.pin_source = ""
 
     def is_live(self) -> bool:
         """是否参与默认召回（archived 不参与）。"""
@@ -271,6 +287,8 @@ class MemoryRecord:
             data["origin"] = dict(self.origin)
         if self.idem:
             data["idem"] = self.idem
+        if self.pin_source and self.pin_source != "legacy":
+            data["pin_source"] = self.pin_source
         if with_embeddings:
             data["embeddings"] = {k: list(v) for k, v in self.embeddings.items()}
         return data
@@ -326,4 +344,5 @@ class MemoryRecord:
                 if isinstance(data.get("origin"), dict) else {}
             ),
             idem=str(data.get("idem") or ""),
+            pin_source=str(data.get("pin_source") or "legacy"),
         )

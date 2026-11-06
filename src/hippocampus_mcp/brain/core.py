@@ -528,6 +528,10 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         # 恒自曝（0 也要报）——「确定没欠账」和「压根没查」必须分得开。
         self._l0_pending = 0
         self._l0_autosave_every = L0_AUTOSAVE_EVERY
+        # R2 / L0 不变式：L1 每次落盘前，先把待落 L0 刷下去（本体见
+        # :meth:`_flush_l0_before_persist`）。挂到 manager 上，一处覆盖
+        # auto_save / save_state / retry_save / session_end 全部落盘入口。
+        self.manager.set_pre_persist_hook(self._flush_l0_before_persist)
         self._nlp = None
         self._nlp_tried = False
         # spaCy 不可用时的原因。留空串表示"可用"或"还没试过"。
@@ -1157,6 +1161,36 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
             return True
         return False
 
+    def _flush_l0_before_persist(self) -> None:
+        """L1 落盘**之前**把待落 L0 刷下去（R2；manager 的 pre_persist 钩子）。
+
+        为什么不靠 ``_maybe_autosave_l0``：两者的**量纲不同**。L1 每 10 条
+        **记忆**落一次盘（``manager.auto_save``），L0 每 20 次 **ingest 调用**
+        落一次（``_l0_autosave_every``），而一次 ingest 会拆成 N 条 L1、只让
+        ``_l0_pending`` +1。于是 L1 已经落了两次盘，L0 计数才 1 —— 此刻宿主
+        回收进程，盘上那批 L1 的 ``source_ids`` 就指向只存在于内存里的 raw。
+        实测：某七千条规模的库悬空近一成（多数还带着 pin），修复上线后仍在新增。
+
+        为什么在 ``save()`` 之前刷：顺序决定**损伤方向**。先 L0 后 L1，被杀
+        最多留下「有 raw 但无人引用」的孤儿（无害，可恢复）；先 L1 后 L0 则
+        留下「引用指向不存在的 raw」（原文永久不可追回）。
+
+        批内不刷：``ingest_batch`` 收尾会成对落盘，且批内每落一次都要重写
+        整层 L0（500 条一批 = 500 次全量覆写）。
+
+        已知重复（有意不优化）：走 ``brain.save()`` 的路径（save_state /
+        session_end / update_tags）在本钩子写完 L0 之后，``_save_layers``
+        还会按自己的指纹记账再写一次同样的内容。显式保存不是热路径
+        （自动落盘只调 ``manager.save()``、不碰 ``_save_layers``），而把
+        ``_layer_written_fp`` 从这里改写要动账本口径——不值得。
+        """
+        if self._batch_depth > 0 or self._l0_pending <= 0 or not self.persist_dir:
+            return
+        if not self._save_l0_only():
+            # 抛给 manager.save() 记进 last_save_error：**静默失败**正是这次
+            # 事故拖到被外部项目发现的原因。不阻断 L1 落盘（见 manager.save）。
+            raise RuntimeError(self.manager.last_save_error or "L0 flush failed")
+
     def _maybe_autosave_l0(self) -> bool:
         """F11：累积的新 raw 到阈值就**只落 L0** 一次。返回是否落了。
 
@@ -1312,7 +1346,9 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
                 self.manager.save()
                 # F11：L1 落了而 L0 不落，等于 L1 的 source_ids 指向不存在的
                 # raw。这里补上；失败不中断（与上面同一套约定），写进 warning。
-                l0_ok = self._save_l0_only()
+                # R2：manager.save() 的 pre_persist 钩子已在 L1 **之前**成对刷过
+                # L0（pending 归零）⇒ 这里再刷一次等于整层重写一遍。
+                l0_ok = True if self._l0_pending <= 0 else self._save_l0_only()
                 if l0_ok:
                     self.manager.last_save_error = None
                 else:

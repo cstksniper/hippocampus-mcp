@@ -695,7 +695,7 @@ class RecallService(BaseService):
     # ---------------------------------------------------------------- 矛盾与漂移
 
     def contradictions(self, *, limit: int, source: str,
-                       filter_tags: str) -> dict[str, Any]:
+                       filter_tags: str, plan: bool = False) -> dict[str, Any]:
         """「同一事实、两种口径」候选对（只标注不裁决，确认后走 update_memory）。"""
         brain = self.brain
         parsed_tags, tag_err = parse_tags_json(filter_tags)
@@ -711,7 +711,83 @@ class RecallService(BaseService):
         # 与 recall / get_memory_context 的 matched 同口径。
         result["filter_applied"] = filter_applied(
             parsed_tags, result.get("candidate_pool"), key_info)
+        if plan:
+            result.update(self._supersede_plan(result.get("candidates") or []))
         return result
+
+    def _supersede_plan(self, candidates: list) -> dict:
+        """Project a reviewable plan; never decide which side is correct.
+
+        Pairs whose timestamps are indistinguishable go to ``need_human``
+        instead of being guessed from an arbitrary tie-break.
+        """
+        plan, need_human = [], []
+        for c in candidates:
+            a_ts = float(c.get("a_timestamp") or 0)
+            b_ts = float(c.get("b_timestamp") or 0)
+            if abs(a_ts - b_ts) < 1.0:
+                need_human.append({k: c.get(k) for k in
+                                   ("a_id", "b_id", "a", "b", "sim")})
+                continue
+            if c.get("newer") == "a":
+                old_id, new_id = c.get("b_id"), c.get("a_id")
+                old_text, new_text = c.get("b"), c.get("a")
+            else:
+                old_id, new_id = c.get("a_id"), c.get("b_id")
+                old_text, new_text = c.get("a"), c.get("b")
+            plan.append({"old_id": old_id, "new_id": new_id,
+                         "old": old_text, "new": new_text,
+                         "sim": c.get("sim"), "newer": c.get("newer")})
+        return {"supersede_plan": plan, "need_human": need_human,
+                "plan_count": len(plan), "need_human_count": len(need_human),
+                "note": "Review the array, then pass the approved entries back "
+                        "as the `confirm` JSON argument. The service never "
+                        "adjudicates; it only writes what the host approved."}
+
+    def apply_supersede_plan(self, plan_json: str) -> dict:
+        """Execute host-approved supersede pairs in one call.
+
+        Supersession is a state change, not a deletion: the old card stays
+        auditable.  Pinned cards are unpinned (batch B) as part of the update.
+        """
+        try:
+            plan = json.loads(plan_json)
+        except (ValueError, TypeError) as exc:
+            return {"error": "confirm is not valid JSON: %s" % exc,
+                    "input": str(plan_json)[:200]}
+        if not isinstance(plan, list):
+            return {"error": "confirm must be a JSON array of {old_id, new_id}"}
+        from ..store.memory import MemoryState
+        store = self.brain.manager.store
+        applied, rejected = [], []
+        for i, item in enumerate(plan):
+            if not isinstance(item, dict) or not item.get("old_id") or not item.get("new_id"):
+                rejected.append({"index": i, "reason": "missing old_id/new_id"})
+                continue
+            old_id, new_id = str(item["old_id"]), str(item["new_id"])
+            if old_id == new_id:
+                rejected.append({"index": i, "reason": "old_id == new_id"})
+                continue
+            old = store.get(old_id)
+            new = store.get(new_id)
+            if old is None or new is None:
+                rejected.append({"index": i, "old_id": old_id,
+                                 "reason": "id not found"})
+                continue
+            if old.state != MemoryState.ACTIVE.value:
+                rejected.append({"index": i, "old_id": old_id,
+                                 "reason": "old state=%s" % old.state})
+                continue
+            ok = store.update(old_id, state=MemoryState.SUPERSEDED.value,
+                              superseded_by=new_id, pin=False)
+            if ok:
+                applied.append({"old_id": old_id, "new_id": new_id})
+            else:
+                rejected.append({"index": i, "old_id": old_id,
+                                 "reason": "update returned False"})
+        return {"applied": applied, "rejected": rejected,
+                "applied_count": len(applied), "rejected_count": len(rejected),
+                "note": "Only host-approved pairs were written."}
 
     def drift_audit(self, *, source: str, limit: int,
                     include_ok: bool, client: str = "") -> dict[str, Any]:

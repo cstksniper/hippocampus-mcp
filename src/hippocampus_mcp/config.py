@@ -547,13 +547,24 @@ ENV_MAP: dict[str, str] = {
 #
 # | 文件 | 读取数 | 名单与豁免理由 |
 # |---|---|---|
-# | launcher.py | 12 | DAEMON_READY_TIMEOUT（模块快照，等 daemon 就绪的进程决定）；RUNTIME_DIR（运行目录）；LAUNCHER 开关（是否走 daemon 拓扑）；`dict(os.environ)`（spawn 环境复制，非旋钮）；LAUNCHER_DEBUG；DIAG；RECONNECT；PERSIST_DIR / EMB_MODEL / DAEMON_LIBRARY / DAEMON_VERSION（向 daemon **announce 透传**——launcher 先于 config 存在，只做信使）；PERSIST_DIR **另有一次启动前可写性预检**（`preflight_persist_dir`：库目录写不进等于每次写入静默丢失，属配置坏了，必须 fail-fast 而非退回直连） |
-# | daemon.py | 10 | DAEMON_HEARTBEAT（模块快照）；MODEL_UNLOAD / SLEEP_IDLE / SLEEP_BUDGET（哨兵阈值，进程拓扑决定——睡眠总开关按「根层入口属启动拓扑 plumbing」口径留在 daemon）；DAEMON_ECHO / FAULTHANDLER（诊断，Config 前生效）；DAEMON_KEY / LIBRARY / MODEL / IDLE_EXIT（socket/key/自退，进程拓扑） |
-# | cli.py | 11 | APPDATA（系统 env，非本项目）；PERSIST_DIR / EMB_MODEL / EMB_CACHE / TOOL_PROFILE（人机输出/自省命令的**展示透传**——CLI 是读给人看的，值与 config 一致，不参与行为分支）；`dict(os.environ)`（setup 写后即验按刚写入的 entry 复制 spawn 环境做真实握手，非旋钮）；HF_ENDPOINT（模型预取走国内镜像，`setdefault` 的返回值直接复用，**不二次读取**）；DAEMON_LIBRARY / EMB_MODEL / DAEMON_VERSION / PERSIST_DIR 再各一次（context 子命令按**真实宿主视角**拼 HELLO 握手——一次性 client 必须看到原始 env 而非 config 解析值，否则注入内容会跟宿主实际绑库不一致） |
+# | launcher.py | 13 | DAEMON_READY_TIMEOUT（模块快照，等 daemon 就绪的进程决定）；RUNTIME_DIR（运行目录）；LAUNCHER 开关（是否走 daemon 拓扑）；`dict(os.environ)`（spawn 环境复制，非旋钮）；LAUNCHER_DEBUG；DIAG；RECONNECT；PERSIST_DIR / EMB_MODEL / DAEMON_LIBRARY / DAEMON_VERSION（向 daemon **announce 透传**——launcher 先于 config 存在，只做信使）；PERSIST_DIR **另有一次启动前可写性预检**（`preflight_persist_dir`：库目录写不进等于每次写入静默丢失，属配置坏了，必须 fail-fast 而非退回直连） |
+# | daemon.py | 11 | DAEMON_HEARTBEAT（模块快照）；MODEL_UNLOAD / SLEEP_IDLE / SLEEP_BUDGET（哨兵阈值，进程拓扑决定——睡眠总开关按「根层入口属启动拓扑 plumbing」口径留在 daemon）；DAEMON_ECHO / FAULTHANDLER（诊断，Config 前生效）；DAEMON_KEY / LIBRARY / MODEL / IDLE_EXIT（socket/key/自退，进程拓扑） |
+# | cli.py | 16 | APPDATA（系统 env，非本项目）；PERSIST_DIR / EMB_MODEL / EMB_CACHE / TOOL_PROFILE（人机输出/自省命令的**展示透传**——CLI 是读给人看的，值与 config 一致，不参与行为分支）；`dict(os.environ)`（setup 写后即验按刚写入的 entry 复制 spawn 环境做真实握手，非旋钮）；HF_ENDPOINT（模型预取走国内镜像，`setdefault` 的返回值直接复用，**不二次读取**）；DAEMON_LIBRARY / EMB_MODEL / DAEMON_VERSION / PERSIST_DIR 再各一次（context 子命令按**真实宿主视角**拼 HELLO 握手——一次性 client 必须看到原始 env 而非 config 解析值，否则注入内容会跟宿主实际绑库不一致） |
 # | warmup.py | 4 | OMP/MKL_NUM_THREADS（第三方库 env，setdefault 预热线程上限）；LNN_BACKEND / EMB_BACKEND（warm 决策的早读——发生在 Config 消费前） |
 # | bridge.py | 1 | BRIDGE_DEBUG（模块快照，调试面） |
 # | __init__.py | 1 | OPENBLAS_NUM_THREADS（第三方库 env，setdefault——numpy 导入前必须定） |
 
+#
+# R2 (2026-11-06): new root-level env reads, all startup-topology plumbing
+# or CLI pass-through (registered here before the guard count was updated):
+# | launcher.py | +1 | ``runtime_identity`` scans _CONFIG_ENV_KEYS to build
+#   ``config_stamp``; it runs before config loading and never branches.
+# | daemon.py | +1 | ``HIPPOCAMPUS_DAEMON_SAVE_IDLE`` -- timed-flush window,
+#   same sentinel class as DAEMON_HEARTBEAT / MODEL_UNLOAD.
+# | cli.py | +5 | New ``stop`` / ``restart`` commands recompute the daemon
+#   key exactly as launcher.main() does (DAEMON_LIBRARY / EMB_MODEL /
+#   DAEMON_VERSION) and pass LIBRARY / MODEL through on restart. Same
+#   rationale as the existing ``context`` HELLO pass-through.
 
 #: bool 字段 → 语义类型（A/B/C/D，见上方注释）。迁移前四处散点各写各的，
 #: 收编时必须按字段记住原语义，否则「HIPPOCAMPUS_RECALL_DECAY=maybe」

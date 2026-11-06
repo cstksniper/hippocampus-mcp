@@ -850,7 +850,10 @@ def _workspace_binding_brief(client: str | None = None) -> dict[str, Any]:
         rec = _conn_workspace_binding.get(session_key(client))
     if not rec:
         return {"status": "undeclared", "cwd": "", "library": "",
-                "task": "", "declared": ""}
+                "task": "", "declared": "",
+                "note": "Direct connection without a HELLO declaration: "
+                        "normal for probes and single-library setups, not "
+                        "an error. The library is matched by cwd."}
     return dict(rec)
 
 
@@ -1376,7 +1379,8 @@ Args:
 
 @server.tool(structured_output=False)
 async def contradictions(limit: int = 10, source: str = "",
-                         filter_tags: str = "", library: str = "") -> str:
+                         filter_tags: str = "", library: str = "",
+                         plan: bool = False, confirm: str = "") -> str:
     """List candidate pairs where one fact may have two versions.
 This is annotation, not adjudication. Review candidates and resolve through
 ``update_memory`` (usually supersession) or ``forget_memory``.
@@ -1385,13 +1389,18 @@ Args:
     limit: Maximum candidate pairs; default 10.
     source: Optional source filter.
     filter_tags: JSON object string narrowing the candidate pool.
+    plan: Also return a reviewable supersede_plan and a need_human bucket.
+    confirm: Host-approved plan array (JSON string) to execute in one call.
+            The service never adjudicates; it writes only what was sent.
     """
     await _await_warmup()
     # filter_tags 解析（错误体不带信封）与 candidate_pool 回显在
     # RecallService.contradictions；解析排在库解析之后，保序。
     svc = _recall_service(library)
+    if confirm:
+        return json.dumps(svc.apply_supersede_plan(confirm), ensure_ascii=False)
     return json.dumps(svc.contradictions(
-        limit=limit, source=source, filter_tags=filter_tags),
+        limit=limit, source=source, filter_tags=filter_tags, plan=plan),
         ensure_ascii=False)
 
 

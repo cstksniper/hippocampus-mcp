@@ -125,6 +125,93 @@ def write_registry(key: str, info: dict[str, Any]) -> bool:
         return False
 
 
+def stop_request_path(key: str) -> str:
+    """Path of the cooperative stop marker for one daemon."""
+    return os.path.join(runtime_dir(), f"daemon-{key}.stop")
+
+
+#: Environment keys that change daemon behaviour.  A mismatch means the
+#: running process was started under a different configuration.
+_CONFIG_ENV_KEYS = (
+    "HIPPOCAMPUS_DAEMON_VERSION",
+    "HIPPOCAMPUS_EMB_MODEL",
+    "HIPPOCAMPUS_TOOL_PROFILE",
+    "HIPPOCAMPUS_STORE_BACKEND",
+    "HIPPOCAMPUS_PERSIST_DIR",
+)
+
+#: Identity fields whose drift means the daemon is serving stale code/config.
+#: ``cwd`` and ``library_stamp`` are recorded for diagnostics only: one daemon
+#: legitimately serves several workspaces, so they must never trigger a warning.
+STALE_IDENTITY_KEYS = ("code_stamp", "config_stamp")
+
+_STALE_WARNED: set[str] = set()
+
+
+def runtime_identity(library: str = "") -> dict[str, Any]:
+    """Snapshot of the code/config a daemon was started with.
+
+    ``daemon_key`` only changes when ``HIPPOCAMPUS_DAEMON_VERSION`` is set, so
+    without this stamp a source edit leaves an old daemon in place forever.
+    The stamp uses file metadata (not content) to stay cheap on the hot path.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    newest, count, total = 0, 0, 0
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            try:
+                st = os.stat(os.path.join(base, name))
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime_ns)
+            count += 1
+            total += st.st_size
+    code = hashlib.sha1(
+        f"{newest}|{count}|{total}".encode("ascii")
+    ).hexdigest()[:12]
+    config = hashlib.sha1(
+        "|".join(f"{k}={os.environ.get(k, '')}" for k in _CONFIG_ENV_KEYS)
+        .encode("utf-8", "replace")
+    ).hexdigest()[:12]
+    lib_stamp = 0
+    if library:
+        try:
+            lib_stamp = os.stat(
+                os.path.join(library, "directory.json")).st_mtime_ns
+        except OSError:
+            lib_stamp = 0
+    return {"cwd": os.getcwd(), "code_stamp": code,
+            "config_stamp": config, "library_stamp": lib_stamp}
+
+
+def warn_daemon_stale(info: dict[str, Any]) -> list[str]:
+    """Warn once when a reusable daemon runs older code/config.
+
+    Never blocks reuse: refusing to connect on a cwd/config difference would
+    break the multi-host, single-daemon topology.  The operator decides via
+    ``hippocampus-mcp restart``.
+    """
+    saved = info.get("identity")
+    if not isinstance(saved, dict) or not saved:
+        return []
+    now = runtime_identity(info.get("library") or "")
+    diffs = [k for k in STALE_IDENTITY_KEYS
+             if saved.get(k) and now.get(k) and saved.get(k) != now.get(k)]
+    if not diffs:
+        return []
+    tag = f"{info.get('pid')}|{','.join(diffs)}"
+    if tag in _STALE_WARNED:
+        return diffs
+    _STALE_WARNED.add(tag)
+    print(f"[launcher] daemon pid={info.get('pid')} is stale ({', '.join(diffs)}); "
+          f"it still serves the previous code/config. Run `hippocampus-mcp restart` "
+          f"to load the current one.", file=sys.stderr, flush=True)
+    return diffs
+
+
+
 def _pid_alive(pid: int) -> bool:
     """只读探测（与 brain.pid_alive 同口径，这里独立实现以保持纯标准库）。"""
     if pid <= 0:
@@ -298,6 +385,14 @@ SPAWN_LOCK_TTL = 120.0      # 锁的最大持有时长（秒）；超时当作�
 #: 不把残缺的锁文件当成陈旧锁，否则会把正在创建锁的邻居一把拍死。
 SPAWN_LOCK_CREATE_GRACE = 5.0
 SPAWN_WAIT_TIMEOUT = 60.0   # 抢不到锁时，跟随别人 spawn 的最长等待（秒）
+#: 「登记里有活 pid，但端口还没接客」时最多等多久（秒）。
+#:
+#: 这段时间**不是**"没有 daemon"，而是"那一个还没就绪"：``Daemon.bind()``
+#: 在 ``announce()`` 之前就 listen 了，所以正常启动时这个窗口很短；它变长只
+#: 有一个原因 —— 那个进程正在收尾（socket 已关、pid 还活着）。等满仍未就绪
+#: 就放弃 spawn，让调用方退化成 inline server：**宁可这一会话重一点，也不
+#: 叠出第二个 ~1GB daemon 去竞写同一个注册表**。
+READY_WAIT_WHEN_ALIVE = SPAWN_WAIT_TIMEOUT
 
 
 def _spawn_without_breakaway(cmd, env, log_fh, base_flags: int,
@@ -534,16 +629,52 @@ def _registry_usable(info: dict[str, Any] | None) -> bool:
     if s is None:
         return False
     s.close()
+    warn_daemon_stale(info)
     return True
+
+
+def _registry_has_live_pid(info: dict[str, Any] | None) -> bool:
+    """登记里的那个 pid 还活着吗（端口接不接客不管）。
+
+    🔴 这个判断补的是一个**语义错误**，不是竞态：旧代码只问"端口连得上吗"，
+    连不上就当"没有 daemon"，于是又 spawn 一个。可"连不上"有两种来源 ——
+    没人、或**有人但还没就绪**，旧代码把后者也算进了前者。
+    """
+    if not info:
+        return False
+    pid = info.get("pid")
+    return isinstance(pid, int) and pid > 0 and _pid_alive(pid)
+
+
+def _wait_until_ready(key: str, info: dict[str, Any] | None,
+                      limit: float) -> dict[str, Any] | None:
+    """等一个「活着但还没接客」的 daemon 就绪。
+
+    只要 pid 一死、或登记被清（正常退出路径会清），立刻返回 None —— 由调用方
+    自己 spawn，一秒都不多等。等满 ``limit`` 仍未就绪也返回 None：那时它要么
+    在收尾、要么卡死，两种情况下再 spawn 一个都只会让局面更糟。
+    """
+    end = time.time() + max(0.0, float(limit))
+    while time.time() < end:
+        time.sleep(0.2)
+        fresh = read_registry(key)
+        if _registry_usable(fresh):
+            return fresh
+        if not _registry_has_live_pid(fresh):
+            return None
+    return None
 
 
 def ensure_daemon(key: str, library: str = "", model: str = "") -> dict[str, Any] | None:
     """找到或拉起 daemon —— **同一时刻只有一个 launcher 会真去 spawn**。
 
-    三条路径：
+    四条路径：
       ① 注册表可用 → 直接返回（最常见，零等待）
-      ② 拿到 spawn 锁 → double-check 后真 spawn（拿锁期间别人可能刚起好）
-      ③ 抢不到锁 → 跟牌等待（持锁者死了或窗超时，回到 ② 自己尝试）
+      ② 拿到 spawn 锁，且登记里**没有活着的 pid** → double-check 后真 spawn
+         （拿锁期间别人可能刚起好）
+      ③ 拿到 spawn 锁，但登记里的 pid **还活着**（端口没接客）→ 等它就绪，
+         **绝不另起一个**；它死了才由这一轮 spawn
+      ④ 抢不到锁 → 跟牌等待（持锁者死了或窗超时，回到 ② 自己尝试）
     """
     deadline = time.time() + DAEMON_READY_TIMEOUT
     while time.time() < deadline:
@@ -555,17 +686,31 @@ def ensure_daemon(key: str, library: str = "", model: str = "") -> dict[str, Any
                 info = read_registry(key)          # double-check
                 if _registry_usable(info):
                     return info
+                # ③ 有人活着但还没接客 ⇒ 等它，**不是**再起一个。
+                #    4 路并发下这条分支实测 1/4 会叠出第二个 daemon（两条不同
+                #    pid 的 banner，注册表被后来者覆盖，谁服务谁是随机的）。
+                if _registry_has_live_pid(info):
+                    ready = _wait_until_ready(
+                        key, info,
+                        min(READY_WAIT_WHEN_ALIVE,
+                            max(0.0, deadline - time.time())))
+                    if ready is not None:
+                        return ready
+                    if _registry_has_live_pid(read_registry(key)):
+                        return None               # 还活着却不接客：宁可退化成 inline
                 return spawn_daemon(key, library=library, model=model)
             finally:
                 release_spawn_lock(key)
-        # ③ 别人在 spawn：跟随，盯着注册表也盯着锁（防止跟着死等）
+        # ④ 别人在 spawn：跟随，盯着注册表也盯着锁（防止跟着死等）
         wait_until = min(time.time() + SPAWN_WAIT_TIMEOUT, deadline)
         while time.time() < wait_until:
             time.sleep(0.2)
             info = read_registry(key)
             if _registry_usable(info):
                 return info
-            if not read_registry(key) and _spawn_lock_stale(
+            # 登记行还在但 pid 已经死了，同样是"跟着一个不存在的人"：早点破，
+            # 不必耗满 SPAWN_WAIT_TIMEOUT 才轮到自己去 spawn。
+            if not _registry_has_live_pid(info) and _spawn_lock_stale(
                     key, _read_spawn_lock(key)):
                 break                              # 持锁者没了且 daemon 没起 ⇒ 自己上
     return None

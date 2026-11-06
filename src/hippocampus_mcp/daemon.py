@@ -34,7 +34,7 @@ import time
 from typing import Any
 
 from .launcher import (read_registry, registry_path, runtime_dir,
-                       write_registry)
+                       runtime_identity, stop_request_path, write_registry)
 from .engine import model_lifecycle
 from .library.registry import DEFAULT_KEY
 
@@ -53,6 +53,14 @@ DEFAULT_MODEL_UNLOAD = 1800.0
 ENV_MODEL_UNLOAD = "HIPPOCAMPUS_MODEL_IDLE_UNLOAD"
 #: 卸载哨兵的巡检间隔（秒）。30s 一次，误差对 30 分钟阈值毫无意义。
 MODEL_UNLOAD_POLL = 30.0
+
+#: Cooperative stop marker poll / timed-flush tick (seconds).
+MAINTENANCE_POLL = 5.0
+#: Time-driven flush window.  Step-based autosave (L1 every 10 writes, L0
+#: every 20) leaves an unbounded in-memory tail when writes are sparse.
+#: Default 15 min; ``0`` disables the timer (the stop marker still works).
+DEFAULT_SAVE_IDLE = 900.0
+ENV_SAVE_IDLE = "HIPPOCAMPUS_DAEMON_SAVE_IDLE"
 
 # ----------------------------------------------------------------------
 # 空闲「睡眠窗口」——离线重放式巩固的宿主侧旋钮。
@@ -194,12 +202,16 @@ class Daemon:
         self._last_conn_at = time.time()
         self._stopped = False
         self._heartbeat_round = 0
+        self.save_idle_seconds = float(
+            os.environ.get(ENV_SAVE_IDLE, str(DEFAULT_SAVE_IDLE)) or 0)
+        self._last_flush_at = time.time()
         # 收尾完成信号 + 空闲回收线程句柄（见 join_idle 的说明：
         # 线程必须是**非 daemon**，否则收尾会被解释器关闭掐断）
         self._finished = threading.Event()
         self._idle_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
         self._model_unload_thread: threading.Thread | None = None
+        self._maintenance_thread: threading.Thread | None = None
         # O2 睡眠批：取消信号（新连接到来即置位）+ 单飞标志 + 线程句柄
         self._sleep_cancel = threading.Event()
         self._sleep_running = False
@@ -226,6 +238,7 @@ class Daemon:
             "started_at": time.time(),
             "alive_at": time.time(),
             "runtime_dir": runtime_dir(),
+            "identity": runtime_identity(library),
         })
 
     def _idle_watch(self) -> None:
@@ -290,6 +303,64 @@ class Daemon:
                     f"conns={self._active_conns} t={time.time():.3f}",
                     file=sys.stderr,
                 )
+
+    def _maintenance_watch(self) -> None:
+        """Housekeeping that must NOT depend on ``_active_conns``.
+
+        The idle-exit sentinel requires ``conns == 0``, which real hosts never
+        reach (the launcher holds the socket for the whole session).  Parking
+        either the stop marker or the timed flush there would silently disable
+        both.  This thread is independent by design.
+        """
+        while not self._stop.wait(MAINTENANCE_POLL):
+            try:
+                if self.key and os.path.exists(stop_request_path(self.key)):
+                    print("[daemon] cooperative stop requested; saving and exiting",
+                          file=sys.stderr, flush=True)
+                    self.stop()
+                    return
+            except Exception as exc:  # noqa: BLE001
+                print(f"[daemon] stop marker check failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+            if self.save_idle_seconds <= 0:
+                continue
+            if time.time() - self._last_flush_at < self.save_idle_seconds:
+                continue
+            self._last_flush_at = time.time()
+            self._flush_dirty_brains()
+
+    def _flush_dirty_brains(self) -> None:
+        """Persist resident libraries that still hold in-memory changes.
+
+        ``save_ledger_view`` is the single source for the dirty judgement;
+        for a brand-new library with no ledger entry yet it reports ``unknown``,
+        so fall back to the store's dirty markers in that case.
+        """
+        for key in self.registry.keys():
+            if self._stop.is_set():
+                return
+            brain = self.registry.get(None if key == DEFAULT_KEY else key)
+            if brain is None:
+                continue
+            try:
+                view = brain.save_ledger_view()
+            except Exception:  # noqa: BLE001 -- one bad library must not stop others
+                continue
+            dirty = bool(view.get("l1_dirty")) or bool(view.get("pending_layers"))
+            if not dirty and view.get("level") == "unknown":
+                store = getattr(getattr(brain, "manager", None), "store", None)
+                dirty = bool(getattr(store, "_dirty_ids", None)
+                             or getattr(store, "_deleted_ids", None))
+            if not dirty:
+                continue
+            try:
+                brain.save()
+                print(f"[daemon] idle flush pid={os.getpid()} library={key} "
+                      f"interval_s={view.get('interval_s')}",
+                      file=sys.stderr, flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[daemon] idle flush failed library={key}: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
     def _model_unload_watch(self) -> None:
         """空闲卸载哨兵：超阈值且无人在用 ⇒ 把嵌入模型卸掉。
@@ -435,6 +506,12 @@ class Daemon:
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_watch, name="heartbeat", daemon=True)
             self._heartbeat_thread.start()
+        # Independent of heartbeat_seconds: the stop marker must work even
+        # when heartbeats are disabled (tests and embedded deployments).
+        if self._maintenance_thread is None:
+            self._maintenance_thread = threading.Thread(
+                target=self._maintenance_watch, name="maintenance", daemon=True)
+            self._maintenance_thread.start()
         while not self._stop.is_set():
             try:
                 client, addr = self.sock.accept()
@@ -523,6 +600,10 @@ class Daemon:
         # 清注册表：本 daemon 已退出，别让 launcher 撞上死条目多等一轮探测
         # （launcher 本就有 pid+port 存活校验，这里只是把现场擦干净）
         if self.key:
+            try:
+                os.remove(stop_request_path(self.key))
+            except OSError:
+                pass
             path = registry_path(self.key)
             try:
                 os.remove(path)

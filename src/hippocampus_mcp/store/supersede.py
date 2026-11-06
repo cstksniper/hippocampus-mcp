@@ -58,7 +58,8 @@ def detect_supersede(
         （后两个是内容前 60 字，仅供回显）。
 
     副作用：把被取代的那条改成 ``state=superseded`` 并挂 ``superseded_by``
-    ——这是本函数**唯一**的写操作，找不到就不写。
+    ——这是本函数**唯一**的写操作，找不到就不写。R2: it also clears
+    ``pin``; a superseded card must not keep occupying a pinned slot.
 
     预存行为（与原实现逐条对齐，不要「顺手修好」）：
 
@@ -103,6 +104,7 @@ def detect_supersede(
                 best.id,
                 state=MemoryState.SUPERSEDED.value,
                 superseded_by=nid,
+                pin=False,
             )
             out.append({
                 "old_id": best.id, "new_id": nid, "sim": round(best_sim, 3),

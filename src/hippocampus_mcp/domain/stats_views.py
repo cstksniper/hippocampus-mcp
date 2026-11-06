@@ -114,7 +114,12 @@ def pin_stats(
     pinned = [r for r in active if getattr(r, "pin", False)]
     auto = [r for r in pinned
             if pin_threshold <= (getattr(r, "importance", 0) or 0) <= 0.75]
+    breakdown = {"auto": 0, "manual": 0, "legacy": 0, "unmarked": 0}
+    for rec in pinned:
+        src = str(getattr(rec, "pin_source", "") or "")
+        breakdown[src if src in breakdown else "unmarked"] += 1
     ratio = len(pinned) / total
+    quota_warning = ratio >= 0.6
     level = "high" if ratio >= 0.5 else ("ok" if ratio >= 0.2 else "low")
     return {
         "active_total": total,
@@ -122,16 +127,18 @@ def pin_stats(
         "pinned_ratio": round(ratio, 4),
         "suspected_auto_pinned": len(auto),
         "pin_threshold": pin_threshold,
+        "pin_source_breakdown": breakdown,
+        "quota_warning": quota_warning,
         "level": level,
         "note": (
-            "pin 只进不退（系统内无自动退出路径）。解除只能靠调用方显式动作："
+            "supersede 会自动解 pin；其余退出仍靠调用方显式动作："
             "① report_feedback(useful=False) ② 显式 pin=False "
             "③ 降 importance 触发 sync_pin（store/vector_store.py → "
             "memory.py:175，双向）。level=high 意味着用层动态位被挤占，"
             "「suspected_auto_pinned」那部分是词面规则自动钉的（疑似，非确证）。"
             if level == "high" else
-            "pin 占比正常。提醒：系统内无自动解 pin 路径，"
-            "解除只能靠调用方显式动作。"),
+            "pin 占比正常。提醒：除 supersede 自动解 pin 外，"
+            "其余解除只能靠调用方显式动作。"),
     }
 
 

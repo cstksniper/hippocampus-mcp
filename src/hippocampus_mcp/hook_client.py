@@ -68,31 +68,49 @@ def format_injection(blocks: dict, *, item_max_chars: int = 150,
     预算是**软首行**：第一条内容行即使超预算也保留（否则会出现"只有标题
     没有内容"的注入），其后一律硬截并打标记。
     """
-    lines: list[str] = [_INJECTION_HEADER]
-    used = len(lines[0])
-    truncated = False
+    sections = []
     for key, header in _SECTION_HEADERS:
         raw = [str(x) for x in (blocks.get(key) or [])]
         body = [x for x in raw if x and x not in _PLACEHOLDERS]
-        if not body:
-            continue
+        if body:
+            sections.append((key, header, body))
+    stats = {k: {"kept": 0, "total": len(b), "dropped": 0}
+             for k, _h, b in sections}
+    lines: list[str] = [_INJECTION_HEADER]
+    used = len(lines[0])
+    truncated = False
+    clipped = 0
+    for key, header, body in sections:
         if len(lines) > 1 and used + len(header) + 1 > token_budget:
             truncated = True
             break
         lines.append(header)
         used += len(header) + 1
         for x in body:
+            if item_max_chars > 0 and len(x) > item_max_chars:
+                clipped += 1
             line = "- " + (x[:item_max_chars] if item_max_chars > 0 else x)
             if len(lines) > 2 and used + len(line) + 1 > token_budget:
                 truncated = True
                 break
             lines.append(line)
             used += len(line) + 1
+            stats[key]["kept"] += 1
         if truncated:
             break
+    for entry in stats.values():
+        entry["dropped"] = entry["total"] - entry["kept"]
     if len(lines) == 1:
         return ""
+    if clipped:
+        lines.append("(%d item(s) clipped to %d chars; pass "
+                     "item_max_chars=0 to keep full text)" % (clipped, item_max_chars))
     if truncated:
+        parts = ["%s %d/%d kept" % (k, v["kept"], v["total"])
+                 for k, v in stats.items()]
+        lines.append("(Slot budget: " + ", ".join(parts) + ")")
+        # Keep the legacy marker as the LAST line: existing callers and tests
+        # detect truncation by endswith("(Truncated to budget)").
         lines.append("(Truncated to budget)")
     return "\n".join(lines)
 

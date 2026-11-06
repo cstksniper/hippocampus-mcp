@@ -124,6 +124,9 @@ research-retrospective.html
 # ------------------------------------------------------------------
 _probe_out/
 mcp_server_debug.log
+# 改动前的版本快照（`_backup/<日期>_<主题>/<原路径>`）。是回滚用的本机副本，
+# 不是交付物：进库只会让 diff 里混进整份旧文件。
+_backup/
 
 # GitHub 建仓（B1-4）一次性注册现场：含浏览器自动化脚本、截图、cookies.txt、
 # hosts 文件，71MB，**绝不可进库**（cookies 属凭据）。注册完即弃。
