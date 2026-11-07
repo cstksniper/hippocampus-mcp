@@ -97,16 +97,23 @@ _PROFILE_GROUPS: dict[str, set[str] | None] = {
     "full": None,  # None = everything
 }
 
-# The common set (front-line observation: zcode daily usage never exceeds 8
-# tools) -- to add/remove/change, edit this line only.
+# The common set -- to add/remove/change, edit this line only.
 # It is **not** derived from {core} ∪ {writer}; it is an independently
 # maintained "daily high-frequency" roster.
 # Tools it excludes are not unavailable: the hidden portion is dispatched
 # back in via hippo_extra.
+# 2026-11-07 slim-down (user-approved): store_memory / list_memories moved
+# to the dispatcher (bare no-provenance write and the raw-listing audit
+# path; ingest and recall are the first-line entries). Revert = re-add the
+# two names here. Telemetry (server_runtime/telemetry.py) keeps recording
+# both surfaces — dispatcher lookups for them are the signal the trial
+# watches.
 _COMMON_TOOLS_DEFAULT = frozenset({
-    # -- read/write backbone, 8 tools (the front-line observed daily surface) --
-    "recall", "store_memory", "ingest", "session_start",
-    "get_memory_context", "update_memory", "forget_memory", "list_memories",
+    # -- read/write backbone, 6 tools --
+    "recall", "ingest", "session_start",
+    "get_memory_context", "update_memory", "forget_memory",
+    # forget_memory stays RESIDENT by design: deletion is a user right and
+    # hiding it behind a generic dispatcher is friction, not safety.
     # -- cross-library guard --
     # The workspace guide file outranks HIPPOCAMPUS_PERSIST_DIR; on ambiguous
     # resolution it only warns and falls back to the default library

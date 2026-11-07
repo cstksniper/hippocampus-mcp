@@ -383,6 +383,16 @@ class WriteService(BaseService):
         }
         if warnings:
             payload["warnings"] = warnings
+        # Correction-chain hint (naturalization P3: result-envelope teaching,
+        # zero standing cost — the resident docstring was slimmed on the
+        # promise this note carries the routing). Only on success AND when
+        # the update looks like a fact correction (content touched) or a
+        # supersede action — pure importance/tag tweaks stay quiet.
+        if success and ("content" in fields or "state" in fields):
+            payload.setdefault("note",
+                               "Correcting a fact: write the new version "
+                               "(ingest), then retire this one traceably with "
+                               "state='superseded' and superseded_by=<new id>.")
         return self._envelope(payload)
 
     # ---------------------------------------------------------------- Bulk tags

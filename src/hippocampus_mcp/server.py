@@ -455,21 +455,7 @@ async def store_memory(
     memory_type: str = "general", library: str = "",
     idem_key: str = "",
 ) -> str:
-    """Store one fact without raw-log provenance or entity linking.
-For long text or conversation transcripts, prefer ``ingest``.
-
-Returns include truncation self-report: embeddings have a 512-token hard limit.
-If ``truncated=true``, only the first ``embedded_chars`` characters contributed to
-the vector; the remaining text is split into additional <500-character cards.
-
-Args:
-    content: Memory text (required).
-    importance: 0.0 to 1.0; default 0.5.
-    memory_type: episodic / semantic / procedural / general; default general.
-    idem_key: Idempotency key. Retrying the same request key does not create a
-        duplicate or re-embed; it returns the existing ``memory_id`` with
-        ``status=duplicate``. Key by request, not by content hash.
-    """
+    """Bare single-fact write WITHOUT provenance; prefer ingest (L0 + entities + dedup). Args: content, importance 0-1, memory_type, idem_key."""
     await _await_warmup()
     svc = _write_service(library)
     return json.dumps(svc.store_memory(
@@ -494,36 +480,17 @@ async def recall(
     scope: str = "project", libraries: str = "",
     occurred_after: str = "", occurred_before: str = "",
 ) -> str:
-    """Semantic search for prior memories.
-Uses the shared scoring pipeline also used by ``brain.recall``: vector
-search with LNN temporal state, BM25 (RRF fusion), MMR, entity boosts,
-a hard relevance floor, and retired/quarantine filtering. Time-window
-and tag filtering narrow the candidate pool before scoring. Set
-``HIPPOCAMPUS_RECALL_FUSION=0`` to fall back to legacy additive scoring.
-
-Returns ``{count, memories[]}`` (not ``hits``). For assembled context, use
-``get_memory_context``. Overly long content is reported via ``content_truncated``.
-
-``score`` is an RRF fusion score (roughly 0.01-0.09 on a real library), not a
-cosine. Use the ``similarity`` field for cosine-scale thresholds; do not gate
-on ``score > 0.3``.
-
-Args:
-    query: Query text. Empty means implicit LNN temporal-state recall only.
-    top_k: Number of results; default 5.
-    use_lnn: Include LNN temporal state; default true.
-    sample: Distance-weighted sampling instead of greedy ranking; default false.
-    filter_tags: JSON object string narrowing candidates before retrieval, e.g.
-        ``{"chapter": 43}``. All keys are AND; multiple values in one key are OR.
-    scope: ``project`` (default), ``user``, or ``all``. For user/all, the response
-        self-reports ``scope`` and ``libraries``; ``top_k`` is the total count.
-    libraries: Explicit multi-library fan-out, comma-separated (up to 4). Each
-        result is marked with its ``library``. Mutually exclusive with
-        ``library=`` and ``scope=user|all``.
-    occurred_after / occurred_before: Inclusive UTC date window in YYYY-MM-DD.
-        Empty means unlimited. A time window narrows candidates; it does not
-        bypass pinned memories.
-    """
+    """Hybrid retrieval: vector + BM25 (RRF fusion) + MMR + entity bonus, hard relevance floor; shared scoring pipeline (R1). HIPPOCAMPUS_RECALL_FUSION=0 restores the legacy additive path.
+    
+    Call BEFORE asserting anything about the past; no hit is not proof of absence.
+    
+    Args:
+        query: natural sentence (Chinese OK). top_k: max entries (default 5).
+        filter_tags: JSON object, narrows BEFORE retrieval, e.g. {"chapter": 43}.
+        occurred_after / occurred_before: 'YYYY-MM-DD', inclusive window.
+        scope: project (default) | user | all; libraries='a,b' fans out to <=4 named libraries (mutually exclusive with scope=user/all).
+    
+    score is a fused RRF ranking point, NOT cosine - judge closeness by 'similarity'. Full text: get_memory; budgeted view: get_memory_context."""
     await _await_warmup()
     # filter_tags parsing, key-name whitelist validation, candidate narrowing,
     # and miss/count bookkeeping all live in RecallService.recall (parsing comes
@@ -563,25 +530,9 @@ async def update_memory(
     superseded_by: str = "",
     clear_quarantine: bool = False, library: str = "",
 ) -> str:
-    """Update selected fields of an existing memory.
-Only supplied fields change; omitted fields remain untouched.
-
-Use ``state="superseded"`` when a newer fact replaces an older one: the old
-record is retained but leaves default recall. Provide ``superseded_by`` with the
-replacement memory ID when available. Avoid overwriting content in place when
-the intent is correction, because that destroys the audit trail.
-
-Args:
-    memory_id: ID of the memory to update.
-    content: New content; omitted means no content change and no re-embedding.
-    importance: New importance; pass -1 or omit to leave unchanged.
-    memory_type: New memory type; omitted means unchanged.
-    state: ``active``, ``superseded``, or ``archived``. Other values error.
-    superseded_by: New memory ID that replaces this one; used with
-        ``state="superseded"``.
-    clear_quarantine: Promote a quarantined user-library write. Allowed only
-        from a home-library session; non-home callers receive an explicit error.
-    """
+    """Update only the provided fields of one memory (locate the id via recall). To retire an outdated fact: write the new version via ingest, then state='superseded' + superseded_by=<new id> (the result echoes this chain). clear_quarantine is a home-session-managed promotion.
+    
+    Args: memory_id; content; importance (-1 keep); memory_type; state active|superseded|archived; superseded_by."""
     await _await_warmup()
     svc = _write_service(library)
     # Validation (MemoryState legality / superseded_by existence) and field
@@ -650,16 +601,9 @@ Args:
 
 @server.tool(structured_output=False)
 async def forget_memory(memory_id: str, reason: str = "", library: str = "") -> str:
-    """Delete one memory and clean every derived copy.
-This is the correct entry point for “forget this.” It cascades through entity
-indexes, profiles, topic layers, and other derived state, writes a tombstone to
-prevent resurrection from old snapshots, and restores records that this memory
-had superseded.
-
-Args:
-    memory_id: ID of the memory to forget.
-    reason: Why it is being deleted; retained in the tombstone/audit trail.
-    """
+    """Delete one memory by id: cascade (entity index, L3 derivatives, tombstone). DESTRUCTIVE - confirm the id via recall first; prefer state='superseded' for corrections.
+    
+    Args: memory_id, reason."""
     await _await_warmup()
     svc = _write_service(library)
     return json.dumps(svc.forget_memory(memory_id=memory_id, reason=reason),
@@ -693,16 +637,7 @@ Args:
 async def list_memories(
     limit: int = 50, source: str = "", state: str = "", library: str = ""
 ) -> str:
-    """List memories with optional filters.
-Use ``state="superseded"`` to inspect replaced records; they are excluded from
-default recall but retained for history and audit.
-
-Args:
-    limit: Maximum number of records; default 50.
-    source: Exact source filter, such as a file path.
-    state: ``active``, ``superseded``, ``archived``, or empty for all.
-    library: Optional library override.
-    """
+    """List raw entries with metadata (source/state filters); audit path - recall is the search entry. Args: limit, source, state."""
     await _await_warmup()
     svc = _recall_service(library)
     return json.dumps(svc.list_memories(
@@ -1245,23 +1180,12 @@ async def ingest(
     auto_tags: bool = False, library: str = "",
     idem_key: str = "",
 ) -> str:
-    """Recommended write entry for conversation or document text.
-Stores the original text in L0, deterministically extracts L1 facts, links
-entities, and reports merge/dedup/truncation details. No LLM API call is required
-on the write path.
-
-Args:
-    text: Original conversation/document text.
-    speaker: Speaker label, such as ``user`` or a role name.
-    importance: 0 to 1; -1 lets the system infer importance.
-    cognitive_type: experience / world / opinion; empty lets the system infer.
-    entities: Comma-separated extra entity names; automatic extraction also runs.
-    source: Source label such as a file path or session; returned on recall hits.
-    tags: Structured tags as a JSON object string, e.g. ``{"chapter": 43}``.
-    auto_tags: Enable automatic tag extraction; default false.
-    idem_key: Idempotency key. Retrying the same request does not create a
-        duplicate L0/L1 write and returns the existing memory IDs.
-    """
+    """RECOMMENDED write entry: raw text -> L0 archive + extracted L1 facts + entity links; dedup, supersede detection, idem_key retries. Use for "remember this".
+    
+    Args:
+        text: verbatim. speaker: user|assistant|role. importance: -1 = auto.
+        cognitive_type: experience|world|opinion (blank = auto). entities: comma list.
+        source: origin label. tags: JSON object. idem_key: same key on retry = no duplicate."""
     await _await_warmup()
     svc = _write_service(library)
     # tags parsing (error body carries the library first key), sentinel
@@ -1304,21 +1228,11 @@ errors. Prefer this over repeated single ``ingest`` calls for bulk imports.
 async def get_memory_context(query: str = "", top_k: int = 5, token_budget: int = 1200,
                              item_max_chars: int = 200, filter_tags: str = "", library: str = "",
                              scope: str = "project") -> str:
-    """Recommended read entry for assembling Agent context.
-Runs state filtering, hybrid retrieval, MMR, entity expansion, conflict
-annotation, and budgeted five-slot assembly. The returned ``text`` is ready to
-prepend to a system prompt; ``blocks`` and ``hits`` remain available for
-programmatic use.
-
-Args:
-    query: Current task/question. Empty uses pinned-memory briefing.
-    top_k: Hits requested for the current-hits slot; default 5.
-    token_budget: Overall context budget; default 1200.
-    item_max_chars: Per-item clipping in the rendered text; default 200.
-        Pass 0 to disable clipping. ``hits`` always contain full content.
-    filter_tags: JSON object string narrowing retrieval, e.g. ``{"chapter": 43}``.
-    scope / libraries: Library selection semantics shared with ``recall``.
-    """
+    """Five-slot assembled context (hits / open todos / timeline / entity state / unfinished topics) under a char budget. For "what should I know right now"; point lookups use recall.
+    
+    Args:
+        query: empty = pinned brief. top_k: hit count. token_budget: whole-block chars (coarse). item_max_chars: per-line clip, 0 = off (numeric tails survive).
+        filter_tags: JSON object. scope: project | user only (no all)."""
     await _await_warmup()
     # filter_tags parsing (error body carries no envelope) and the J2 echo live
     # in RecallService.get_memory_context; parsing comes after library resolution,
@@ -1337,31 +1251,11 @@ async def session_start(task: str = "", recent_limit: int = 10,
                         pin_limit: int = 0, filter_tags: str = "",
                         client: str = "", library: str = "",
                         user_scope: int = 0, task_directory: int = 0) -> str:
-    """Call at session start, after compaction, or when resuming work.
-Returns a pre-activation package: recent memories, task recall, pinned items,
-knowledge map, overview, status, task profile, map index, active sessions, and a
-receipt.
-
-For compaction recovery, keep only the receipt identity (``session_id``,
-``assembled_at``, ``blocks``, ``memory_active``, ``knowledge_epoch``), do not copy
-prose, then call this tool again with that ``session_id``. Treat the new response
-as authoritative.
-
-Args:
-    task: Current task description; used for pre-recall and write origin.
-    recent_limit: Number of recent memories; default 10, 0 disables.
-    working_on: File/module being changed. Check ``active_sessions`` before editing.
-    task_top_k: Task-recall result count; default 5, 0 disables.
-    pin_limit: Pinned-slot count. 0 uses env (default 3); negative disables.
-    filter_tags: JSON object string narrowing task pre-recall.
-    client: Caller identity. Required on shared connections; otherwise the server
-        creates a synthetic ``sess_*`` identity.
-    library: Optional library override for this call/session.
-    user_scope: User-level inheritance slot count. 0 uses env (default 3);
-        negative disables the slot.
-    task_directory: User-level task-directory slot count. 0 uses env (default 8);
-        negative disables the slot.
-    """
+    """Open a session; return the pre-activation package (pins, profile, open topics, intents, task recall, receipt). Call at session start or after compaction - on compaction keep ONLY the receipt identity and call again. Check active_sessions before editing files.
+    
+    Args:
+        task: drives pre-recall and write attribution. working_on: module/file.
+        recent_limit / task_top_k / pin_limit / user_scope / task_directory: 0 = env default, negative = off."""
     await _await_warmup()
     return await _session_start_payload(
         task=task, recent_limit=recent_limit, working_on=working_on,
@@ -1425,20 +1319,12 @@ async def session_end(summary: str = "", open_topics: str | list[str] = "",
                       close_topics: str | list[str] = "",
                       session_id: str = "",
                       client: str = "", library: str = "") -> str:
-    """Call at session end or when the user stops work.
-Writes an L2 summary, records open topics, updates profile, triggers
-consolidation, and closes the session lifecycle.
-
-Args:
-    summary: One-paragraph session summary.
-    open_topics: Topics intentionally left unfinished; JSON array or comma list.
-    close_topics: Topics now finished; JSON array or comma list. Close topics
-        that have actually been resolved so the global backlog does not grow stale.
-    session_id: Optional explicit session to finalize. Only sessions owned by
-        this client may be finalized.
-    client: Caller identity. Required on shared connections.
-    library: Optional library override.
-    """
+    """Close THIS session: L2 summary, profile update, consolidate trigger, forced save.
+    
+    Args:
+        summary: one line. open_topics: unfinished topics (array or comma string).
+        close_topics: topics to close (exact text). client: caller id.
+    Skip entirely when this session never touched a hippocampus tool."""
     await _await_warmup()
     # P1: clear the task registration at session end so the next session does not
     # wrongly inherit the previous origin.task.
@@ -1907,10 +1793,7 @@ Empty library means the default/current library.
 
 @server.tool(structured_output=False)
 async def library_whoami() -> str:
-    """Report the library this session/call currently targets.
-Call this when the active library is uncertain. Write responses also self-report
-``library`` as their first key, so a wrong destination can be checked there too.
-    """
+    """Which library this session reads/writes (binding self-report). Call when the target library is uncertain; near-zero cost."""
     await _await_warmup()
     svc = _library_admin_service()
     return json.dumps(svc.whoami(), ensure_ascii=False)
