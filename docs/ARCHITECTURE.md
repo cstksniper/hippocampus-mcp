@@ -1,421 +1,475 @@
-# HippoMCP 架构总览
+# HippoMCP Architecture
 
-> 智能体的记忆底座 ｜ 对照 `src/hippocampus_mcp/` 实际代码
-> 相关联文档：[`README.md`](../README.md)（安装 / 宿主接入 / 工具面 / 评测口径）
-
----
-
-## 一、定位
-
-**HippoMCP 不是另一个 Agent 框架，而是智能体大脑里缺失的"存储部分"。**
-
-宿主（WorkBuddy / Claude Code / ZCode / 自研 Agent / 应用）负责推理与行动，
-HippoMCP 通过 MCP 协议负责四件事：**记住、想起、整理、以及把当下最该想起的东西按槽位递上去**。
-
-对标 Mem0，但战场划分不同——Mem0 的竞争点在"存 + 搜"，HippoMCP 的差异化在**用层**
-（会话生命周期、预激活、纠错级联、巩固与画像）。检索分数追平对手很难，用层体验目前没人做。
+> The memory substrate for agents ｜ Mirrors the actual code under `src/hippocampus_mcp/`
+> Related: [`README.md`](../README.md) (installation / host integration / tool surface / evaluation)
+> 🌐 中文版：[ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md) — the English edition below is the maintenance trunk.
 
 ---
 
-## 二、分层架构
+## Contents
+
+1. [Positioning](#1-positioning)
+2. [Layered architecture](#2-layered-architecture)
+3. [Storage model: four memory layers + index layer](#3-storage-model-four-memory-layers--index-layer)
+4. [Write path (ingest)](#4-write-path-ingest)
+5. [Recall path (recall / get_memory_context)](#5-recall-path-recall--get_memory_context)
+6. [Session lifecycle](#6-session-lifecycle)
+7. [Tech stack](#7-tech-stack)
+8. [Critical engineering constraints (where mistakes happen)](#8-critical-engineering-constraints-where-mistakes-happen)
+9. [Evaluation status and bottlenecks](#9-evaluation-status-and-bottlenecks)
+10. [Code map](#10-code-map)
+11. [Environment variables](#11-environment-variables)
+
+---
+
+## 1. Positioning
+
+**HippoMCP is not another agent framework — it is the missing "storage part" of an agent's brain.**
+
+The host (WorkBuddy / Claude Code / ZCode / your own agent / an application) handles reasoning and
+acting. HippoMCP, over the MCP protocol, does four things: **remember, recall, tidy up, and hand
+up — by slot — exactly what should be recalled right now**.
+
+It benchmarks against Mem0 with a different battlefield split: Mem0 competes on "store + search",
+while HippoMCP differentiates on the **usage layer** (session lifecycle, pre-activation,
+correction cascades, consolidation and profile). Matching a rival's retrieval scores is hard;
+nobody is yet competing on the usage-layer experience.
+
+---
+
+## 2. Layered architecture
 
 ```mermaid
 flowchart TB
-    HOST["宿主 Agent<br/>WorkBuddy / Claude Code / ZCode"]
-    SRV["MCP Server（FastMCP · stdio）<br/>46 个工具 · structured_output=False"]
-    subgraph BRAIN["HippoBrain 编排层（brain/core.py）"]
-        W["写侧 ingest<br/>L0 + L1 + 实体"]
-        R["读侧 recall<br/>融合 + MMR"]
-        U["用层 5 槽位<br/>拼进 system prompt"]
-        C["巩固 / 画像<br/>session_end"]
+    HOST["Host agent<br/>WorkBuddy / Claude Code / ZCode"]
+    SRV["MCP server (FastMCP · stdio)<br/>46 tools · structured_output=False"]
+    subgraph BRAIN["HippoBrain orchestration layer (brain/core.py)"]
+        W["Write side: ingest<br/>L0 + L1 + entities"]
+        R["Read side: recall<br/>fusion + MMR"]
+        U["Usage layer: 5 slots<br/>pasted into the system prompt"]
+        C["Consolidation / profile<br/>session_end"]
     end
-    subgraph MGR["MemoryManager 引擎层（engine/manager.py）"]
-        V["向量检索<br/>numpy"]
-        S["打分引擎<br/>加法公式"]
-        L["LNN / CfC<br/>时序状态"]
+    subgraph MGR["MemoryManager engine layer (engine/manager.py)"]
+        V["Vector search<br/>numpy"]
+        S["Scoring engine<br/>additive formula"]
+        L["LNN / CfC<br/>temporal state"]
     end
-    HOST -->|"MCP stdio（JSON-RPC）"| SRV
+    HOST -->|"MCP stdio (JSON-RPC)"| SRV
     SRV --> BRAIN
     BRAIN --> MGR
-    MGR --> STORE["存储层<br/>memories.json + vectors.npz + lnn_state.pt"]
+    MGR --> STORE["Storage layer<br/>memories.json + vectors.npz + lnn_state.pt"]
 ```
 
-**为什么分层**：`server.py` 只做协议适配与参数校验，`brain/core.py` 承担全部业务语义
-（分层、萃取、融合、状态机），`engine/manager.py` 保持"向量 / 时序 / 打分"的纯工程职责。
-这样换宿主不需要动业务，换检索策略不需要动协议。
+**Why layers**: `server.py` only adapts the protocol and validates parameters; `brain/core.py`
+carries all business semantics (layering, extraction, fusion, state machines);
+`engine/manager.py` keeps the pure engineering duties of "vectors / time / scoring".
+Swapping hosts then never touches business logic, and swapping retrieval strategy never
+touches the protocol.
 
 ---
 
-## 三、存储模型：四层记忆 + 索引层
+## 3. Storage model: four memory layers + index layer
 
 ```mermaid
 flowchart TB
-    L3["L3 画像层 profile<br/>长期稳定偏好与事实 · 低置信不入 · 冲突不覆盖"]
-    L2["L2 摘要层 summaries<br/>会话摘要 + 主题聚合（攒够 N 条上卷）"]
-    L1["L1 事实层 memories<br/>萃取事实 + 状态机 + 认知类型 + 标签"]
-    L0["L0 原始层 raw_log<br/>原始对话流水 · append-only · 永不改写"]
-    IDX["索引层 entities<br/>实体表 + 记忆倒排 + 共现边"]
+    L3["L3 profile layer: profile<br/>long-term stable preferences & facts · low confidence never enters · conflicts never overwrite"]
+    L2["L2 summary layer: summaries<br/>session summaries + topic roll-ups (N facts trigger a roll-up)"]
+    L1["L1 fact layer: memories<br/>extracted facts + state machine + cognitive type + tags"]
+    L0["L0 raw layer: raw_log<br/>raw dialogue stream · append-only · never rewritten"]
+    IDX["Index layer: entities<br/>entity table + memory inverted index + co-occurrence edges"]
     L3 --- L2 --- L1 --- L0
-    L1 -.->|"source_ids 回指"| L0
+    L1 -.->|"source_ids point back"| L0
     L1 -.->|"entity_ids"| IDX
 ```
 
-| 层 | 内容 | 关键约束 |
+| Layer | Content | Key constraint |
 |---|---|---|
-| **L3 画像** | 长期偏好 / 稳定事实 | 低置信不入；冲突只提示不覆盖 |
-| **L2 摘要** | 会话摘要 | **不入检索路径**：写完只在开场显示最近 2–3 条，即沉睡 |
-| **L2T 主题** | L1 事实的**派生聚类**：知识点骨架 + 成员 + 代表句 | **不进 `recall`**（实测教训：摘要类内容进检索把 F1 从 .311 打到 .200）；出口＝`knowledge_map`（列结构）/ `knowledge_topic`（读写单个知识点）工具与开场 `block_knowledge` 槽 |
-| **L1 事实** | 萃取事实 + 状态机 + 认知类型 + 结构化标签 | 检索主战场 |
-| **L0 原始** | 原始对话流水 | append-only，**保证"核对原话"能力，是反幻觉的基础** |
-| **索引层** | 实体表 + 实体↔记忆倒排 + 共现边 | P0 实体图的前身 |
+| **L3 profile** | long-term preferences / stable facts | low confidence never enters; conflicts only surface, never overwrite |
+| **L2 summary** | session summaries | **not in the retrieval path**: after a write, only the latest 2–3 show in the opening pack, then it sleeps |
+| **L2T topic** | **derived clustering** of L1 facts: knowledge skeleton + members + representative sentences | **never in `recall`** (measured lesson: summaries in retrieval dropped F1 from .311 to .200); exits = the `knowledge_map` (list structure) / `knowledge_topic` (read/write one topic) tools and the opening pack's `block_knowledge` slot |
+| **L1 fact** | extracted facts + state machine + cognitive type + structured tags | the main battleground of retrieval |
+| **L0 raw** | raw dialogue stream | append-only; **guarantees the "check the original words" ability — the foundation of anti-hallucination** |
+| **index** | entity table + entity↔memory inverted index + co-occurrence edges | forerunner of the P0 entity graph |
 
-### L1 上的三个枚举
+### Three enums on L1
 
 ```python
-MemoryState    active / superseded / archived      # 生命周期
-CognitiveType  experience / world / opinion        # 认识论来源，引用时区别对待
+MemoryState    active / superseded / archived      # lifecycle
+CognitiveType  experience / world / opinion        # epistemic origin; treat citations differently
 MemoryType     episodic / semantic / procedural / general
 ```
 
-- **`superseded` 不删除**——事实被取代时标记并指向取代者，时序类与知识更新类问题直接受益。
-- **`importance >= 0.7` 自动 `pin`**——豁免时间衰减。
+- **`superseded` is never deleted** — when a fact is replaced it is flagged and points at its
+  successor; temporal questions and knowledge-update questions benefit directly.
+- **`importance >= 0.7` auto-`pin`s** — exempt from time decay.
 
-### 层间关系（删改的硬约束）
+### Cross-layer relations (hard constraints on deletion/editing)
 
-> **L2 / L2T 主题 / L3 / 索引层都是 L1 的派生副本。只删 L1 等于假删除。**
+> **L2 / L2T topics / L3 / the index layer are all derived copies of L1. Deleting L1 alone is a
+> fake delete.**
 >
-> 主题层（L2T）落在 `brain_knowledge.json`，由 `src/hippocampus_mcp/domain/topic.py` 计算：受信任实体锚点 + 余弦凝聚（leader 型贪心扫描，O(n·k) 而非 O(n²)，质心增量维护、**不存质心**）。它回答的是「这个库有哪些知识点」——L1 平铺、L2 只有会话摘要、L3 是热点条目，没有其他工具能回答这个问题。代表句是**抽取式摘录**（离质心最近的几条原文），**不是归纳**：归纳需要智能，而生产路径不内嵌 LLM，由宿主完成后写回。
+> The topic layer (L2T) lives in `brain_knowledge.json`, computed by
+> `src/hippocampus_mcp/domain/topic.py`: trusted entity anchors + cosine leader clustering
+> (leader-style greedy scan, O(n·k) rather than O(n²), incremental centroid maintenance,
+> **centroids are not stored**). It answers "what knowledge topics does this library have" —
+> L1 is flat, L2 only has session summaries, L3 is hot entries; no other tool answers this.
+> Representative sentences are **extractive quotes** (the originals closest to the centroid),
+> **not abstractions**: abstraction needs intelligence, and the production path embeds no LLM —
+> the host does it and writes the result back.
 
-- 只从 L1 物理删除 → 画像里的错误文字仍会拼进上下文，实体倒排留下悬挂引用。
-- 唯一合法入口是 `brain.forget(id, reason)`，级联 6 步：实体倒排 → 画像层 →
-  被取代者恢复 → L0 来源标记 → 墓碑 → 重算实体统计。
-- `mention_count ≡ len(memory_ids)`，加载后全量重算，防历史脏数据虚高。
+- Physically deleting only from L1 → wrong profile text still gets assembled into context, and
+  the entity inverted index keeps dangling references.
+- The only legal entry is `brain.forget(id, reason)`, cascading 6 steps: entity inverted index →
+  profile layer → revive superseded entries → L0 source flagging → tombstones → recompute entity stats.
+- `mention_count ≡ len(memory_ids)`, fully recomputed on load, so historical dirty data cannot inflate it.
 
 ---
 
-## 四、写入链路（ingest）
+## 4. Write path (ingest)
 
 ```mermaid
 flowchart LR
-    A["对话原文"] --> B["L0 追加<br/>append-only"]
-    B --> C["萃取成 L1<br/>切分 · 认知类型 · 权重"]
-    C --> D["去重 / 挂实体<br/>dedup ≥ 0.85"]
+    A["Raw dialogue"] --> B["L0 append<br/>append-only"]
+    B --> C["Extract into L1<br/>splitting · cognitive type · weight"]
+    C --> D["Dedup / attach entities<br/>dedup >= 0.85"]
 ```
 
-- **去重合并语义**：相似度 ≥ `dedup_threshold`（默认 0.85）时**不新建**，合并进那条**仍为 active** 的记忆
-  —— `content` 取更长者、`timestamp` 取最新、`importance` 取最大、
-  `source_ids` / `entity_ids` 取**并集**、`pin` 与 `importance` 同步。
-- 候选是 `superseded` / `archived` 时**改为新建**——否则新内容一进来就被状态过滤隐身。
-- `ingest_batch`：逐项错误隔离，批内不逐条落盘不逐条巩固，上限 `INGEST_BATCH_MAX = 2000`。
-- **`ingest` 与 `store_memory` 的区别**：前者原文进 L0、萃取进 L1、自动挂实体；
-  后者只裸写 L1 单条，**不产生 L0 溯源、不建实体**。
+- **Dedup merge semantics**: at similarity >= `dedup_threshold` (default 0.85) a new record is
+  **not** created; content merges into the matching memory that is **still active** —
+  `content` takes the longer, `timestamp` the newest, `importance` the max,
+  `source_ids` / `entity_ids` the **union**, and `pin` stays in sync with `importance`.
+- When the candidate is `superseded` / `archived`, **create new instead** — otherwise the new
+  content would be invisible the moment it lands, hidden by the state filter.
+- `ingest_batch`: per-item error isolation; no per-item persistence or per-item consolidation
+  within the batch; cap `INGEST_BATCH_MAX = 2000`.
+- **`ingest` vs `store_memory`**: the former sends the raw text to L0, extracts into L1, and
+  attaches entities automatically; the latter writes one bare L1 record — **no L0 provenance,
+  no entities**.
 
 ---
 
-## 五、召回链路（recall / get_memory_context）
+## 5. Recall path (recall / get_memory_context)
 
 ```mermaid
 flowchart LR
-    Q["查询 query"] --> V["向量路<br/>top_k×4 候选"]
-    Q --> B["BM25 路"]
-    V --> F["RRF 融合"]
+    Q["Query"] --> V["Vector lane<br/>top_k×4 candidates"]
+    Q --> B["BM25 lane"]
+    V --> F["RRF fusion"]
     B --> F
-    F --> G["硬门槛 + 状态过滤<br/>+ MMR 去重"]
-    G --> O["结果 / 5 槽位装配"]
+    F --> G["Hard floor + state filter<br/>+ MMR dedup"]
+    G --> O["Results / 5-slot assembly"]
 ```
 
-### 打分公式（默认 RRF 融合）
+### Scoring formula (RRF fusion, the default)
 
 ```
-fused  = Σ_lane  w_lane / (60 + rank_lane)      # 向量路 w=1.0，字面路 w=bm25_weight
+fused  = Σ_lane  w_lane / (60 + rank_lane)      # vector lane w=1.0, literal lane w=bm25_weight
 score  = fused + 0.1 · vec_score + 0.03 · time_decay + entity_bonus(0.12)
-         （× nav_penalty / × pin 折扣，按记录字段）
+         (× nav_penalty / × pin discount, per record fields)
 ```
 
-> **尺度警告**：`score` 现在是 RRF 融合分（实测真库约 0.01–0.09），
-> **不再是余弦量级**。原始余弦在各条目的 `similarity` 字段里，两者别混用；
-> 任何依赖 `score > 0.3` 类阈值的宿主规则必须改用 `similarity`。
+> **Scale warning**: `score` is now an RRF fusion score (measured ~0.01–0.09 on a real library)
+> and is **no longer cosine-magnitude**. The raw cosine lives in each entry's `similarity`
+> field; do not mix the two. Any host rule that thresholds on `score > 0.3`-style values must
+> switch to `similarity`.
 
-### 回退路径（`HIPPOCAMPUS_RECALL_FUSION=0`）
+### Fallback path (`HIPPOCAMPUS_RECALL_FUSION=0`)
 
 ```
 score = 0.95 · sim + 0.03 · time_decay − 0.02 · recall_boost
 ```
 
-> 加法公式在 LoCoMo 上 MRR@5 从 0.042 提升到 0.183（**4.4 倍**）。
-> 关键点是**负 recall 权重当多样性惩罚**；乘法公式已弃用。
-> 这条公式在 R1 之后只用于回退路径，默认不再走它。
+> The additive formula lifted MRR@5 from 0.042 to 0.183 on LoCoMo (**4.4×**).
+> The key is the **negative recall weight acting as a diversity penalty**; the multiplicative
+> formula is deprecated. After R1 this formula is fallback-only — the default path no longer
+> uses it.
 
-### 融合后的加分与闸门
+### Post-fusion boosts and gates
 
-| 机制 | 参数 | 作用 |
+| Mechanism | Parameter | Effect |
 |---|---|---|
-| 相关性硬门槛 | `RELEVANCE_HARD_FLOOR = 0.30` | 阻断"摘要层和什么都相似"而霸榜 |
-| 实体桥接加成 | `ENTITY_BONUS = 0.12` | 跨越语义鸿沟（向量低但实体对上） |
-| 字面豁免 | `MMR_LITERAL_EXEMPT_TOPN = 3` | BM25 前 N 名豁免 MMR，防"带章号那条"被近义项折叠 |
-| 导航降权 | `nav_penalty`，默认 1.0 | 默认**不生效**，需导入端显式打标并配折扣 |
-| 冲突标注 | `annotate_conflicts` | 打 `conflict_group` / `conflict_with` / `newer`，**只标注不折叠** |
+| Relevance hard floor | `RELEVANCE_HARD_FLOOR = 0.30` | blocks "the summary layer is similar to everything" from dominating |
+| Entity-bridge boost | `ENTITY_BONUS = 0.12` | crosses the semantic gap (low vector, right entity) |
+| Literal exemption | `MMR_LITERAL_EXEMPT_TOPN = 3` | exempts BM25's top N from MMR, so "the entry with the chapter number" is not folded away by near-synonyms |
+| Navigation down-weight | `nav_penalty`, default 1.0 | **inert by default**; requires the ingest side to tag explicitly plus a configured discount |
+| Conflict annotation | `annotate_conflicts` | adds `conflict_group` / `conflict_with` / `newer` — **annotates only, never folds** |
 
-### 两个入口不要混用
+### Do not mix the two entries
 
-| | `get_memory_context`（推荐） | `recall`（底层） |
+| | `get_memory_context` (recommended) | `recall` (low level) |
 |---|---|---|
-| 检索 | 在 `recall` 之上加槽位编排 + token 预算 | 向量 + BM25(RRF) + MMR + 实体加成 + 硬门槛 |
-| 状态过滤 | 过 superseded / archived | **同样过**（固定 `include_superseded=False`，MCP 工具无逃生参数） |
-| 用途 | 递给宿主的上下文 | 调试 / 程序化调用 |
+| Retrieval | slot orchestration + token budget on top of `recall` | vector + BM25 (RRF) + MMR + entity boost + hard floor |
+| State filter | filters superseded / archived | **the same** (fixed `include_superseded=False`; the MCP tool has no escape parameter) |
+| Use | context handed to the host | debugging / programmatic calls |
 
-> R1（2026-11-06）起两个入口共用 `retrieval/recall_pipeline.run_recall_pipeline`：
-> MCP `recall` 经 `RecallService._recall_one`，`brain.recall` 经薄壳；
-> 打分、排序、状态过滤逐位一致。差别只在呈现层——MCP 工具把结果
-> 适配成 14 键信封并关闭冲突标注。`HIPPOCAMPUS_RECALL_FUSION=0`
-> 可回退到旧的加法打分路径（此时上表右列不成立）。
-> `include_superseded` 逃生参数只存在于 `brain.recall` / `entity_profile`，
-> **不在** MCP `recall` 工具上。
-> 已知缺陷：状态过滤发生在候选循环内，而 `fetch_k` 取在过滤**之前**
-> ⇒ 作废条目多的库里，有效条数会被作废项挤掉（名额稀释）。
+> Since R1 (2026-11-06) both entries share `retrieval/recall_pipeline.run_recall_pipeline`:
+> the MCP `recall` goes through `RecallService._recall_one`, `brain.recall` through a thin
+> shell; scoring, ordering and state filtering are identical bit for bit. The difference is
+> presentation only — the MCP tool adapts results into a 14-key envelope and switches conflict
+> annotation off. `HIPPOCAMPUS_RECALL_FUSION=0` falls back to the old additive scoring path
+> (which voids the right column above). The `include_superseded` escape parameter exists only
+> on `brain.recall` / `entity_profile`, **not** on the MCP `recall` tool.
+> Known defect: state filtering happens inside the candidate loop while `fetch_k` is taken
+> **before** filtering ⇒ in libraries with many superseded entries, live entries get crowded
+> out of the quota (quota dilution).
 
-### 5 槽位（用层核心）
+### The 5 slots (core of the usage layer)
 
-`get_memory_context` 不平铺 top-k，而是按固定槽位装配，可直接拼进 system prompt：
+`get_memory_context` does not flatten a top-k; it assembles fixed slots, ready to paste into a
+system prompt:
 
-| 槽位 | 内容 | 来源 |
+| Slot | Content | Source |
 |---|---|---|
-| `block_1` | 当前任务的直接命中记忆（MMR 去重） | L1 |
-| `block_2` | 未决问题 / 待办意图（≤5） | WorkMemory |
-| `block_3` | 时间线位置：最近会话摘要 | L2 |
-| `block_4` | 相关实体状态（实体→事实） | 索引层 |
-| `block_5` | 上次结论 / 未完结话题 | SessionState |
+| `block_1` | direct hits for the current task (MMR-deduped) | L1 |
+| `block_2` | open questions / pending intents (≤5) | WorkMemory |
+| `block_3` | timeline position: recent session summaries | L2 |
+| `block_4` | related entity states (entity → facts) | index layer |
+| `block_5` | last conclusions / unfinished topics | SessionState |
 
-> **`block_4` 有独立预算**，不随 `top_k` 膨胀（`BLOCK4_MAX_ENTITIES=3` / 每实体 3 条 / 全块 400 字符）。
-> 原因：上下文越多，模型越不敢答。
+> **`block_4` has its own budget** and does not grow with `top_k`
+> (`BLOCK4_MAX_ENTITIES=3` / 3 entries per entity / 400 characters for the block).
+> Reason: the more context you stuff in, the less the model dares to answer.
 
 ---
 
-## 六、会话生命周期
+## 6. Session lifecycle
 
 ```mermaid
 flowchart LR
-    S["session_start<br/>预激活包"] --> I["ingest<br/>干活中写入"]
-    I --> G["get_memory_context<br/>需要回忆"]
-    G --> E["session_end<br/>摘要 + 画像 + 巩固"]
+    S["session_start<br/>pre-activation pack"] --> I["ingest<br/>write while working"]
+    I --> G["get_memory_context<br/>recall when needed"]
+    G --> E["session_end<br/>summary + profile + consolidation"]
 ```
 
 ---
 
-## 七、技术栈
+## 7. Tech stack
 
-| 层 | 技术 | 说明 |
+| Layer | Technology | Notes |
 |---|---|---|
-| 协议 | **MCP** + FastMCP SDK | stdio + JSON-RPC，46 个工具 |
-| 稠密检索 | sentence-transformers | 默认 `all-MiniLM-L6-v2`（384D，**英文评测口径**）；中文用 `BAAI/bge-base-zh-v1.5`（768D） |
-| 稀疏检索 | **自研 BM25 + RRF** | 补向量的字面盲区（章号、数额、专名） |
-| 时序编码 | **ncps CfC**（闭式连续时间）+ AutoNCP | 隐式查询向量，HippoMCP 的差异项 |
-| 向量库 | **自研 numpy VectorStore** | 分块 matmul 余弦；**唯一受支持后端**，传其他值显式报错 |
-| 重排去重 | MMR（带字面豁免） | 检索失败往往是重排问题而非召回问题 |
-| 实体抽取 | spaCy（英文）+ 启发式 / 词库（中文） | CJK 跳过 spaCy |
-| 持久化 | JSON + npz + pt 三分离 | 带滚动备份与损坏隔离 |
-| 评测 | LoCoMo `locomo10` | LLM-as-judge |
+| Protocol | **MCP** + FastMCP SDK | stdio + JSON-RPC, 46 tools |
+| Dense retrieval | sentence-transformers | default `all-MiniLM-L6-v2` (384D, **English evaluation setup**); for Chinese `BAAI/bge-base-zh-v1.5` (768D) |
+| Sparse retrieval | **in-house BM25 + RRF** | covers the vector lane's literal blind spots (chapter numbers, amounts, proper names) |
+| Temporal encoding | **ncps CfC** (closed-form continuous time) + AutoNCP | implicit query vectors; HippoMCP's differentiator |
+| Vector store | **in-house numpy VectorStore** | blocked matmul cosine; **the only supported backend** — any other value fails loudly |
+| Rerank/dedup | MMR (with literal exemption) | retrieval failure is usually a reranking problem, not a recall problem |
+| Entity extraction | spaCy (English) + heuristics / lexicon (Chinese) | CJK skips spaCy |
+| Persistence | JSON + npz + pt, three-way split | with rolling backups and corruption isolation |
+| Evaluation | LoCoMo `locomo10` | LLM-as-judge |
 
-### 嵌入器协议（四件套，强制）
+### The embedder protocol (four pieces, enforced)
 
 ```
-embed(text)         文档侧（写入时用）
-embed_query(text)   查询侧（召回一律走它，BGE 在此加指令前缀）
-embed_batch(texts)  批量
-model_key           多模型向量库的槽位键
+embed(text)         document side (used on write)
+embed_query(text)   query side (all recall goes through it; BGE adds its instruction prefix here)
+embed_batch(texts)  batch
+model_key           slot key of the multi-model vector store
 ```
 
-`create_embedder()` 强制校验，缺任一方法在**初始化期**抛 `TypeError`，而不是等召回才炸。
+`create_embedder()` validates strictly: a missing method raises `TypeError` **at
+initialization**, not at first recall.
 
 ---
 
-## 八、关键工程约束（会做错事的部分）
+## 8. Critical engineering constraints (where mistakes happen)
 
-1. **模型解析唯一真相源** `embeddings.resolve_embedder_model()`（参数 > env > 默认）。
-   "静默回落 MiniLM"是**默认参数问题**，不是异常兜底。别处不许抄 env 字面量。
-2. **模型跟随库内数据**：不符 + 显式指定 → 报错；不符 + 默认 → 跟随库内模型。
-   `reembed.py` 是**唯一合法换模型入口**。
-3. **向量与本体解耦**：`MemoryRecord.embeddings: dict[model_key, vec]`，旧向量归 `__legacy__`。
-   删掉 `.npz` 不会丢记忆。
-4. **时间基准必须 `_reference_time or time.time()`**：裸 `time.time()` 会让老记忆
-   永久豁免归档，机制反向失效。
-5. **`recall_count` 记候选集，`last_recalled_at` 记结果集**——否则沉寂归档被稀释成
-   "每次查询给十来条记录续命"。
-6. **46 个工具必须带 `structured_output=False`**：否则返回双份。stdout 是协议通道，
-   **所有日志必须走 stderr**。
-7. **过滤必须在检索前**：`search(allow_ids=)` 用 `-inf` 屏蔽白名单外；**BM25 路必须显式过滤**，
-   否则字面命中会绕过。
-8. **跨进程写同一目录：默认"冲突即合并"**。脏集重放，脏集只在完全写成功后清空。
-   逃逸舱 `MULTI_WRITER=0`（报错）/ `ALLOW_STALE_SAVE=1`（强制覆盖）。
-9. **预热等待必须有界**：`HIPPOCAMPUS_WARMUP_TIMEOUT` 默认 90s，**必须 < 宿主 120s**。
-   超预算抛 `WarmupPendingError`，失败抛 `WarmupFailedError`（不伪装成超时）。
-10. **顶层导入不得引入重库**：`TYPE_CHECKING` + 惰性 `_brain_class()`。
-    torch 可在事件循环后导入，**scipy 不行**。
-11. **改 `store/memory.py` 后必须同步 `store/__init__.py`**。
-12. **写文件后必须回读**：仓库换行符是混合的（`src/store/*.py` 全 LF、`src/*.py` 多为 CRLF），
-    替换前先探测，别假设。
+1. **Single source of truth for model resolution**: `embeddings.resolve_embedder_model()`
+   (parameter > env > default). "Silently falling back to MiniLM" is a **default-parameter
+   problem**, not an exception fallback. No copying env literals elsewhere.
+2. **The model follows the data inside the library**: mismatch + explicit request → error;
+   mismatch + default → follow the library's model. `reembed.py` is **the only legal
+   model-swap entry**.
+3. **Vectors decoupled from the record**: `MemoryRecord.embeddings: dict[model_key, vec]`,
+   old vectors land in `__legacy__`. Deleting the `.npz` never loses memories.
+4. **Time base must be `_reference_time or time.time()`**: bare `time.time()` grants old
+   memories a permanent dormancy exemption — the mechanism silently inverts.
+5. **`recall_count` counts the candidate set, `last_recalled_at` the result set** — otherwise
+   dormancy archiving gets diluted into "every query grants a dozen records a life extension".
+6. **All 46 tools must carry `structured_output=False`**: otherwise responses double. stdout is
+   the protocol channel — **all logging must go to stderr**.
+7. **Filter before retrieval**: `search(allow_ids=)` masks non-whitelisted ids with `-inf`;
+   **the BM25 lane must filter explicitly**, otherwise literal hits bypass it.
+8. **Cross-process writes to one directory: "conflict means merge" by default**. Dirty sets
+   replay, and clear only after a fully successful write. Escape hatches: `MULTI_WRITER=0`
+   (error out) / `ALLOW_STALE_SAVE=1` (force overwrite).
+9. **Warmup waits must be bounded**: `HIPPOCAMPUS_WARMUP_TIMEOUT` defaults to 90s and **must
+   stay < the host's 120s**. Over-budget raises `WarmupPendingError`; failure raises
+   `WarmupFailedError` (never disguised as a timeout).
+10. **Top-level imports must not pull heavy libraries**: `TYPE_CHECKING` + a lazy
+    `_brain_class()`. torch may be imported after the event loop starts; **scipy may not**.
+11. **After changing `store/memory.py`, sync `store/__init__.py`**.
+12. **Read back after writing files**: this repo's line endings are mixed (`src/store/*.py`
+    all LF; `src/*.py` mostly CRLF) — probe before replacing, never assume.
 
 ---
 
-## 九、评测现状与瓶颈
+## 9. Evaluation status and bottlenecks
 
-| 版本 | F1 | mrr3 | hit3 | 说明 |
+| Version | F1 | mrr3 | hit3 | Notes |
 |---|---:|---:|---:|---|
-| V9 纯向量+白化+BM25 | .286 | .287 | .350 | 检索指标最好 |
-| V9b +Rerank5 | .295 | .212 | .275 | rerank 提 F1、**损检索** |
+| V9 pure vector + whitening + BM25 | .286 | .287 | .350 | best retrieval metrics |
+| V9b +Rerank5 | .295 | .212 | .275 | rerank lifts F1, **hurts retrieval** |
 | V9c +NER1.1 | .303 | .212 | .275 | |
-| **V9d +Rerank10+NER1.2** | **.311** | .221 | .300 | 当前最优 |
-| V9e Rerank15 | .277 | .221 | .300 | 过犹不及 |
-| **V9f 实体图+2跳扩散** | **.200** | .050 | .050 | **灾难** |
+| **V9d +Rerank10+NER1.2** | **.311** | .221 | .300 | current best |
+| V9e Rerank15 | .277 | .221 | .300 | too much of a good thing |
+| **V9f entity graph + 2-hop diffusion** | **.200** | .050 | .050 | **disaster** |
 
-**V9d 分类 F1**：单跳 .357 / 对抗 1.0 / 时序 .116 / **多跳 .081** / **开放域 0.0**
+**V9d per-class F1**: single-hop .357 / adversarial 1.0 / temporal .116 / **multi-hop .081** /
+**open-domain 0.0**
 
-### ⚠️ 三条必须写在明面上的诚实声明
+### ⚠️ Three honesty statements that must stay in the open
 
-1. **评测口径非标准**：只用了 `locomo10` 的 **50 道 QA + 40 道检索**，
-   而 Mem0 论文的协议是 **1,540 道题、排除对抗类**。样本量差 30 倍，**不可直接对比**。
-2. **"超越 Mem0"是自建口径下的结果**：`Mem0 0.285` 是本地复现值，不是论文值。
-   论文中 Mem0 的公开 F1 为单跳 38.72 / 多跳 28.64 / 开放域 47.65 / 时序 48.93
-   —— 尤其在**时序**上，本地复现得到 0.000 而论文是 48.93，这个落差必须先解释清楚，
-   否则会成为开源后的第一个质疑点。
-3. **优势不稳健**：同一配置在 Judge-A 下 +9.1%、Judge-B 下 **−7.2%**（方向反转）。
-   **跨模型对比必须先固定 LLM。**
+1. **The evaluation setup is non-standard**: it uses only `locomo10`'s **50 QA + 40 retrieval**
+   items, while the Mem0 paper's protocol is **1,540 questions with adversarial excluded**.
+   A 30× sample-size gap — **the numbers are not directly comparable**.
+2. **"Beats Mem0" holds only under our own setup**: `Mem0 0.285` is a locally reproduced value,
+   not the paper's. The paper's published Mem0 F1 is single-hop 38.72 / multi-hop 28.64 /
+   open-domain 47.65 / temporal 48.93 — in **temporal** especially, local reproduction scored
+   0.000 against the paper's 48.93. That gap must be explained up front, or it becomes the
+   first objection after open-sourcing.
+3. **The advantage is not robust**: the same configuration scores +9.1% under Judge-A and
+   **−7.2%** under Judge-B (direction flips). **Cross-model comparisons must pin the LLM first.**
 
-### 已知短板（按优先级）
+### Known shortcomings (by priority)
 
-1. **多跳 .081**（P0）——先复盘 V9f 的失败，再定路线（查询分解 / 两轮迭代检索 / 实体约束重排）
-2. **开放域 0.0**——主因在**检索**而非 prompt（10 道里 7 道 evidence 没进 top-3）
+1. **Multi-hop .081** (P0) — post-mortem the V9f failure first, then pick a route (query
+   decomposition / two-pass iterative retrieval / entity-constrained reranking)
+2. **Open-domain 0.0** — mostly a **retrieval** problem, not a prompt problem (in 7 of 10
+   questions the evidence never reached top-3)
 
 ---
 
-## 十、代码地图
+## 10. Code map
 
-> 关键文件导览（**非全量**）：每层只列入口与核心文件；完整文件清单以 `src/hippocampus_mcp/` 目录为准。
+> A guided tour of key files (**not exhaustive**): each layer lists entries and core files
+> only; the full inventory is the `src/hippocampus_mcp/` directory itself.
 
 ```
 src/hippocampus_mcp/
 │
-├─ ★ 入口层（扁平，不可再分层）
-├── server.py            MCP 工具面（46 个工具）+ 剖面门控 + 预热/等待/单例守卫
-├── cli.py               命令行入口
-├── launcher.py          共享 daemon 启动器
-├── daemon.py            常驻进程（空闲自退）
-├── prewarm.py           进程树改写（预热）
-├── bridge.py            会话桥接
+├─ ★ Entry layer (flat; must not be nested deeper)
+├── server.py            MCP tool surface (46 tools) + profile gating + warmup/wait/singleton guards
+├── cli.py               command-line entry
+├── launcher.py          shared daemon launcher
+├── daemon.py            resident process (idles out by itself)
+├── prewarm.py           process-tree rewrite (warmup)
+├── bridge.py            session bridging
 │
-├─ brain/                编排层 HippoBrain（原单文件 brain.py）
-│   ├── __init__.py      命名空间再导出，包外 `from ..brain import X` 一行未改
-│   ├── core.py          主类：分层 / 萃取 / 融合 / 状态机 / 巩固
-│   ├── pure.py          无状态 mixin（打分公式、块渲染）
-│   ├── entity.py        实体词典与别名归一
-│   └── session.py       会话续接与开场包
+├─ brain/                orchestration layer HippoBrain (formerly single-file brain.py)
+│   ├── __init__.py      namespace re-exports; `from ..brain import X` unchanged outside
+│   ├── core.py          main class: layering / extraction / fusion / state machines / consolidation
+│   ├── pure.py          stateless mixins (scoring formulas, block rendering)
+│   ├── entity.py        entity lexicon and alias normalization
+│   └── session.py       session continuation and the opening pack
 │
-├─ engine/               引擎层
-│   ├── manager.py       MemoryManager：向量 + 时序 + 打分
-│   ├── embeddings.py    嵌入器（四件套协议 + 模型解析唯一真相源）
-│   ├── onnx_embedder.py ONNX 后端
-│   ├── model_lifecycle.py  模型租约与空闲卸载
-│   └── model_cache.py   模型缓存自省与回收（`models` 子命令的后端）
+├─ engine/               engine layer
+│   ├── manager.py       MemoryManager: vectors + time + scoring
+│   ├── embeddings.py    embedders (four-piece protocol + the single source of model resolution)
+│   ├── onnx_embedder.py ONNX backend
+│   ├── model_lifecycle.py  model leases and idle unloading
+│   └── model_cache.py   model-cache introspection and eviction (backend of the `models` subcommand)
 │
-├─ map/                  信息地图层（状态寄存器）
-│   ├── store.py         地图存储
-│   ├── auto.py          自动校验
-│   ├── mention.py       提及漂移
-│   ├── file_registry.py 项目文件建档（签名比对）
-│   └── constants.py     地图层阈值
+├─ map/                  information-map layer (state register)
+│   ├── store.py         map storage
+│   ├── auto.py          automatic verification
+│   ├── mention.py       mention drift
+│   ├── file_registry.py project file registry (signature comparison)
+│   └── constants.py     map-layer thresholds
 │
-├─ domain/               纯领域逻辑（零包内依赖，可单测）
-│   ├── topic.py         主题层 L2T：聚类 / 成员维护 / 抽取式代表句 / 覆盖统计
-│   ├── aliases.py       实体别名发现（四条领域无关信号 + 两轮扫）
-│   ├── tagging.py       可配置标签抽取器（后缀 → 族 → 键名 两层映射）
-│   └── long_content.py  超长内容策略：三态白名单解析 + 分句/硬切计划
+├─ domain/               pure domain logic (zero intra-package dependencies; unit-testable)
+│   ├── topic.py         topic layer L2T: clustering / member maintenance / extractive representatives / coverage stats
+│   ├── aliases.py       entity alias discovery (four domain-independent signals + two passes)
+│   ├── tagging.py       configurable tag extractor (suffix → family → key-name, two-level mapping)
+│   └── long_content.py  overlong-content policy: three-state whitelist parsing + split/hard-cut plans
 │
-├─ library/              多库
-│   ├── __init__.py      库发现与路径解析（原 library.py）
-│   └── registry.py      进程内库注册表
+├─ library/              multi-library
+│   ├── __init__.py      library discovery and path resolution (formerly library.py)
+│   └── registry.py      in-process library registry
 │
-├─ common/               最底层（只依赖标准库）
-│   ├── constants.py     全局阈值 + 无状态纯函数
-│   ├── sidecar_lock.py  侧车并发锁
-│   └── session_ctx.py   会话级上下文
+├─ common/               the bottom layer (standard library only)
+│   ├── constants.py     global thresholds + stateless pure functions
+│   ├── sidecar_lock.py  sidecar concurrency lock
+│   └── session_ctx.py   session-scoped context
 │
-├─ store/                存储后端
-│   ├── memory.py        MemoryRecord 数据模型（多模型向量字典）
-│   ├── vector_store.py  numpy 向量索引 + JSON/npz 分离持久化
-│   └── backend.py       JSON / SQLite 双后端（按目录内容判定）
+├─ store/                storage backends
+│   ├── memory.py        MemoryRecord data model (multi-model vector dict)
+│   ├── vector_store.py  numpy vector index + JSON/npz split persistence
+│   └── backend.py       JSON / SQLite dual backend (decided by directory contents)
 │
 ├─ retrieval/
-│   ├── bm25.py          BM25 + RRF 融合
-│   ├── scoring.py       打分引擎（加法 / 乘法两模式）
-│   ├── sampler.py       距离加权抽样
-│   └── intent.py        意图路由
+│   ├── bm25.py          BM25 + RRF fusion
+│   ├── scoring.py       scoring engine (additive / multiplicative modes)
+│   ├── sampler.py       distance-weighted sampling
+│   └── intent.py        intent routing
 │
-├─ lnn/                  CfC 时序记忆核
-│   ├── memory_core.py   CfC 动态记忆核
-│   ├── numpy_cfc.py     numpy 前向（无 torch 也能跑）
-│   ├── projector.py     维度投影
-│   ├── checkpoint.py    检查点（原子写 + 备份 + 损坏隔离）
-│   └── pt_migrate.py    旧 torch 权重迁移
+├─ lnn/                  CfC temporal memory core
+│   ├── memory_core.py   CfC dynamic memory core
+│   ├── numpy_cfc.py     numpy forward pass (runs without torch)
+│   ├── projector.py     dimension projection
+│   ├── checkpoint.py    checkpoints (atomic write + backup + corruption isolation)
+│   └── pt_migrate.py    legacy torch weight migration
 │
-└─ benchmarks/           评测框架（LoCoMo 加载 / 指标 / 多基线）
+└─ benchmarks/           evaluation framework (LoCoMo loading / metrics / multiple baselines)
 
-scripts/    维护脚本扁平命名空间（见「`scripts/` 保持扁平」一节的完整清单）
-docs/       ARCHITECTURE.md（本文）与 README 配图
+scripts/    flat namespace of maintenance scripts (see the full list under "scripts/ stays flat")
+docs/       ARCHITECTURE.md (this file, English trunk), ARCHITECTURE.zh-CN.md, and README figures
 ```
 
-> ❗ 不支持 ChromaDB 等第三方向量库后端：实测该路径会静默损坏数据，
-> 拒绝原因保留在 `MemoryManager` 的错误信息里。
+> ❗ Third-party vector-store backends such as ChromaDB are not supported: that path was
+> measured to silently corrupt data; the reasons live on in `MemoryManager`'s error message.
 
-### ⚠️ 入口层为什么不平摊进子包
+### ⚠️ Why the entry layer stays flat instead of spreading into subpackages
 
-`python -m hippocampus_mcp.{cli,server,launcher,daemon,prewarm}` 这些**字符串**
-被外部配置写死 —— `mcp.json` 的 `command`/`args`、各宿主的启动脚本、
-用户已经粘贴进配置里的整段 JSON 都是这个形式。把它们搬进子目录等于
-**让所有现存用户的 MCP 配置在一次升级后同时失效**，而且失败现象是
-"连接器连不上"，不会指向 import 错误。
+The **strings** `python -m hippocampus_mcp.{cli,server,launcher,daemon,prewarm}` are baked
+into external configuration — the `command`/`args` of `mcp.json`, every host's launch scripts,
+and the whole JSON snippets users have already pasted into their setups. Moving them into
+subdirectories would **break every existing user's MCP config in a single upgrade**, and the
+failure would surface as "connector can't connect", never pointing at the import error.
 
-所以根层的 6 个 `.py` 是**契约层**，只允许改内部实现，不允许改路径。
-同理 `brain/__init__.py` 用命名空间再导出（`from .core import *`）兜住
-包外 67 处 `from ..brain import XXX`，让分层成为**纯内部重构**。
+The 6 root-level `.py` files are therefore a **contract layer**: internal implementations may
+change, paths may not. For the same reason `brain/__init__.py` uses namespace re-exports
+(`from .core import *`) to shelter the 67 out-of-package `from ..brain import XXX` call sites,
+making the layering a **pure internal refactor**.
 
-### ⚠️ 改常量要改到 `brain/core.py`，不是 `brain/__init__.py`
+### ⚠️ Change constants in `brain/core.py`, not `brain/__init__.py`
 
-`brain/__init__.py` 只是**再导出**，不是定义。`brain.LEDGER_RING = v` 改的是
-包的属性副本，`core.py` 内的函数读自己的模块全局，**看不到这次赋值**。
-测试 monkeypatch 与线上调参都必须写 `brain.core.LEDGER_RING`。
+`brain/__init__.py` **re-exports**; it does not define. `brain.LEDGER_RING = v` assigns the
+package's attribute copy, while functions inside `core.py` read their own module globals and
+**never see that assignment**. Test monkeypatches and live tuning must write
+`brain.core.LEDGER_RING`.
 
-### ⚠️ `scripts/` 保持扁平
+### ⚠️ `scripts/` stays flat
 
-公开的维护脚本保持扁平命名空间，角色由文件名自解释：
+Public maintenance scripts keep a flat namespace; the filename says the role:
 
-| 脚本 | 角色 |
+| Script | Role |
 |---|---|
-| `reembed.py` | 换嵌入模型入口：查看 / 补齐 / 认领 / 裁剪多模型向量（不重切片、不重导入） |
-| `import_md.py` | Markdown 文档批量导入（切片 / 结构化标签 / 断点续跑 / 幂等） |
-| `demo_brain.py` | 核心能力演示 |
-| `mcp_smoke.py` | MCP 协议冒烟 |
-| `verify_onnx.py` | ONNX 后端验证 |
-| `verify_install_e2e.py` | 安装链路端到端验收（CI 引用） |
-| `judge_client.py` | 评测 LLM-as-judge 客户端 |
-| `run_all_tests.py` | 回归唯一入口（跑 `tests/` 全量，CI 与本地都用它） |
+| `reembed.py` | model-swap entry: inspect / backfill / adopt / prune multi-model vectors (no re-chunking, no re-import) |
+| `import_md.py` | bulk Markdown import (chunking / structured tags / resumable / idempotent) |
+| `demo_brain.py` | core-capability demo |
+| `mcp_smoke.py` | MCP protocol smoke test |
+| `verify_onnx.py` | ONNX backend verification |
+| `verify_install_e2e.py` | end-to-end install-path acceptance (referenced by CI) |
+| `judge_client.py` | evaluation LLM-as-judge client |
+| `run_all_tests.py` | the single regression entry (runs all of `tests/`, in CI and locally) |
 
-唯一的共用模块是 `_lib_access.py`（库目录判定 / 读取的统一入口，后端无关；
-`reembed.py` 硬依赖它），其余脚本彼此独立。
+The only shared module is `_lib_access.py` (the backend-agnostic unified entry for library-dir
+detection/reading; `reembed.py` hard-depends on it); every other script stands alone.
 
 ---
 
-## 十一、环境变量
+## 11. Environment variables
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Notes |
 |---|---|---|
-| `HIPPOCAMPUS_PERSIST_DIR` | `~/.hippocampus_mcp` | 记忆持久化目录 |
-| `HIPPOCAMPUS_EMB_MODEL` | 按系统语言自动 | 嵌入模型。未设时中文系统用 `BAAI/bge-base-zh-v1.5`（768D），其余用 `all-MiniLM-L6-v2`（384D）；显式设值完全以它为准，且老库仍自动跟随库内已有模型 |
-| `HIPPOCAMPUS_EMB_MODEL_AUTO` | `1` | 0/false/off/no = 关掉按系统语言自动选型，恒用 `all-MiniLM-L6-v2` |
-| `HIPPOCAMPUS_WARMUP` | `auto` | `auto` / `off` / `sync`（sync 是历史故障档） |
-| `HIPPOCAMPUS_WARMUP_TIMEOUT` | `90` | 秒，**必须 < 宿主 120s** |
-| `HIPPOCAMPUS_PRELOAD` | `scipy.special,scipy.interpolate` | 预载模块；`full` 会超宿主窗口 |
-| `HIPPOCAMPUS_LAMBDA_DECAY` | `7776000` | 时间衰减常数（90 天） |
-| `HIPPOCAMPUS_W_SIM/W_TIME/W_RECALL` | `0.95/0.03/-0.02` | 加法评分权重 |
-| `HIPPOCAMPUS_MULTI_WRITER` | `1` | 0 = 冲突报错 |
-| `HIPPOCAMPUS_TAG_SCHEMA` | 空 | 标签 schema 路径（优先级：显式 > env > persist_dir > 内置） |
-| `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | 未设 | 生产建议设 1（需模型已缓存） |
+| `HIPPOCAMPUS_PERSIST_DIR` | `~/.hippocampus_mcp` | memory persistence directory |
+| `HIPPOCAMPUS_EMB_MODEL` | auto by system language | embedding model. Unset: Chinese systems get `BAAI/bge-base-zh-v1.5` (768D), others `all-MiniLM-L6-v2` (384D); an explicit value always wins, and existing libraries still auto-follow the model already in the library |
+| `HIPPOCAMPUS_EMB_MODEL_AUTO` | `1` | 0/false/off/no = disable the by-system-language auto-selection, always `all-MiniLM-L6-v2` |
+| `HIPPOCAMPUS_WARMUP` | `auto` | `auto` / `off` / `sync` (sync is a historical failure mode) |
+| `HIPPOCAMPUS_WARMUP_TIMEOUT` | `90` | seconds; **must stay < the host's 120s** |
+| `HIPPOCAMPUS_PRELOAD` | `scipy.special,scipy.interpolate` | preloaded modules; `full` exceeds the host's window |
+| `HIPPOCAMPUS_LAMBDA_DECAY` | `7776000` | time-decay constant (90 days) |
+| `HIPPOCAMPUS_W_SIM/W_TIME/W_RECALL` | `0.95/0.03/-0.02` | additive-scoring weights |
+| `HIPPOCAMPUS_MULTI_WRITER` | `1` | 0 = conflict means error |
+| `HIPPOCAMPUS_TAG_SCHEMA` | empty | tag-schema path (priority: explicit > env > persist_dir > built-in) |
+| `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | unset | set to 1 in production (model must be cached) |

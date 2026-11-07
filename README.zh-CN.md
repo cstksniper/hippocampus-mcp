@@ -227,7 +227,7 @@ flowchart LR
 | 工具面 | 46 个 MCP 工具，按剖面裁剪；默认暴露 12 个高频工具，约 4.7k token |
 
 分层、流程、评分公式和工程约束见
-[架构文档](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.md)。
+[架构文档](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.zh-CN.md)。
 
 ---
 
@@ -457,7 +457,7 @@ judge 通过 `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` 接入 OpenAI �
 | `HIPPOCAMPUS_NER_ALLOW_TORCH` | `0` | 英文 NER 加载时是否允许 torch 回流 |
 | `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL` | 空 | 仅评测使用，核心服务不依赖 |
 
-完整存储、ONNX、FTS5、daemon 等配置以 `.env.example` 和 `docs/ARCHITECTURE.md` 为准。
+完整存储、ONNX、FTS5、daemon 等配置以 `.env.example` 和 `docs/ARCHITECTURE.zh-CN.md` 为准。
 
 ### 回归测试
 
@@ -475,7 +475,7 @@ pytest tests/
 
 ## 文档与贡献
 
-- [架构文档](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.md)：分层、流程、评分公式与工程约束。
+- [架构文档](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.zh-CN.md)：分层、流程、评分公式与工程约束。
 - [选型指南](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/SELECTION.md)：适用边界、非目标与核验清单。
 - [接入指南](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/INTEGRATION.md)：宿主配置、生命周期、压缩恢复与故障降级。
 - [隐私与数据说明](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/PRIVACY.md)：本地存储、网络边界、user 待审与删除范围。
