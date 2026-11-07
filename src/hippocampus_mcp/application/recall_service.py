@@ -1,33 +1,42 @@
 # -*- coding: utf-8 -*-
-"""RecallService：读侧用例（11 工具）。
+"""RecallService: read-side use cases (11 tools).
 
-工具面：recall / get_memory /
+Tool surface: recall / get_memory /
 get_memory_context / list_memories / list_sources / contradictions /
 drift_audit / knowledge_map / knowledge_topic / entity_profile /
-entity_list。
+entity_list.
 
-本类的每个方法都是**从 server.py 工具体逐字搬来的编排逻辑**（去掉了
-``_await_warmup`` / brain 获取 / ``json.dumps``）——只挪位置不改行为，
-行为等值由全量回归门禁保证；后续脑方法体上收进本类时，本类 API
-不动。
+Every method of this class is **orchestration logic moved verbatim from
+the server.py tool bodies** (minus ``_await_warmup`` / brain fetching /
+``json.dumps``) — relocation only, no behavior change; behavioral
+equivalence is guaranteed by the full regression gate. When brain method
+bodies are lifted into this class later, this class's API stays put.
 
-「谁解析参数」的切分（按**现行代码里解析与库解析的先后**
-定，保字节级一致）：
+The "who parses the arguments" split (decided by the **order of parsing
+vs library resolution in the current code**, to keep byte-level parity):
 
-* 全部 11 个工具的 JSON 解析都排在库解析**之后**（现行代码先
-  ``_brain_for(library)`` 再解析），故解析随编排整体进服务——工厂调用
-  即库解析，方法体里的解析自然晚于它，错误次序不变；
-* 解析失败的错误体**不带** ``library`` 首键（recall / get_memory_context /
-  contradictions 的 filter_tags、knowledge_topic 的 items/fras），服务内
-  以裸 dict 返回，与现行工具逐位一致；
-* knowledge_topic 的 ``evidence`` / ``topics`` 走 lenient 解析
-  （``common.params.parse_str_list_lenient``，永不报错），随编排进服务。
+* All 11 tools parse JSON **after** library resolution (current code runs
+  ``_brain_for(library)`` first, then parses), so parsing moves into the
+  service along with the orchestration — the factory call is the library
+  resolution, and parsing inside the method body naturally comes after
+  it; the error order is unchanged;
+* Parse-failure error bodies **carry no** ``library`` first key (recall /
+  get_memory_context / contradictions' filter_tags, knowledge_topic's
+  items/fras); inside the service they return as bare dicts, bit-for-bit
+  identical to the current tools;
+* knowledge_topic's ``evidence`` / ``topics`` go through lenient parsing
+  (``common.params.parse_str_list_lenient``, never raises) and move into
+  the service with the orchestration.
 
-信封（库自曝首键）**按工具逐个保留现行形态**，不做统一——本层是行为等值
-迁移，"给读侧工具补 library 首键"是产品决策不是迁移副产物：
+Envelopes (library self-report first key) **keep the current shape per
+tool**, no unification — this layer is a behavior-preserving migration;
+"adding a library first key to the read-side tools" is a product decision,
+not a migration side effect:
 
-* **带**信封：knowledge_map / knowledge_topic（现行经 ``_with_library``）；
-* **不带**：其余 9 个（现行直接 ``json.dumps``，含全部错误路径）。
+* **With** envelope: knowledge_map / knowledge_topic (currently via
+  ``_with_library``);
+* **Without**: the other 9 (currently straight ``json.dumps``, including
+  all error paths).
 """
 from __future__ import annotations
 
@@ -65,7 +74,8 @@ from .tags import check_tag_keys
 
 logger = logging.getLogger("hippocampus_mcp")
 
-#: D2b：none 档对 user 库的读拒绝文案（单一真相，多工具共用）。
+#: D2b: the read-denial message for none-tier access to the user library
+#: (single source of truth, shared by multiple tools).
 USER_READ_DENIED = (
     "This workspace has none-level read access to the user library (not registered/bound; fail-closed)."
     "Register the task directory from a session in this workspace first (library_create with workspace_root), "
@@ -86,9 +96,9 @@ _MCP_RECALL_ITEM_ORDER = (
 
 
 class RecallService(BaseService):
-    """读用例：检索/单条/列举/矛盾/漂移/实体/知识地图（策略与算法暂居 brain/manager，后续上收）。"""
+    """Read use cases: retrieval / single item / listing / contradictions / drift / entities / knowledge map (policies and algorithms stay in brain/manager for now, to be lifted later)."""
 
-    # ---------------------------------------------------------------- 语义检索
+    # ---------------------------------------------------------------- semantic retrieval
 
     def recall(self, *, query: str, top_k: int, use_lnn: bool, sample: bool,
                filter_tags: str, client: str,
@@ -96,32 +106,42 @@ class RecallService(BaseService):
                libraries: str = "",
                occurred_after: str = "",
                occurred_before: str = "") -> dict[str, Any]:
-        """向量 + BM25(RRF) + MMR + 实体加成 + 硬门槛（默认滤 superseded/archived）。
+        """Vector + BM25(RRF) + MMR + entity bonus + hard floor (superseded/archived filtered by default).
 
-        ``client`` 由适配层传 ``session_key()``（读也要走本会话那一路
-        LNN 状态，与 store_memory 同一笔接线）。
+        ``client`` is passed by the adapter layer as ``session_key()`` (reads
+        also ride this session's LNN state — the same wiring as
+        store_memory).
 
-        scope 三值（枚举不泛化，有意收窄）：
+        The three scope values (enumerated, not generalized — deliberately
+        narrow):
 
-        * ``project``（默认）：单库流，返回体不带 scope/libraries 键
-          （保持最简形态）；
-        * ``user``：整条流换到用户级库 brain 上跑（组合根注入），成功体加
-          ``scope`` + ``libraries`` 自曝；留痕（miss/bump_daily）按意图归
-          用户库，stamp_recalled 照盖；
-        * ``all``：项目流全前、用户流殿后（硬分段，分数跨库不可比不融合），
-          ``top_k`` 是**总数**；两库各自 stamp，miss/
-          bump_daily 归项目库（查询语境是项目的）；跨库**精确内容**
-          相同的用户级条目标 ``duplicate_of``（只标注不丢弃）；
-          成功体加 ``scope`` + ``libraries``（顺序 = 实际打的库序）。
+        * ``project`` (default): single-library flow; the response carries no
+          scope/libraries keys (simplest possible shape);
+        * ``user``: the whole flow runs on the user-level library brain
+          (injected by the composition root); on success the body gains
+          ``scope`` + ``libraries`` self-report; bookkeeping (miss/
+          bump_daily) goes to the user library by intent, stamp_recalled is
+          stamped as usual;
+        * ``all``: project flow first in full, user flow behind it (hard
+          segmentation; scores are not comparable across libraries and are
+          not fused), ``top_k`` is the **total**; each library stamps its
+          own; miss/ bump_daily go to the project library (the query context
+          is the project's); user-level entries whose **exact content**
+          matches across libraries are marked ``duplicate_of`` (annotation
+          only, nothing dropped); on success the body gains ``scope`` +
+          ``libraries`` (order = the order the libraries were actually hit).
 
-        错误体（scope 非法 / filter_tags 语法错 / 键名校验失败）一律是裸
-        dict，**不带**任何自曝键。
+        Error bodies (invalid scope / filter_tags syntax error / tag-key
+        validation failure) are always bare dicts, carrying **no**
+        self-report keys.
         """
         err = validate_scope(scope)
         if err:
             return {"error": err, "input": scope}
-        # B1 互斥（拍板②a）：libraries= 是显式多库通道，与双库语法糖
-        # scope=user/all 组合没有可预期的语义 → 显式报错，不静默择一。
+        # B1 mutual exclusion (decision ②a): libraries= is the explicit
+        # multi-library channel; combined with the two-library sugar
+        # scope=user/all it has no predictable semantics → explicit error,
+        # no silent pick of one.
         spec_names: list[str] = []
         if (libraries or "").strip():
             if scope != SCOPE_PROJECT:
@@ -140,11 +160,15 @@ class RecallService(BaseService):
                         "input": libraries}
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
-            # 注意：此错误体**不带** library 首键（与现行工具逐位一致）。
+            # Note: this error body carries **no** library first key
+            # (bit-for-bit identical to the current tool).
             return {"error": f"filter_tags parse failed: {tag_err}",
                     "input": filter_tags[:200]}
-        # 时间窗解析（2026-11-05）：日期格式错**显式报错**，不静默当"不限"。
-        # 静默丢参数的后果是「结果看起来像库里真没有」，而实际是条件没生效。
+        # Time-window parsing (2026-11-05): a malformed date is an **explicit
+        # error**, never silently treated as "unbounded". Silently dropping
+        # the argument makes 「结果看起来像库里真没有」 (the results look like
+        # the library truly has nothing) when in fact the condition never
+        # took effect.
         try:
             win_after = parse_date_bound(occurred_after)
             win_before = parse_date_bound(occurred_before, end_of_day=True)
@@ -162,7 +186,8 @@ class RecallService(BaseService):
                     query=query, top_k=top_k, use_lnn=use_lnn, sample=sample,
                     parsed_tags=parsed_tags, client=client, time_window=tw,
                     spec_names=spec_names)
-            # D2b：目标 = user 库（library="user"）时按档位执行。
+            # D2b: when the target is the user library (library="user"),
+            # execute per access tier.
             tier = self._ua(client)
             if tier == "none":
                 return {"error": USER_READ_DENIED, "input": scope}
@@ -179,12 +204,15 @@ class RecallService(BaseService):
             return body
         user_brain = self.user_brain
         if user_brain is None:
-            # 正常到不了这里：库缺失时工厂解析已抛 LibraryResolutionError
-            # （显式检索找不到库必须报错）。防御性自曝，不静默回落 project。
+            # Normally unreachable: with the library missing, the factory
+            # resolution has already raised LibraryResolutionError (an
+            # explicit recall that cannot find its library must error).
+            # Defensive self-report; never silently fall back to project.
             return {"error": "scope=user/all requires the user-level library "
                              "(conventional name user); it was not injected for "
                              "this call.", "input": scope}
-        # D2b：用户库流的档位门（scope=user/all 打的就是用户库）。
+        # D2b: the access-tier gate for the user-library flow (scope=user/all
+        # targets the user library).
         tier = self._ua(client)
         if scope == SCOPE_USER:
             if tier == "none":
@@ -204,9 +232,11 @@ class RecallService(BaseService):
             self._log_route(client, scope=SCOPE_USER, probed=["user"],
                             hits={"user": int(body.get("count", 0))})
             return body
-        # scope=all：项目流（全量留痕）+ 用户流（只 stamp，miss/日计数按
-        # 查询意图归项目库）→ domain 纯函数硬分段合并。
-        # D2b：档位门——none 降级 project-only 并自曝；masked 用户流滤敏感。
+        # scope=all: project flow (full bookkeeping) + user flow (stamp only;
+        # miss/daily counts go to the project library by query intent) →
+        # hard-segmented merge via the domain pure function.
+        # D2b: tier gate — none degrades to project-only with a self-report;
+        # masked filters sensitive entries from the user flow.
         tier = self._ua(client)
         proj_body = self._recall_one(
             self.brain, query=query, top_k=top_k, use_lnn=use_lnn,
@@ -241,8 +271,9 @@ class RecallService(BaseService):
         out = {
             "count": len(merged),
             "memories": merged,
-            # 回显标签域以项目库为准（查询语境；用户库各自过滤已体现在
-            # 各条目的 tags 上——按库独立过滤）。
+            # The echoed tag domain follows the project library (query
+            # context; the user library's own filtering is already reflected
+            # in each entry's tags — filtering is per library).
             "filter_applied": proj_body.get("filter_applied"),
             "scope": SCOPE_ALL,
             "libraries": [self.library_self, self.user_library_self],
@@ -259,9 +290,11 @@ class RecallService(BaseService):
 
     def _log_route(self, client: str, *, scope: str, probed: list[str],
                    hits: dict[str, int]) -> None:
-        """B3：路由事件入 user 库 access_log——「谁在什么时候跨库查了什么、
-        各库命中几条」。查询原文只留指纹（build_access_event 口径）；
-        审计是旁路，失败静默。"""
+        """B3: route events go into the user library's access_log —
+        「谁在什么时候跨库查了什么、各库命中几条」 (who queried what across
+        libraries when, and how many hits each library got). Only a
+        fingerprint of the raw query is kept (build_access_event policy);
+        audit is a side path and fails silently."""
         lib = (self.user_library_self or {}).get("path")
         if not lib:
             return
@@ -272,7 +305,7 @@ class RecallService(BaseService):
                 content=str(getattr(self, "_last_route_query", "") or ""))
             ev["route"] = {"scope": scope, "probed": probed, "hits": hits}
             append_access_event(lib, ev)
-        except Exception:  # noqa: BLE001 —— 审计旁路
+        except Exception:  # noqa: BLE001 -- audit side path
             pass
 
     def _recall_multi(self, *, query: str, top_k: int, use_lnn: bool,
@@ -281,12 +314,16 @@ class RecallService(BaseService):
                       spec_names: list[str] | None = None,
                       time_window: tuple[float, float] = (0.0, 0.0)
                       ) -> dict[str, Any]:
-        """B1 层次化多库（拍板②a）：家库段全前 + 外围库内 RRF 竞争剩余名额。
+        """B1 hierarchical multi-library (decision ②a): home-library segment all first + periphery libraries compete for the remaining slots via RRF.
 
-        家库段保留现行排序语义与留痕口径（record_miss=True）；外围各流
-        record_miss=False（查询意图归家库，与 scope=all 的用户库流同款），
-        每流各自过本库标签白名单（``_recall_one`` 逐库口径）。信封自曝
-        ``mode`` + ``libraries``（实际打的库序）+ 目录外值 ``unregistered``。
+        The home-library segment keeps the current ordering semantics and
+        bookkeeping policy (record_miss=True); each periphery flow runs
+        record_miss=False (query intent belongs to the home library, same as
+        the user-library flow of scope=all), and each flow passes its own
+        library's tag whitelist (``_recall_one``, per-library policy). The
+        envelope self-reports ``mode`` + ``libraries`` (the order the
+        libraries were actually hit) + out-of-directory values as
+        ``unregistered``.
         """
         tw = time_window
         home_body = self._recall_one(
@@ -302,8 +339,10 @@ class RecallService(BaseService):
         probed: list[dict[str, str]] = [self.library_self]
         tier = self._ua(client)
         for info, brain in self.extra_libraries:
-            # D2b：外围流若含 user 库，档位同款执行——none 整调用报错
-            # （显式点名了被拒的库），masked 该流滤敏感。
+            # D2b: when a periphery flow includes the user library, the tier
+            # applies the same way — none errors the whole call (the denied
+            # library was explicitly named), masked filters sensitive
+            # entries from that flow.
             if (info.get("name") or "").strip() == "user" and tier != "full":
                 if tier == "none":
                     return {"error": USER_READ_DENIED,
@@ -328,7 +367,8 @@ class RecallService(BaseService):
         out: dict[str, Any] = {
             "count": len(merged),
             "memories": merged,
-            # 回显标签域以家库为准（查询语境；各库过滤已体现在条目 tags）。
+            # The echoed tag domain follows the home library (query context;
+            # each library's filtering is already reflected in entry tags).
             "filter_applied": home_body.get("filter_applied"),
             "mode": "multi_library",
             "libraries": probed,
@@ -336,7 +376,8 @@ class RecallService(BaseService):
         if self.unregistered_names:
             out["unregistered"] = list(self.unregistered_names)
         self._last_route_query = query
-        # 路由事件只落 user 库被探测的调用（access_log 是 user 库的读审计）。
+        # Route events are recorded only for calls that probed the user
+        # library (access_log is the user library's read audit).
         probed_names = [i.get("name", "") for i in probed]
         if "user" in probed_names:
             self._log_route(client, scope="multi", probed=probed_names,
@@ -350,13 +391,16 @@ class RecallService(BaseService):
                     exclude_sensitive: bool = False,
                     time_window: tuple[float, float] = (0.0, 0.0)
                     ) -> dict[str, Any]:
-        """单库检索流（recall 的单库执行体）。
+        """Single-library retrieval flow (recall's single-library execution body).
 
-        ``brain`` 参数化使 project 路径与用户库路径同一条流；
-        ``record_miss=False`` 只给 scope=all 的用户库流用：stamp_recalled
-        照盖（库内治理数据，两边都盖），miss/按日计数不记（查询
-        意图归项目库）。``filter_tags`` 的 JSON 语法解析在调用方做一次，
-        键名白名单校验**逐库**做（schema 是每库一份）。
+        Parameterizing ``brain`` makes the project path and the user-library
+        path the same flow; ``record_miss=False`` is used only by the
+        scope=all user-library flow: stamp_recalled is stamped as usual
+        (in-library governance data, stamped on both sides), while miss/
+        daily counts are not recorded (query intent belongs to the project
+        library). ``filter_tags`` JSON syntax parsing happens once in the
+        caller; the key-name whitelist validation is done **per library**
+        (each library has its own schema).
         """
         mgr = brain.manager
         parsed_tags, key_info = check_tag_keys(brain, parsed_tags)
@@ -364,8 +408,9 @@ class RecallService(BaseService):
             return key_info
         allow_ids = brain._ids_matching_tags(parsed_tags)
         if allow_ids is not None and not allow_ids:
-            # 过滤没命中任何条目——matched=0 让调用方当场看出"键名/值对不上"，
-            # 而不是误读成"库里真没有"。
+            # The filter matched nothing — matched=0 lets the caller see
+            # immediately that "key names/values do not line up", instead of
+            # misreading it as "the library truly has nothing".
             return {"count": 0, "memories": [],
                     "filter_applied": filter_applied(parsed_tags, 0, key_info)}
         # R1 (2026-11-06): both branches stay verbatim so the rollout switch
@@ -463,7 +508,8 @@ class RecallService(BaseService):
                 memories.append(d)
             stamp_ids = [r.memory_id for r in results]
         memories = self._cap_contents(memories)
-        # D2b masked 档：sensitive:* 卡不出流（计数自曝，绝不静默）。
+        # D2b masked tier: sensitive:* cards never leave the flow (count is
+        # self-reported, never silent).
         filtered_sensitive = 0
         if exclude_sensitive:
             kept: list[dict[str, Any]] = []
@@ -476,14 +522,18 @@ class RecallService(BaseService):
                     continue
                 kept.append(d)
             memories = kept
-        # 盖上「最后一次被召回」时间戳：共享层刻意无副作用，记账
-        # 留在调用方壳内（与 brain.recall 同款纪律，防两条路径双记）。
-        # 融合开启时只盖最终返回条目；关时保持旧口径盖全部候选。
+        # Stamp the 「最后一次被召回」 (last recalled) timestamp: the shared
+        # layer is deliberately side-effect free, so bookkeeping stays inside
+        # the caller's shell (same discipline as brain.recall, preventing
+        # double counting across the two paths).
+        # With fusion on, only the final returned entries are stamped; with
+        # it off, the legacy policy of stamping all candidates is kept.
         mgr.stamp_recalled(stamp_ids)
         if record_miss:
-            # 未命中留痕 + 按日召回计数：MCP recall 是宿主的
-            # 主要检索入口，共享层不记账，必须在这里补，否则
-            # miss_log / 按日统计里全是 0。
+            # Miss logging + daily recall counting: MCP recall is the host's
+            # main retrieval entry; the shared layer does no bookkeeping, so
+            # it must be added here, otherwise
+            # miss_log / the daily stats are all zeros.
             if query:
                 if brain.miss_log_enabled and top_sim < brain.miss_log_threshold:
                     brain.log_miss(query, top_sim, top_k=top_k,
@@ -492,18 +542,23 @@ class RecallService(BaseService):
         out = {
             "count": len(memories),
             "memories": memories,
-            # 回显本次标签域与过滤后候选数（matched=None = 无过滤全库）。
+            # Echo this call's tag domain and post-filter candidate count
+            # (matched=None = no filter, whole library).
             "filter_applied": filter_applied(
                 parsed_tags, len(allow_ids) if allow_ids is not None else None,
                 key_info),
         }
         if exclude_sensitive:
-            # D2b masked 档：被滤条数自曝（0 也带键——档位行为可断言，
-            # 不与"没过滤"混淆）。
+            # D2b masked tier: self-report the filtered count (the key is
+            # present even at 0 — tier behavior stays assertable and is not
+            # confused with "no filtering happened").
             out["filtered_sensitive"] = filtered_sensitive
         if time_window[0] > 0 or time_window[1] > 0:
-            # 时间窗自曝：**count=0 时尤其重要**——否则「窗口内确实没有」
-            # 和「检索没找到」在返回面上长得一模一样，调用方会把前者当后者。
+            # Time-window self-report: **especially important when count=0**
+            # — otherwise 「窗口内确实没有」 (truly nothing in the window) and
+            # 「检索没找到」 (retrieval found nothing) look identical on the
+            # response surface, and the caller will read the former as the
+            # latter.
             out["time_window"] = {
                 "after": iso_date(time_window[0]) if time_window[0] > 0 else None,
                 "before": iso_date(time_window[1]) if time_window[1] > 0 else None,
@@ -527,19 +582,25 @@ class RecallService(BaseService):
         return {k: d[k] for k in _MCP_RECALL_ITEM_ORDER}
 
     def _cap_contents(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """截断护栏：把每条命中记忆的 ``content`` 压到字符上限内。
+        """Truncation guard: clamp each hit memory's ``content`` to the character cap.
 
-        为什么要有它：``recall`` 原本**只按条数收口**（``top_k``），单条
-        ``content`` 想多长就多长——一条长记忆就能让一次召回上万字符，
-        而调用方（宿主上下文）根本没法预判。
+        Why it exists: ``recall`` originally **bounded only the entry count**
+        (``top_k``) while a single ``content`` could be arbitrarily long —
+        one long memory could push a single recall into the tens of thousands
+        of characters, and the caller (the host's context) had no way to
+        anticipate it.
 
-        为什么不静默切：切掉的内容宿主看不见，会以为"库里就这些"。所以被
-        切的条目必须带 ``content_truncated=true`` + ``content_chars``
-        （原文长度），要全文走 ``get_memory(memory_id)``。
+        Why not truncate silently: the host cannot see what was cut and would
+        believe "this is all the library has". So a truncated entry must
+        carry ``content_truncated=true`` + ``content_chars`` (original
+        length); for the full text, use ``get_memory(memory_id)``.
 
-        ``0`` = 不截断（**默认**，= 现状零变化）；上限比原文长时不加任何键
-        （返回面与关态逐字节一致）。上限由组合根现读
-        ``HIPPOCAMPUS_RECALL_CONTENT_MAX_CHARS`` 注入（application 不读 config）。
+        ``0`` = no truncation (**default**, = zero change from the status
+        quo); when the cap is longer than the text, no keys are added (the
+        response surface is byte-identical to the off state). The cap is read
+        now by the composition root from
+        ``HIPPOCAMPUS_RECALL_CONTENT_MAX_CHARS`` and injected (application
+        does not read config).
         """
         cap = int(self.recall_content_max_chars or 0)
         if cap <= 0:
@@ -557,19 +618,23 @@ class RecallService(BaseService):
             out.append(d)
         return out
 
-    # ---------------------------------------------------------------- 单条与列举
+    # ---------------------------------------------------------------- single item and listing
 
     def get_memory(self, *, memory_id: str,
                    include_history: bool = False,
                    client: str = "") -> dict[str, Any]:
-        """按 ID 取单条完整信息（不存在显式报，不静默返回空）。
+        """Fetch one entry's full information by ID (explicit error when absent, never a silent empty).
 
-        ``include_history=True`` 时附 ``history`` 键——
-        mem_history.jsonl 里该记录的改写前值（update/merge，最新在前，
-        cap 20）。默认不加键（返回面零变化）；账本是审计面，不进检索。
+        With ``include_history=True`` a ``history`` key is attached —
+        the pre-rewrite values of this record from mem_history.jsonl
+        (update/merge, newest first,
+        cap 20). The key is absent by default (zero change to the response
+        surface); the ledger is an audit surface and stays out of retrieval.
 
-        D2b：目标 = user 库时按档位——masked 档 sensitive:* 卡显式报错
-        （单条读取没有"滤掉"可言，给一半就是泄密）；none 档整体拒绝。
+        D2b: when the target is the user library, per tier — the masked tier
+        errors explicitly on sensitive:* cards (a single-item read has no
+        "filter out" to speak of; handing over half of it is a leak); the
+        none tier refuses entirely.
         """
         tier = self._ua(client)
         if tier == "none":
@@ -593,9 +658,10 @@ class RecallService(BaseService):
 
     def list_memories(self, *, limit: int, source: str,
                       state: str, client: str = "") -> dict[str, Any]:
-        """按来源/状态列元数据（不含嵌入向量）。
+        """List metadata by source/state (no embedding vectors).
 
-        D2b masked 档：sensitive:* 行滤除并计数（列表是内容面，同召回口径）。
+        D2b masked tier: sensitive:* rows are filtered out and counted (the
+        listing is a content surface, same policy as recall).
         """
         memories = self.manager.list_memories(
             limit=limit, source=source or None, state=state or None
@@ -619,10 +685,12 @@ class RecallService(BaseService):
         return {"count": len(memories), "memories": memories}
 
     def list_sources(self, client: str = "") -> dict[str, Any]:
-        """来源标签及各自条数（导入幂等的基础）。
+        """Source labels and their entry counts (the basis of import idempotency).
 
-        D2b：来源是 L0 回指的**索引**（能直接定位原话），masked 档一律拒绝
-        （fail-closed：内容面已滤但回指面敞着等于没滤）。
+        D2b: a source is the **index** behind L0 back-references (it can
+        locate the original text directly), so the masked tier refuses
+        outright (fail-closed: filtering the content surface while leaving
+        the back-reference surface open equals no filtering).
         """
         if self._ua(client) in ("masked", "none"):
             return {"error": USER_READ_DENIED}
@@ -634,23 +702,28 @@ class RecallService(BaseService):
             "unlabeled": raw.get("", 0),
         }
 
-    # ---------------------------------------------------------------- 装配上下文
+    # ---------------------------------------------------------------- assembled context
 
     def get_memory_context(self, *, query: str, top_k: int,
                            token_budget: int, item_max_chars: int,
                            filter_tags: str,
                            scope: str = SCOPE_PROJECT,
                            client: str = "") -> dict[str, Any]:
-        """5 槽位装配（当前命中/待办未决/时间线/实体状态/上次未聊完）。
+        """5-slot assembly (current hits / pending open intents / timeline / entity state / last session's unfinished topics).
 
-        ``filter_tags`` 解析错误体不带信封（同 :meth:`recall`）；与 recall
-        的差异：不过早返回 count=0——空候选也装配（各槽自曝为空），
-        ``filter_applied.matched`` 照样回显。
+        A ``filter_tags`` parse-error body carries no envelope (same as
+        :meth:`recall`); the difference from recall: it does not return
+        count=0 early — empty candidates are still assembled (each slot
+        self-reports as empty), and ``filter_applied.matched`` is echoed as
+        usual.
 
-        scope：**只支持 project / user**（5 槽位装配没有
-        "项目排前用户殿后"的自然落点，有意收窄）。scope=user 整条装配换到用户库
-        brain 上跑，成功体加 ``scope`` + ``libraries`` 自曝；project 默认
-        路径不加自曝键。scope=all 显式报错（错误体不带自曝键）。
+        scope: **only project / user are supported** (5-slot assembly has no
+        natural place for "project first, user behind", deliberately
+        narrow). scope=user moves the whole assembly onto the user-library
+        brain; on success the body gains ``scope`` + ``libraries``
+        self-report; the project default path adds no self-report keys.
+        scope=all is an explicit error (the error body carries no
+        self-report keys).
         """
         err = validate_scope(scope, allow_all=False)
         if err:
@@ -665,8 +738,10 @@ class RecallService(BaseService):
                 return {"error": "scope=user requires the user-level library "
                                  "(conventional name user); it was not injected "
                                  "for this call.", "input": scope}
-            # D2b：装配面的跨库通道只在 full 档开放——5 槽位装配里没有
-            # 「滤一半」的自然落点（同 scope=all 只配 recall 的收窄理由）。
+            # D2b: the assembly surface's cross-library channel opens only at
+            # the full tier — 5-slot assembly has no natural place for
+            # 「滤一半」 (filtering half), same narrowing rationale as
+            # scope=all being recall-only.
             tier = self._ua(client)
             if tier == "none":
                 return {"error": USER_READ_DENIED, "input": scope}
@@ -686,23 +761,30 @@ class RecallService(BaseService):
                                        token_budget=token_budget,
                                        item_max_chars=item_max_chars,
                                        filter_tags=parsed_tags)
-        # 前瞻记忆情境触发。查询实体/实词与活跃待办的
-        # 触发集相交时，该待办在 block_2 置前回带（cap 5 不膨胀），触发
-        # 详情走新键 ``prospective_intents`` 自曝。落在服务层后处理而非
-        # brain 包装——brain.get_memory_context 保持薄壳（有 parity 与
-        # AST 级测试钉住其结构），context_slots 也不动。
-        # 开关由组合根现读注入（application 不 import config）。
+        # Prospective-memory contextual triggering. When the query's
+        # entities/content words intersect an active open intent's trigger
+        # set, that intent is brought back at the front of block_2 (cap 5, no
+        # inflation) and the trigger details are self-reported under the new
+        # key ``prospective_intents``. Done as service-layer post-processing
+        # rather than in the brain wrapper — brain.get_memory_context stays
+        # a thin shell (parity and AST-level tests pin its structure), and
+        # context_slots is untouched.
+        # The switch is read now by the composition root and injected
+        # (application does not import config).
         if self.prospective_trigger:
             self._apply_prospective(ctx, brain, query=query,
                                     token_budget=token_budget,
                                     item_max_chars=item_max_chars)
-        # 元记忆置信度外显。逐条命中附 ``confidence``，
-        # 全体块附收据式 ``confidence`` 自曝块（承 session_start 收据
-        # 纪律：回答"这次装配的把握是什么状态、怎么算的"）。只添新键，
-        # 向后兼容；不加新工具。公式与校准锚点见 domain/metacog.py。
+        # Metamemory confidence made visible. Each hit gets a ``confidence``
+        # field, and the whole block set gets a receipt-style ``confidence``
+        # self-report block (inheriting the session_start receipt discipline:
+        # it answers "what state is this assembly's certainty in and how was
+        # it computed"). Only new keys are added, backward compatible; no new
+        # tool. Formulas and calibration anchors: domain/metacog.py.
         self._apply_confidence(ctx, brain)
-        # 回显标签域 + 过滤后候选数（与 recall / contradictions 同口径；
-        # matched=None = 无过滤，0 = 过滤没命中任何条目）。
+        # Echo the tag domain + post-filter candidate count (same policy as
+        # recall / contradictions;
+        # matched=None = no filter, 0 = the filter matched nothing).
         allow = brain._ids_matching_tags(parsed_tags)
         ctx["filter_applied"] = filter_applied(
             parsed_tags, len(allow) if allow is not None else None, key_info)
@@ -711,17 +793,20 @@ class RecallService(BaseService):
             ctx["libraries"] = [self.user_library_self]
         return ctx
 
-    # -------------------------------------------- 前瞻触发 / 置信度
+    # -------------------------------------------- prospective trigger / confidence
 
     @staticmethod
     def _apply_prospective(ctx: dict[str, Any], brain: Any, *,
                            query: str, token_budget: int,
                            item_max_chars: int) -> None:
-        """block_2 情境触发回带（就地改 ``ctx``；未触发零痕迹不加键）。
+        """block_2 contextual-trigger bring-back (mutates ``ctx`` in place; when not triggered, zero trace and no keys added).
 
-        重排后重渲染 ``text``（blocks 与文本双轨同源，改了 blocks 必须
-        同步重渲染，``token_estimate`` 一并刷新）。待办条目本身只读——
-        不改 text / status，complete_intent 的完成语义不受影响。
+        ``text`` is re-rendered after the reordering (blocks and text are two
+        tracks of one source; once blocks change, text must be re-rendered in
+        sync, and ``token_estimate`` refreshed along with it). The open-intent
+        entries themselves are read-only —
+        text / status are not modified, so complete_intent's completion
+        semantics are unaffected.
         """
         if not (query or "").strip():
             return
@@ -742,12 +827,14 @@ class RecallService(BaseService):
 
     @staticmethod
     def _apply_confidence(ctx: dict[str, Any], brain: Any) -> None:
-        """逐条命中 + 各块置信度（就地改 ``ctx``；只添键，不改既有键）。
+        """Per-hit + per-block confidence (mutates ``ctx`` in place; only adds keys, never changes existing ones).
 
-        block_1 = 逐条命中的平均；block_2/3/5 出自 first-party 层给满档；
-        block_4（实体状态）由 L1 派生且 entity_facts 只回文本不回 id，
-        无法逐条溯源——诚实报 None 并在 basis 写明（收据纪律：
-        不可评估 ≠ 0 分）。
+        block_1 = the mean over per-hit confidences; block_2/3/5 come from
+        the first-party layer and get the full score;
+        block_4 (entity state) is derived from L1 and entity_facts returns
+        text only, never ids, so per-item traceability is impossible —
+        honestly report None and say so in basis (receipt discipline:
+        not assessable ≠ a score of 0).
         """
         raw_ids = {r.get("id")
                    for r in (getattr(brain, "raw_log", None) or [])
@@ -765,9 +852,10 @@ class RecallService(BaseService):
         blocks = ctx.get("blocks") or {}
 
         def _first_party(lines: Any, basis: str) -> dict[str, Any]:
-            """first-party 块的置信条目：非空给满档，占位/空 = None（非 0 分）。
+            """Confidence entry for a first-party block: non-empty gets the full score; placeholder/empty = None (not a score of 0).
 
-            basis 与 value 联动：None 时报 empty_*，不给"满档"的假标签。
+            basis is coupled with value: when None it reports empty_* rather
+            than slapping on a fake "full score" label.
             """
             lines = lines or []
             if not lines or (len(lines) == 1 and str(lines[0]) in BLOCK_PLACEHOLDERS):
@@ -792,11 +880,11 @@ class RecallService(BaseService):
             },
             computed_at=time.time())
 
-    # ---------------------------------------------------------------- 矛盾与漂移
+    # ---------------------------------------------------------------- contradictions and drift
 
     def contradictions(self, *, limit: int, source: str,
                        filter_tags: str, plan: bool = False) -> dict[str, Any]:
-        """「同一事实、两种口径」候选对（只标注不裁决，确认后走 update_memory）。"""
+        """Candidate pairs of 「同一事实、两种口径」 (one fact, two accounts) (annotation only, no adjudication; after confirmation go through update_memory)."""
         brain = self.brain
         parsed_tags, tag_err = parse_tags_json(filter_tags)
         if tag_err:
@@ -807,8 +895,9 @@ class RecallService(BaseService):
             return key_info
         result = brain.contradictions(limit=limit, source=source,
                                       filter_tags=parsed_tags)
-        # 回显标签域 + 过滤后候选数。candidate_pool 就是"收窄后进比对的条数"，
-        # 与 recall / get_memory_context 的 matched 同口径。
+        # Echo the tag domain + post-filter candidate count. candidate_pool
+        # is "how many entries entered the comparison after narrowing",
+        # same policy as recall / get_memory_context's matched.
         result["filter_applied"] = filter_applied(
             parsed_tags, result.get("candidate_pool"), key_info)
         if plan:
@@ -891,20 +980,29 @@ class RecallService(BaseService):
 
     def drift_audit(self, *, source: str, limit: int,
                     include_ok: bool, client: str = "") -> dict[str, Any]:
-        """源文件漂移审计：签名 vs 磁盘现状，六类回报各带分母。
+        """Source-file drift audit: signature vs on-disk reality, six report classes each with its denominator.
 
-        D2b（Q-14 倾向落地）：目标 = user 库时审计面**仅家可调**——审计会
-        吐 L2/L3 聚合内容（画像/主题），masked 档下等于绕过内容滤除的面。
-        待审复审本就该在家工作区做（提权键不在 agent 手里）。
+        D2b (landing the Q-14 leaning): when the target is the user library,
+        the audit surface is **callable from the home workspace only** — the
+        audit emits L2/L3 aggregate content (profile/topics), which under the
+        masked tier would amount to a surface bypassing content filtering.
+        Quarantine review belongs in the home workspace to begin with (the
+        privilege-escalation key is not in the agent's hands).
 
-        D2a 起附带**待审队列过目区**（设计稿 §4.3 拍板①）：本库的
-        quarantine 卡逐条列出供用户过目（转正走 ``update_memory`` 的
-        ``clear_quarantine``，删除走 ``forget_memory``）；user 库还附
-        access_log 尾窗——"谁在什么时候对用户库动过笔"在这里可审。
-        审计是旁路：本节任何失败不阻断源漂移报告本身。
+        Since D2a, also carries a **quarantine-queue review section**
+        (design draft §4.3, decision ①): this library's quarantine cards are
+        listed one by one for the user to review (promotion goes through
+        ``update_memory``'s ``clear_quarantine``, deletion through
+        ``forget_memory``); the user library also gets an access_log
+        tail window — "who touched the user library, and when" is auditable
+        here.
+        Audit is a side path: any failure in this section does not block the
+        source-drift report itself.
         """
-        # 档位门只对 user 库目标生效（resolver 对非 user 目标返回 ""）——
-        # 用 in 判 masked/none，不能用 != "full"（空串档位会被误拒）。
+        # The tier gate applies only to user-library targets (the resolver
+        # returns "" for non-user targets) —
+        # use `in` to test masked/none, not != "full" (the empty-string tier
+        # would be wrongly refused).
         _tier = self._ua(client)
         if _tier in ("masked", "none"):
             return {"error": (
@@ -934,8 +1032,10 @@ class RecallService(BaseService):
                          "clear_quarantine=True) (home-library session only); "
                          "delete: forget_memory(memory_id=...)."),
             }
-            # B2 目录健康：库路径/绑定根失联与僵尸条目（描述审计挂点，
-            # 设计稿 §2.2/§3.2——目录 note 会腐化，路径会漂移，要看得见）。
+            # B2 directory health: lost library paths/bound roots and zombie
+            # entries (the descriptive audit hook,
+            # design draft §2.2/§3.2 — directory notes rot and paths drift;
+            # this must be visible).
             try:
                 ulib = resolve_library("user", libs=scan_libraries())
                 ddata, dissue = load_directory(ulib.path)
@@ -955,50 +1055,54 @@ class RecallService(BaseService):
                         if wr and not os.path.isdir(wr):
                             health["workspace_missing"].append(e.get("task"))
                 out["directory_health"] = health
-            except Exception as e2:  # noqa: BLE001 —— 审计旁路
+            except Exception as e2:  # noqa: BLE001 -- audit side path
                 out["directory_health"] = {
                     "ready": False, "reason": f"{type(e2).__name__}: {e2}"}
             if (self.library_self or {}).get("name") == "user":
                 out["access_log"] = read_access_events(self.persist_dir,
                                                        limit=limit)
-        except Exception as e:  # noqa: BLE001 —— 审计旁路绝不炸主报告
+        except Exception as e:  # noqa: BLE001 -- audit side path must never blow up the main report
             out["quarantine_error"] = f"{type(e).__name__}: {e}"
         return out
 
-    # ---------------------------------------------------------------- 实体档案
+    # ---------------------------------------------------------------- entity profiles
 
     def entity_profile(self, *, entity: str, limit: int, order: str,
                        include_superseded: bool) -> dict[str, Any]:
-        """单实体完整档案：参与过的全部记忆按时间拉一遍。"""
+        """One entity's full profile: every memory it took part in, pulled in time order."""
         return self.brain.entity_profile(entity, limit=limit, order=order,
                                          include_superseded=include_superseded)
 
     def entity_list(self, *, prefix: str, limit: int, min_mentions: int,
                     trusted_only: bool) -> dict[str, Any]:
-        """已有哪些实体（按提及条数降序；可信来源过滤排噪）。"""
+        """Which entities exist (descending by mention count; trusted-source filtering to cut noise)."""
         return self.brain.entity_list(prefix=prefix, limit=limit,
                                       min_mentions=min_mentions,
                                       trusted_only=trusted_only)
 
-    # ---------------------------------------------------------------- 知识地图
+    # ---------------------------------------------------------------- knowledge map
 
     def knowledge_map(self, *, limit: int,
                       include_archived: bool) -> dict[str, Any]:
-        """知识结构总览（主题 + 代表句 + playbook）。**带** library 信封。"""
+        """Knowledge-structure overview (topics + representative sentences + playbook). **With** the library envelope."""
         return self._envelope(self.brain.knowledge_map(
             limit=limit, include_archived=include_archived))
 
     def knowledge_topic(self, *, topic_id: str, action: str, summary: str,
                         evidence: str, limit: int, topics: str, items: str,
                         batch: int, per_topic: int, fras: str) -> dict[str, Any]:
-        """单知识点读写通道：brief / summarize / revert / rebuild / refresh。
+        """Single knowledge-point read/write channel: brief / summarize / revert / rebuild / refresh.
 
-        ``items`` / ``fras`` 的解析失败错误体**不带** library 首键——
-        静默当空会让宿主以为写回成功了，实际一条都没进库。
-        成功路径经 ``_envelope``（与适配层 ``_with_library`` 同规则）。
+        Parse-failure error bodies for ``items`` / ``fras`` carry **no**
+        library first key —
+        silently treating them as empty would make the host believe the
+        write-back succeeded when in fact nothing entered the library.
+        The success path goes through ``_envelope`` (same rule as the
+        adapter layer's ``_with_library``).
         """
-        # items 是「归纳条目数组」的 JSON 字符串（[{"topic_id":..,"summary":..
-        # ,"evidence":[..]}]）。解析失败要**显式报错**。
+        # items is the JSON string of the 「归纳条目数组」 (summary-entry
+        # array) ([{"topic_id":..,"summary":..
+        # ,"evidence":[..]}]). Parse failure must be an **explicit error**.
         parsed_items: Any = None
         raw_items = (items or "").strip()
         if raw_items:
@@ -1010,7 +1114,9 @@ class RecallService(BaseService):
             if not isinstance(parsed_items, list):
                 return {"ok": False, "action": action,
                         "error": "items must be an array (each item contains topic_id/summary/evidence)"}
-        # fras 同上：解析失败显式报错（静默当"没传"会让宿主以为结构写进去了）。
+        # fras same as above: parse failure is an explicit error (silently
+        # treating it as "not provided" would make the host believe the
+        # structure was written).
         parsed_fras: Any = None
         raw_fras = (fras or "").strip()
         if raw_fras:

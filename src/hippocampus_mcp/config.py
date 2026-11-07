@@ -1,32 +1,42 @@
 # -*- coding: utf-8 -*-
-"""配置单一来源 —— 全库唯一的 env 读取点，产出不可变 Config。
+"""Single source of truth for configuration — the repo's only env read
+point, producing an immutable Config.
 
-## 为什么要有这个文件
+## Why this file exists
 
-设计动机：env 读取曾散落在 **23 个文件 / 101 处**：server.py
-模块级 18 处 import-time 快照、manager/core/pure 各 4 处函数内读取、
-domain/topic.py 4 处、constants 里还有 18 处 ``_env_*`` 模块级求值。
-后果是「改一个旋钮要 grep 半个仓库」「测试 patch 了一个副本另一个没变」。
+Design motivation: env reads used to be scattered across **23 files /
+101 places**: 18 module-level import-time snapshots in server.py, 4
+in-function reads each in manager/core/pure, 4 in domain/topic.py, plus
+another 18 ``_env_*`` module-level evaluations in constants.
+The consequence was "changing one knob requires grepping half the repo"
+and "a test patches one copy while another stays unchanged".
 
-本文件把它们收成一份**显式字段清单**：
+This file collects them into one **explicit field list**:
 
-* :class:`Config` —— frozen dataclass，每个字段 = 一个 env 旋钮，
-  默认值与迁移前逐一比对（``tests/test_config_parity.py`` 钉住）；
-* :func:`load_config` —— **唯一**的 ``os.environ`` 读取点。刻意**不缓存**：
-  测试与评测脚本靠「改 env → 再调一次」观察行为变化（如
-  ``test_c1_source_drift.py`` D6 设 ``HIPPOCAMPUS_SOURCE_SIG=0``），
-  缓存会把这种切换变成静默失效。
+* :class:`Config` — frozen dataclass, each field = one env knob, defaults
+  checked one by one against pre-migration values (pinned by
+  ``tests/test_config_parity.py``);
+* :func:`load_config` — the **sole** ``os.environ`` read point.
+  Deliberately **not cached**: tests and evaluation scripts rely on
+  "change env → call again" to observe behavior changes (e.g.
+  ``test_c1_source_drift.py`` D6 sets ``HIPPOCAMPUS_SOURCE_SIG=0``);
+  caching would turn such switches into silent no-ops.
 
-## 边界（防范围蔓延）
+## Boundaries (scope-creep prevention)
 
-* **只收 server/manager/core/pure 的散点**（32 处）。``common/constants.py``
-  的 ``_env_*`` 模块级求值与 ``domain/topic.py`` 的参数化散点由第二批
-  收编（见下文对应分组）。config 依赖 common/constants 的默认值表
-  （最底层底座），不反向依赖任何上层。
-* **不动 101 个 env 的名字与语义**：Config 是读取点的搬迁，不是旋钮的
-  重新设计。用户环境变量一个都不用改。
+* **Only collects the scattered points in server/manager/core/pure**
+  (32 places). The ``_env_*`` module-level evaluations in
+  ``common/constants.py`` and the parameterized scattered points in
+  ``domain/topic.py`` are absorbed by the second batch (see the
+  corresponding groups below). config depends on common/constants'
+  defaults table (the lowest base layer) and never depends back on any
+  upper layer.
+* **Names and semantics of the 101 envs stay untouched**: Config
+  relocates the read points, it does not redesign the knobs. Not a
+  single user environment variable needs to change.
 
-依赖方向：``config`` → ``common.constants``（取默认值常量），无其他依赖。
+Dependency direction: ``config`` → ``common.constants`` (for default
+value constants), no other dependencies.
 """
 from __future__ import annotations
 
@@ -34,21 +44,23 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-#: LNN 分路上限默认值（config 是最底层，不能反向依赖 engine；
-#: manager 从这里 import）
+#: Default for the LNN context-branch ceiling (config is the lowest layer
+#: and must not depend back on engine; manager imports from here)
 LNN_CTX_MAX_DEFAULT = 8
 
 # ---------------------------------------------------------------------------
-# 类型化 env 读取。**四种 bool 语义并存是现状**（如实复现存量散点），
-# 逐一复现、不统一——统一就是行为漂移：
-#   A 黑名单默认 true ：「false/0/no」关，其余含未设都开
-#       （server.py _AUTO_SAVE/_AUTO_BACKFILL/_SUPERSEDE）
-#   B 白名单          ：只有「1/true/yes/on」开，其余含未设都关
-#       （manager _recall_decay_enabled、core NER_ALLOW_TORCH_ENV）
-#   C 黑名单默认 false：「false/0/no」关，其余含未设……未设关、其他值开
-#       （server.py _WARMUP_DIAG，get 默认 "0"）
-#   D 非空非 0        ：空串/未设/"0" 关，其余（含 "false"！）开
-#       （manager ENV_ALLOW_MODEL_SWITCH）
+# Typed env reads. **Four coexisting bool semantics are the status quo**
+# (faithfully reproducing the existing scattered points), reproduced one
+# by one, not unified — unification would be behavior drift:
+#   A deny-list default true: "false/0/no" off, everything else including
+#       unset on (server.py _AUTO_SAVE/_AUTO_BACKFILL/_SUPERSEDE)
+#   B allow-list          : only "1/true/yes/on" on, everything else
+#       including unset off (manager _recall_decay_enabled,
+#       core NER_ALLOW_TORCH_ENV)
+#   C deny-list default false: "false/0/no" off, otherwise... unset off,
+#       other values on (server.py _WARMUP_DIAG, get default "0")
+#   D non-empty and non-0 : empty/unset/"0" off, the rest (including
+#       "false"!) on (manager ENV_ALLOW_MODEL_SWITCH)
 # ---------------------------------------------------------------------------
 
 
@@ -61,9 +73,10 @@ def _flag_deny_true(name: str, default: bool = True) -> bool:
 
 def _flag_allow_only(name: str, default: bool = False,
                      with_on: bool = True) -> bool:
-    """白名单开关。``with_on=False`` 复现 core.py NER 的窄名单
-    （("1","true","yes") 无 "on"——与 manager recall_decay 的宽名单差一个词，
-    M1 实测抓到的第二处 parity 裂缝，逐字段复现不统一）。"""
+    """Allow-list flag. ``with_on=False`` reproduces core.py NER's narrow
+    list (("1","true","yes") without "on" — one word short of manager
+    recall_decay's wide list; the second parity crack caught live during
+    M1; reproduced field by field, not unified)."""
     words = ("1", "true", "yes", "on") if with_on else ("1", "true", "yes")
     return os.environ.get(name, "").strip().lower() in words
 
@@ -78,10 +91,12 @@ def _flag_nonempty(name: str, default: bool = False) -> bool:
 
 
 def _flag_tristate(name: str, default: bool) -> bool:
-    """E 型：两份名单都认，**其余值回落到 default**（不像 A 型那样判开）。
+    """Type E: both lists are recognized, **any other value falls back to
+    default** (unlike type A, which judges it on).
 
-    这条很重要： ``HIPPOCAMPUS_MAP_MENTION=maybe`` 在迁移前是什么结果，
-    迁移后还得是什么——脏值的行为也是行为的一部分。
+    This matters: whatever ``HIPPOCAMPUS_MAP_MENTION=maybe`` produced
+    before the migration, it must still produce after — behavior on dirty
+    values is part of the behavior.
     """
     raw = os.environ.get(name, "").strip().lower()
     if raw in ("0", "false", "no", "off"):
@@ -92,11 +107,14 @@ def _flag_tristate(name: str, default: bool) -> bool:
 
 
 def _positive_float(name: str, default: float) -> float:
-    """取值必须是正数，否则回落默认（原 ``constants.writer_ttl`` 的 ``v > 0`` 门）。
+    """Value must be positive, otherwise fall back to the default (the
+    original ``v > 0`` gate of ``constants.writer_ttl``).
 
-    为什么保留这道门、而不是把它当成普通的「配错兜底」：TTL 这类旋钮，
-    ``0`` 的语义是「立刻过期、谁也看不见」，配出来只会制造一批幽灵写者，
-    比不生效更糟——现状选了挡掉，收编照搬。
+    Why keep this gate instead of treating it as ordinary misconfiguration
+    fallback: for knobs like TTL, ``0`` means "expire immediately,
+    invisible to everyone" — configuring it would only create a batch of
+    ghost writers, worse than not taking effect. The status quo chose to
+    block it, and this absorption copies that.
     """
     v = _float(name, default)
     return v if v > 0 else default
@@ -133,61 +151,65 @@ def _str(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    """全库配置快照（不可变）。字段 = env 旋钮，默认值 = 迁移前实测值。
+    """Whole-repo config snapshot (immutable). Field = env knob, default =
+    the measured pre-migration value.
 
-    每次 :func:`load_config` 重读 env——这是特性不是遗漏：测试与评测
-    依赖「改 env 立刻生效」的语义（见模块 docstring）。
+    Every :func:`load_config` call re-reads env — that is a feature, not
+    an omission: tests and evaluation depend on the "change env, takes
+    effect immediately" semantics (see the module docstring).
     """
 
-    # --- 启动与库位置（server.py 模块级） ---
+    # --- Startup and library location (server.py module level) ---
     log_level: str = "INFO"
     persist_dir: str = field(
         default_factory=lambda: os.path.join(
             os.path.expanduser("~"), ".hippocampus_mcp"))
 
-    # --- 检索调参（server.py 模块级，LoCoMo 调优结果） ---
-    lambda_decay: float = 7776000.0        # 90 天
-    mu_importance: float = 15552000.0      # 180 天
+    # --- Retrieval tuning (server.py module level, LoCoMo tuning results) ---
+    lambda_decay: float = 7776000.0        # 90 days
+    mu_importance: float = 15552000.0      # 180 days
     w_sim: float = 0.95
     w_time: float = 0.03
     w_recall: float = -0.02
-    # 检索强度权重：+w·log1p(recall_strength)——成功召回
-    # 巩固痕迹（测试效应）。0 = 关（与旧打分逐位一致）。
+    # Retrieval strength weight: +w·log1p(recall_strength) — successful
+    # recall of consolidation traces (testing effect). 0 = off
+    # (bit-for-bit identical to the old scoring).
     w_strength: float = 0.03
-    # 改写历史账本 ring：mem_history.jsonl 保留最新 N 条
-    # （update/merge 的 before 流水，sidecar 审计面；形态镜像 tag_ops）。
-    # 0 的切片语义见 store/mem_history 模块 docstring（[-0:] 全量怪癖，
-    # 调用方不传 0）。
+    # Rewrite-history ledger ring: mem_history.jsonl keeps the latest N
+    # entries (the before journal of update/merge, a sidecar audit
+    # surface; shape mirrors tag_ops). For the slicing semantics of 0 see
+    # the store/mem_history module docstring (the [-0:] full-volume
+    # quirk; callers never pass 0).
     mem_history_ring: int = 200
     nav_penalty: float = 1.0
     recall_decay: bool = False
-    recall_decay_tau: float = 7776000.0    # 与 lambda_decay 同基准（90 天）
+    recall_decay_tau: float = 7776000.0    # same basis as lambda_decay (90 days)
     library_cache_ttl: float = 30.0
 
-    # --- 模型与嵌入（server.py / core.py / embeddings.ENV_MODEL） ---
+    # --- Model and embedding (server.py / core.py / embeddings.ENV_MODEL) ---
     emb_model: str = ""
     crl_model: str = ""
     allow_model_switch: bool = False
 
-    # --- 写入策略（server.py 模块级） ---
+    # --- Write policy (server.py module level) ---
     auto_save: bool = True
     auto_backfill: bool = True
     supersede: bool = True
 
-    # --- 实体与块限（pure.py 函数内） ---
+    # --- Entity and block limits (pure.py in-function) ---
     entity_lexicon: str = ""
     daily_activity_days: str = ""
     knowledge_block_limit: str = ""
     pin_block_limit: str = ""
 
-    # --- LNN（manager.py 函数内） ---
+    # --- LNN (manager.py in-function) ---
     lnn_ctx_max: int = LNN_CTX_MAX_DEFAULT
 
-    # --- 漂移审计（core.py 函数内） ---
+    # --- Drift audit (core.py in-function) ---
     source_root: str = ""
     ner_allow_torch: bool = False
 
-    # --- 预热与握手（server.py 模块级，launcher 协作协议） ---
+    # --- Warmup and handshake (server.py module level, launcher cooperation protocol) ---
     warmup: str = "auto"
     warmup_timeout: float = 90.0
     warmup_wait: str = "raise"
@@ -196,36 +218,43 @@ class Config:
     preload: str = "1"
     preload_budget: float = 6.0
 
-    # --- 工具面（server.py 模块级，剖面门控） ---
+    # --- Tool surface (server.py module level, profile gating) ---
     tool_profile: str = "common"
     common_tools: str = ""
 
     # ------------------------------------------------------------------
-    # 第二批收编的 28 个旋钮
+    # The 28 knobs absorbed in the second batch
     # ------------------------------------------------------------------
-    # 来源四处：
-    #   * common/constants 的**模块级求值**（3 个 ring + 写者 TTL +
-    #     三个层开关）
-    #   * brain/core.py 的函数内散点（状态卡矛盾信号 + 三条巡检链路）
-    #   * brain/session.py 的 5 个预激活槽位开关（三态由来已久）
-    #   * domain/topic.py 的 6 个（domain 不许 import config ⇒ 参数化注入）
-    # 默认值一律写成**字面量**而不是 import 常量：config 是 L0 纯叶
-    # （依赖图 ``_ALLOWED["config"] == {"config"}``），不许反向依赖 common
-    # 或 domain —— 两侧同值的等价性由 ``test_config_parity`` 的 P7 钉住。
+    # Four sources:
+    #   * common/constants' **module-level evaluations** (3 rings +
+    #     writer TTL + three layer switches)
+    #   * brain/core.py in-function scattered points (status-card
+    #     contradiction signal + three inspection chains)
+    #   * brain/session.py's 5 pre-activation slot switches (tri-state
+    #     since long ago)
+    #   * domain/topic.py's 6 (domain may not import config ⇒ parameterized
+    #     injection)
+    # Defaults are always written as **literals** rather than imported
+    # constants: config is an L0 pure leaf (dependency graph
+    # ``_ALLOWED["config"] == {"config"}``) and must not depend back on
+    # common or domain — the equivalence of both sides' identical values
+    # is pinned by ``test_config_parity`` P7.
 
-    # 环形缓冲与写入纪律（原 constants 模块级求值）
+    # Ring buffers and write discipline (formerly constants module-level evaluations)
     tag_ops_ring: int = 50
     save_ledger_ring: int = 200
     l0_autosave_every: int = 20
-    #: 写者心跳过期窗口。**正值门**：解析出 <=0 一律回落默认（现状语义，
-    #: 见原 ``constants.writer_ttl`` 的 ``if v > 0`` 分支——它不是配错兜底，
-    #: 是「0 秒过期」这种无意义取值要被挡掉）
+    #: Writer heartbeat expiry window. **Positive-value gate**: any parsed
+    #: value <= 0 falls back to the default (status quo semantics, see the
+    #: original ``if v > 0`` branch of ``constants.writer_ttl`` — it is not
+    #: misconfiguration fallback; meaningless values like "expire in 0
+    #: seconds" must be blocked)
     writer_ttl: float = 3600.0
     layer_fp: bool = True
     layer_del: bool = True
     source_sig: bool = True
 
-    # 巡检链路与状态卡（原 brain/core.py 函数内散点）
+    # Inspection chains and status card (formerly brain/core.py in-function scattered points)
     status_contradictions: bool = True
     map_auto_verify: bool = True
     map_auto_interval_h: float = 6.0
@@ -237,15 +266,16 @@ class Config:
     file_registry_off: bool = False
     file_registry_interval_h: int = 6
 
-    # session_start 预激活槽位（原 _block_switch 的 env 分支；三态语义本身
-    # 留在 session.py，Config 只提供 **param==0 时**的答案）
+    # session_start pre-activation slots (formerly the env branch of
+    # _block_switch; the tri-state semantics itself stays in session.py,
+    # Config only provides the answer for **param==0**)
     overview_block: bool = True
     status_block: bool = True
     task_profile_block: bool = True
     map_index_block: bool = True
     map_detail_block: bool = True
 
-    # 主题层（原 domain/topic.py；由调用方注入进纯函数）
+    # Topic layer (formerly domain/topic.py; injected into the pure function by the caller)
     topic_layer: bool = True
     topic_join_sim: float = 0.55
     topic_max: int = 1000
@@ -254,83 +284,120 @@ class Config:
     topic_low_info: bool = True
 
     # ------------------------------------------------------------------
-    # 用户级记忆继承槽（新字段无迁移前语义，
-    # 型别：条数三态 + 阈值档下限）
+    # User-level memory inheritance slots (new fields have no
+    # pre-migration semantics; types: count tri-state + threshold-tier
+    # floor)
     # ------------------------------------------------------------------
-    #: 用户级继承槽条数。三态表见 ``brain/pure.resolve_user_scope_limit``：
-    #: param==0 时看这里——**正 = 条数、负 = 关**、0 / 空 / 非法
-    #: 回落默认 3（注意与 pin_limit 的差别：pin 的 env 负值落默认，
-    #: user_scope 的 env 负值是显式关）。
+    #: User-level inheritance slot count. For the tri-state table see
+    #: ``brain/pure.resolve_user_scope_limit``: when param==0 this field
+    #: is consulted — **positive = count, negative = off**, 0 / empty /
+    #: invalid falls back to the default 3 (note the difference from
+    #: pin_limit: a negative env value for pin falls to the default,
+    #: while a negative env value for user_scope is an explicit off).
     user_scope_limit: int = 3
-    #: 用户级任务目录槽条数。三态表在
-    #: ``brain/pure.resolve_task_directory_limit``（与 user_scope 同构）：
-    #: param==0 时看这里——**正 = 条数、负 = 关**、0 / 空 / 非法回落默认 8。
+    #: User-level task directory slot count. The tri-state table lives in
+    #: ``brain/pure.resolve_task_directory_limit`` (isomorphic with
+    #: user_scope): when param==0 this field is consulted — **positive =
+    #: count, negative = off**, 0 / empty / invalid falls back to
+    #: default 8.
     task_directory_limit: int = 8
-    #: 阈值档下限：非 pinned 条目 importance >= 该值才进继承槽。
+    #: Threshold-tier floor: non-pinned entries enter the inheritance slot
+    #: only when importance >= this value.
     user_scope_importance: float = 0.7
-    #: 提升候选稳定期限：≥N 个不同会话复现才成候选。
+    #: Promotion candidate stability period: becomes a candidate only
+    #: after being reproduced in >= N distinct sessions.
     promote_min_sessions: int = 2
-    # 检索端过时窗口（天）：记忆 age > 窗口且未
-    # pin → 不进 recall / get_memory_context 结果集。**零状态变更**：
-    # 不删、不归档、不改 state，只挡输出。
-    # **默认 0 = 关**：归档的老记忆也必须能被相似查询查到，不能被时间
-    # 单方面判死；输出长度由 top_k / limit 控制，排名靠后的自然被截掉。
-    # 需要"只看近期"时显式设天数（或查询时传 occurred_after/before）。
-    # 时间基准＝_reference_time or 墙钟（约束 4）。
+    # Recall-side staleness window (days): a memory with age > window and
+    # not pinned → excluded from the recall / get_memory_context result
+    # set. **Zero state change**: no deletion, no archiving, no state
+    # change, only output gating.
+    # **Default 0 = off**: archived old memories must remain findable by
+    # similar queries; time alone must not unilaterally kill them. Output
+    # length is controlled by top_k / limit; lower-ranked items are
+    # naturally truncated.
+    # To "see only recent", explicitly set a number of days (or pass
+    # occurred_after/before at query time).
+    # Time basis = _reference_time or wall clock (constraint 4).
     recency_window_days: int = 0
-    #: 敏感词表文件路径：一行一词，``#`` 注释行、空行
-    #: 跳过；空 = 无部署词表（**模式级内置兜底仍在**——「任一不过
-    #: 不写」纪律的第二道门不依赖词表存在）。
+    #: Sensitive word list file path: one word per line, ``#`` comment
+    #: lines and blank lines skipped; empty = no deployed word list
+    #: (**the pattern-level built-in fallback remains** — the second gate
+    #: of the "any check fails → no write" discipline does not depend on
+    #: the word list existing).
     sensitive_words: str = ""
-    #: 逃生门：**False（默认）= 家库写边界生效**
-    #: ——写类工具的目标不是本次连接的家库、也不是 user 受管通道时显式报错；
-    #: True = 全局放开跨库写（运维搬库 / 批量迁移用）。
-    #: 语义类型 B（**白名单**，与 recall_decay 同款）——逃生门必须是"说清楚了
-    #: 才开"：空串、脏值（``maybe``）一律落默认 False。不能用 C 型（黑名单）：
-    #: C 型的*"不是假就是真"*会让空 env 与拼错的取值把边界悄悄放开。
+    #: Escape hatch: **False (default) = home-library write boundary
+    #: enforced** — write tools raise explicitly when their target is
+    #: neither the home library bound for this connection nor the user
+    #: managed channel; True = globally open up cross-library writes (for
+    #: ops library relocation / bulk migration).
+    #: Semantic type B (**allow-list**, same as recall_decay) — an escape
+    #: hatch must be "explicitly stated before it opens": empty strings
+    #: and dirty values (``maybe``) all fall back to the default False.
+    #: Type C (deny-list) cannot be used: its *"everything that isn't
+    #: false is true"* would let an empty env or a typoed value silently
+    #: open the boundary.
     cross_library_write: bool = False
 
     # ------------------------------------------------------------------
-    # engine/brain 可直连面收编的 4 个旋钮
+    # The 4 knobs absorbed from the engine/brain direct-read surface
     # ------------------------------------------------------------------
-    # 字符串运输、语义解析留在调用点（照抄原表达式，零语义漂移）：
-    #   * onnx_no_arena 原文 `not in ("1", "true")`——大小写敏感、不含
-    #     yes/on，走通用 bool 分派会漂移，故按 str 收；
-    #   * emb_model / entity_lexicon 字段早已存在，本批只是杀掉
-    #     embeddings.resolve_embedder_model 与 brain/entity 的第二读取点。
-    # store/lnn/library/map/retrieval/domain 构造注入面 + 根层入口
-    # 的收编见下方对应分组。
-    onnx_backend: str = "auto"        # torch/onnx/auto，非法值回落 auto
-    onnx_no_arena: str = ""           # "1"/"true" 才关 arena（默认开）
-    shared_embedder: str = ""         # 0/false/off/no 才关共享池（默认开）
-    emb_cache: str = ""               # 显式嵌入缓存目录
-    # 按系统语言自动选「应用默认」嵌入模型（中文→BGE-zh，其余→MiniLM）。
-    # 字符串运输、语义解析在 embeddings.auto_model_selection_enabled（照抄
-    # shared_embedder 的同款口径：0/false/off/no 才关，未设即开）。
-    # **只影响「什么都没配」这条路径**：显式 HIPPOCAMPUS_EMB_MODEL 永远优先。
+    # String transport, semantic parsing stays at the call site (original
+    # expressions copied verbatim, zero semantic drift):
+    #   * onnx_no_arena's original form `not in ("1", "true")` — case
+    #     sensitive, without yes/on; the generic bool dispatch would
+    #     drift, so it is absorbed as str;
+    #   * emb_model / entity_lexicon fields already exist; this batch
+    #     only kills the second read points in
+    #     embeddings.resolve_embedder_model and brain/entity.
+    # For the absorption of the store/lnn/library/map/retrieval/domain
+    # constructor-injection surface + root-level entries, see the
+    # corresponding groups below.
+    onnx_backend: str = "auto"        # torch/onnx/auto; invalid values fall back to auto
+    onnx_no_arena: str = ""           # arena off only for "1"/"true" (on by default)
+    shared_embedder: str = ""         # shared pool off only for 0/false/off/no (on by default)
+    emb_cache: str = ""               # explicit embedding cache directory
+    # Auto-select the "application default" embedding model by system
+    # language (Chinese → BGE-zh, others → MiniLM).
+    # String transport, semantic parsing in
+    # embeddings.auto_model_selection_enabled (same rule as
+    # shared_embedder copied verbatim: 0/false/off/no turns it off,
+    # unset = on).
+    # **Only affects the "nothing configured" path**: an explicit
+    # HIPPOCAMPUS_EMB_MODEL always wins.
     emb_model_auto: str = ""
-    # 超长内容（超过嵌入模型 token 上限）的处置策略。
-    # warn（默认，= 只自曝）/ split（拆成多张卡）/ reject（拒写）。
-    # **白名单**：只有明确写 split|reject 才改变行为，其余一律 warn
-    # （同款口径：写错等同于没写，绝不让开关被悄悄打开）。
-    # 语义解析在 domain.long_content.parse_policy（纯函数，可单测）。
+    # Disposition policy for over-long content (beyond the embedding
+    # model's token ceiling).
+    # warn (default, = self-report only) / split (split into multiple
+    # cards) / reject (refuse the write).
+    # **Allow-list**: only an explicit split|reject changes behavior,
+    # everything else is warn (same rule: a typo equals not written; the
+    # switch is never silently opened).
+    # Semantic parsing in domain.long_content.parse_policy (pure
+    # function, unit-testable).
     long_content: str = ""
-    # recall 返回体里**单条记忆 content 的字符上限**（截断护栏）。
-    # 0 = 不截断（现状，长记忆一次召回能上万字符）。字符串运输，语义解析
-    # 在 application/recall_service（`_content_cap`，非数字/负数按 0 处理
-    # = 不截断，写错等同于没写）。**截断必须自曝**：被切的条目带
-    # content_truncated=true + content_chars，绝不静默切。
+    # **Per-entry character cap on a single memory's content** in the
+    # recall response body (truncation guard).
+    # 0 = no truncation (status quo; one recall of a long memory can
+    # exceed ten thousand characters). String transport, semantic parsing
+    # in application/recall_service (`_content_cap`; non-numeric/negative
+    # treated as 0 = no truncation; a typo equals not written).
+    # **Truncation must self-report**: truncated entries carry
+    # content_truncated=true + content_chars, never a silent cut.
     recall_content_max_chars: str = ""
 
     # ------------------------------------------------------------------
-    # store/lnn/library/map/retrieval/domain 构造注入面 16 旋钮收编。
-    # 全部**字符串运输**（口径：语义解析
-    # 留消费点，零漂移），消费侧（store/lnn/library/map/retrieval/domain）
-    # 受 G1 矩阵约束不 import config —— 由唯一生产构造方 **engine**
-    # （manager import 时）apply_config 注入；消费点的 env 直读降级为
-    # 「直连回退」（env 先、注入值回退——测试直接设 os.environ 的面
-    # 原样保住；生产路径 env 未设时默认值单点走这里）。
-    # 默认值全部＝迁移前 env 兜底值的原文。
+    # Absorption of the 16-knob constructor-injection surface of
+    # store/lnn/library/map/retrieval/domain.
+    # All are **string transport** (rule: semantic parsing stays at the
+    # consumer, zero drift). The consumers
+    # (store/lnn/library/map/retrieval/domain) are bound by the G1 matrix
+    # not to import config — the sole production constructor **engine**
+    # (at manager import time) injects via apply_config; the consumers'
+    # direct env reads are demoted to "direct-read fallback" (env first,
+    # injected value as fallback — the surface where tests set os.environ
+    # directly is preserved as-is; on the production path, when env is
+    # unset the default is routed single-point through here).
+    # All defaults = the verbatim pre-migration env fallback values.
     # ------------------------------------------------------------------
     snapshot_min_hours: str = "6"       # HIPPOCAMPUS_SNAPSHOT_MIN_HOURS
     multi_writer: str = "1"             # HIPPOCAMPUS_MULTI_WRITER
@@ -342,7 +409,7 @@ class Config:
     fts5: str = ""                      # HIPPOCAMPUS_FTS5
     lnn_backend: str = ""               # HIPPOCAMPUS_LNN_BACKEND
     library_roots: str = ""             # HIPPOCAMPUS_LIBRARY_ROOTS
-    #: 默认驻留 2→3（实测容量权衡），此处按 3 落字段。
+    #: Default residency 2→3 (measured capacity trade-off); the field lands as 3.
     max_resident_libs: str = "3"        # HIPPOCAMPUS_MAX_RESIDENT_LIBS
     file_registry_ignore: str = ""      # HIPPOCAMPUS_FILE_REGISTRY_IGNORE
     file_registry_max_files: str = ""   # HIPPOCAMPUS_FILE_REGISTRY_MAX_FILES
@@ -351,41 +418,63 @@ class Config:
     tag_schema: str = ""                # HIPPOCAMPUS_TAG_SCHEMA
 
     # ------------------------------------------------------------------
-    # daemon 空闲「睡眠窗口」的脑侧旋钮。
-    # **总开关不在 config**：``HIPPOCAMPUS_SLEEP_IDLE``（空闲多少秒开睡，
-    # 0 = 关）是 daemon 进程拓扑决定，随 model-unload 同款在 daemon.py
-    # 直读 env（口径：根层入口属启动拓扑 plumbing）。
-    # 这里只收「睡眠批内容」的三个语义旋钮，由 brain.core.sleep_batch
-    # 调用时现取（同 source_root / status_contradictions 的先例）。
-    # 默认值不动生产行为：睡眠批本身默认关（SLEEP_IDLE=0），这里的
-    # 旋钮只在开关打开后才被读。
+    # Brain-side knobs for the daemon idle "sleep window".
+    # **The master switch is not in config**: ``HIPPOCAMPUS_SLEEP_IDLE``
+    # (idle seconds before sleeping, 0 = off) is decided by the daemon
+    # process topology and, like model-unload, is read directly from env
+    # in daemon.py (rule: root-level entries are startup-topology
+    # plumbing).
+    # Only the three semantic knobs of the "sleep batch content" are
+    # absorbed here, read live by brain.core.sleep_batch at call time
+    # (same precedent as source_root / status_contradictions).
+    # Defaults do not change production behavior: the sleep batch itself
+    # is off by default (SLEEP_IDLE=0); these knobs are only read after
+    # the switch is on.
     # ------------------------------------------------------------------
-    #: 重放窗口（天）：只重放「窗口内写入」的 L1 记忆做共激活强化。
-    #: 对齐生物事实——SWR 重放的是**近期**经历，不是全库倒带。
+    #: Replay window (days): only L1 memories "written within the window"
+    #: are replayed for co-activation reinforcement.
+    #: Aligned with the biological fact — SWR replays **recent**
+    #: experience, not a whole-library rewind.
     sleep_replay_days: float = 2.0
-    #: 单次睡眠批最多多少条 L1 记录参与重放（大库限幅；0 = 不限）。
+    #: Max L1 records participating in replay per sleep batch (cap for
+    #: large libraries; 0 = unlimited).
     sleep_max_replay: int = 200
-    #: 成簇下限：实体共现少于该数的记忆不构成重放簇（共激活至少要有
-    #: 两个成员才有意义；无实体的记忆不参与）。
+    #: Clustering floor: memories with fewer entity co-occurrences than
+    #: this do not form a replay cluster (co-activation needs at least
+    #: two members to matter; memories without entities do not
+    #: participate).
     sleep_min_cluster: int = 2
 
     # ------------------------------------------------------------------
-    # 写侧·呈现线两个旋钮（编码门控 / 前瞻触发）
+    # Two write-side presentation-line knobs (encoding gating /
+    # prospective triggering)
     # ------------------------------------------------------------------
-    #: 新颖度/预测误差门控编码。True（默认）= ingest 分句判定时与
-    #: 既有图式（L3 画像 / L2T 知识点摘要 / 高置信 L1）比对：印证→不加强
-    #: （重复归 dedup 管）、矛盾→importance 提升 + 冲突对象回显、
-    #: 全新实体→小幅加权。**门控只调编码强度（importance），不制造 pin**：
-    #: base < 0.7 时提升后被钳在 0.69，绝不新跨越 PIN_IMPORTANCE——pin 的
-    #: 进退权留给用户/反馈通道（pin 单调堆积是 policies.py 记录在案的教训）。
-    #: 显式传入 importance 时门控整体旁路（宿主说了算）。
-    #: 语义类型 A（黑名单默认 true）：0/false/no/off 显式关，脏值回落默认开。
+    #: Novelty/prediction-error gated encoding. True (default) = at
+    #: ingest sentence adjudication, compare against existing schemas
+    #: (L3 profile / L2T knowledge-point summaries / high-confidence L1):
+    #: confirmation → no boost (duplicates are dedup's business),
+    #: contradiction → importance raised + conflicting object echoed
+    #: back, brand-new entity → small weight boost. **Gating only adjusts
+    #: encoding strength (importance), it never creates a pin**: when
+    #: base < 0.7 the boosted value is clamped to 0.69 and never newly
+    #: crosses PIN_IMPORTANCE — pin entry/exit authority is left to the
+    #: user/feedback channel (pins accumulating monotonically is a lesson
+    #: on record in policies.py).
+    #: With an explicitly passed importance the gate is bypassed entirely
+    #: (the host decides).
+    #: Semantic type A (deny-list default true): 0/false/no/off explicitly
+    #: off, dirty values fall back to default on.
     novelty_gate: bool = True
-    #: 前瞻记忆情境触发。True（默认）= remember_intent 登记时从文本
-    #: 派生触发条件（trigger_entities / trigger_topic），get_memory_context
-    #: 的查询实体/实词与活跃待办的触发集相交时，该待办在 block_2 置前回带
-    #: （cap 5 不膨胀）。关掉时**双端都关**：登记不再派生触发集、装配不再
-    #: 触发回带（存量已带触发集的待办也一律不触发）。语义类型 A 同上。
+    #: Prospective memory contextual triggering. True (default) = at
+    #: remember_intent registration, trigger conditions are derived from
+    #: the text (trigger_entities / trigger_topic); when the query
+    #: entities/content words of get_memory_context intersect the trigger
+    #: set of an active open intent, that intent is carried back at the
+    #: front of block_2 (cap 5, no inflation). Turning it off shuts
+    #: **both ends**: registration no longer derives trigger sets and
+    #: assembly no longer triggers carry-back (existing open intents that
+    #: already carry trigger sets also never trigger). Semantic type A as
+    #: above.
     prospective_trigger: bool = True
     #: R1 (2026-11-06): the production MCP ``recall`` tool shares
     #: the evaluation scoring pipeline (BM25/RRF, MMR, entity bonus,
@@ -402,22 +491,29 @@ class Config:
     #: type B (allow-list): only an explicit 1/true enables it; a typo
     #: stays off. Scoring formulas untouched (R1's territory).
     recall_query_fanout: bool = False
-    #: 访问驱动的画像转存。True（默认）= consolidate 刷新画像时把
-    #: 「没人钉但反复被想起（检索强度 ≥ 3）且活得够久（≥ 7 天）」的
-    #: L1 条目毕业进 L3 独立槽 ``recurring_facts``（展示层追加，不写记录、
-    #: 不改状态、不碰用户库——与 U3 跨库提升流的边界见 domain/profile_ops
-    #: 模块 docstring）。关掉只停**新增**毕业条目：存量条目的失效摘除
-    #: （归档/删除后）仍由 prune 管理，不留僵尸。阈值常量在
-    #: common/constants（PROFILE_STRENGTH_*）。语义类型 A（黑名单默认
-    #: true）：0/false/no/off 显式关，脏值回落默认开。
+    #: Access-driven profile promotion. True (default) = when consolidate
+    #: refreshes the profile, L1 entries that "no one pinned but keep
+    #: being recalled (retrieval strength >= 3) and have lived long
+    #: enough (>= 7 days)" graduate into the dedicated L3 slot
+    #: ``recurring_facts`` (appended at the presentation layer; no ledger
+    #: writes, no state changes, never touches the user library — for
+    #: the boundary with the U3 cross-library promotion flow see the
+    #: domain/profile_ops module docstring). Turning it off only stops
+    #: **new** graduate entries: invalidation pruning of existing entries
+    #: (after archive/delete) is still managed by prune, leaving no
+    #: zombies. Threshold constants in common/constants
+    #: (PROFILE_STRENGTH_*). Semantic type A (deny-list default true):
+    #: 0/false/no/off explicitly off, dirty values fall back to default
+    #: on.
     profile_promotion: bool = True
 
     def as_dict(self) -> dict[str, Any]:
-        """字典视图（调试/自曝用；不参与行为）。"""
+        """Dict view (for debugging/self-reporting; not part of behavior)."""
         return dict(self.__dict__)
 
 
-#: env 名 → Config 字段名。一处对照表，防「改了 env 忘了字段」。
+#: env name → Config field name. One mapping table, guarding against
+#: "changed the env, forgot the field".
 ENV_MAP: dict[str, str] = {
     "HIPPOCAMPUS_LOG_LEVEL": "log_level",
     "HIPPOCAMPUS_PERSIST_DIR": "persist_dir",
@@ -426,9 +522,9 @@ ENV_MAP: dict[str, str] = {
     "HIPPOCAMPUS_W_SIM": "w_sim",
     "HIPPOCAMPUS_W_TIME": "w_time",
     "HIPPOCAMPUS_W_RECALL": "w_recall",
-    # --- 检索强度权重（0 = 关）---
+    # --- Retrieval strength weight (0 = off) ---
     "HIPPOCAMPUS_W_STRENGTH": "w_strength",
-    # --- 改写历史账本 ring ---
+    # --- Rewrite-history ledger ring ---
     "HIPPOCAMPUS_MEM_HISTORY_RING": "mem_history_ring",
     "HIPPOCAMPUS_NAV_PENALTY": "nav_penalty",
     "HIPPOCAMPUS_RECALL_DECAY": "recall_decay",
@@ -457,10 +553,10 @@ ENV_MAP: dict[str, str] = {
     "HIPPOCAMPUS_TOOL_PROFILE": "tool_profile",
     "HIPPOCAMPUS_COMMON_TOOLS": "common_tools",
 
-    # --- 检索端过时窗口（天；0 = 关）---
+    # --- Recall-side staleness window (days; 0 = off) ---
     "HIPPOCAMPUS_RECENCY_WINDOW_DAYS": "recency_window_days",
 
-    # --- 第二批收编 28 个 ---
+    # --- Second batch, 28 absorbed ---
     "HIPPOCAMPUS_TAG_OPS_RING": "tag_ops_ring",
     "HIPPOCAMPUS_SAVE_LEDGER_RING": "save_ledger_ring",
     "HIPPOCAMPUS_L0_AUTOSAVE_EVERY": "l0_autosave_every",
@@ -490,33 +586,33 @@ ENV_MAP: dict[str, str] = {
     "HIPPOCAMPUS_TOPIC_SUMMARY_TOPN": "topic_summary_topn",
     "HIPPOCAMPUS_TOPIC_LOW_INFO_FILTER": "topic_low_info",
 
-    # --- 用户级记忆继承槽 ---
+    # --- User-level memory inheritance slots ---
     "HIPPOCAMPUS_USER_SCOPE_LIMIT": "user_scope_limit",
     "HIPPOCAMPUS_USER_SCOPE_IMPORTANCE": "user_scope_importance",
 
-    # --- 提升流 ---
+    # --- Promotion flow ---
     "HIPPOCAMPUS_PROMOTE_MIN_SESSIONS": "promote_min_sessions",
     "HIPPOCAMPUS_SENSITIVE_WORDS": "sensitive_words",
 
-    # --- 家库写边界 ---
+    # --- Home-library write boundary ---
     "HIPPOCAMPUS_CROSS_LIBRARY_WRITE": "cross_library_write",
 
-    # --- 用户级任务目录 ---
+    # --- User-level task directory ---
     "HIPPOCAMPUS_TASK_DIRECTORY_LIMIT": "task_directory_limit",
 
-    # --- engine/brain 直连面 4 个 ---
+    # --- The 4 engine/brain direct-read surface knobs ---
     "HIPPOCAMPUS_EMB_BACKEND": "onnx_backend",
     "HIPPOCAMPUS_ONNX_NO_ARENA": "onnx_no_arena",
     "HIPPOCAMPUS_SHARED_EMBEDDER": "shared_embedder",
     "HIPPOCAMPUS_EMB_CACHE": "emb_cache",
 
-    # --- 按系统语言自动选默认嵌入模型 ---
+    # --- Auto-select default embedding model by system language ---
     "HIPPOCAMPUS_EMB_MODEL_AUTO": "emb_model_auto",
 
-    # --- 超长内容处置（warn/split/reject，默认 warn）---
+    # --- Over-long content disposition (warn/split/reject, default warn) ---
     "HIPPOCAMPUS_LONG_CONTENT": "long_content",
 
-    # --- recall 单条 content 截断护栏（0 = 不截断）---
+    # --- recall per-entry content truncation guard (0 = no truncation) ---
     "HIPPOCAMPUS_RECALL_CONTENT_MAX_CHARS": "recall_content_max_chars",
 
     # --- R1: production recall shares the evaluation scoring pipeline ---
@@ -524,20 +620,20 @@ ENV_MAP: dict[str, str] = {
     # --- V2: recall query fanout (keyword variant + RRF merge; default off) ---
     "HIPPOCAMPUS_RECALL_QUERY_FANOUT": "recall_query_fanout",
 
-    # --- 睡眠窗口脑侧旋钮（总开关在 daemon）---
+    # --- Sleep-window brain-side knobs (master switch in daemon) ---
     "HIPPOCAMPUS_SLEEP_REPLAY_DAYS": "sleep_replay_days",
     "HIPPOCAMPUS_SLEEP_MAX_REPLAY": "sleep_max_replay",
     "HIPPOCAMPUS_SLEEP_MIN_CLUSTER": "sleep_min_cluster",
 
-    # --- 写侧·呈现线（编码门控 / 前瞻触发）---
+    # --- Write-side presentation line (encoding gating / prospective triggering) ---
     "HIPPOCAMPUS_NOVELTY_GATE": "novelty_gate",
     "HIPPOCAMPUS_PROSPECTIVE_TRIGGER": "prospective_trigger",
 
-    # --- 访问驱动的画像转存 ---
+    # --- Access-driven profile promotion ---
     "HIPPOCAMPUS_PROFILE_PROMOTION": "profile_promotion",
 
-    # --- store/lnn/library/map/retrieval/domain 构造注入面 16 旋钮
-    #     （消费点注入缝见各模块 apply_config）---
+    # --- The 16-knob store/lnn/library/map/retrieval/domain constructor
+    #     injection surface (injection seams at consumers: each module's apply_config) ---
     "HIPPOCAMPUS_SNAPSHOT_MIN_HOURS": "snapshot_min_hours",
     "HIPPOCAMPUS_MULTI_WRITER": "multi_writer",
     "HIPPOCAMPUS_SAVE_LOCK_TIMEOUT": "save_lock_timeout",
@@ -557,22 +653,25 @@ ENV_MAP: dict[str, str] = {
 }
 
 
-# ── 根层入口 env 直读豁免清单（封闭）──────────
-# 根层入口（launcher/daemon/cli/warmup/bridge/__init__）的 env 直读**刻意
-# 不收编**进 load_config 字段——它们是**启动拓扑 plumbing**：多为「Config
-# 加载之前的进程决定」（launcher 开关 / daemon socket·key / 自退超时 /
-# 第三方库线程 env），收进 config 反而把加载顺序绕成环。清单**封闭**：
-# tests/test_m1c_batch2_config.py 的 G7 守卫按文件钉住读取数，新增直读
-# 必须先来这里登记理由，否则测试翻红。
+# ── Root-level entry env direct-read exemption list (closed) ──────────
+# The env direct reads of root-level entries (launcher/daemon/cli/warmup/
+# bridge/__init__) are **deliberately not absorbed** into load_config
+# fields — they are **startup-topology plumbing**: mostly "process
+# decisions made before Config loads" (launcher switches / daemon
+# socket·key / self-exit timeout / third-party library thread env);
+# absorbing them into config would loop the load order. The list is
+# **closed**: the G7 guard in tests/test_m1c_batch2_config.py pins the
+# read counts per file; a new direct read must first register its
+# rationale here, otherwise the test goes red.
 #
-# | 文件 | 读取数 | 名单与豁免理由 |
+# | File | Reads | List and exemption rationale |
 # |---|---|---|
-# | launcher.py | 13 | DAEMON_READY_TIMEOUT（模块快照，等 daemon 就绪的进程决定）；RUNTIME_DIR（运行目录）；LAUNCHER 开关（是否走 daemon 拓扑）；`dict(os.environ)`（spawn 环境复制，非旋钮）；LAUNCHER_DEBUG；DIAG；RECONNECT；PERSIST_DIR / EMB_MODEL / DAEMON_LIBRARY / DAEMON_VERSION（向 daemon **announce 透传**——launcher 先于 config 存在，只做信使）；PERSIST_DIR **另有一次启动前可写性预检**（`preflight_persist_dir`：库目录写不进等于每次写入静默丢失，属配置坏了，必须 fail-fast 而非退回直连） |
-# | daemon.py | 11 | DAEMON_HEARTBEAT（模块快照）；MODEL_UNLOAD / SLEEP_IDLE / SLEEP_BUDGET（哨兵阈值，进程拓扑决定——睡眠总开关按「根层入口属启动拓扑 plumbing」口径留在 daemon）；DAEMON_ECHO / FAULTHANDLER（诊断，Config 前生效）；DAEMON_KEY / LIBRARY / MODEL / IDLE_EXIT（socket/key/自退，进程拓扑） |
-# | cli.py | 16 | APPDATA（系统 env，非本项目）；PERSIST_DIR / EMB_MODEL / EMB_CACHE / TOOL_PROFILE（人机输出/自省命令的**展示透传**——CLI 是读给人看的，值与 config 一致，不参与行为分支）；`dict(os.environ)`（setup 写后即验按刚写入的 entry 复制 spawn 环境做真实握手，非旋钮）；HF_ENDPOINT（模型预取走国内镜像，`setdefault` 的返回值直接复用，**不二次读取**）；DAEMON_LIBRARY / EMB_MODEL / DAEMON_VERSION / PERSIST_DIR 再各一次（context 子命令按**真实宿主视角**拼 HELLO 握手——一次性 client 必须看到原始 env 而非 config 解析值，否则注入内容会跟宿主实际绑库不一致） |
-# | warmup.py | 4 | OMP/MKL_NUM_THREADS（第三方库 env，setdefault 预热线程上限）；LNN_BACKEND / EMB_BACKEND（warm 决策的早读——发生在 Config 消费前） |
-# | bridge.py | 1 | BRIDGE_DEBUG（模块快照，调试面） |
-# | __init__.py | 1 | OPENBLAS_NUM_THREADS（第三方库 env，setdefault——numpy 导入前必须定） |
+# | launcher.py | 13 | DAEMON_READY_TIMEOUT (module snapshot, a process decision waiting for daemon readiness); RUNTIME_DIR (runtime directory); the LAUNCHER switch (whether to use the daemon topology); `dict(os.environ)` (spawn environment copy, not a knob); LAUNCHER_DEBUG; DIAG; RECONNECT; PERSIST_DIR / EMB_MODEL / DAEMON_LIBRARY / DAEMON_VERSION (**announce pass-through to the daemon** — launcher predates config and is only a messenger); PERSIST_DIR **also gets one pre-start writability precheck** (`preflight_persist_dir`: an unwritable library directory means every write is silently lost — that is broken configuration and must fail fast rather than fall back to direct connection) |
+# | daemon.py | 11 | DAEMON_HEARTBEAT (module snapshot); MODEL_UNLOAD / SLEEP_IDLE / SLEEP_BUDGET (sentinel thresholds, decided by process topology — the sleep master switch stays in daemon under the "root-level entries are startup-topology plumbing" rule); DAEMON_ECHO / FAULTHANDLER (diagnostics, effective before Config); DAEMON_KEY / LIBRARY / MODEL / IDLE_EXIT (socket/key/self-exit, process topology) |
+# | cli.py | 16 | APPDATA (system env, not this project); PERSIST_DIR / EMB_MODEL / EMB_CACHE / TOOL_PROFILE (**display pass-through** for human-facing output/introspection commands — the CLI reads for humans, values match config, no behavior branching); `dict(os.environ)` (setup post-write verification copies the spawn environment per the just-written entry for a real handshake, not a knob); HF_ENDPOINT (model prefetch uses the China mirror, `setdefault`'s return value is reused directly, **never read a second time**); DAEMON_LIBRARY / EMB_MODEL / DAEMON_VERSION / PERSIST_DIR once more each (the context subcommand assembles the HELLO handshake from the **real host's perspective** — the one-shot client must see the raw env, not config-parsed values, otherwise injected content would diverge from the library the host actually bound) |
+# | warmup.py | 4 | OMP/MKL_NUM_THREADS (third-party library env, setdefault warmup thread caps); LNN_BACKEND / EMB_BACKEND (early reads for the warm decision — happen before Config is consumed) |
+# | bridge.py | 1 | BRIDGE_DEBUG (module snapshot, debug surface) |
+# | __init__.py | 1 | OPENBLAS_NUM_THREADS (third-party library env, setdefault — must be fixed before numpy import) |
 
 #
 # R2 (2026-11-06): new root-level env reads, all startup-topology plumbing
@@ -586,36 +685,46 @@ ENV_MAP: dict[str, str] = {
 #   DAEMON_VERSION) and pass LIBRARY / MODEL through on restart. Same
 #   rationale as the existing ``context`` HELLO pass-through.
 
-#: bool 字段 → 语义类型（A/B/C/D，见上方注释）。迁移前四处散点各写各的，
-#: 收编时必须按字段记住原语义，否则「HIPPOCAMPUS_RECALL_DECAY=maybe」
-#: 这种边界值就从 False 变 True。
-#: B 型（白名单）内部还分宽/窄名单：recall_decay 含 "on"、ner_allow_torch
-#: 不含（core.py 实录）。_BOOL_NARROW 列窄名单字段。
+#: bool field → semantic type (A/B/C/D, see the comment above). The four
+#: pre-migration scattered points each wrote their own rules; at
+#: absorption each field's original semantics must be remembered,
+#: otherwise boundary values like "HIPPOCAMPUS_RECALL_DECAY=maybe"
+#: change from False to True.
+#: Type B (allow-list) further splits into wide/narrow lists:
+#: recall_decay includes "on", ner_allow_torch does not (as recorded in
+#: core.py). _BOOL_NARROW lists the narrow-list fields.
 _BOOL_SEMANTICS: dict[str, str] = {
-    # A 黑名单默认 true（server.py 模块级）
+    # A deny-list default true (server.py module level)
     "auto_save": "A", "auto_backfill": "A", "supersede": "A",
-    # 写侧·呈现线两旋钮同为 A 型：显式 0/false/no/off 才关，脏值回落默认开
-    # （编码门控与前瞻触发都是"默认生效、说清楚才关"的机制）。
+    # The two write-side presentation-line knobs are also type A: only
+    # explicit 0/false/no/off turns them off, dirty values fall back to
+    # default on (encoding gating and prospective triggering are both
+    # "on by default, off only when explicitly stated" mechanisms).
     "novelty_gate": "A", "prospective_trigger": "A",
     # R1 production recall fusion (default on, explicit deny only).
     "recall_fusion": "A",
     # V2 query fanout (default off, explicit allow only — evaluation
     # reproducibility first; promoted by decision after dev-library validation).
     "recall_query_fanout": "B",
-    # 画像转存同为 A 型（默认生效的巩固期机制，说清楚才关）。
+    # Profile promotion is also type A (a consolidation-period mechanism
+    # on by default, off only when explicitly stated).
     "profile_promotion": "A",
-    # B 白名单（manager/core 函数内）
-    #   逃生门（cross_library_write）亦走白名单：**只有显式真值开**，
-    #   空串/脏值（maybe）落默认 False——边界不能因为拼错的 env 悄悄失效。
+    # B allow-list (manager/core in-function)
+    #   The escape hatch (cross_library_write) is also allow-list:
+    #   **only an explicit truthy value opens it**, empty string/dirty
+    #   value (maybe) falls to the default False — the boundary must not
+    #   be silently disabled by a typoed env.
     "recall_decay": "B", "ner_allow_torch": "B", "cross_library_write": "B",
-    # C 黑名单默认 false（server.py _WARMUP_DIAG）
+    # C deny-list default false (server.py _WARMUP_DIAG)
     "warmup_diag": "C",
-    # D 非空非 0（manager ENV_ALLOW_MODEL_SWITCH）
+    # D non-empty and non-0 (manager ENV_ALLOW_MODEL_SWITCH)
     "allow_model_switch": "D",
-    # E 三态（原 ``common/constants._env_flag``）**：0/false/no/off 关、
-    #   1/true/yes/on 开、其余脏值回落到字段默认**。与 A 型的唯一差别就在
-    #   ``X=maybe`` 这种输入上：A 判开、E 判默认——parity 探针
-    #   实测过这一列，它是区分两种语义的唯一判据。
+    # E tri-state (formerly ``common/constants._env_flag``)**:
+    #   0/false/no/off off, 1/true/yes/on on, other dirty values fall
+    #   back to the field default**. The only difference from type A
+    #   shows on inputs like ``X=maybe``: A judges on, E judges default —
+    #   the parity probe measured this column live; it is the sole
+    #   criterion distinguishing the two semantics.
     "layer_fp": "E", "layer_del": "E", "source_sig": "E",
     "status_contradictions": "E", "map_auto_verify": "E", "map_mention": "E",
     "file_registry_off": "E",
@@ -625,13 +734,15 @@ _BOOL_SEMANTICS: dict[str, str] = {
 }
 _BOOL_NARROW: set[str] = {"ner_allow_torch"}
 
-#: 特殊取值形态（不走通用类型分派）。登记的是**语义**，不是参数。
-#: ``writer_ttl`` 的正值门见 Config 字段注释。
+#: Special value shapes (bypassing the generic type dispatch). What is
+#: registered here is the **semantics**, not the parameter.
+#: For ``writer_ttl``'s positive-value gate see the Config field comment.
 _POSITIVE_ONLY: set[str] = {"writer_ttl"}
 
 
 def load_config() -> Config:
-    """读 env 产出一份不可变配置。**每次调用重读**（无缓存，理由见 docstring）。"""
+    """Read env and produce an immutable config. **Re-read on every call**
+    (no caching; rationale in the module docstring)."""
     c = Config()
     values: dict[str, Any] = {}
     for env, attr in ENV_MAP.items():
@@ -657,6 +768,7 @@ def load_config() -> Config:
             values[attr] = _float(env, default)
         else:
             values[attr] = _str(env, default)
-    # recall_decay_tau 的现状语义：空串 = 默认 90 天（不是 0.0），
-    # 显式 0 由调用方判「关闭」。_float 的空串回落已保证这一点。
+    # recall_decay_tau's status quo semantics: empty string = default
+    # 90 days (not 0.0); an explicit 0 is judged "off" by the caller.
+    # _float's empty-string fallback already guarantees this.
     return Config(**values)

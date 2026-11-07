@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
-"""MCP Server 入口.
+"""MCP server entry point.
 
-启动一个符合 Model Context Protocol 标准的 stdio 服务端,
-为 AI Agent 提供记忆增强能力.
+Starts a stdio server conforming to the Model Context Protocol,
+providing memory augmentation for AI agents.
 
-暴露的 MCP 工具:
-    - store_memory:    存储新记忆 (文本 → 嵌入 → LNN → 向量库)
-    - recall:          回忆相关记忆 (LNN 查询 + 打分 + 排序)
-    - get_memory:      按 ID 获取单条记忆
-    - update_memory:   更新记忆字段
-    - list_memories:   列出所有记忆
-    - reset_context:   重置 LNN 上下文 (新对话)
-    - get_stats:       获取系统状态
-    - save_state:      持久化所有状态
-    - load_state:      从磁盘恢复状态
+Exposed MCP tools:
+    - store_memory:    store a new memory (text → embedding → LNN → vector store)
+    - recall:          recall relevant memories (LNN query + scoring + ranking)
+    - get_memory:      fetch a single memory by ID
+    - update_memory:   update memory fields
+    - list_memories:   list all memories
+    - reset_context:   reset the LNN context (new conversation)
+    - get_stats:       get system status
+    - save_state:      persist all state
+    - load_state:      restore state from disk
 
-启动方式:
+How to start:
     python -m hippocampus_mcp.server
 
-    或在 MCP 客户端配置中指定:
+    or specify it in the MCP client configuration:
     {
         "command": "python",
         "args": ["-m", "hippocampus_mcp.server"],
@@ -37,101 +37,114 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-# 库发现层与多库注册表（**均为纯标准库**，不碰 torch，
-# 所以可以安全地放在顶层导入，不会把加载时间顶到 MCP 握手路径上）。
+# Library discovery layer and multi-library registry (**both pure stdlib**,
+# torch-free, so top-level imports are safe and stay off the MCP handshake path).
 from hippocampus_mcp import library as _library
-from hippocampus_mcp.library import LibraryResolutionError  # noqa: F401（工具签名要抛）
+from hippocampus_mcp.library import LibraryResolutionError  # noqa: F401 (thrown by tool signatures)
 from hippocampus_mcp.library.registry import BrainRegistry, DEFAULT_KEY
-# 任务目录 sidecar 的读写原语（library 层，纯标准库）。
-# 放在这里而不是组合根：组合根有「顶层 import 白名单」（仅
-# logging/os/typing/application），而登记点只需经 _LIB_PORTS 的活引用
-# ``_task_directory_register`` 被调用——与家库写边界判定同一手法。
+# Read/write primitives for the task-directory sidecar (library layer, pure stdlib).
+# Placed here rather than the composition root: the root has a "top-level import
+# whitelist" (logging/os/typing/application only), and the registration point is just
+# invoked via _LIB_PORTS's live reference ``_task_directory_register`` — same technique
+# as the home-library write-boundary predicate.
 from hippocampus_mcp.library import task_directory as _task_directory
-# session_key 随多库寻址区在 server_runtime/routing.py（其内部
-# 用的 session_ctx 也随迁），本行别名成为死导入，移除——f9_4e/f9_5a 一律
-# 直接 ``from hippocampus_mcp.common import session_ctx``（全仓无
-# ``S._session_ctx`` 引用，无 patch 面损失）。
+# session_key moved with the multi-library addressing area to server_runtime/routing.py
+# (the session_ctx it uses moved along), making the alias here a dead import; removed —
+# f9_4e/f9_5a now always do ``from hippocampus_mcp.common import session_ctx`` directly
+# (no ``S._session_ctx`` references remain repo-wide, no patch-surface loss).
 from .config import load_config
-# 门控/派发/头部/入口在 profiles.py / dispatch.py /
-# stdout_guard.py / entry.py。状态经再导出留在本模块命名空间（patch 面
-# 不变），四个模块一律经 _srv() 现取——_dispatch_map 经 vars(server)
-# 现取工具函数（快照替身会吞新注册的工具，目标测试 N1 钉死）；
-# _gated_tool 的 _original_tool 在 server.tool 替换前赋值、调用时现取；
-# main 留壳调 entry.run_main()（cli/launcher 的 import 零改动）。
+# Gating/dispatch/header/entry live in profiles.py / dispatch.py /
+# stdout_guard.py / entry.py. State stays in this module's namespace via
+# re-exports (patch surface unchanged); all four modules fetch live through
+# _srv() — _dispatch_map fetches tool functions via vars(server)
+# (snapshot stubs would swallow newly registered tools; target test N1 pins this);
+# _gated_tool's _original_tool is assigned before the server.tool replacement and
+# fetched at call time; main keeps its shell and calls entry.run_main()
+# (zero import changes in cli/launcher).
 from .server_runtime import entry as _entry
-from .server_runtime import profiles as _profiles  # noqa: F401（工厂宿主）
+from .server_runtime import profiles as _profiles  # noqa: F401 (factory host)
 from .server_runtime import stdout_guard as _sg
-from .server_runtime.dispatch import (_dispatch_map,  # noqa: F401（再导出）
+from .server_runtime.dispatch import (_dispatch_map,  # noqa: F401 (re-export)
                                       _hippo_extra, _hippo_help)
-from .server_runtime.profiles import (_COMMON_TOOLS,  # noqa: F401（再导出）
+from .server_runtime.profiles import (_COMMON_TOOLS,  # noqa: F401 (re-export)
                                       _COMMON_TOOLS_DEFAULT,
                                       _PROFILE_GROUPS, _TOOL_GROUPS,
                                       _TOOL_PROFILE, make_gated_tool)
-from .server_runtime.profiles import _tool_enabled  # noqa: F401（再导出）
-from .server_runtime.stdout_guard import (_ThreadAwareStdout,  # noqa: F401（再导出）
+from .server_runtime.profiles import _tool_enabled  # noqa: F401 (re-export)
+from .server_runtime.stdout_guard import (_ThreadAwareStdout,  # noqa: F401 (re-export)
                                           configure_logging, ensure_paths)
 
-# sys.path 兜底（libs append + src insert）在
-# server_runtime/stdout_guard.py，传入本文件路径（原 ``__file__`` 语义）。
+# The sys.path fallback (libs append + src insert) lives in
+# server_runtime/stdout_guard.py; this file's path is passed in (the old ``__file__`` semantics).
 _sg.ensure_paths(__file__)
 
-try:  # mcp >= 1.0（新版 SDK）
+try:  # mcp >= 1.0 (new SDK)
     from mcp.server.fastmcp import FastMCP as MCPServer
-except ImportError:  # pragma: no cover - 老版本 SDK
+except ImportError:  # pragma: no cover - legacy SDK
     try:
         from mcp.server import MCPServer  # type: ignore
     except ImportError:
         from mcp.server.lowlevel import Server as MCPServer  # type: ignore
 
-# 重型依赖（``brain`` → ``manager`` → ``torch``，本机热态就要 5.7s）**故意不在此处导入**：
-# 顶层每多 1 秒，MCP 的 ``initialize`` 就晚 1 秒应答，直接吃掉宿主的工具注册窗口
-# （约 15s）。改成在 ``get_brain()`` 里按需导入 —— auto 模式下首次导入发生在
-# 预热线程（事件循环已启动），实测该路径不会触发 scipy 那类 LoadLibrary 卡死
-# （对照见 ``_preload_import_chain`` 的说明与 diag 脚本）。
-if TYPE_CHECKING:  # 仅供静态检查，运行时不执行（注解已被 future import 字符串化）
+# Heavy dependencies (``brain`` → ``manager`` → ``torch``, 5.7s even warm on this
+# machine) are **deliberately not imported here**: every extra second at the top
+# level delays the MCP ``initialize`` response by one second, eating directly into
+# the host's tool-registration window (about 15s). Instead they are imported on
+# demand inside ``get_brain()`` — in auto mode the first import happens on the
+# warmup thread (event loop already running); in practice that path does not
+# trigger the scipy-style LoadLibrary hang (see ``_preload_import_chain``'s notes
+# and the diag script for comparison).
+if TYPE_CHECKING:  # static checks only, never executed (annotations are string-ified by the future import)
     from hippocampus_mcp.brain import HippoBrain
     from hippocampus_mcp.engine.manager import MemoryManager
 
-from hippocampus_mcp.engine.embeddings import ENV_MODEL  # noqa: F401（_EMB_MODEL 走 config；保留再导出防包外断裂）
-# 包外请从 ``hippocampus_mcp.store`` 取 ConcurrentWriteError，
-# 不要从 server 符号导入。
+from hippocampus_mcp.engine.embeddings import ENV_MODEL  # noqa: F401 (_EMB_MODEL goes through config; kept as re-export to avoid breakage outside the package)
+# Outside the package, take ConcurrentWriteError from ``hippocampus_mcp.store``;
+# do not import it from the server symbol.
 
-# 参数解析助手与键名校验在 common/params.py 与 application/tags.py——
-# 工具层与用例层共用同一份实现，这里以**别名 import** 保留调用点名字
-# 不变；服务层不 import 本模块（依赖方向纪律）。update_tags 的四段解析
-# 走 parse_tagops_args（逐段严格解析、第一处错误即停，消息文本逐位
-# 不变）；session_start 仍用 ``parse_tags_json``。严格版与 lenient 版
-# 两个名字各归其主，避免相互遮蔽。
+# Parameter parsing helpers and key validation live in common/params.py and
+# application/tags.py — the tool layer and the use-case layer share one
+# implementation; **alias imports** here keep the call-site names unchanged;
+# the service layer never imports this module (dependency-direction discipline).
+# update_tags's four-segment parsing goes through parse_tagops_args (strict
+# per-segment parsing, stop at the first error, message text byte-identical);
+# session_start still uses ``parse_tags_json``. Strict and lenient versions each
+# keep their own name to avoid shadowing each other.
 from .application import (BootstrapService, LibraryAdminService,
                           LibraryPorts, MaintainService, OrganizeService,
                           RecallService, WriteService)
 from .common.params import parse_str_list_lenient as _parse_str_list
 from .common.params import parse_tagops_args as _parse_tagops_args
 from .common.params import parse_tags_json as _parse_tags_json
-# 预热区（后台线程/工具侧等待/就绪探针/看门狗/预载/层级表/
-# 异常类/torch 兜底）整体拆去 server_runtime/warmup.py。**状态与模式常量
-# 刻意留在本模块**（测试对本命名空间的 monkeypatch 面：_WARMUP_MODE /
-# _warmup_ready / _warmup_started / _warmup_error / _warmup_fatal /
-# _warmup_phase / _store_ready / _WARMUP_WAIT_* / _warmup_libs … 全部经
-# warmup._srv() 现取生效，见该模块 docstring）。此处按 import 名原样
-# 再导出——46 个工具体的 await _await_warmup() 字面、srv.STORE_ONLY_TOOLS /
-# srv.WarmupPendingError 等既有引用零改动。
-from .server_runtime.warmup import (STORE_ONLY_TOOLS,  # noqa: F401（再导出）
+# The warmup area (background thread / tool-side waiting / readiness probes /
+# watchdog / preload / tier table / exception classes / torch fallback) moved
+# wholesale to server_runtime/warmup.py. **State and mode constants are
+# deliberately kept in this module** (the monkeypatch surface tests target on
+# this namespace: _WARMUP_MODE / _warmup_ready / _warmup_started / _warmup_error /
+# _warmup_fatal / _warmup_phase / _store_ready / _WARMUP_WAIT_* / _warmup_libs …
+# all take effect via warmup._srv() live fetches, see that module's docstring).
+# Re-exported here under the import names — the 46 tool bodies' await
+# _await_warmup() literals and existing references like srv.STORE_ONLY_TOOLS /
+# srv.WarmupPendingError change zero.
+from .server_runtime.warmup import (STORE_ONLY_TOOLS,  # noqa: F401 (re-export)
                                      WarmupFailedError, WarmupPendingError,
                                      _await_warmup, _preload_import_chain,
                                      _prepare_torch, _start_warmup_watchdog,
                                      maybe_warmup_library,
                                      start_background_warmup, warmup_status)
 
-# 多库寻址（引导文件/默认库解析/会话 key/库清单/
-# 三级优先/粘性绑定/whoami 自曝/信封装配/端口 I/O 助手）与组合根（_LIB_PORTS
-# + 6 个用例工厂 + _build_brain）拆去 server_runtime/routing.py +
-# composition.py。**状态与 patch 面刻意留在本模块**（_DEFAULT_LIB_PATH /
-# _conn_* / _library_cache* / _registry 三件 / _brain_for / get_brain /
-# _brain / _PERSIST_DIR / 配置常量），两个新模块一律经 _srv() 现取（见
-# 各自 docstring）。此处按 import 名原样再导出——工具体调用点、
-# m4_batch1/4 的 hasattr、f10/f9_4e/workspace_guide 的直调零改动。
-from .server_runtime.routing import (GUIDE_FILENAME,  # noqa: F401（再导出）
+# Multi-library addressing (guide file / default-library resolution / session
+# key / library listing / three-tier precedence / sticky binding / whoami
+# self-report / envelope assembly / port I/O helpers) and the composition root
+# (_LIB_PORTS + 6 use-case factories + _build_brain) moved to
+# server_runtime/routing.py + composition.py. **State and the patch surface are
+# deliberately kept in this module** (_DEFAULT_LIB_PATH / _conn_* /
+# _library_cache* / the _registry trio / _brain_for / get_brain / _brain /
+# _PERSIST_DIR / config constants); both new modules fetch live via _srv() (see
+# their docstrings). Re-exported here under the import names — tool-body call
+# sites, m4_batch1/4 hasattr checks, and f10/f9_4e/workspace_guide direct calls
+# change zero.
+from .server_runtime.routing import (GUIDE_FILENAME,  # noqa: F401 (re-export)
                                      _ensure_default_dir,
                                      _find_workspace_guide, _layer_files,
                                      _library_binding,
@@ -143,163 +156,198 @@ from .server_runtime.routing import (GUIDE_FILENAME,  # noqa: F401（再导出�
                                      get_library_binding, libraries,
                                      resolve_library_path, session_key,
                                      set_library_binding)
-from .server_runtime.composition import (_LIB_PORTS,  # noqa: F401（再导出）
+from .server_runtime.composition import (_LIB_PORTS,  # noqa: F401 (re-export)
                                          _bootstrap_service, _build_brain,
                                          _maintain_service, _organize_service,
                                          _recall_service, _write_service)
-# 家库写边界的**纯判定**（写类工具清单 / 归一比对 /
-# 三值权限 / 拒绝文案）在 domain/write_boundary.py——放那儿是因为它能零 I/O
-# 单测，边界行为的每一次调整都不必碰注册表与磁盘。
-# 为什么不直接 import 进 composition.py：组合根有 S4.2「顶层 import 无越层」
-# 断言（白名单仅 logging/os/typing/application），加了就翻这条钉子。**本模块
-# 先 import，组合根再经 _srv() 现取**——与 U2 合流时 ``s._library`` 的手法同款，
-# monkeypatch 面一路穿透到守卫。
-from .domain.write_boundary import (CrossLibraryWriteDenied,  # noqa: F401（再导出）
+# The **pure predicates** of the home-library write boundary (write-class tool
+# list / normalized comparison / three-valued permission / rejection text) live
+# in domain/write_boundary.py — placed there so they can be unit-tested with zero
+# I/O and boundary tweaks never touch the registry or disk.
+# Why not import it straight into composition.py: the composition root has the
+# S4.2 "no cross-layer top-level imports" assertion (whitelist is only
+# logging/os/typing/application); adding it would trip that pin. **This module
+# imports first, the composition root fetches via _srv()** — same technique as
+# ``s._library`` from the U2 merge, so the monkeypatch surface penetrates all the
+# way down to the guard.
+from .domain.write_boundary import (CrossLibraryWriteDenied,  # noqa: F401 (re-export)
                                     READ_ONLY, USER_LIBRARY_NAME,
                                     WRITE_CLASS_TOOLS, boundary_error_message,
                                     caller_tool_name, classify_write_permission,
                                     library_display, same_library)
-# D2a 写侧隔离的纯判据同款手法：domain 真相先 import 进本模块，
-# 组合根经 _srv() 现取（S4.2 白名单不放 domain import，monkeypatch 穿透）。
-from .domain.write_quarantine import should_quarantine  # noqa: F401（再导出）
+# Same technique for D2a write-side quarantine pure predicates: import the domain
+# truth into this module first, composition root fetches via _srv() (the S4.2
+# whitelist takes no domain imports; monkeypatch penetration kept).
+from .domain.write_quarantine import should_quarantine  # noqa: F401 (re-export)
 from .common.session_task import bind_task, clear_task, current_task
 from .common.write_origin import build_origin
-# C1 工作区绑定反查的纯判定（domain/task_directory.resolve_workspace）
-# + D2b 读侧档位判定（resolve_user_access）。
+# Pure predicates for the C1 workspace-binding reverse lookup
+# (domain/task_directory.resolve_workspace)
+# + the D2b read-side tier decision (resolve_user_access).
 from .domain.task_directory import (normalize_entries, resolve_user_access,
                                     resolve_workspace)
-# B1 libraries= 语法解析（组合根经 _srv() 现取，S4.2 白名单同款手法）。
-from .domain.scope_recall import parse_library_spec  # noqa: F401（再导出）
-# 注：_library_admin_service 留在本模块（见其 docstring 的说明），
-# 不在 composition 再导出名内。
+# B1 libraries= syntax parsing (composition root fetches via _srv(), same technique as the S4.2 whitelist).
+from .domain.scope_recall import parse_library_spec  # noqa: F401 (re-export)
+# Note: _library_admin_service stays in this module (see the note in its docstring);
+# it is not among the composition re-export names.
 
 # ------------------------------------------------------------------
-# 日志配置（handler/级别装配在 stdout_guard.configure_logging，
-# 逐位一致；_ThreadAwareStdout 类同迁、按 import 名再导出）
+# Logging configuration (handler/level assembly in stdout_guard.configure_logging,
+# byte-identical; the _ThreadAwareStdout class moved too, re-exported by import name)
 # ------------------------------------------------------------------
 logger = _sg.configure_logging()
 
 
 # ------------------------------------------------------------------
-# 全局配置（唯一的记忆管理器在下方 get_brain() 中惰性创建）
+# Global configuration (the sole memory manager is lazily created in get_brain() below)
 # ------------------------------------------------------------------
 _PERSIST_DIR = load_config().persist_dir
 
-# 评测最优配置 (LoCoMo 调优结果)
-# 注：嵌入维度与神经元数已由嵌入模型/默认值决定（HIPPOCAMPUS_EMB_DIM /
-# HIPPOCAMPUS_N_NEURONS 不再生效，保留仅为向后兼容旧配置文件）。
-_LAMBDA_DECAY = load_config().lambda_decay  # 90天
-_MU_IMPORTANCE = load_config().mu_importance  # 180天
+# Benchmark-optimal configuration (LoCoMo tuning result)
+# Note: embedding dim and neuron count are decided by the embedding model /
+# defaults (HIPPOCAMPUS_EMB_DIM / HIPPOCAMPUS_N_NEURONS no longer take effect;
+# kept only for backward compatibility with old config files).
+_LAMBDA_DECAY = load_config().lambda_decay  # 90 days
+_MU_IMPORTANCE = load_config().mu_importance  # 180 days
 _W_SIM = load_config().w_sim
 _W_TIME = load_config().w_time
 _W_RECALL = load_config().w_recall
 _CRL_MODEL_PATH = load_config().crl_model
-_EMB_MODEL = load_config().emb_model  # 如 BAAI/bge-base-zh-v1.5（留空则跟随库内模型）
-# 每 10 次写入自动落盘（覆盖报告·追加 4）。
-# **MCP 场景下默认开**：宿主进程随时可能被回收（实测 ingest 2 条 → 进程退出 →
-# 磁盘条数回退），而写入是稀疏的（对话级），代价摊薄后每条约 +0.15s
-# （大库实测全量落盘也在秒级，不会挡住会话）。
-# 库层（HippoBrain/MemoryManager）默认仍是 False——评测与批量导入不该被
-# 写盘打断；``ingest_batch`` 也会在批内临时关掉它。
+_EMB_MODEL = load_config().emb_model  # e.g. BAAI/bge-base-zh-v1.5 (empty = follow the library's own model)
+# Auto-persist to disk every 10 writes (coverage report, addendum 4).
+# **On by default in the MCP scenario**: the host process may be recycled at any
+# time (measured: ingest 2 items → process exit → on-disk count regresses), while
+# writes are sparse (conversation-level); amortized the cost is about +0.15s per
+# write (on large libraries a full save is still seconds-level and does not block
+# the session).
+# The library layer (HippoBrain/MemoryManager) defaults to False — benchmarks and
+# bulk imports should not be interrupted by disk writes; ``ingest_batch`` also
+# temporarily turns it off within a batch.
 _AUTO_SAVE = load_config().auto_save
-# 启动时自动补算缺失向量。库里向量与当前模型不符时（例如换模型后首次启动），
-# 补算是分钟级且同步阻塞，MCP 客户端会等到超时——大库请先离线跑
-# scripts/reembed.py，再设 HIPPOCAMPUS_AUTO_BACKFILL=0 启动服务。
+# Auto-backfill missing vectors at startup. When stored vectors do not match the
+# current model (e.g. first start after a model swap), backfill takes minutes and
+# blocks synchronously, so the MCP client would wait until timeout — for large
+# libraries run scripts/reembed.py offline first, then start with HIPPOCAMPUS_AUTO_BACKFILL=0.
 _AUTO_BACKFILL = load_config().auto_backfill
-# 导航类内容（INDEX / 目录 / 表头）的召回折扣，1.0 = 不降权（追加八）。
-# 只有导入端用 ``import_md.py --nav-files`` 给那些记忆打上 ``_nav`` 标签后
-# 才有对象可降——两头都得开着，少一头则静默无效（导入侧会打印它用到的值）。
+# Recall discount for navigational content (INDEX / TOC / table headers); 1.0 = no demotion (addendum eight).
+# Only after the import side tags those memories with the ``_nav`` tag via
+# ``import_md.py --nav-files`` is there anything to demote — both ends must be on;
+# missing either end silently disables it (the importer prints the value it uses).
 _NAV_PENALTY = load_config().nav_penalty
-# 事实更新检测开关（批量导入文档的场景应关闭）
+# Fact-update (supersede) detection switch (turn off for bulk document imports)
 _SUPERSEDE = load_config().supersede
 
 # ------------------------------------------------------------------
-# 预热策略（追加 10：握手不能被预热阻塞）
+# Warmup policy (addendum 10: the handshake must not be blocked by warmup)
 # ------------------------------------------------------------------
-# 背景：预热＝加载全库记忆 + 嵌入模型 + spaCy，实测 30-36 秒。原先放在
-# ``server.run()`` **之前**同步执行，等于把 MCP 握手一起堵住了——宿主侧
-# 会话启动后约 15 秒就完成工具注册，结果本服务的工具一次都没注册上，
-# 表现为「连接状态成功，但会话里没有工具」（ZCode 实测）。
+# Background: warmup = load all library memories + embedding model + spaCy,
+# measured 30-36 seconds. It used to run synchronously **before** ``server.run()``,
+# which blocked the MCP handshake too — the host finishes tool registration about
+# 15 seconds after session start, so this service's tools never got registered at
+# all, showing up as "connection succeeds, but the session has no tools"
+# (observed on ZCode).
 #
-# 三种模式（环境变量 HIPPOCAMPUS_WARMUP）：
-#   auto（默认）　起后台线程预热，握手立即应答；首个工具调用若预热尚未完成，
-#                 在 worker 线程里等待（不占事件循环，不阻塞其他 MCP 消息）。
-#                 ➜ 宿主能注册到工具；最坏情况下把等待挪到第一次调用，且只等一次。
-#   off　　　　　 完全不预热，握手立即应答；首次工具调用时惰性初始化（约 25-30 秒）。
-#   sync　　　　  回归旧行为：预热完才握手。仅离线脚本 / 评测用，**不要给宿主**。
+# Three modes (env HIPPOCAMPUS_WARMUP):
+#   auto (default)  start a background warmup thread, answer the handshake
+#                   immediately; if the first tool call arrives before warmup
+#                   finishes, wait on a worker thread (does not occupy the event
+#                   loop, does not block other MCP messages).
+#                   ➜ the host can register the tools; worst case the wait moves
+#                   to the first call, and only once.
+#   off             no warmup at all, handshake answers immediately; lazy init on
+#                   first tool call (about 25-30 seconds).
+#   sync            old behavior again: handshake only after warmup. For offline
+#                   scripts / benchmarks only, **never give this to a host**.
 #
-# 注意：``auto`` 下工具调用仍要保证「预热完成才执行」，否则第一次调用会与
-# 预热线程并发构造 HippoBrain——见 ``get_brain`` 的单例锁。
+# Note: under ``auto``, tool calls must still guarantee "execute only after warmup
+# completes", otherwise the first call would construct HippoBrain concurrently
+# with the warmup thread — see the singleton lock in ``get_brain``.
 _WARMUP_MODE = load_config().warmup.strip().lower()
 if _WARMUP_MODE not in ("auto", "off", "sync"):
     logger.warning("Unknown HIPPOCAMPUS_WARMUP=%r; falling back to auto", _WARMUP_MODE)
     _WARMUP_MODE = "auto"
-# 工具调用等待后台预热的上限。
+# Upper bound for how long a tool call waits on background warmup.
 #
-# **这个值必须小于宿主的调用超时**（ZCode 是 120s），否则"等"与"挂死"在宿主
-# 侧长得一模一样：调用方先超时，拿到的是一条超时错误，而不是"后端仍在预热"。
-# 原默认 300s 正是"冷启动期并发首调撞 120s 超时（重试即好）"的直接成因。
+# **This value must be smaller than the host's call timeout** (ZCode's is 120s),
+# otherwise "waiting" and "hung" look identical on the host side: the caller times
+# out first and gets a timeout error instead of "the backend is still warming up".
+# The old 300s default was the direct cause of "concurrent first calls during cold
+# start hitting the 120s timeout (retry works)".
 _WARMUP_WAIT_TIMEOUT = load_config().warmup_timeout
 
-# 超预算后的处置策略：
-#   raise（默认）　抛出 WarmupPendingError。宿主拿到的是**可解析的明确状态**
-#                 （已等多久、卡在哪个阶段、可以重试），而不是一条超时。
-#                 并发首调也自然去重：每个等待者都在同一个 Event 上等，
-#                 不会各自触发一次加载（惊群）。
-#   release       　旧行为：放行，转由惰性初始化接手（慢，但"一定会执行"）。
-#                 只有明确知道模型加载就是很慢、且宿主超时足够长时才用。
+# What to do once the budget is exceeded:
+#   raise (default)  raise WarmupPendingError. The host gets a **parseable,
+#                    explicit status** (how long it waited, which phase it is stuck
+#                    on, that it may retry) instead of a timeout. Concurrent first
+#                    calls also dedupe naturally: every waiter waits on the same
+#                    Event, so no double loading (thundering herd).
+#   release          old behavior: let it through, lazy init takes over (slow, but
+#                    "it will definitely run"). Only use when you know model loading
+#                    really is that slow and the host timeout is long enough.
 _WARMUP_WAIT_POLICY = load_config().warmup_wait.strip().lower()
 if _WARMUP_WAIT_POLICY not in ("raise", "release"):
     logger.warning("Unknown HIPPOCAMPUS_WARMUP_WAIT=%r; falling back to raise", _WARMUP_WAIT_POLICY)
     _WARMUP_WAIT_POLICY = "raise"
 
-# 进程起点时间戳：自曝「spawn → 站到 server.run() 之前」的**真实**耗时。
-# 要区分「本端慢」与「宿主聚合时机」，靠 _HANDSHAKE_BASE_COLD 估算不算证据。
+# Process start timestamp: self-reports the **real** elapsed time from spawn to
+# just before server.run(). To tell "slow on our side" from "host aggregation
+# timing", an estimate via _HANDSHAKE_BASE_COLD does not count as evidence.
 _PROCESS_T0 = time.time()
 
-# 宿主留给「握手 + 工具注册」的窗口（秒），ZCode 实测约 15s。
-# 站到 server.run() 之前的耗时超过它，本服务的工具就可能被整个漏注册。
+# The window (seconds) the host allots to "handshake + tool registration"; ~15s
+# measured on ZCode. If the time before server.run() exceeds it, this service's
+# tools may be missed by registration entirely.
 _HANDSHAKE_WINDOW = load_config().handshake_window
 
-_warmup_ready = threading.Event()   # 完整就绪（含嵌入模型）
-_store_ready = threading.Event()    # 库存就绪（不含嵌入模型，通常早 20-60 秒）
-_warmup_started = False  # 只有 main() 真正起过后台预热，工具才需要等待
-# 预热失败的**原因**（空 = 没失败）。失败要能立即说清楚，而不是让调用方
-# 等满超时再收到一句"超时"——那会把"配置问题"伪装成"性能问题"。
+_warmup_ready = threading.Event()   # fully ready (embedding model included)
+_store_ready = threading.Event()    # library store ready (no embedding model; usually 20-60s earlier)
+_warmup_started = False  # tools only need to wait if main() actually started background warmup
+# The **reason** warmup failed (empty = no failure). A failure must be explainable
+# immediately rather than letting the caller wait out the full timeout only to hear
+# "timed out" — that would disguise a "configuration problem" as a "performance problem".
 _warmup_error: str = ""
-_warmup_phase: str = ""            # 当前/最后进入的阶段名（超时消息里带上）
-# 失败是否**致命**（核心层没建起来）。区分致命与非致命很关键：
-#   · 致命（构造 HippoBrain 就失败）→ 后续任何工具都不可能成功，必须当场报错；
-#   · 非致命（spaCy 加载失败 / 首次推理失败）→ 核心仍可用，应当放行，
-#     只把原因留在 ready 探针里。一刀切抛错会把"降级可用"误判成"服务挂了"。
+_warmup_phase: str = ""            # name of the current/last phase entered (included in timeout messages)
+# Whether the failure is **fatal** (the core layer never came up). Telling fatal
+# from non-fatal matters:
+#   · fatal (constructing HippoBrain itself fails) → no later tool can ever
+#     succeed, must error out on the spot;
+#   · non-fatal (spaCy load failed / first inference failed) → the core still
+#     works, should be let through, keeping only the reason in the readiness
+#     probe. Blanket errors would misread "degraded but usable" as "service down".
 _warmup_fatal = False
-# 诊断开关：预热迟迟不完成时，按 30s/60s/120s … 打印所有线程的 Python 栈。
-# 背景：模型构造在**后台线程**里实测比在主线程慢一个数量级（29s → >250s），
-# 而"卡住"和"慢"在宿主侧看起来一样（工具调用无响应）——没有栈就只能猜。
-# 默认关闭，出问题时设 HIPPOCAMPUS_WARMUP_DIAG=1 重启即可拿到现场。
+# Diagnostic switch: when warmup stubbornly does not finish, dump every thread's
+# Python stack at 30s/60s/120s … intervals.
+# Background: model construction on a **background thread** measured an order of
+# magnitude slower than on the main thread (29s → >250s), and "stuck" vs "slow"
+# look identical from the host (tool calls unresponsive) — without stacks you can
+# only guess. Off by default; set HIPPOCAMPUS_WARMUP_DIAG=1 and restart to capture
+# the scene when trouble hits.
 _WARMUP_DIAG = load_config().warmup_diag
 
-# 预热异常类（WarmupPendingError / WarmupFailedError）、torch 单线程兜底
-# （_prepare_torch）与预热区全部逻辑在
-# server_runtime/warmup.py（顶部 import 再导出，命名空间不变）。
-# 原「单例构造锁 _INIT_LOCK」随多库注册表（每库独立锁）退役，
-# 全仓已无引用，一并清除。
+# The warmup exception classes (WarmupPendingError / WarmupFailedError), the torch
+# single-thread fallback (_prepare_torch), and all warmup logic live in
+# server_runtime/warmup.py (re-exported via the top imports, namespace unchanged).
+# The old "singleton construction lock _INIT_LOCK" retired with the multi-library
+# registry (per-library locks); no references remain repo-wide and it was removed.
 
-# 刻意留下：_brain_class 是 ``_build_brain``
-# 的类解析点（``globals().get("HippoBrain")`` 语义，测试的
-# ``server.HippoBrain = Fake`` 替换靠它生效）；get_manager 是
-# test_warmup / test_recall_consistency / f10 的直调面；
-# _PRELOAD / _PRELOAD_BUDGET / _HANDSHAKE_BASE_COLD 由 warmup.py 经
-# _srv() 现取（档位语义与实测数据见 warmup.py 内注释）。
+# Deliberately kept: _brain_class is the class-resolution point of ``_build_brain``
+# (``globals().get("HippoBrain")`` semantics; tests rely on it for the
+# ``server.HippoBrain = Fake`` replacement); get_manager is the direct-call
+# surface of test_warmup / test_recall_consistency / f10;
+# _PRELOAD / _PRELOAD_BUDGET / _HANDSHAKE_BASE_COLD are fetched live by warmup.py
+# via _srv() (tier semantics and measured numbers in warmup.py comments).
 
 
 def _brain_class() -> Any:
-    """解析 ``HippoBrain`` 类：**模块属性优先**，其次才真正导入。
+    """Resolve the ``HippoBrain`` class: **module attribute first**, real import second.
 
-    为什么属性优先：本模块不再在顶层导入 ``brain``（那会把 torch 的 ~5.7s 顶到
-    MCP 握手路径上）。但测试与诊断脚本需要替换实现（``server.HippoBrain = Fake``，
-    见 ``scripts/test_warmup.py`` 的并发单例用例），所以保留"先看模块属性"的语义。
-    未见替换时才做真正的导入（此后 ``sys.modules`` 已缓存，重复调用几乎零成本）。
+    Why attribute first: this module no longer imports ``brain`` at the top level
+    (that would push torch's ~5.7s onto the MCP handshake path). But tests and
+    diagnostic scripts need to swap the implementation (``server.HippoBrain = Fake``;
+    see the concurrent-singleton case in ``scripts/test_warmup.py``), so the
+    "module attribute first" semantics are kept. The real import happens only when
+    no replacement is present (afterwards ``sys.modules`` caches it; repeat calls
+    cost almost nothing).
     """
     cls = globals().get("HippoBrain")
     if cls is not None:
@@ -310,41 +358,51 @@ def _brain_class() -> Any:
 
 
 def get_manager() -> MemoryManager:
-    """获取全局 MemoryManager 单例。
+    """Get the global MemoryManager singleton.
 
-    **v0.4 起与 v0.3 用层共用同一个实例**（即 ``get_brain().manager``）。
-    此前本函数与 ``get_brain()`` 各自 ``new`` 一个 MemoryManager，却指向
-    同一个 ``memories.json``：结果是 ingest 写入的记忆 recall 搜不到，
-    并且任一侧 ``save`` 都会整体覆写另一侧（实测互删记录、数据丢失）。
-    现在整个进程只有一份内存状态、一份存储。
+    **Since v0.4 the v0.3 use layer shares the same instance** (i.e.
+    ``get_brain().manager``). Previously this function and ``get_brain()`` each
+    ``new``ed a MemoryManager that both pointed at the same ``memories.json``:
+    memories written by ingest were invisible to recall, and a ``save`` on either
+    side wholesale-overwrote the other (measured: records deleting each other,
+    data loss). Now the whole process has one in-memory state and one store.
 
-    配置来源统一为环境变量（见 ``get_brain``），旧路径不再单独持有参数。
+    Configuration comes from environment variables uniformly (see ``get_brain``);
+    the old path no longer holds its own parameters.
     """
     return _brain_for(None).manager
 
 
-# 预载档位值本体（``HIPPOCAMPUS_PRELOAD`` 解析结果）与预算：无 patch 面但属
-# 头部配置区，server_runtime/warmup.py 的 _preload_list / _preload_import_chain
-# 经 _srv() 现取（档位语义、为什么不能再收窄与实测数据见 warmup.py 内注释）。
+# The preload tier value itself (``HIPPOCAMPUS_PRELOAD`` parse result) and the
+# budget: no patch surface of their own but part of the header config area;
+# warmup.py's _preload_list / _preload_import_chain fetch them live via _srv()
+# (tier semantics, why they cannot shrink further, and measured numbers in
+# warmup.py comments).
 _PRELOAD = load_config().preload.strip()
 
-# 站内默认可接受的预载耗时上限（秒）：超过它握手就可能错过宿主注册窗口。
-# 用于在日志里给出明确警告，而不是让运维自己去算。
+# In-repo default upper bound (seconds) for acceptable preload time: beyond it the
+# handshake may miss the host's registration window.
+# Used to log an explicit warning instead of making ops compute it themselves.
 _PRELOAD_BUDGET = load_config().preload_budget
 
-# "spawn → 预载开始"这段固定开销（解释器启动 + 顶层 import），冷启动实测约 5.7s
-# （其中 import mcp 1.6s）。torch 不放顶层导入（预热区才加载），否则这段是 11.4s。
-# 只用于把"预载耗时"换算成"握手总耗时"写进告警，方便运维判断会不会超窗口。
+# The fixed overhead of "spawn → preload start" (interpreter boot + top-level
+# imports); ~5.7s measured on cold start (import mcp is 1.6s of that). torch is
+# not a top-level import (loaded in the warmup area), otherwise this would be 11.4s.
+# Only used to convert "preload time" into "total handshake time" in warnings so
+# ops can judge whether the window is exceeded.
 _HANDSHAKE_BASE_COLD = 5.7
 
 
 # ------------------------------------------------------------------
-# 创建 MCP Server 并注册工具
+# Create the MCP server and register tools
 # ------------------------------------------------------------------
-#: 一次性递送的全局说明（会话级常驻，**不要**往里塞每次调用都要重复的内容）。
-#: 为什么要放在这儿：`session_start` 每次返回都要付 token，而"压缩后怎么恢复"
-#: 这类说明对宿主是**一次性**的——挪到 instructions 只付一次。返回体
-#: `receipt.resume_hint` 只留一句指向本工具的指针（键位不动，形状探针仍绿）。
+#: One-shot global instructions (resident for the session; **do not** stuff
+#: content that would need repeating on every call into it).
+#: Why it lives here: every `session_start` response pays tokens, whereas notes
+#: like "how to recover after compaction" are **one-time** for the host — moving
+#: them into instructions pays once. The response's
+#: `receipt.resume_hint` keeps just a pointer to this tool (keys unchanged,
+#: shape probes stay green).
 _INSTRUCTIONS = (
     "This service is a memory layer for AI agents. "
     "Write with ingest, read with get_memory_context, raw retrieval with recall, "
@@ -359,7 +417,7 @@ _INSTRUCTIONS = (
 
 
 def _create_server() -> Any:
-    """兼容不同版本的 mcp SDK 构造参数。"""
+    """Absorb constructor-parameter differences across mcp SDK versions."""
     try:
         return MCPServer(
             name="hippocampus-mcp",
@@ -368,7 +426,7 @@ def _create_server() -> Any:
             instructions=_INSTRUCTIONS,
         )
     except TypeError:
-        # FastMCP（mcp >= 1.0）：只接受 name/instructions
+        # FastMCP (mcp >= 1.0): accepts only name/instructions
         return MCPServer(name="hippocampus-mcp", instructions=_INSTRUCTIONS)
 
 
@@ -376,13 +434,15 @@ server = _create_server()
 
 
 # ------------------------------------------------------------------
-# 工具剖面门控（状态/判定/包装在 profiles.py，经 _srv() 现取）
+# Tool profile gating (state/decisions/wrapping in profiles.py, fetched live via _srv())
 # ------------------------------------------------------------------
-# 剖面语义（D 方案）、_TOOL_GROUPS 分组表、常用集与 HIPPOCAMPUS_COMMON_TOOLS
-# 覆盖、_tool_enabled 判定与 _gated_tool 包装工厂的完整说明见
-# server_runtime/profiles.py；状态经再导出留在本模块命名空间（上方 import
-# 块），测试对本命名空间的 patch 面不变。_original_tool 必须在
-# server.tool 替换之前赋值（_gated_tool 调用时现取它）。
+# Profile semantics (plan D), the _TOOL_GROUPS group table, the common set and
+# HIPPOCAMPUS_COMMON_TOOLS override, the _tool_enabled decision, and the
+# _gated_tool wrapper factory are fully documented in
+# server_runtime/profiles.py; state stays in this module's namespace via
+# re-exports (import block above), so the tests' patch surface on this namespace
+# is unchanged. _original_tool must be assigned before the server.tool
+# replacement (_gated_tool fetches it at call time).
 _original_tool = server.tool
 _gated_tool = make_gated_tool()
 server.tool = _gated_tool
@@ -414,10 +474,12 @@ Args:
     svc = _write_service(library)
     return json.dumps(svc.store_memory(
         content=content, importance=importance, memory_type=memory_type,
-        # 接线见 WriteService.store_memory：client 决定 LNN 隐状态
-        # 落在哪一路（daemon 下 N 条连接不能全挤在 __default__）。
+        # For wiring see WriteService.store_memory: client decides which lane the
+        # LNN hidden state lands on (with a daemon, N connections cannot all crowd
+        # onto __default__).
         client=session_key(),
-        # P0-1 写入凭据：谁在什么写入面写的（只写不筛，不进检索）。
+        # P0-1 write origin: who wrote from which write surface (written only,
+        # never filtered; excluded from retrieval).
         origin=build_origin(session=session_key(), task=_origin_task(), surface="store_memory"),
         idem_key=idem_key), ensure_ascii=False)
 
@@ -463,9 +525,10 @@ Args:
         bypass pinned memories.
     """
     await _await_warmup()
-    # filter_tags 解析、键名白名单校验、候选收窄与 miss/计数留痕
-    # 全部在 RecallService.recall（解析排在库解析之后，保序）；client 由
-    # 适配层取 session_key() 传入（读侧接线）。
+    # filter_tags parsing, key-name whitelist validation, candidate narrowing,
+    # and miss/count bookkeeping all live in RecallService.recall (parsing comes
+    # after library resolution, order preserved); the adapter layer passes
+    # client=session_key() (read-side wiring).
     svc = _recall_service(library, scope, libraries)
     return json.dumps(svc.recall(
         query=query, top_k=top_k, use_lnn=use_lnn, sample=sample,
@@ -521,8 +584,9 @@ Args:
     """
     await _await_warmup()
     svc = _write_service(library)
-    # 校验（MemoryState 合法性 / superseded_by 存在性）与字段组装在
-    # WriteService.update_memory；本工具只剩「调用 → 序列化」。
+    # Validation (MemoryState legality / superseded_by existence) and field
+    # assembly live in WriteService.update_memory; this tool is just
+    # "call → serialize".
     return json.dumps(svc.update_memory(
         memory_id=memory_id, content=content, importance=importance,
         memory_type=memory_type, state=state, superseded_by=superseded_by,
@@ -564,10 +628,13 @@ Args:
     untagged_only: Restrict the operation to records with no tags.
     """
     await _await_warmup()
-    # 四段 JSON 解析走共用助手（行为逐位不变）：其错误体
-    # **不带** library 首键，且现行代码就排在库解析之前（先报语法错，
-    # 不碰库）——保序即保字节级一致。助手内部走严格版，坏 JSON
-    # 显式报错，不与 knowledge_topic 那侧的 lenient 版混名。
+    # Four-segment JSON parsing goes through the shared helper (behavior
+    # byte-identical): its error body **does not** carry the library first key,
+    # and the current code already runs it before library resolution (syntax
+    # error first, library untouched) — preserving order preserves byte-identical
+    # behavior. The helper uses the strict variant internally; bad JSON is an
+    # explicit error, never conflated with the lenient variant used by
+    # knowledge_topic.
     parsed, arg_err = _parse_tagops_args(tags, clear_keys, missing_keys, memory_ids)
     if arg_err:
         return json.dumps({"ok": False, "error": arg_err}, ensure_ascii=False)
@@ -663,7 +730,7 @@ memories or alter stored records.
     """
     await _await_warmup()
     svc = _organize_service(library)
-    # 注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # Note: the response body **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.reset_context(), ensure_ascii=False)
 
 
@@ -674,7 +741,7 @@ For richer self-reporting, use ``brain_stats``.
     """
     await _await_warmup()
     svc = _bootstrap_service(library)
-    # 注意：stats 返回体**不带** library 首键（与现行工具逐位一致）。
+    # Note: the stats response body **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.get_stats(), ensure_ascii=False)
 
 
@@ -686,8 +753,9 @@ external inspection. Returns a save receipt/report.
     """
     await _await_warmup()
     svc = _write_service(library)
-    # ConcurrentWriteError 的 conflict 信封在 WriteService.save_state 内组装
-    # （hint 指向 load_state / retry_save），工具只序列化。
+    # The ConcurrentWriteError conflict envelope is assembled inside
+    # WriteService.save_state (hint points to load_state / retry_save); the tool
+    # only serializes.
     return json.dumps(svc.save_state(), ensure_ascii=False)
 
 
@@ -710,49 +778,63 @@ save. Avoid reloading while another writer is mid-operation.
     """
     await _await_warmup()
     svc = _maintain_service(library)
-    # 加载翻车（load_issue）与成功路径都在服务内组装，工具只序列化；
-    # 返回体**不带** library 首键（与现行工具逐位一致）。
+    # Both the load failure (load_issue) and the success path are assembled in the
+    # service; the tool only serializes. The response body **does not** carry the
+    # library first key (byte-identical with the current tool).
     return json.dumps(svc.load_state(), ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
-# v0.3 用层工具：会话生命周期 + 5 槽位上下文 + 巩固 + 反馈
+# v0.3 use-layer tools: session lifecycle + 5-slot context + consolidation + feedback
 # ------------------------------------------------------------------
 # ==================================================================
-# 多库：进程内注册表 + 调用侧寻址（主通道）
+# Multi-library: in-process registry + call-side addressing (main channel)
 # ==================================================================
-# 默认库 = env HIPPOCAMPUS_PERSIST_DIR。留空（没指定）时落到它，
-# 行为与多库之前**逐位一致** —— 兼容性是验收项。
+# Default library = env HIPPOCAMPUS_PERSIST_DIR. Empty (unset) falls back to it,
+# with behavior **byte-identical** to pre-multi-library — compatibility is an
+# acceptance item.
 _DEFAULT_LIB_PATH = _resolve_default_lib_path()
 
-# 连接级默认库：session key -> 库路径（修 daemon 复用串库）。
-# 为什么必须有：daemon 一条进程服务 N 条连接，``_DEFAULT_LIB_PATH`` 是**进程级**
-# 常量（模块导入时按当时那个 launcher 的 env/cwd 算出）。第二个工作区复用同一个
-# daemon 时，若没有这份连接级覆盖，它的写入会落进第一个工作区的库 —— 静默串库。
-# 由 launcher 的带外握手行（``session_ctx.HELLO_PREFIX``）在连接建立时写入。
+# Connection-level default library: session key -> library path (fixes daemon-reuse
+# cross-library contamination).
+# Why it must exist: one daemon process serves N connections, and
+# ``_DEFAULT_LIB_PATH`` is a **process-level** constant (computed at module import
+# from that launcher's env/cwd at the time). When a second workspace reuses the
+# same daemon, without this connection-level override its writes would land in the
+# first workspace's library — silent cross-contamination.
+# Written by the launcher's out-of-band handshake line (``session_ctx.HELLO_PREFIX``)
+# at connection setup.
 _conn_default_lib: dict[str, str] = {}
 _conn_lib_lock = threading.RLock()
 
-# C1 工作区绑定：session key -> 反查结果（session_start 自曝用）。
-# 状态机四值 + declared：bound（目录 workspace_root 精确命中，library=命中库）
-# ／unbound（目录在但没这条工作区）／ambiguous（多条命中——**不取第一个**，
-# 歧义的家库比没有家库更危险，回落声明库并自曝）／no_cwd／no_user_library
-# ／directory_unreadable（坏 sidecar ≠ 空，U5 教训）／lookup_error。
-# declared = launcher HELLO 声明的库（env 口径）——反查命中时与 library
-# 不同，这就是「绑库而非装机」覆盖 env 声明的可见证据。
+# C1 workspace binding: session key -> reverse-lookup result (for session_start self-report).
+# State machine values + declared: bound (directory workspace_root exact hit,
+# library = the hit library) / unbound (directory exists but not this workspace) /
+# ambiguous (multiple hits — **never take the first**; an ambiguous home library is
+# more dangerous than none, fall back to the declared library and self-report) /
+# no_cwd / no_user_library / directory_unreadable (a broken sidecar ≠ empty, U5
+# lesson) / lookup_error.
+# declared = the library declared by the launcher HELLO (env semantics) — when the
+# reverse lookup hits it differs from library, which is the visible evidence that
+# "bind the library, not the install" overrides the env declaration.
 _conn_workspace_binding: dict[str, dict[str, Any]] = {}
 
 
 def _resolve_workspace_binding(cwd: str) -> tuple[str, dict[str, Any]]:
-    """按连接工作区路径反查任务目录定家库（C1，设计稿 §3.2）。
+    """Reverse-look up the task directory by the connection's workspace path to
+    pick the home library (C1, design doc §3.2).
 
-    反查是**增强**不是前提：任何失败（user 库失联 / sidecar 坏 / 意外异常）
-    都返回空路径 + 带原因的状态，绝不阻断连接建立——与 bridge 握手失败
-    回落进程默认库同一纪律。判据（normcase 精确全等、歧义不裁决）在
-    domain/task_directory.resolve_workspace，这里只做发现与 I/O。
+    The reverse lookup is an **enhancement**, not a precondition: any failure
+    (user library unreachable / broken sidecar / unexpected exception) returns an
+    empty path plus a status with reason and never blocks connection setup — the
+    same discipline as the bridge handshake falling back to the process default
+    library on failure. The criteria (exact normcase equality, ambiguity left
+    unadjudicated) live in domain/task_directory.resolve_workspace; this function
+    only does discovery and I/O.
 
     Returns:
-        ``(path, info)``。path 非空 = 命中即家库；info 恒带 status（自曝原料）。
+        ``(path, info)``. Non-empty path = hit, i.e. home library; info always
+        carries status (self-report raw material).
     """
     info: dict[str, Any] = {"cwd": cwd or "", "status": "no_cwd",
                             "library": "", "task": ""}
@@ -778,39 +860,46 @@ def _resolve_workspace_binding(cwd: str) -> tuple[str, dict[str, Any]]:
         if entry is not None:
             info["library"] = entry["path"]
             info["task"] = entry["task"]
-            # D2b：命中条目的读侧档位声明随绑定记录走（""=未声明→masked）。
+            # D2b: the hit entry's read-side tier declaration travels with the binding record ("" = undeclared → masked).
             info["access"] = entry.get("access", "")
             return entry["path"], info
         return "", info
-    except Exception as exc:  # noqa: BLE001 —— 反查绝不阻断连接
+    except Exception as exc:  # noqa: BLE001 — the reverse lookup never blocks connection setup
         logger.warning("workspace binding reverse lookup failed (falling back to the declared library): %r", exc)
         info["status"] = "lookup_error"
         info["reason"] = f"{type(exc).__name__}: {exc}"
         return "", info
 
-# **按库**去重的预热登记。
-# 背景：main() 那次预热跑在进程启动期，contextvar 为空 ⇒ session_key() 恒为
-# __default__ ⇒ 用的是**进程级** _DEFAULT_LIB_PATH（＝第一个 launcher 的库）。
-# daemon 被第二个工作区复用时，它的库**永远不会被预热**，首次调用自付 25–33s
-# 加载（撞宿主工具超时，同型问题）。于是每条连接声明自己的库时补一次预热。
-# 集合而非计数：同一库被 N 条连接声明，只预热一次。
+# **Per-library** deduplicated warmup registration.
+# Background: main()'s warmup runs during process startup, when the contextvar is
+# empty ⇒ session_key() is always __default__ ⇒ it uses the **process-level**
+# _DEFAULT_LIB_PATH (= the first launcher's library). When the daemon is reused by
+# a second workspace, that library would **never be warmed up** and its first call
+# would pay the 25–33s load itself (hitting the host's tool timeout — same class of
+# problem). Hence each connection triggers one extra warmup when it declares its
+# library. A set, not a counter: N connections declaring the same library warm it up once.
 _warmup_libs: set[str] = set()
 _warmup_libs_lock = threading.Lock()
 
 
 def set_connection_default_library(persist_dir: str = "", cwd: str = "",
                                    session: str | None = None) -> str:
-    """给**当前连接**声明默认库（daemon 化后每条连接各自一份）。
+    """Declare the default library for the **current connection** (one per
+    connection after daemonization).
 
-    C1 起多一层**工作区绑定反查**：任务目录（user 库 sidecar）里
-    ``workspace_root`` 与本连接 cwd 精确命中的条目，其 ``path`` 接管
-    连接默认库——「绑库而非装机」的解析依据（设计稿 §3.2）。优先级：
-    **目录反查命中 > launcher 声明（env 口径）> 进程级默认**。反查命中
-    覆盖 env 声明是拍板过的裁决：用户级安装下 launcher 恒带 env 声明，
-    若声明优先则绑定永不触发；显式性由 session_start 的
-    ``workspace_binding`` 自曝兜底（declared 与 library 并列可见）。
-    未命中/歧义/任何失败都回落声明库并记录状态——**未命中绝不落到
-    user 库**（设计稿 §3.2 红线），status 留给开场包自曝。
+    Since C1 there is an extra **workspace-binding reverse lookup**: an entry in
+    the task directory (user library sidecar) whose ``workspace_root`` exactly
+    matches this connection's cwd hands its ``path`` the connection default
+    library — the resolution basis of "bind the library, not the install" (design
+    doc §3.2). Precedence: **directory reverse-lookup hit > launcher declaration
+    (env semantics) > process-level default**. That a reverse-lookup hit overrides
+    the env declaration was an explicit ruling: under a user-level install the
+    launcher always carries the env declaration, so if the declaration won,
+    binding would never trigger; explicitness is backstopped by session_start's
+    ``workspace_binding`` self-report (declared and library visible side by side).
+    Miss/ambiguity/any failure falls back to the declared library with the status
+    recorded — **a miss never lands on the user library** (design doc §3.2 red
+    line); status is left for the opening pack to self-report.
     """
     path, fallback = resolve_default_lib_ex(persist_dir or None, cwd or None)
     declared = path
@@ -818,10 +907,12 @@ def set_connection_default_library(persist_dir: str = "", cwd: str = "",
     hit, binding = _resolve_workspace_binding(cwd or "")
     binding["declared"] = declared
     if fallback:
-        # 实测反馈 2026-10-31：声明库解析失败原本只落服务端日志（agent
-        # 看不见），declared 还被改写成回落路径、原始声明名丢失。三键
-        # 进 binding（task_directory 槽的 workspace 透传可见），warning
-        # 文本另经 _inject_fallback_warning 顶到 session_start 返回体。
+        # Field feedback 2026-10-31: declared-library resolution failures used to
+        # land only in server logs (invisible to the agent), and declared was even
+        # rewritten to the fallback path, losing the original declared name. Three
+        # keys go into binding (visible via the task_directory slot's workspace
+        # passthrough), and the warning text additionally surfaces to the
+        # session_start response via _inject_fallback_warning.
         binding["declared_raw"] = fallback["declared_raw"]
         binding["fallback_reason"] = fallback["reason"]
         binding["warning"] = _fallback_warning_text(fallback, declared)
@@ -832,14 +923,15 @@ def set_connection_default_library(persist_dir: str = "", cwd: str = "",
     with _conn_lib_lock:
         _conn_default_lib[key] = path
         _conn_workspace_binding[key] = binding
-    # I3：daemon 被多个工作区复用时，main() 那次进程级预热覆盖不到这个库。
-    # 连接刚声明完就补一次（按库去重，失败只落一行 warning）。
+    # I3: when the daemon is reused by multiple workspaces, main()'s process-level
+    # warmup never covers this library. Run one extra warmup right after the
+    # connection declares it (per-library dedup; failure logs a single warning line).
     maybe_warmup_library(path)
     return path
 
 
 def default_library_path(client: str | None = None) -> str:
-    """本次调用语境下的默认库：连接级 > 进程级。"""
+    """Default library for this call's context: connection-level > process-level."""
     with _conn_lib_lock:
         cd = _conn_default_lib.get(session_key(client))
     if cd:
@@ -848,10 +940,12 @@ def default_library_path(client: str | None = None) -> str:
 
 
 def _workspace_binding_brief(client: str | None = None) -> dict[str, Any]:
-    """本连接的工作区绑定状态（session_start 的 task_directory 槽自曝用）。
+    """This connection's workspace binding status (for session_start's
+    task_directory slot self-report).
 
-    无 HELLO 的直连客户端（测试/排障）没有绑定记录 → ``undeclared``——
-    不是错误，是「这条连接没走过声明通道」。
+    Direct clients without HELLO (tests/troubleshooting) have no binding record
+    → ``undeclared`` — not an error, just "this connection never went through the
+    declaration channel".
     """
     with _conn_lib_lock:
         rec = _conn_workspace_binding.get(session_key(client))
@@ -865,22 +959,26 @@ def _workspace_binding_brief(client: str | None = None) -> dict[str, Any]:
 
 
 def _origin_task() -> str:
-    """写入凭据 ``origin.task`` 的取值：会话声明 > 工作区绑定映射 > 空。
+    """Value of the write-origin ``origin.task``: session declaration >
+    workspace-binding mapping > empty.
 
-    两个来源都是**宿主显式登记**的，不从正文猜（``common/write_origin``
-    口径 3）：
+    Both sources are **explicitly registered by the host**, never guessed from
+    content (``common/write_origin`` rule 3):
 
-    - 会话声明 ``session_start(task=...)``：本次会话在干什么，动态；
-    - 任务目录的「任务 → 库」映射（``_conn_workspace_binding`` 的 task）：
-      这个库属于哪个工作项，稳定。
+    - session declaration ``session_start(task=...)``: what this session is doing;
+      dynamic;
+    - the task directory's "task → library" mapping (``_conn_workspace_binding``'s
+      task): which work item this library belongs to; stable.
 
-    Super-agent 的 Ticket 更接近后者，但宿主若能显式声明任务，动态值更准，
-    故优先前者。定义在文件下半部，上方三个写工具按名字运行时解析调用，
-    与定义顺序无关。
+    A super-agent's Ticket is closer to the latter, but when the host can declare
+    the task explicitly the dynamic value is more accurate, hence the former wins.
+    Defined in the lower half of the file; the three write tools above resolve it
+    by name at runtime, independent of definition order.
 
-    key 一律走 ``session_key()``（**不带 client**）——三个写工具都没有
-    ``client`` 参数，若混用 ``session_key(client)``，宿主传了 client 就会
-    错位，表现为 task 静默读不到（C1 绑定同一命名空间，不能各用一套）。
+    Keys always go through ``session_key()`` (**without client**) — the three
+    write tools have no ``client`` parameter; mixing in ``session_key(client)``
+    would misalign whenever the host passes client, showing up as the task being
+    silently unreadable (C1 binding shares this namespace; the two cannot diverge).
     """
     declared = current_task()
     if declared:
@@ -892,11 +990,13 @@ def _origin_task() -> str:
 
 def _user_access_tier(info: dict[str, str] | None,
                       client: str | None = None) -> str:
-    """D2b：本连接对 user 库的读侧档位（非 user 库目标返回空串）。
+    """D2b: this connection's read-side tier for the user library (returns the
+    empty string for non-user-library targets).
 
-    判据单一真相在 domain/task_directory.resolve_user_access；这里只做
-    发现（家库比对、绑定记录、逃生门）。档位随 client 解析——多库 daemon
-    下每条连接各有绑定。
+    The single source of truth for the criteria is
+    domain/task_directory.resolve_user_access; this only does discovery (home
+    library comparison, binding record, escape hatch). The tier resolves per
+    client — under a multi-library daemon every connection has its own binding.
     """
     info = info or {}
     if (info.get("name") or "").strip() != USER_LIBRARY_NAME:
@@ -913,11 +1013,14 @@ def _user_access_tier(info: dict[str, str] | None,
 
 
 def _fallback_warning_text(fallback: dict[str, str], declared: str) -> str:
-    """声明库解析回落的 agent 可见告警文本（改动二，2026-10-31）。
+    """Agent-visible warning text for declared-library resolution fallback
+    (change two, 2026-10-31).
 
-    措辞与 D2b 现实对齐：unbound 回落形态下写走待审隔离，不是全量直写
-    ——说「进待审」，不说「将错库」。回落库名取路径尾段做展示（user 级
-    接入下 env 默认库目录名即 `user`）。
+    Wording aligned with the D2b reality: in the unbound fallback form, writes go
+    to review quarantine, not full direct writes — say "goes to review", not
+    "would write the wrong library". The fallback library name takes the path's
+    tail segment for display (under user-level access the env default library's
+    directory name is `user`).
     """
     raw = fallback.get("declared_raw") or "(empty)"
     tail = os.path.basename((declared or "").rstrip("\\/")) or declared or "(unknown)"
@@ -928,23 +1031,29 @@ def _fallback_warning_text(fallback: dict[str, str], declared: str) -> str:
 
 
 def _inject_session_disclosures(payload: str, client: str | None) -> str:
-    """session_start 的全部注入（工具体 ≤20 行纪律的外移口）。
+    """All session_start injections (the extraction point for the "tool body
+    ≤20 lines" discipline).
 
-    顺序：先 C1 工作区绑定自曝（task_directory 槽内），后声明库回落
-    ``⚠``（返回体顶层）——后者改写返回体结构，放最后避免被前者覆盖。
+    Order: first the C1 workspace-binding self-report (inside the task_directory
+    slot), then the declared-library fallback ``⚠`` (top level of the response) —
+    the latter rewrites the response structure, so it goes last to avoid being
+    overwritten by the former.
     """
     return _inject_fallback_warning(
         _inject_workspace_disclosure(payload, client), client)
 
 
 def _inject_fallback_warning(payload: str, client: str | None) -> str:
-    """实测反馈 2026-10-31：本连接发生过声明库回落时，session_start 返回体
-    **顶层**放 ``⚠`` 告警块。
+    """Field feedback 2026-10-31: when this connection has had a declared-library
+    fallback, session_start's response gets a ``⚠`` warning block at the **top
+    level**.
 
-    **与 task_directory 槽位解耦**（槽关也注入）：误回落比省 token 贵——
-    这是对「关＝零痕迹」口径的一处**有意例外**，注入前提是「这条连接真的
-    发生了回落」（binding 带 warning），不是常驻键。自曝是赠品：任何异常
-    原样返回，绝不炸开场包。
+    **Decoupled from the task_directory slot** (injected even when the slot is
+    off): a mistaken fallback costs more than saved tokens — this is a
+    **deliberate exception** to the "off = zero traces" rule; the injection
+    precondition is "this connection really did fall back" (binding carries a
+    warning), not a resident key. The self-report is a freebie: any exception
+    returns the payload as-is and never blows up the opening pack.
     """
     try:
         with _conn_lib_lock:
@@ -955,18 +1064,21 @@ def _inject_fallback_warning(payload: str, client: str | None) -> str:
         obj = json.loads(payload) if isinstance(payload, str) else payload
         if isinstance(obj, dict) and "⚠" not in obj:
             return json.dumps({"⚠": str(warning), **obj}, ensure_ascii=False)
-    except Exception:  # noqa: BLE001 —— 自曝绝不炸开场包
+    except Exception:  # noqa: BLE001 — the self-report never blows up the opening pack
         pass
     return payload if isinstance(payload, str) else json.dumps(
         payload, ensure_ascii=False)
 
 
 def _inject_workspace_disclosure(payload: str, client: str | None) -> str:
-    """C1：task_directory 槽 ready 时注入 ``workspace`` 绑定自曝。
+    """C1: inject the ``workspace`` binding self-report when the task_directory
+    slot is ready.
 
-    槽关 / 不 ready = 零痕迹（不加键，U5「关＝零痕迹」同口径）。自曝是
-    赠品：任何异常原样返回 payload，绝不炸开场包。**独立成函数是 M6
-    S1.2「工具体 ≤20 行」纪律的要求**——工具体只留一行调用。
+    Slot off / not ready = zero traces (no key added; same rule as U5's
+    "off = zero traces"). The self-report is a freebie: any exception returns the
+    payload as-is and never blows up the opening pack. **Being a separate function
+    is required by the M6 S1.2 "tool body ≤20 lines" discipline** — the tool body
+    keeps only the one-line call.
     """
     try:
         obj = json.loads(payload) if isinstance(payload, str) else payload
@@ -975,13 +1087,13 @@ def _inject_workspace_disclosure(payload: str, client: str | None) -> str:
             if isinstance(td, dict) and td.get("ready"):
                 td["workspace"] = _workspace_binding_brief(client)
                 return json.dumps(obj, ensure_ascii=False)
-    except Exception:  # noqa: BLE001 —— 自曝绝不炸开场包
+    except Exception:  # noqa: BLE001 — the self-report never blows up the opening pack
         pass
     return payload if isinstance(payload, str) else json.dumps(
         payload, ensure_ascii=False)
 
 
-# 库清单缓存：扫描要 walk 磁盘，每次调用都重扫会把 list 类工具拖慢。
+# Library list cache: scanning walks the disk; rescanning on every call would slow the list-type tools.
 _library_cache: list[Any] | None = None
 _library_cache_at = 0.0
 _LIBRARY_CACHE_TTL = load_config().library_cache_ttl
@@ -991,7 +1103,7 @@ _registry_lock = threading.RLock()
 
 
 def _registry_get() -> BrainRegistry:
-    """进程内多库注册表（惰性）。factory 注入使测试可塞假 brain。"""
+    """In-process multi-library registry (lazy). The injected factory lets tests plug in fake brains."""
     global _registry
     if _registry is not None:
         return _registry
@@ -1003,66 +1115,79 @@ def _registry_get() -> BrainRegistry:
 
 def _brain_for(library: str | None = None,
                client: str | None = None) -> HippoBrain:
-    """取本次调用目标库的 brain（多库入口）。
+    """Get the brain for this call's target library (multi-library entry).
 
-    **同一库路径只构造一次**：两个 brain 指向同一份 ``memories.json``
-    是 v0.4 明确禁止的（写入互不可见 + 整体覆写丢数据）。
-    每库独立锁 ⇒ 库 A 正在加载（25–33 秒）不会挡住库 B 的调用。
+    **Each library path is constructed only once**: two brains pointing at the
+    same ``memories.json`` are explicitly forbidden in v0.4 (writes invisible to
+    each other + wholesale overwrite loses data).
+    Per-library locks ⇒ library A loading (25–33s) never blocks library B calls.
     """
     return _registry_get().get(resolve_library_path(library, client))
 
 
 def _manager_for(library: str | None = None,
                  client: str | None = None) -> MemoryManager:
-    """取本次调用目标库的 MemoryManager（与 brain 同一份内存状态）。"""
+    """Get this call's target-library MemoryManager (same in-memory state as the brain)."""
     return _brain_for(library, client).manager
 
 def _map_fields_error(message: str, library: str | None = None) -> str:
-    """map_set fields 解析失败的错误体（共用助手产出，序列化逐位不变）。
+    """Error body for map_set fields parse failures (produced by this shared
+    helper; serialization byte-identical).
 
-    两处 fields 错误（坏 JSON / 非 JSON 对象）现行都经
+    Both fields errors (bad JSON / non-JSON-object) are currently assembled via
     ``json.dumps(_with_library({"status": "error", "error": ...}, library),
-    ensure_ascii=False)`` 组装——错误体**带** library 首键（这是 map_set 与
-    update_tags 两个保序工具的唯一差异点，有探针用例钉死）。抽成助手只省
-    工具体行数，dict 键序（status→error）与序列化参数原样保留。
+    ensure_ascii=False)`` — the error body **does** carry the library first key
+    (the only divergence between the two order-preserving tools map_set and
+    update_tags, pinned by a probe case). Extracting the helper only saves tool
+    body lines; the dict key order (status→error) and the serialization arguments
+    are preserved as-is.
 
-    注意 fields 的 ``json.loads`` 解析本身**刻意不抽**：工具层
-    用例（test_m4_batch3_tool_face T4）以源码字面钉住「json.loads(fields)
-    在 _organize_service(library) 之前」（保序：坏库名+坏 fields 先抛库错
-    ——信封组装即库解析），抽走字面会翻红那条断言。
+    Note the ``json.loads`` parse of fields itself is **deliberately not
+    extracted**: the tool-layer case (test_m4_batch3_tool_face T4) pins the source
+    literal "json.loads(fields) before _organize_service(library)" (order
+    preservation: bad library name + bad fields must raise the library error
+    first — envelope assembly IS library resolution); removing the literal would
+    turn that assertion red.
     """
     return json.dumps(_with_library(
         {"status": "error", "error": message}, library), ensure_ascii=False)
 
 
 def _task_directory_register(entry: dict[str, Any]) -> dict[str, Any]:
-    """把条目登记进用户级任务目录（``<user 库>/directory.json``）。
+    """Register an entry into the user-level task directory
+    (``<user library>/directory.json``).
 
-    这是任务目录的**受管通道**之一（登记），也是唯一自动
-    挂点：``library_create`` 建库即调用。语义三条：
+    This is one of the task directory's **managed channels** (registration) and
+    the only automatic hook: ``library_create`` calls it right after creating a
+    library. Three semantics:
 
-    * **目标库按角色定**：约定名 ``user`` 的用户级库——不是
-      「当前寻址落点」，也不是调用方的家库。用户库没建/失联 ⇒ 返回
-      ``registered: false`` + ``user_library_not_found``（**不建**用户库：
-      建库是显式动作，不能被一次登记悄悄触发）。
-    * **失败不抛**：登记是赠品，抛出去会让一次成功的建库变成失败（库已经在
-      磁盘上，agent 却收到错误）。原因原样返回，由用例层转成
-      ``directory_registered: false`` + warning。
-    * **不静默**：坏 sidecar / 写盘失败都带 reason，绝不假装登记成功。
+    * **The target library is fixed by role**: the user-level library with the
+      conventional name ``user`` — not "the current addressing target", nor the
+      caller's home library. If the user library is missing/unreachable ⇒ return
+      ``registered: false`` + ``user_library_not_found`` (**do not create** the
+      user library: library creation is an explicit action and must not be
+      quietly triggered by a registration).
+    * **Failures do not raise**: registration is a freebie; raising would turn a
+      successful library creation into a failure (the library is already on disk,
+      yet the agent gets an error). The reason is returned as-is for the use-case
+      layer to turn into ``directory_registered: false`` + warning.
+    * **Never silent**: broken sidecar / write failures both carry a reason;
+      never pretend registration succeeded.
 
-    读路径（``brain/session.py::_task_directory_brief``）不经过这里——它走
-    轻量路径直读 sidecar，符号也不在本函数里出（读不需要权限）。
+    The read path (``brain/session.py::_task_directory_brief``) does not go
+    through here — it takes the lightweight path reading the sidecar directly,
+    and no symbol from this function appears there (reads need no permission).
     """
     try:
         info = _library.resolve_library("user", libs=libraries())
     except LibraryResolutionError as exc:
         return {"registered": False, "reason": "user_library_not_found",
                 "detail": str(exc)}
-    if info is None:  # "user" 非空必走解析；None = 真失联（防御同上）
+    if info is None:  # a non-empty "user" always resolves; None = truly unreachable (same defense as above)
         return {"registered": False, "reason": "user_library_not_found"}
     try:
         return _task_directory.upsert_entry(info.path, entry)
-    except Exception as exc:  # noqa: BLE001 —— 坏文件/写盘失败都要自曝
+    except Exception as exc:  # noqa: BLE001 — broken files/write failures must self-report
         logger.warning("task-directory write failed (%s): %r", _task_directory.directory_path(
             info.path), exc)
         return {"registered": False, "reason": "task_directory_write_failed",
@@ -1070,18 +1195,20 @@ def _task_directory_register(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _library_admin_service() -> LibraryAdminService:
-    """跨库管理 5 工具的用例服务（list/info/whoami/use/create）。
+    """Use-case service for the 5 cross-library admin tools
+    (list/info/whoami/use/create).
 
-    **刻意不传 brain**：这 5 个工具不为某一个库构造 brain。唯一需要 brain
-    的 ``library_create`` 经端口的 ``brain_for`` 在建库后现取（且只对**新建
-    的那个库**取），其余四个全程与注册表无接触。
+    **Deliberately no brain passed**: these 5 tools never construct a brain for
+    some library. The only one needing a brain, ``library_create``, fetches it
+    after creation via the port's ``brain_for`` (and only for the **newly created**
+    library); the other four never touch the registry.
 
-    注：本工厂**留在 server.py**（其余五个在
-    ``server_runtime/composition.py``）——test_m4_batch4_tool_face T4 以
-    ``ast.get_source_segment`` 钉住本函数在 server.py 源码里的函数体
-    （「不传 brain、不经注册表直取」的源码级契约），按「改代码适配测试、
-    不改测试」纪律（map_set json.loads 同例）留置；端口对象经
-    再导出现取同一份。
+    Note: this factory **stays in server.py** (the other five live in
+    ``server_runtime/composition.py``) — test_m4_batch4_tool_face T4 pins this
+    function's body in server.py source via ``ast.get_source_segment`` (the
+    source-level contract "no brain passed, no registry touch"), kept per the
+    "adapt code to tests, never edit tests" discipline (same case as map_set's
+    json.loads); the ports object is the same instance fetched via re-export.
     """
     return LibraryAdminService(ports=_LIB_PORTS)
 
@@ -1090,12 +1217,13 @@ _brain: HippoBrain | None = None
 
 
 def get_brain() -> HippoBrain:
-    """获取 HippoBrain 单例入口。
+    """Entry point getting the HippoBrain singleton.
 
-    **保留此函数是为了兼容性**（预热、旧脚本、测试都在用它）：它等价于
-    ``_brain_for(None)``，即**默认库**。多库请用 :func:`_brain_for`。
-    ``_brain`` 这个模块级变量现在只作**默认库的快捷缓存**，
-    真正的持有者是 :class:`BrainRegistry`（key = 归一化的库路径）。
+    **Kept for compatibility** (warmup, old scripts, and tests all use it): it
+    equals ``_brain_for(None)``, i.e. the **default library**. For multi-library
+    use :func:`_brain_for`. The module-level ``_brain`` is now only a **shortcut
+    cache for the default library**; the real holder is :class:`BrainRegistry`
+    (key = normalized library path).
     """
     global _brain
     if _brain is not None:
@@ -1136,8 +1264,9 @@ Args:
     """
     await _await_warmup()
     svc = _write_service(library)
-    # tags 解析（错误体带 library 首键）、entities/importance/cognitive_type
-    # 哨兵归一、save_warning 注入与日志都在 WriteService.ingest。
+    # tags parsing (error body carries the library first key), sentinel
+    # normalization of entities/importance/cognitive_type, save_warning injection,
+    # and logging all live in WriteService.ingest.
     return json.dumps(svc.ingest(
         text=text, speaker=speaker, importance=importance,
         cognitive_type=cognitive_type, entities=entities, source=source,
@@ -1158,13 +1287,15 @@ errors. Prefer this over repeated single ``ingest`` calls for bulk imports.
     """
     await _await_warmup()
     svc = _write_service(library)
-    # items/tags 解析（错误体均带 library 首键）、逐项隔离与整批落盘在
-    # WriteService.ingest_batch；本工具只剩「调用 → 序列化」。
+    # items/tags parsing (both error bodies carry the library first key),
+    # per-item isolation, and whole-batch persistence live in
+    # WriteService.ingest_batch; this tool is just "call → serialize".
     return json.dumps(svc.ingest_batch(
         items=items, source=source, tags=tags, granularity=granularity,
         detect_supersede=detect_supersede, save=save, auto_tags=auto_tags,
-        # P0-1：批量只接写入凭据，不接幂等键（批量导入的重放判据是
-        # 源文件签名 source_drift，不是请求键）。
+        # P0-1: batch takes only the write origin, not an idempotency key (bulk-
+        # import replay detection is the source-file signature source_drift, not
+        # a request key).
         origin=build_origin(session=session_key(), task=_origin_task(), surface="ingest_batch")),
         ensure_ascii=False)
 
@@ -1189,8 +1320,9 @@ Args:
     scope / libraries: Library selection semantics shared with ``recall``.
     """
     await _await_warmup()
-    # filter_tags 解析（错误体不带信封）与 J2 回显在 RecallService.
-    # get_memory_context；解析排在库解析之后，保序。
+    # filter_tags parsing (error body carries no envelope) and the J2 echo live
+    # in RecallService.get_memory_context; parsing comes after library resolution,
+    # order preserved.
     svc = _recall_service(library, scope)
     return json.dumps(svc.get_memory_context(
         query=query, top_k=top_k, token_budget=token_budget,
@@ -1281,7 +1413,7 @@ Args:
     """
     await _await_warmup()
     svc = _maintain_service(library)
-    # 注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # Note: the response body **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.export_memories(since_ts=since_ts, source=source,
                                           state=state, limit=limit,
                                           client=session_key()),
@@ -1308,11 +1440,12 @@ Args:
     library: Optional library override.
     """
     await _await_warmup()
-    # P1：收尾清掉任务登记，避免下一会话误继承上一次的 origin.task。
+    # P1: clear the task registration at session end so the next session does not
+    # wrongly inherit the previous origin.task.
     clear_task()
     svc = _bootstrap_service(library)
 
-    # open_topics / close_topics 两种形态（JSON 数组 / 逗号串）的归一留在适配层。
+    # Normalization of the two open_topics / close_topics forms (JSON array / comma string) stays in the adapter layer.
     def _norm_list(v: str | list[str]) -> list[str]:
         if isinstance(v, str):
             return [t.strip() for t in v.split(",") if t.strip()]
@@ -1376,8 +1509,9 @@ Args:
     dry_run: Report the plan without writing; default false.
     """
     await _await_warmup()
-    # filter_tags 解析（错误体不带信封）、键名校验与 J2 软降级回显都在
-    # OrganizeService.consolidate；解析排在库解析之后，保序。
+    # filter_tags parsing (error body carries no envelope), key validation, and
+    # the J2 soft-degrade echo all live in OrganizeService.consolidate; parsing
+    # comes after library resolution, order preserved.
     svc = _organize_service(library)
     return json.dumps(svc.consolidate(
         filter_tags=filter_tags, max_items=max_items, dry_run=dry_run),
@@ -1401,8 +1535,9 @@ Args:
             The service never adjudicates; it writes only what was sent.
     """
     await _await_warmup()
-    # filter_tags 解析（错误体不带信封）与 candidate_pool 回显在
-    # RecallService.contradictions；解析排在库解析之后，保序。
+    # filter_tags parsing (error body carries no envelope) and the candidate_pool
+    # echo live in RecallService.contradictions; parsing comes after library
+    # resolution, order preserved.
     svc = _recall_service(library)
     if confirm:
         return json.dumps(svc.apply_supersede_plan(confirm), ensure_ascii=False)
@@ -1424,8 +1559,10 @@ Args:
     limit: Maximum detailed rows; default 50.
     filter_tags: JSON object string narrowing the audited records.
     """
-    # 零参数写法：层级按函数名在 STORE_ONLY_TOOLS 查表推断（drift_audit 已入表，
-    # 只读库存 + 源签名层，不需要嵌入模型）。派发器那两处显式传参是结构性例外。
+    # Zero-argument form: the tier is inferred by looking the function name up in
+    # STORE_ONLY_TOOLS (drift_audit is already in the table; it only reads the
+    # store + source-signature layer, no embedding model needed). The dispatcher's
+    # two explicit-argument spots are structural exceptions.
     await _await_warmup()
     svc = _recall_service(library)
     return json.dumps(svc.drift_audit(
@@ -1474,11 +1611,13 @@ Args:
 
 
 # ------------------------------------------------------------------
-# 信息地图层：地图答「现在是什么」，记忆答「发生过
-# 什么」。状态只走 map_set 一个入口（按键更新，同键再写整体替换）；
-# 精确查询走 map_get（语义 top-k 查状态 = 把精确换成猜中）。
-# 四个工具归独立 profile 组 "map" ⇒ common 面零 token 增加，full 与
-# hippo_extra 可触达（drift_audit 归 admin 组的同一先例）。
+# Information map layer: maps answer "what is the state now", memories answer
+# "what happened". State writes go only through map_set (keyed updates; rewriting
+# a key replaces the entry wholesale); exact lookups go through map_get (semantic
+# top-k for state = trading exactness for a guess).
+# The four tools form the standalone profile group "map" ⇒ zero added tokens on
+# the common surface; reachable under full and hippo_extra (same precedent as
+# drift_audit in the admin group).
 # ------------------------------------------------------------------
 
 @server.tool(structured_output=False)
@@ -1502,9 +1641,11 @@ Args:
     library: Optional library override.
     """
     await _await_warmup()
-    # fields 的 JSON 协议解析留在适配层：现行它排在 _brain_for 之前（先报
-    # 语法错，不碰库），错误体带 library 首键（两保序工具的唯一差异点）。
-    # json.loads 字面刻意保留在本函数——用例以它钉保序，见 _map_fields_error。
+    # The JSON protocol parsing of fields stays in the adapter layer: currently it
+    # runs before _brain_for (syntax error first, library untouched), and the error
+    # body carries the library first key (the two order-preserving tools' only
+    # divergence). The json.loads literal is deliberately kept in this function —
+    # cases pin order preservation on it, see _map_fields_error.
     fdict: dict | None = None
     if (fields or "").strip():
         try:
@@ -1514,7 +1655,7 @@ Args:
         if not isinstance(fdict, dict):
             return _map_fields_error("fields must be a JSON object", library)
     svc = _organize_service(library)
-    # brain.map_set 的 ValueError（非法 name/key）错误体在服务内组装，同样带 library 首键。
+    # The ValueError (illegal name/key) error body of brain.map_set is assembled in the service, also carrying the library first key.
     return json.dumps(svc.map_set(
         name=name, key=key, status=status, fields=fdict, desc=desc,
         truth_source=truth_source, note=note, updated_by=updated_by),
@@ -1529,7 +1670,7 @@ semantic recall when you need current state, not historical discussion.
     """
     await _await_warmup()
     svc = _organize_service(library)
-    # 注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # Note: the response body **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.map_get(name=name, key=key), ensure_ascii=False)
 
 
@@ -1541,7 +1682,7 @@ With ``name``, returns the entries in that map.
     """
     await _await_warmup()
     svc = _organize_service(library)
-    # 注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # Note: the response body **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.map_list(name=name), ensure_ascii=False)
 
 
@@ -1554,7 +1695,7 @@ counterpart to source-drift auditing.
     """
     await _await_warmup()
     svc = _organize_service(library)
-    # 信封（library 首键）在服务内组装——与现行 _with_library 逐位一致。
+    # The envelope (library first key) is assembled in the service — byte-identical with the current _with_library.
     return json.dumps(svc.map_verify(name=name), ensure_ascii=False)
 
 
@@ -1573,7 +1714,7 @@ Args:
     """
     await _await_warmup()
     svc = _recall_service(library)
-    # 信封（library 首键）在服务内组装——本工具是读侧少数带 F5 自曝的。
+    # The envelope (library first key) is assembled in the service — this tool is one of the few read-side tools with F5 self-report.
     return json.dumps(svc.knowledge_map(
         limit=limit, include_archived=include_archived), ensure_ascii=False)
 
@@ -1599,9 +1740,10 @@ Args:
     library: Optional library override.
     """
     await _await_warmup()
-    # items / fras 的 JSON 解析（失败显式报错、错误体不带信封）与
-    # evidence/topics 的 lenient 解析都在 RecallService.knowledge_topic；
-    # 解析排在库解析之后，与现行代码同序。
+    # JSON parsing of items / fras (explicit error on failure, error body carries
+    # no envelope) and the lenient parsing of evidence/topics all live in
+    # RecallService.knowledge_topic; parsing comes after library resolution, same
+    # order as the current code.
     svc = _recall_service(library)
     return json.dumps(svc.knowledge_topic(
         topic_id=topic_id, action=action, summary=summary,
@@ -1622,8 +1764,9 @@ Args:
     library: Optional library override.
     """
     await _await_warmup()
-    # terms 的 lenient 解析（JSON 数组/逗号串都收，永不报错）与信封都在
-    # OrganizeService.lexicon_add；解析排在库解析之后，保序。
+    # The lenient parsing of terms (accepts JSON arrays and comma strings, never
+    # errors) and the envelope both live in OrganizeService.lexicon_add; parsing
+    # comes after library resolution, order preserved.
     svc = _organize_service(library)
     return json.dumps(svc.lexicon_add(terms=terms, relink=relink),
                       ensure_ascii=False)
@@ -1637,8 +1780,8 @@ Read-only candidate generation. Review suggestions before adding them; do not
 automatically accept every frequent token.
     """
     await _await_warmup()
-    # exclude 的 lenient 解析在服务内（现行排在库解析之后，保序）；
-    # 注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # The lenient parsing of exclude lives in the service (currently after library resolution, order preserved);
+    # Note: the response body **does not** carry the library first key (byte-identical with the current tool).
     svc = _organize_service(library)
     return json.dumps(svc.lexicon_suggest(
         top_n=top_n, min_docs=min_docs, min_files=min_files,
@@ -1658,8 +1801,9 @@ Returns candidate groups with evidence; it does not merge automatically. Review
 evidence, then register confirmed aliases through ``lexicon_add``.
     """
     await _await_warmup()
-    # exclude / cue_words 的 lenient 解析在服务内（现行排在库解析之后，
-    # 保序）；注意：返回体**不带** library 首键（与现行工具逐位一致）。
+    # The lenient parsing of exclude / cue_words lives in the service (currently
+    # after library resolution, order preserved); Note: the response body
+    # **does not** carry the library first key (byte-identical with the current tool).
     svc = _organize_service(library)
     return json.dumps(svc.lexicon_alias_suggest(
         top_n=top_n, min_confidence=min_confidence, min_support=min_support,
@@ -1677,7 +1821,7 @@ reports how many memories were relinked and any errors.
     """
     await _await_warmup()
     svc = _organize_service(library)
-    # 信封（library 首键）在服务内组装——与现行 _with_library 逐位一致。
+    # The envelope (library first key) is assembled in the service — byte-identical with the current _with_library.
     return json.dumps(svc.relink_entities(), ensure_ascii=False)
 
 
@@ -1695,7 +1839,7 @@ Args:
     """
     await _await_warmup()
     svc = _maintain_service(library)
-    # 本工具与 save_brain 一样**不带** library 首键（与现行工具逐位一致）。
+    # Like save_brain, this tool **does not** carry the library first key (byte-identical with the current tool).
     return json.dumps(svc.miss_log(limit=limit, clear=clear),
                       ensure_ascii=False)
 
@@ -1709,7 +1853,7 @@ for diagnosis.
     """
     await _await_warmup()
     svc = _maintain_service(library)
-    # warmup 一节由注入探针产出（MaintainService.brain_stats），工具只序列化。
+    # The warmup section is produced by an injected probe (MaintainService.brain_stats); the tool only serializes.
     return json.dumps(svc.brain_stats(daily_days=daily_days),
                       ensure_ascii=False)
 
@@ -1722,12 +1866,12 @@ report; failures are not silently swallowed.
     """
     await _await_warmup()
     svc = _maintain_service(library)
-    # 信封（含 ConcurrentWriteError 的 conflict 体）在服务内组装，工具只序列化。
+    # The envelope (including the ConcurrentWriteError conflict body) is assembled in the service; the tool only serializes.
     return json.dumps(svc.save_brain(), ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
-# F4' · 多库：library_* 工具（36 → 41）
+# F4' · Multi-library: library_* tools (36 → 41)
 # ------------------------------------------------------------------
 @server.tool(structured_output=False)
 async def library_list(include_backups: bool = False) -> str:
@@ -1741,8 +1885,10 @@ Args:
     """
     await _await_warmup()
     svc = _library_admin_service()
-    # 扫描 / 零库自动建默认目录 / 行组装都在服务内（端口把连接态与磁盘读写
-    # 留在适配层），工具只序列化。返回体**不带** library 首键（逐位一致）。
+    # Scanning / zero-library auto default-directory creation / row assembly all
+    # live in the service (ports keep connection state and disk I/O in the adapter
+    # layer); the tool only serializes. The response body **does not** carry the
+    # library first key (byte-identical).
     return json.dumps(svc.list_libraries(include_backups=include_backups),
                       ensure_ascii=False)
 
@@ -1755,7 +1901,7 @@ Empty library means the default/current library.
     """
     await _await_warmup()
     svc = _library_admin_service()
-    # 刻意不为它构造 brain（只读目录元信息）；层文件大小经端口读盘。
+    # Deliberately no brain constructed for it (directory metadata only); layer file sizes are read from disk via the port.
     return json.dumps(svc.describe(library=library), ensure_ascii=False)
 
 
@@ -1783,7 +1929,7 @@ Args:
     """
     await _await_warmup()
     svc = _library_admin_service()
-    # 解析不明/目标是备份 ⇒ 服务抛 LibraryResolutionError（不吞、不回落默认库）。
+    # Unresolvable / target is a backup ⇒ the service raises LibraryResolutionError (never swallowed, never falls back to the default library).
     return json.dumps(svc.use(library=library, client=client),
                       ensure_ascii=False)
 
@@ -1804,20 +1950,23 @@ Args:
     """
     await _await_warmup()
     svc = _library_admin_service()
-    # 重名/空名/目标已存在且非目录 ⇒ 服务抛 LibraryResolutionError。
+    # Duplicate name / empty name / target exists and is not a directory ⇒ the service raises LibraryResolutionError.
     return json.dumps(svc.create(name=name, path=path, aliases=aliases,
                                  use=use, client=client,
                                      workspace_root=workspace_root), ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
-# 派发器（渐进式披露）：实现主体在 dispatch.py，注册块留在本模块
+# Dispatcher (progressive disclosure): implementation lives in dispatch.py, the
+# registration block stays in this module
 # ------------------------------------------------------------------
-# _dispatch_map（经 vars(server) 现取工具函数）/ _hippo_help / _hippo_extra
-# 见 server_runtime/dispatch.py（上方 import 再导出）；名单现取
-# _TOOL_GROUPS（原 _ALL_TOOL_NAMES 快照随迁为现取派生），patch 后即刻生效。
-# 仅在 _TOOL_PROFILE != "full" 时注册，两个理由（原文随迁 dispatch.py）：
-# full 下派发器是多余负担；add_tool 程序化注册保持"已声明工具面 = 46"。
+# _dispatch_map (fetches tool functions via vars(server)) / _hippo_help /
+# _hippo_extra: see server_runtime/dispatch.py (re-exported via the imports
+# above); the name list is fetched live from _TOOL_GROUPS (the old
+# _ALL_TOOL_NAMES snapshot moved along and became a live derivation), taking
+# effect immediately after patching. Registered only when _TOOL_PROFILE != "full",
+# for two reasons (original text moved to dispatch.py): under full the dispatcher
+# is dead weight; add_tool's programmatic registration keeps "declared tool surface = 46".
 
 if _TOOL_PROFILE != "full":
     server._tool_manager.add_tool(
@@ -1843,20 +1992,22 @@ if _TOOL_PROFILE != "full":
 
 
 # ------------------------------------------------------------------
-# 入口
+# Entry point
 # ------------------------------------------------------------------
 def main() -> None:
-    """启动 MCP stdio 服务端（启动序列在 entry.run_main）。"""
+    """Start the MCP stdio server (startup sequence in entry.run_main)."""
     _entry.run_main()
 
 
 def __getattr__(name: str) -> Any:
-    """按需解析重型符号（PEP 562）。
+    """Resolve heavy symbols on demand (PEP 562).
 
-    本模块刻意不在顶层导入 ``brain`` / ``manager``（那会把 torch 的 ~5.7s 顶到
-    MCP 握手路径上，见文件头的 import 说明）。为了让 ``server.HippoBrain``
-    这类既有引用继续可用，这里在**首次读取该属性时**才真正导入 ——
-    不读就没有任何代价，``get_brain()`` 走的是 ``_brain_class()``。
+    This module deliberately does not import ``brain`` / ``manager`` at the top
+    level (that would push torch's ~5.7s onto the MCP handshake path; see the
+    import notes in the file header). To keep existing references like
+    ``server.HippoBrain`` working, the real import happens **on first attribute
+    read** — not reading costs nothing, and ``get_brain()`` goes through
+    ``_brain_class()``.
     """
     if name == "HippoBrain":
         from hippocampus_mcp.brain import HippoBrain

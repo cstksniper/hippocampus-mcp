@@ -1,37 +1,49 @@
 # -*- coding: utf-8 -*-
-"""组合根工厂（server.py 组合根区块的实现本体）。
+"""Composition-root factories (the implementation body of server.py's
+composition root block).
 
-这里实现：跨库用例端口填空 ``_LIB_PORTS``、6 个 application 用例工厂
-（``_write_service`` / ``_bootstrap_service`` / ``_recall_service`` /
-``_organize_service`` / ``_maintain_service`` / ``_library_admin_service``）、
-brain 构造器 ``_build_brain``。
+Implemented here: the cross-library use-case port shim ``_LIB_PORTS``, the
+6 application use-case factories (``_write_service`` / ``_bootstrap_service``
+/ ``_recall_service`` / ``_organize_service`` / ``_maintain_service`` /
+``_library_admin_service``), and the brain constructor ``_build_brain``.
 
-🔴 组合根的**全部输入经 :func:`_srv` 现取**：
+🔴 Every input of the composition root is **fetched live via
+:func:`_srv`**:
 
-* 工厂经 ``s._brain_for`` / ``s._library_self``——测试替换
-  ``server._brain_for`` 后工厂拿到的是替 brain（knowledge_tool_face
-  同款手法必须一路生效到工厂）；
-* ``_LIB_PORTS`` 每条端口都是 ``lambda *a, **k: _srv().X(*a, **k)``
-  的**活引用**——不是 import 时快照，端口被调用时才解析 server 命名空间；
-* ``_build_brain`` 经 ``s._brain_class()`` 解析类（``globals().get(
-  "HippoBrain")`` 语义，``server.HippoBrain = Fake`` 替换生效）、经
-  ``s._prepare_torch()`` 兜底、配置常量（``_LAMBDA_DECAY`` 等）逐个现取；
-* ``probe=s.warmup_status`` 同样在构造时现取。
+* the factories go through ``s._brain_for`` / ``s._library_self`` -- after
+  a test replaces ``server._brain_for``, the factory gets the replacement
+  brain (the knowledge_tool_face trick must keep working all the way into
+  the factories);
+* every port of ``_LIB_PORTS`` is a **live reference** of the form
+  ``lambda *a, **k: _srv().X(*a, **k)`` -- not an import-time snapshot; the
+  server namespace is resolved only when the port is called;
+* ``_build_brain`` resolves the class via ``s._brain_class()``
+  (``globals().get("HippoBrain")`` semantics, so a ``server.HippoBrain =
+  Fake`` replacement takes effect), falls back via ``s._prepare_torch()``,
+  and fetches the config constants (``_LAMBDA_DECAY`` etc.) live one by one;
+* ``probe=s.warmup_status`` is likewise fetched live at construction.
 
-留在 server.py：``_brain`` / ``get_brain`` / ``_brain_for`` /
-``_manager_for`` / ``_brain_class`` / ``_registry`` 三件 / ``_PERSIST_DIR``
-与全部配置常量（patch 面 + 组合根语义）。server.py 按 import 名
-原样再导出本模块符号——tests/test_m4_batch1_tool_face.py /
-tests/test_m4_batch4_tool_face.py 的 ``hasattr(S, "_write_service" /
-"_maintain_service" / "_LIB_PORTS")`` 与工具体调用点零改动。
+Stays in server.py: ``_brain`` / ``get_brain`` / ``_brain_for`` /
+``_manager_for`` / ``_brain_class`` / the ``_registry`` trio /
+``_PERSIST_DIR`` and all config constants (the patch surface + composition
+root semantics). server.py re-exports this module's symbols verbatim by
+import name -- the ``hasattr(S, "_write_service" / "_maintain_service" /
+"_LIB_PORTS")`` checks of tests/test_m4_batch1_tool_face.py /
+tests/test_m4_batch4_tool_face.py and the tool-body call sites change by
+zero lines.
 
-家库写守卫：本模块的组合根工厂是写类工具**家库写边界**的落点
-（``_guard_write_boundary``，比对解析目标 vs 连接默认库——写永远钉在
-家库，跨库写只留 ``user`` 受管通道）；现取模式已提供全部钩子
-（``s.default_library_path`` 留 server、``session_key`` 进 routing），
-「工具 → 工厂」单一调用路径保住即可。
-组合根**不 import domain**（层级面白名单）：判定所需的纯函数与符号一律经
-``server`` 命名空间现取，与跨库读第二 brain 的注入手法同款。
+Home-library write guard: this module's composition-root factories are
+where the write-class tools' **home-library write boundary** lands
+(``_guard_write_boundary``, comparing the resolved target vs the
+connection's default library -- writes are always pinned to the home
+library, cross-library writes keep only the ``user`` managed channel); the
+live-fetch pattern already provides every hook (``s.default_library_path``
+stays in server, ``session_key`` goes into routing); keeping the single
+"tool → factory" call path intact is all that is needed.
+The composition root does **not import domain** (layer whitelist): the pure
+functions and symbols needed for decisions are all fetched live through the
+``server`` namespace -- the same trick as injecting the second brain for
+cross-library reads.
 """
 from __future__ import annotations
 
@@ -44,23 +56,25 @@ from hippocampus_mcp.application import (BootstrapService, LibraryAdminService,
                                          OrganizeService, RecallService,
                                          WriteService)
 
-if TYPE_CHECKING:  # 仅供静态检查（注解已被 future import 字符串化）
+if TYPE_CHECKING:  # for static checks only (annotations already stringified by the future import)
     from hippocampus_mcp.brain import HippoBrain
 
 logger = logging.getLogger("hippocampus_mcp")
 
 
 def _srv() -> Any:
-    """server 模块本体（现取入口，见模块 docstring 的现取清单）。"""
+    """The server module itself (the live-fetch entry point; see the
+    live-fetch list in the module docstring)."""
     from hippocampus_mcp import server as _s
 
     return _s
 
 
-#: 跨库用例的端口填空（无状态，进程全局一份即可）。
-#: 每条端口都是经 :func:`_srv` 的**活引用**——被调用时才解析
-#: server 命名空间，测试对 ``server._brain_for`` / ``server._registry_get``
-#: 等的替换照样穿过端口（import 时快照会让 patch 静默失效）。
+#: Port shim for the cross-library use cases (stateless; one process-global
+#: copy is enough). Every port is a **live reference** via :func:`_srv` --
+#: the server namespace is resolved only when called, so test replacements
+#: of ``server._brain_for`` / ``server._registry_get`` etc. still pass
+#: through the ports (an import-time snapshot would silently void patches).
 _LIB_PORTS = LibraryPorts(
     libraries=lambda *a, **k: _srv().libraries(*a, **k),
     default_path=lambda *a, **k: _srv().default_library_path(*a, **k),
@@ -72,30 +86,40 @@ _LIB_PORTS = LibraryPorts(
     ensure_dir=lambda *a, **k: _srv()._ensure_default_dir(*a, **k),
     layer_files=lambda *a, **k: _srv()._layer_files(*a, **k),
     prefetch=lambda *a, **k: _srv()._prefetch_library(*a, **k),
-    # 任务目录登记（受管通道：user 库 sidecar 的唯一写入口）。
-    # 实现在 server.py（要解析约定名 ``user`` 的用户库 + 写 sidecar），
-    # 照样走活引用——测试替换 ``server._task_directory_register`` 即刻生效。
+    # Task directory registration (managed channel: the only write entry
+    # into the user library's sidecar). Implemented in server.py (it has to
+    # resolve the user library under the reserved name ``user`` + write the
+    # sidecar); still a live reference -- replacing
+    # ``server._task_directory_register`` in tests takes effect immediately.
     task_directory_register=lambda *a, **k: _srv()._task_directory_register(*a, **k),
 )
 
 
 # ------------------------------------------------------------------
-# application 用例工厂（组合根）：工具 → 服务的唯一调用路径
+# application use-case factories (composition root): the single call path
+# from tools to services
 # ------------------------------------------------------------------
-# 「单一调用路径」纪律的落地：工具不再直调
-# ``_manager_for`` / ``_brain_for``，只经这些工厂拿用例服务。
-# 工厂做且只做组合根三件事：解析目标库（_brain_for，注册表缓存）、
-# 算库自曝（_library_self，TTL 缓存扫描）、注入配置值（_PERSIST_DIR，
-# 模块导入时读一次）。每调用新建——brain 由注册表按路径缓存，库自曝
-# 走缓存扫描，与现行工具逐个 _brain_for 同成本，无新增状态。
-# （三个输入全部经 _srv() 现取。）
+# Grounding of the "single call path" discipline: tools no longer call
+# ``_manager_for`` / ``_brain_for`` directly, they get use-case services
+# only through these factories. Each factory does exactly the composition
+# root's three things: resolve the target library (_brain_for, registry
+# cache), compute the library self-exposure (_library_self, TTL-cached
+# scan), inject config values (_PERSIST_DIR, read once at module import).
+# Built fresh per call -- brains are cached by path in the registry and the
+# self-exposure goes through the cached scan, the same cost as the current
+# tools' per-call _brain_for, no new state.
+# (All three inputs are fetched live via _srv().)
 def _sensitive_words() -> tuple[str, ...]:
-    """读部署敏感词表：一行一词，``#`` 注释行与空行跳过。
+    """Read the deployed sensitive-word list: one word per line; ``#``
+    comment lines and blank lines are skipped.
 
-    **每次调用现读**（与 load_config 不缓存同语义：改词表立刻生效）；
-    文件缺失/不可读 = 空词表 + warning（模式级内置兜底仍在，敏感词红线
-    的第二道门不依赖词表存在）。application 层不许 import config
-    （层级依赖纪律），所以读取点落组合根——本模块即组合根。
+    **Re-read on every call** (same semantics as load_config not caching:
+    editing the word list takes effect immediately); a missing/unreadable
+    file = empty word list + warning (the pattern-level built-in fallback
+    is still there -- the second gate of the sensitive-word red line does
+    not depend on the list existing). The application layer must not import
+    config (layer dependency discipline), so the read point lands in the
+    composition root -- this module is the composition root.
     """
     path = _srv().load_config().sensitive_words
     if not path:
@@ -112,11 +136,14 @@ def _sensitive_words() -> tuple[str, ...]:
 
 
 def _int_or_zero(raw: str) -> int:
-    """把配置字符串解析成非负整数，**解析不出就给 0**（= 不截断）。
+    """Parse a config string into a non-negative int, **0 when
+    unparseable** (= no truncation).
 
-    「写错等同于没写」是本项目旋钮的默认语义（同 ``long_content`` /
-    ``onnx_no_arena``）：一个看不懂的值绝不能把护栏悄悄打开，把长记忆
-    切掉却没人知道——那比不省这点 token 糟得多。
+    "A wrong setting equals no setting" is the default semantics of this
+    project's knobs (same as ``long_content`` / ``onnx_no_arena``): an
+    unintelligible value must never silently open the guard and cut long
+    memories without anyone knowing -- that is far worse than not saving
+    those few tokens.
     """
     try:
         v = int(str(raw or "").strip())
@@ -126,29 +153,37 @@ def _int_or_zero(raw: str) -> int:
 
 
 def _guard_write_boundary(library: str | None = None) -> None:
-    """写类工具的**跨库写守卫**。
+    """The **cross-library write guard** for write-class tools.
 
-    语义一句话：**``library_use`` 只影响读落哪，写永远钉在家库**。
-    这是对旧语义「写跟随粘性库」的有意收紧，相应行为断言已同步更新。
+    Semantics in one sentence: **``library_use`` only affects where reads
+    land; writes are always pinned to the home library**. This is a
+    deliberate tightening of the old semantics ("writes follow the sticky
+    library"); the corresponding behavior assertions were updated in sync.
 
-    用到的符号全部经 :func:`_srv` 现取：
+    Every symbol used here is fetched live via :func:`_srv`:
     ``caller_tool_name`` / ``WRITE_CLASS_TOOLS`` / ``load_config`` /
-    ``_library_self`` / ``default_library_path`` / ``libraries`` / 判定三件
-    （``classify_write_permission`` / ``same_library`` / ``library_display``）
-    ——组合根**不 import domain**（层级面白名单），测试对本命名空间的
-    替换照样穿过守卫（替换 ``server.default_library_path`` 就等于换了「家库」）。
+    ``_library_self`` / ``default_library_path`` / ``libraries`` / the
+    decision trio (``classify_write_permission`` / ``same_library`` /
+    ``library_display``) -- the composition root does **not import domain**
+    (layer whitelist), and test replacements of this namespace still pass
+    through the guard (replacing ``server.default_library_path`` is exactly
+    how the "home library" gets swapped).
 
     Raises:
-        LibraryResolutionError: 解析不明（``_library_self`` 上游抛：
-            目标库都定不下来时谈不了权限）。
-        CrossLibraryWriteDenied: 目标既非家库、也非 user 受管通道。
+        LibraryResolutionError: ambiguous resolution (raised upstream by
+            ``_library_self``: with the target library undecidable there is
+            nothing to decide permissions about).
+        CrossLibraryWriteDenied: the target is neither the home library nor
+            the user managed channel.
     """
     s = _srv()
-    # depth=3：caller_tool_name 本身 → 本守卫 → 用例工厂 → 工具体。
-    # 写成 2 会取到工厂名（``_write_service``），表里没有它 ⇒ 守卫静默放行。
+    # depth=3: caller_tool_name itself → this guard → the use-case factory
+    # → the tool body. Writing 2 would pick up the factory name
+    # (``_write_service``), which is not in the table ⇒ the guard passes
+    # silently.
     tool = s.caller_tool_name(3)
     if tool not in s.WRITE_CLASS_TOOLS:
-        return  # 读类工具 / 非工具调用：跨库读开放
+        return  # read-class tools / non-tool calls: cross-library reads are open
     if s.load_config().cross_library_write:
         logger.warning(
             "Escape hatch HIPPOCAMPUS_CROSS_LIBRARY_WRITE=1 active: cross-library writes to %s "
@@ -173,26 +208,37 @@ def _guard_write_boundary(library: str | None = None) -> None:
 
 
 def _write_service(library: str | None = None) -> WriteService:
-    """Write 面 9 工具的用例服务（store/update/tags/forget/ingest/save）。"""
+    """Use-case service for the 9 tools of the Write surface
+    (store/update/tags/forget/ingest/save)."""
     _guard_write_boundary(library)
     s = _srv()
     brain = s._brain_for(library)
     info = s._library_self(library)
-    # D2a 写侧隔离三件（纯判据在 domain/write_quarantine，经 server 命名
-    # 空间现取——S4.2 白名单不放 domain import，与写守卫同款手法）：
-    # 非家工作区经 user 豁免通道的直写 → 待审队列（拍板①a）；
-    # 家库 = user 库的日常宿主写自己家 → 不隔离（拍板③的 full 档语义）；
-    # 逃生门开 = 显式运维窗口 → 不隔离但仍记审计。
+    # D2a write-side isolation trio (pure criteria in domain/write_quarantine,
+    # fetched live through the server namespace -- the S4.2 whitelist does
+    # not allow a domain import, same trick as the write guard):
+    # a direct write from a non-home workspace via the user exemption
+    # channel → the review queue (decision ①a);
+    # home library = the user library's daily host writing its own home
+    # → no isolation (the full-tier semantics of decision ③);
+    # escape hatch open = an explicit ops window → no isolation but still
+    # audit-logged.
     home_path = s.default_library_path()
     escape_open = bool(s.load_config().cross_library_write)
     same_home = s.same_library(info.get("path", ""), home_path)
     target_name = info.get("name", "")
-    # 收窄（2026-10-31 拍板，迁移文档 §六）："家"不再由回落推断——用户级
-    # 安装下 unbound/ambiguous/目录坏的回落 same_home **不算家**（旧判据下
-    # 未绑定工作区回落 user 库被判"家"→ full 读写、写不隔离的洞）。
-    # 真·家库形态二选一：无工作区声明（no_cwd/undeclared）且 same_home
-    # （A1 日常宿主显式单库部署）；或 bound 后条目显式声明 full（提权要
-    # 显式，与读侧 full 同判据——full 档 = 被授权把 user 库当自己家）。
+    # Narrowing (2026-10-31 decision, migration doc §六): "家" (home) is no
+    # longer inferred from fallback -- under a user-level install, the
+    # fallback same_home of unbound/ambiguous/corrupt-directory states does
+    # **not count as home** (under the old criterion an unbound workspace
+    # falling back to the user library was judged "家" → the hole of full
+    # read/write and non-isolated writes).
+    # Genuine home is one of exactly two shapes: no workspace declaration
+    # (no_cwd/undeclared) and same_home (A1 daily host, explicit single-
+    # library deployment); or bound with the entry explicitly declaring
+    # full (elevation must be explicit, same criterion as the read-side
+    # full tier -- full tier = authorized to treat the user library as
+    # one's own home).
     brief = s._workspace_binding_brief()
     status = str(brief.get("status") or "undeclared")
     entry_access = str(brief.get("access") or "")
@@ -206,9 +252,12 @@ def _write_service(library: str | None = None) -> WriteService:
                         library_self=info,
                         persist_dir=s._PERSIST_DIR,
                         sensitive_words=_sensitive_words(),
-                        # 超长内容策略：现读（改配置立刻生效，同 sensitive_words）。
+                        # long-content policy: read live (config edits take
+                        # effect immediately, same as sensitive_words).
                         long_content_policy=s.load_config().long_content,
-                        # 分句器本体（含「短句并入上一条」怪癖），不另写一份。
+                        # the sentence splitter itself (including the "short
+                        # sentence merged into the previous one" quirk), not
+                        # a second implementation.
                         split_facts=getattr(brain, "_split_facts", None),
                         user_write_quarantine=quarantine,
                         is_home_write=genuine_home or escape_open,
@@ -218,11 +267,13 @@ def _write_service(library: str | None = None) -> WriteService:
 
 
 def _bootstrap_service(library: str | None = None) -> BootstrapService:
-    """Bootstrap 面 5 工具的用例服务（session_start/end、意图、反馈、stats）。
+    """Use-case service for the 5 tools of the Bootstrap surface
+    (session_start/end, intents, feedback, stats).
 
-    写类成员（session_end / remember_intent /
-    complete_intent / report_feedback）经 :func:`_guard_write_boundary` 拦关，
-    读类成员（session_start / get_stats）跨库不受限。
+    Write-class members (session_end / remember_intent /
+    complete_intent / report_feedback) are gated via
+    :func:`_guard_write_boundary`; read-class members (session_start /
+    get_stats) are unrestricted across libraries.
     """
     _guard_write_boundary(library)
     s = _srv()
@@ -232,17 +283,22 @@ def _bootstrap_service(library: str | None = None) -> BootstrapService:
 
 
 def _spec_parse(spec: str):
-    """libraries= 语法解析（B1）：domain 真相经 server 命名空间现取——
-    组合根不 import domain（S4.2 白名单），与写守卫/隔离判据同款手法。"""
+    """Parse the libraries= syntax (B1): the domain truth is fetched live
+    through the server namespace -- the composition root does not import
+    domain (S4.2 whitelist), the same trick as the write guard / isolation
+    criteria."""
     return _srv().parse_library_spec(spec)
 
 
 def _names_outside_directory(s: Any, names: list[str]) -> list[str]:
-    """软目录校验（B1/Q-D）：值不在任务目录 → 返回名单供信封自曝，不拦截。
+    """Soft directory check (B1/Q-D): a value not in the task directory →
+    return the list for the envelope to disclose, do not block.
 
-    目录是导航不是门禁——老库/未登记库不该因此查不了（「不静默」的
-    实现是**可见**不是「不可用」）。目录读不到（user 库失联/sidecar 坏）
-    → 空名单不标注，校验本身就是赠品。
+    The directory is navigation, not a gate -- old/unregistered libraries
+    must not become unqueryable because of it (the realization of "not
+    silent" is **visible**, not "unavailable"). If the directory cannot be
+    read (user library unreachable / sidecar broken) → empty list with
+    nothing flagged; the check itself is a freebie.
     """
     try:
         info = s._library.resolve_library("user", libs=s.libraries())
@@ -259,38 +315,49 @@ def _names_outside_directory(s: Any, names: list[str]) -> list[str]:
                 if v:
                     known.add(v)
         return [n for n in names if n.strip().casefold() not in known]
-    except Exception:  # noqa: BLE001 —— 校验是赠品
+    except Exception:  # noqa: BLE001 -- the check is a freebie
         return []
 
 
 def _recall_service(library: str | None = None,
                     scope: str = "project",
                     libraries_spec: str = "") -> RecallService:
-    """Recall 面 11 工具的用例服务（recall/get/list/context/contradictions/
-    drift/entity/map/topic）。
+    """Use-case service for the 11 tools of the Recall surface (recall/get/
+    list/context/contradictions/drift/entity/map/topic).
 
-    ``scope="user"/"all"`` 时解析约定名 ``user`` 的用户级库
-    并经注册表注入第二 brain（显式检索意图 ⇒ 用户库首访自付完整
-    brain 加载成本。注册表驻留上限 3：家库 + 他库 + 用户库是跨任务读的
-    常态组合，项目+用户两库当然同驻）。
-    解析失败**抛 LibraryResolutionError**（显式检索找不到库必须
-    报错，不静默回落 project——同 ``library`` 参数先例）。值校验在服务内
-    （domain 纯函数，错误体不带自曝键）。
+    With ``scope="user"/"all"``, resolves the user-level library under the
+    reserved name ``user`` and injects a second brain via the registry
+    (an explicit retrieval intent ⇒ the first visit to the user library
+    pays the full brain load cost itself. The registry residency cap is 3:
+    home library + another library + user library is the normal cross-task
+    read combination; the project+user pair of course co-resides).
+    On resolution failure **raises LibraryResolutionError** (an explicit
+    retrieval that cannot find the library must error out, not silently
+    fall back to project -- same precedent as the ``library`` argument).
+    Value validation happens inside the service (a domain pure function;
+    the error body carries no self-exposure keys).
 
-    B1 多库（拍板②a）：``libraries=`` 显式多库通道，与 ``library=`` /
-    ``scope=user|all`` **互斥**（这里显式报错）；每个值按三态寻址解析
-    （未知值报错带值本身），逐库注入 ``(library_self, brain)``。
-    软目录校验：值不在任务目录 → 照常可用，名字进 ``unregistered_names``
-    由信封自曝（目录是导航不是门禁——老库/未登记库不该查不了）。
+    B1 multi-library (decision ②a): ``libraries=`` is the explicit
+    multi-library channel and is **mutually exclusive** with ``library=`` /
+    ``scope=user|all`` (an explicit error is raised here); each value is
+    resolved by three-state addressing (an unknown value errors with the
+    value itself), and ``(library_self, brain)`` is injected per library.
+    Soft directory check: a value not in the task directory stays usable,
+    its name goes into ``unregistered_names`` for the envelope to disclose
+    (the directory is navigation, not a gate -- old/unregistered libraries
+    must not become unqueryable).
 
-    组合根口径：``libraries`` / ``_registry_get`` / ``resolve_library``
-    全部经 :func:`_srv` 或模块属性现取（测试替换 ``server.libraries``、
-    ``server._registry_get`` 照样穿透）。
+    Composition-root rule: ``libraries`` / ``_registry_get`` /
+    ``resolve_library`` are all fetched live via :func:`_srv` or module
+    attributes (test replacements of ``server.libraries`` /
+    ``server._registry_get`` still pass through).
 
-    单次 ``library=`` 命中他库时挂后台预热
-    （``maybe_warmup_library``）——显式跨库读常态化后，25–33 秒不该由首次
-    调用自付。失败不阻断（与预取学习自 ``library_use`` 的同款语义），且
-    只在目标不是家库时触发（家库本就该已驻留）。
+    When a single ``library=`` hits another library, a background warmup is
+    kicked off (``maybe_warmup_library``) -- with explicit cross-library
+    reads normalized, 25–33 seconds should not be paid by the first call.
+    Failure does not block (the same semantics as the prefetch learned from
+    ``library_use``), and it only triggers when the target is not the home
+    library (the home library should already be resident).
     """
     s = _srv()
     extra: list[tuple[dict, Any]] = []
@@ -308,7 +375,8 @@ def _recall_service(library: str | None = None,
         for name in spec_names:
             path = s.resolve_library_path(name)
             if not s.same_library(path, s.default_library_path()):
-                # 预热是加速不是前提：失败只落 warning，本次调用照常（§4.1）。
+                # Warmup is an accelerator, not a prerequisite: failure only
+                # logs a warning; this call proceeds as usual (§4.1).
                 try:
                     s.maybe_warmup_library(path)
                 except Exception as exc:  # noqa: BLE001
@@ -320,7 +388,8 @@ def _recall_service(library: str | None = None,
     if (library or "").strip():
         path = s.resolve_library_path(library)
         if not s.same_library(path, s.default_library_path()):
-            # 预热是加速不是前提：失败只落 warning，本次调用照常（§4.1）。
+            # Warmup is an accelerator, not a prerequisite: failure only
+            # logs a warning; this call proceeds as usual (§4.1).
             try:
                 s.maybe_warmup_library(path)
             except Exception as exc:  # noqa: BLE001
@@ -328,9 +397,11 @@ def _recall_service(library: str | None = None,
                                path, exc)
     user_brain = None
     user_self: dict[str, str] | None = None
-    # D2b：档位判定的对象是**用户库**——scope=user/all 的流打的是用户库
-    # （服务的 library_self 仍是项目库），libraries= 的外围也可能含它。
-    # 漏判会让 masked/none 档恒为空（E2E 实测抓到的接线 bug）。
+    # D2b: the target of the tier decision is the **user library** -- the
+    # scope=user/all stream targets the user library (the service's
+    # library_self is still the project library), and the libraries=
+    # periphery may also include it. Missing this makes the masked/none
+    # tiers always empty (a wiring bug caught by E2E testing).
     user_tier_info: dict[str, str] | None = None
     if scope in ("user", "all") or spec_names:
         info = s._library.resolve_library("user", libs=s.libraries())
@@ -339,9 +410,11 @@ def _recall_service(library: str | None = None,
         user_tier_info = user_self
         if scope in ("user", "all"):
             user_brain = s._registry_get().get(info.path)
-    # D2b 读侧档位 resolver：按 client 现算（多库 daemon 每连接各有绑定）。
-    # 判定对象 = 用户库（流的目标）；非用户库语境（裸 project 流且外围无
-    # user）返回 ""（无档位）。
+    # D2b read-side tier resolver: computed per client (in the multi-library
+    # daemon each connection has its own binding). Decision target = the
+    # user library (the stream's target); in a non-user-library context
+    # (a bare project stream with no user in the periphery) returns ""
+    # (no tier).
     target_info = s._library_self(library)
     access_resolver = (lambda client="": s._user_access_tier(
         user_tier_info or target_info, client))
@@ -351,17 +424,24 @@ def _recall_service(library: str | None = None,
                          user_brain=user_brain,
                          user_library_self=user_self,
                          user_access_resolver=access_resolver,
-                         # B1 多库：外围 [(library_self, brain)]（已解析）
-                         # + 目录外值名单（软校验，信封自曝）。
+                         # B1 multi-library: the periphery
+                         # [(library_self, brain)] (already resolved) +
+                         # the list of out-of-directory values (soft
+                         # check, disclosed by the envelope).
                          extra_libraries=extra,
                          unregistered_names=unregistered,
-                         # 前瞻记忆情境触发开关，现读注入
-                         # （application 不 import config——同
-                         # long_content_policy 口径；改配置立刻生效）。
+                         # prospective-memory contextual trigger switch,
+                         # read live and injected (application does not
+                         # import config -- the same rule as
+                         # long_content_policy; config edits take effect
+                         # immediately).
                          prospective_trigger=s.load_config().prospective_trigger,
-                         # recall 单条 content 截断护栏（0 = 不截断）。
-                         # 非法值/负数一律按 0（不截断）——写错等同于没写，
-                         # 绝不让护栏被悄悄打开。解析在 BaseService。
+                         # per-record recall content truncation guard
+                         # (0 = no truncation). Invalid/negative values
+                         # are all treated as 0 (no truncation) -- a wrong
+                         # setting equals no setting; never let the guard
+                         # be silently opened. Parsing happens in
+                         # BaseService.
                          recall_content_max_chars=_int_or_zero(
                              s.load_config().recall_content_max_chars),
                          # R1: shared scoring pipeline for production
@@ -377,13 +457,14 @@ def _recall_service(library: str | None = None,
 
 
 def _organize_service(library: str | None = None) -> OrganizeService:
-    """Organize 面 10 工具的用例服务（consolidate/relink/lexicon 三件/
-    map 四件/reset_context）。
+    """Use-case service for the 10 tools of the Organize surface
+    (consolidate/relink/the lexicon trio/the map quartet/reset_context).
 
-    写类成员（consolidate / relink_entities /
-    lexicon_add / map_set / reset_context）经 :func:`_guard_write_boundary`
-    拦关，读类成员（map_get / map_list / map_verify / lexicon_suggest /
-    lexicon_alias_suggest）跨库不受限。
+    Write-class members (consolidate / relink_entities /
+    lexicon_add / map_set / reset_context) are gated via
+    :func:`_guard_write_boundary`; read-class members (map_get / map_list /
+    map_verify / lexicon_suggest / lexicon_alias_suggest) are unrestricted
+    across libraries.
     """
     _guard_write_boundary(library)
     s = _srv()
@@ -396,17 +477,21 @@ def _organize_service(library: str | None = None) -> OrganizeService:
 
 
 def _maintain_service(library: str | None = None) -> MaintainService:
-    """Maintain 面 5 工具的用例服务（export/miss_log/stats/save/load）。
+    """Use-case service for the 5 tools of the Maintain surface
+    (export/miss_log/stats/save/load).
 
-    ``probe`` 注入的是 :func:`warmup_status`（实现在
-    ``server_runtime.warmup``，经 import 现取，调用形态 ``warmup_status()``
-    不变）—— ``brain_stats`` 的 ``warmup`` 一节是设施状态不是库存事实，
-    让它从构造参数进来，依赖才看得见。
+    What ``probe`` injects is :func:`warmup_status` (implemented in
+    ``server_runtime.warmup``, fetched via import; the call shape
+    ``warmup_status()`` is unchanged) -- the ``warmup`` section of
+    ``brain_stats`` is facility status, not library facts; letting it in
+    through a constructor argument is what keeps the dependency visible.
 
-    写类成员（save_brain / load_state / miss_log）经
-    :func:`_guard_write_boundary` 拦关，读类（export_memories / brain_stats）
-    跨库不受限。持久化类的危险程度不低于内容写（设计 §2.5：对半写状态的库
-    做显式持久化同样危险），故一并钉死。
+    Write-class members (save_brain / load_state / miss_log) are gated via
+    :func:`_guard_write_boundary`; read-class members (export_memories /
+    brain_stats) are unrestricted across libraries. Persistence-class
+    operations are no less dangerous than content writes (design §2.5:
+    explicit persistence against a half-written library state is just as
+    dangerous), so they are pinned down together.
     """
     _guard_write_boundary(library)
     s = _srv()
@@ -414,24 +499,30 @@ def _maintain_service(library: str | None = None) -> MaintainService:
     return MaintainService(brain=s._brain_for(library),
                            library_self=info,
                            persist_dir=s._PERSIST_DIR, probe=s.warmup_status,
-                           # D2b：user 库导出的档位门（export 拒绝用）。
+                           # D2b: the read-side tier gate for user-library
+                           # exports (consumed by export refusals).
                            user_access_resolver=lambda client="":
                            s._user_access_tier(info, client))
 
 
-# 注：``_library_admin_service`` **留在 server.py**——
-# tests/test_m4_batch4_tool_face.py 以 ast.get_source_segment 钉住它在
-# server.py 源码里的函数体（「不传 brain/不过 _brain_for」，LibraryAdminService
-# 不绑定单一 brain 的结构契约）。项目纪律是改代码适配测试、不改测试；
-# 其余五个工厂无源码级钉子，正常随组合根收在本模块。
+# Note: ``_library_admin_service`` **stays in server.py** --
+# tests/test_m4_batch4_tool_face.py pins its function body in the server.py
+# source via ast.get_source_segment (the structural contract of "no brain
+# passed / no _brain_for hop": LibraryAdminService is not bound to a single
+# brain). Project discipline is to adapt code to tests, never edit tests;
+# the other five factories have no source-level pins and are collected into
+# this module along with the composition root as normal.
 def _build_brain(persist_dir: str) -> HippoBrain:
-    """构造一个 HippoBrain（**每个库一份**，由注册表保证同路径只建一次）。
+    """Build a HippoBrain (**one per library**; the registry guarantees the
+    same path is only ever built once).
 
-    逻辑与多库改造前的 ``get_brain()`` 逐位一致（兼容性要求），
-    唯一差别是 ``persist_dir`` 改为入参。
+    The logic is bit-for-bit identical to the pre-multi-library
+    ``get_brain()`` (compatibility requirement); the only difference is
+    that ``persist_dir`` became a parameter.
 
-    类解析（``s._brain_class()``，``globals().get("HippoBrain")``
-    语义）、torch 兜底与全部配置常量经 :func:`_srv` 现取。
+    Class resolution (``s._brain_class()``, ``globals().get("HippoBrain")``
+    semantics), the torch fallback, and all config constants are fetched
+    live via :func:`_srv`.
     """
     s = _srv()
     s._prepare_torch()
@@ -452,7 +543,8 @@ def _build_brain(persist_dir: str) -> HippoBrain:
         w_strength=s.load_config().w_strength,
         mem_history_ring=s.load_config().mem_history_ring,
     )
-    # 生效模型必须可见：导错模型的坑就是「谁都没说自己在用哪个模型」。
+    # The effective model must be visible: the trap with the wrong model
+    # was that "nobody said which model was in use".
     _stats = brain.stats()
     logger.info(
         "effective embedding model: %s (vectors %s, missing %d); supersede=%s; lexicon %d entries",
@@ -467,14 +559,15 @@ def _build_brain(persist_dir: str) -> HippoBrain:
             _stats["vectors_missing"], _stats["embed_model"], _stats["embed_model"],
         )
 
-    # 加载 CRL 训练权重（如果配置了）
+    # Load CRL training weights (if configured)
     if s._CRL_MODEL_PATH and os.path.isfile(s._CRL_MODEL_PATH):
         if brain.manager.load_trained_weights(s._CRL_MODEL_PATH):
             logger.info("CRL training weights loaded: %s", s._CRL_MODEL_PATH)
         else:
             logger.warning("CRL weight loading failed: %s", s._CRL_MODEL_PATH)
 
-    # 存储加载异常必须显式告警：损坏文件已隔离，但人得知道
+    # Store load failures must be flagged explicitly: the corrupt file is
+    # quarantined, but a human has to know
     issue = brain.manager.store.last_load_issue
     if issue:
         logger.error(
