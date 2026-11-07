@@ -87,6 +87,7 @@ from ..domain import forget_entry as _forget_entry
 from ..domain import aliases as alias_mod
 from ..engine.embeddings import ENV_MODEL, embedder_pool_stats
 from ..engine.manager import MemoryManager
+from ..retrieval import recall_pipeline as _recall_pipeline
 from ..retrieval.bm25 import BM25, rrf_fuse
 from ..store.memory import (
     PIN_IMPORTANCE,  # noqa: F401  （唯一阈值定义处见 store/memory.py）
@@ -418,6 +419,7 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
             recency_window_days=recency_window_days,
             w_strength=w_strength,
             mem_history_ring=mem_history_ring,
+            save_ledger_hook=self._store_autosave_ledger,
         )
 
         # L0 原始层
@@ -467,6 +469,10 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         # 写者可见化。_save_seq 是落盘次数（心跳的一部分）。
         self._created_at = time.time()
         self._save_seq = 0
+        # V1-a: autosave ledger rows use their own seq space (kind-tagged
+        # rows), so layer-save rows keep their historical contiguous seqs and
+        # boot reconcile matches begin/fail pairs by (seq, kind).
+        self._autosave_seq = 0
         # F14：账本末条与行数。行数只用于 ring buffer 的触发时机，不追求精确——
         # 多进程各记各的，偏大只是早裁一点，不影响正确性。
         self._ledger_last: dict[str, Any] | None = None
@@ -1218,6 +1224,15 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         """
         if not self.persist_dir:
             return False
+        # V1-a: the L0 autosave used to be invisible to the save ledger (the
+        # explicit path goes through _save_layers/run_layer_save, this one did
+        # not) — the 2026-11-06 dangling audit traced 699 lost-source memories
+        # to exactly this blind spot. begin carries the raw-layer fingerprint
+        # so a kill mid-flush gets content-level loss judgment on reboot.
+        row_layers = {"brain_raw.json": len(self.raw_log)}
+        row_fps = {"brain_raw.json": self._layer_fingerprint(self.raw_log)}
+        self._ledger_row("begin", "l0_autosave",
+                         layers=row_layers, layer_fps=row_fps)
         try:
             self.raw_log = _layer_gc.save_l0_only(
                 persist_dir=self.persist_dir, raw_log=self.raw_log,
@@ -1227,8 +1242,13 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
                 backend=self._backend, get_backend_fn=get_backend,
                 layer_stamp=self._layer_stamp)
             self._l0_pending = 0
+            self._ledger_row("end", "l0_autosave",
+                             layers=row_layers, layer_fps=row_fps)
             return True
         except Exception as e:  # noqa: BLE001 —— 见 docstring：不抛，但自曝
+            self._ledger_row("fail", "l0_autosave", layers=row_layers,
+                             layer_fps=row_fps,
+                             error=f"{type(e).__name__}: {e}")
             self.manager.last_save_error = (
                 f"L0 自动落盘失败：{type(e).__name__}: {e}")
             logger.warning("[l0_autosave] %s", self.manager.last_save_error)
@@ -1552,177 +1572,78 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         client: str | None = None,
         occurred_after: float = 0.0,
         occurred_before: float = 0.0,
+        use_lnn: bool = True,
+        sample: bool = False,
     ) -> list[dict[str, Any]]:
-        """召回记忆：硬门槛过滤 + MMR 去重 + 钉住豁免衰减 + 实体加成。
+        """Recall memories: hard relevance floor, MMR, pin decay, entity bonus.
 
         Args:
-            log_miss: 召回不到时是否自动记入 :attr:`miss_log`。
-                默认 True。内部调用（如装配上下文时的间接召回）可传 False 避免噪声。
-            annotate_conflicts: 是否对结果集内的**疑似同一事实的不同口径**打标
-                （``conflict_group`` / ``conflict_with`` / ``newer``）。
-                只增注释，不折叠、不改排序、不影响分数。top_k 很大或高频调用
-                时可关掉省开销。
-            filter_tags: 结构化标签过滤，如 ``{"章": 43}`` 或
-                ``{"年": ["己丑", "庚寅"]}``。**在检索前收窄候选集**，
-                而不是检索后再筛——后者会在"匹配项都排在 top_k 之外"时漏召回。
-                指定后 BM25 路同样受白名单约束，否则字面命中会绕过过滤。
+            log_miss: Log a miss when the top similarity is below threshold.
+                Internal callers may pass False to avoid noise.
+            annotate_conflicts: Mark suspected conflicting statements in the
+                result set (annotation only: no folding, no reordering).
+            filter_tags: Structured tag filter, e.g. ``{"chapter": 43}``.
+                Narrow the candidate pool BEFORE retrieval; post-filtering
+                would miss items ranked outside top_k. The lexical lane obeys
+                the same whitelist.
+            use_lnn: Forwarded to ``manager.recall``. Defaults to True, the
+                value previously hard-coded here.
+            sample: Forwarded to ``manager.recall``. Defaults to False.
+
+        R1 (2026-11-06): the scoring orchestration now lives in the shared,
+        side-effect-free ``retrieval/recall_pipeline``. This shell keeps only
+        library guards and the three accounting effects, so the production
+        MCP tool can call the very same pipeline. The two new parameters
+        default to the previous behaviour exactly.
         """
         if self.manager.store.count() == 0:
             return []
 
         allow_ids = self._ids_matching_tags(filter_tags)
         if allow_ids is not None and not allow_ids:
-            # 过滤条件没有任何命中：直接返回，且按"未命中"留痕（这是真信号）
+            # No tag matches is a real signal, not "library is empty".
             if log_miss and query and self.miss_log_enabled:
                 self.log_miss(query, 0.0, top_k=top_k,
                               path="brain.recall:tag_empty", client=client)
             return []
 
-        fetch_k = max(top_k * 4, 12)
-        raw = self.manager.recall(
-            query=query, top_k=fetch_k, use_lnn=True, allow_ids=allow_ids,
-            client=client,
-            # 时间窗下沉到 manager：候选池在那里取，若不透传，池子先按
-            # 无窗口裁到 fetch_k，窗口内的条目可能压根没进候选。
-            occurred_after=occurred_after, occurred_before=occurred_before,
-        )
-        now = self.manager._reference_time or _now()
-
-        # 查询实体 → 命中记忆加实体加成（语义鸿沟时靠实体桥接，T1 结论的最小实现）
-        # 只认受信任来源：启发式产出的"这笔账没法记"这类短语若参与加成，
-        # 会把纯属巧合的命中抬到相关记忆之上（见 ENTITY_ORIGIN_* 说明）。
-        # 实体 id 查询本体在 domain/recall_flow.py::query_entity_ids。
-        query_ent_ids = _recall_flow.query_entity_ids(
-            self.extract_entities(query), self.entities,
-            self._trusted_entity_ids())
-
-        # BM25 混合检索（V9d 评测关键组件，此前只存在于评测 harness）
-        bm25_scores: dict[str, float] = {}
-        if self.use_bm25:
-            # 能用 FTS5 就用——**关键是别再调 _sync_bm25()**，否则内存
-            # BM25 索引照样被建起来，省 34.5MB 这件事当场作废。
-            fts_hits = self._fts_hits(query, fetch_k * 2)
-            if fts_hits is not None:
-                bm25_scores = fts_hits
-                self._last_lexical_path = "fts5"
-            else:
-                self._sync_bm25()
-                if self._bm25.docs:
-                    bm25_scores = self._bm25.query(query, top_k=fetch_k * 2)
-                self._last_lexical_path = "memory"
-            bm25_ranked = list(bm25_scores.keys())
-        else:
-            bm25_ranked = []
-            self._last_lexical_path = "off"
-
-        # 字面强命中集合：BM25 单路前 N 名（dict 已按分数降序）。
-        # 这些候选在 MMR 阶段豁免多样性惩罚，避免"带章号/数额的那条"被近义项折叠。
-        # 本集合随打分块（块 C）搬进 domain/recall_flow.py，
-        # 由 bm25_scores 的键序同源派生（见模块 docstring 第 1 条）。
-
-        # RRF 融合：向量路 + BM25 路，兼候选并集。
-        # rrf_fuse 按第 16 条铁律注入（retrieval 不在 domain 依赖范围内）。
-        fusion = _recall_flow.build_fusion(
-            raw, bm25_ranked,
-            bm25_weight=self.bm25_weight, fuse=rrf_fuse)
-
-        # O8 过时窗口（融合路兜底）：向量路的过时候选已在 manager.recall
-        # 被挡掉，这里拦 BM25/FTS 字面路捞回的。rec 为 None 的候选
-        # collect_recall_items 本来就会丢，提前丢等价。
-        candidate_ids = fusion.candidate_ids
-        window_active = occurred_after > 0 or occurred_before > 0
-        if self._recency_window_seconds > 0 or window_active:
-            kept: list[str] = []
-            for cid in candidate_ids:
-                rec = self.manager.store.get(cid)
-                if rec is None:
-                    continue
-                if (self._recency_window_seconds > 0 and not window_active
-                        and out_of_window(rec.timestamp, rec.pin, now,
-                                          self._recency_window_seconds)):
-                    continue
-                # 用户显式时间窗：BM25/字面路会带回区间外的条目（它只按
-                # 文本匹配），这里必须再裁一次，否则时间窗在字面路上失效。
-                if window_active and not in_time_window(
-                        rec.timestamp, occurred_after, occurred_before):
-                    continue
-                kept.append(cid)
-            candidate_ids = kept
-
-        # 候选过滤与打分构建：全部旋钮调用时现取后注入。
-        items = _recall_flow.collect_recall_items(
-            candidate_ids,
-            _recall_flow.RecallCandidateContext(
-                allow_ids=allow_ids,
-                include_superseded=include_superseded,
+        items = _recall_pipeline.run_recall_pipeline(
+            self,
+            _recall_pipeline.RecallRequest(
+                query=query, top_k=top_k, use_lnn=use_lnn, sample=sample,
+                allow_ids=allow_ids, client=client,
+                include_superseded=include_superseded, use_mmr=use_mmr,
+                annotate_conflicts=annotate_conflicts,
+                occurred_after=occurred_after,
+                occurred_before=occurred_before,
+            ),
+            _recall_pipeline.RecallDeps(
+                fuse=rrf_fuse, exp=np.exp,
                 archived_state=MemoryState.ARCHIVED.value,
                 superseded_state=MemoryState.SUPERSEDED.value,
+                # Explicit overrides keep the core-namespace monkeypatch
+                # surface alive (see the constants import comment above).
                 hard_floor=RELEVANCE_HARD_FLOOR,
                 entity_bonus=ENTITY_BONUS,
                 literal_topn=MMR_LITERAL_EXEMPT_TOPN,
-                w_time=self.manager.scorer.w_time,
-                lambda_decay=self.lambda_decay,
-                nav_penalty=self.nav_penalty,
-                nav_tag_key=self.nav_tag_key,
-                bm25_scores=bm25_scores,
-                query_ent_ids=query_ent_ids,
-                vec_set=fusion.vec_set,
-                fused=fusion.fused,
-                vec_score_by_id=fusion.vec_score_by_id,
-                sim_by_id=fusion.sim_by_id,
-                get_record=self.manager.store.get,
-                embed=self.manager.vector_of,
-                exp=np.exp,
-                now=now,
-            ))
+                now_fn=_now,
+                strip_fn=strip_internal_fields,
+                iso_fn=iso_date, weekday_fn=weekday_abbr,
+                in_window_fn=in_time_window,
+                out_window_fn=out_of_window,
+            ),
+        )
 
-        if use_mmr and len(items) > top_k:
-            items = self._mmr_select(items, top_k)
-        else:
-            items = sorted(items, key=lambda x: -x["score"])[:top_k]
-
-        # 并存口径标注：必须在**清理内部字段之前**——它要用 _emb 算近邻。
-        # 放在排序之后：只为用户真正会看到的那几条算，不为被淘汰的候选白算。
-        if annotate_conflicts:
-            self._annotate_conflicts(items)
-
-        for it in items:
-            # 统一清理内部字段（不再手写单个 pop——`_sel_sim` 就是这样漏出去的）
-            strip_internal_fields(it)
-            # 时间派生字段（2026-11-05）：宿主拿 `occurred_at` 就能拼出
-            # "[2023-01-08 Fri] ..."，不必自己算 epoch→日期、也不必算星期
-            # （LLM 算星期是弱项，而「上周五」这类相对定位正卡在这一步）。
-            #
-            # 为什么派生而不改 `timestamp`：老调用方仍按 float 用（排序、
-            # 区间比较、衰减），改类型会全数报错。
-            # 为什么放在这里而不是 `recall_flow`：那个模块有 AST 断言守着
-            # **只许 import 标准库**（见 test_m5 的 S4），时间格式化属于
-            # 呈现、归调用方；manager 那条路径在 `RecallResult.to_dict` 里
-            # 同口径补齐。
-            it["occurred_at"] = iso_date(it["timestamp"])
-            it["weekday"] = weekday_abbr(it["timestamp"])
-
-        # **"最后一次被召回"只记在真正返回给宿主的条目上**。
-        # 计数（recall_count）记在候选集上（manager.search），时间戳记在结果集
-        # 上：候选会被硬门槛 / MMR / 标签过滤掉一大半，若在候选阶段打戳，
-        # 沉寂归档就会被稀释成"每次查询给十来条记录续命"。
-        #
-        # 时间基准必须与 consolidate 的 now 一致（`_reference_time or wall-clock`）：
-        # LoCoMo 评测的数据时间戳可能是 2023 年，若写裸 time.time()，老记忆会被
-        # 判成"刚刚被召回"→ **永久豁免沉寂归档**，机制反向失效。
-        #
-        # 此前 last_recalled_at **全仓零写入**（追加五实测：224 条被召回过的
-        # 记忆该字段全为 0），沉寂归档退化成"按写入时间算"，DORMANT_DAYS=180
-        # 下归档 0 条等于机制闲置。
+        # Stamp only the items actually returned to the caller, never the
+        # candidate pool: the floor / MMR / tag filters drop most of it, and
+        # stamping candidates would keep stale memories alive forever.
+        # Use the same time base as consolidate so LoCoMo-style historical
+        # timestamps do not look "just recalled".
         self.manager.stamp_recalled([it["memory_id"] for it in items])
-
-        # 按日召回计数（追加五）：平行期"该想起率"的分子。检索入口不止这一处
-        # （MCP 的 recall 工具直连 manager.recall），那边也要记，见 server.py。
         self.bump_daily("recall")
 
-        # 未命中留痕：拿"最高相似度"判定，而不是"结果是否为空"——
-        # BM25 单路捞回来的条目 similarity 是 0.0，只看空结果会把这类
-        # "其实没找到"记成命中。
+        # A miss is judged by top similarity, not by an empty result: an item
+        # rescued by the lexical lane alone has similarity 0.0.
         if log_miss and query and self.miss_log_enabled:
             top_sim = max((it["similarity"] for it in items), default=0.0)
             if top_sim < self.miss_log_threshold:
@@ -4040,6 +3961,52 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         n = ledger_trim(self.persist_dir, LEDGER_RING)
         if n is not None:
             self._ledger_lines = n
+
+    def _ledger_row(self, phase: str, kind: str, *, layers: dict | None = None,
+                    layer_fps: dict | None = None,
+                    error: str | None = None,
+                    extra: dict[str, Any] | None = None) -> None:
+        """V1-a: one ledger row for an autosave persist (outside _save_layers).
+
+        Same row conventions as ``store.layer_save.run_layer_save``
+        (seq / at_wall / at_mono / pid / layers / layer_fps), plus a ``kind``
+        field telling which previously-unledgered path wrote it
+        (``l0_autosave`` / ``store_autosave``). ``seq`` comes from a dedicated
+        autosave counter — layer rows keep their historical contiguous seqs,
+        and boot reconcile matches begin/fail pairs by ``(seq, kind)`` so the
+        two spaces cannot cross. Appending stays best-effort like every ledger
+        write: failures inside ``_ledger_append`` never break the persist
+        itself.
+        """
+        self._autosave_seq += 1
+        entry: dict[str, Any] = {
+            "seq": self._autosave_seq,
+            "phase": phase,
+            "kind": kind,
+            "at_wall": time.time(),
+            "at_mono": time.monotonic(),
+            "pid": os.getpid(),
+        }
+        if layers is not None:
+            entry["layers"] = layers
+        if layer_fps is not None:
+            entry["layer_fps"] = layer_fps
+        if error is not None:
+            entry["error"] = error
+        if extra:
+            entry.update(extra)
+        self._ledger_append(entry)
+
+    def _store_autosave_ledger(self, phase: str, info: dict[str, Any]) -> None:
+        """V1-a hook target for the manager's every-10-steps store autosave.
+
+        The explicit save path is ledgered by ``_save_layers``; this closes
+        the same visibility gap for the store-only autosave. Rows carry no
+        layer fingerprints (the store is not a layer) — boot reconciliation
+        reports them as ``layer_fps_absent`` and still flags an unpaired
+        ``begin`` after a kill.
+        """
+        self._ledger_row(phase, "store_autosave", extra=dict(info))
 
     def save_ledger_view(self) -> dict[str, Any]:
         """F14：账本投影（``brain_stats.save_ledger``）。

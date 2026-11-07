@@ -387,6 +387,21 @@ class Config:
     #: （cap 5 不膨胀）。关掉时**双端都关**：登记不再派生触发集、装配不再
     #: 触发回带（存量已带触发集的待办也一律不触发）。语义类型 A 同上。
     prospective_trigger: bool = True
+    #: R1 (2026-11-06): the production MCP ``recall`` tool shares
+    #: the evaluation scoring pipeline (BM25/RRF, MMR, entity bonus,
+    #: hard relevance floor, retired/quarantine filtering). True by
+    #: default; ``HIPPOCAMPUS_RECALL_FUSION=0`` restores the legacy
+    #: additive ``manager.recall`` path. Semantic type A (deny-list):
+    #: only an explicit 0/false/no turns it off; a typo stays enabled.
+    recall_fusion: bool = True
+    #: V2 (2026-11-07) recall query fanout: for natural-sentence queries
+    #: (>= 10 chars) derive a keyword variant and run the shared pipeline
+    #: twice, merging the hit lists with RRF. Default OFF — recall behaviour
+    #: must stay reproducible for the pinned evaluation baselines until this
+    #: is validated on the dev library and promoted by decision. Semantic
+    #: type B (allow-list): only an explicit 1/true enables it; a typo
+    #: stays off. Scoring formulas untouched (R1's territory).
+    recall_query_fanout: bool = False
     #: 访问驱动的画像转存。True（默认）= consolidate 刷新画像时把
     #: 「没人钉但反复被想起（检索强度 ≥ 3）且活得够久（≥ 7 天）」的
     #: L1 条目毕业进 L3 独立槽 ``recurring_facts``（展示层追加，不写记录、
@@ -504,6 +519,11 @@ ENV_MAP: dict[str, str] = {
     # --- recall 单条 content 截断护栏（0 = 不截断）---
     "HIPPOCAMPUS_RECALL_CONTENT_MAX_CHARS": "recall_content_max_chars",
 
+    # --- R1: production recall shares the evaluation scoring pipeline ---
+    "HIPPOCAMPUS_RECALL_FUSION": "recall_fusion",
+    # --- V2: recall query fanout (keyword variant + RRF merge; default off) ---
+    "HIPPOCAMPUS_RECALL_QUERY_FANOUT": "recall_query_fanout",
+
     # --- 睡眠窗口脑侧旋钮（总开关在 daemon）---
     "HIPPOCAMPUS_SLEEP_REPLAY_DAYS": "sleep_replay_days",
     "HIPPOCAMPUS_SLEEP_MAX_REPLAY": "sleep_max_replay",
@@ -577,6 +597,11 @@ _BOOL_SEMANTICS: dict[str, str] = {
     # 写侧·呈现线两旋钮同为 A 型：显式 0/false/no/off 才关，脏值回落默认开
     # （编码门控与前瞻触发都是"默认生效、说清楚才关"的机制）。
     "novelty_gate": "A", "prospective_trigger": "A",
+    # R1 production recall fusion (default on, explicit deny only).
+    "recall_fusion": "A",
+    # V2 query fanout (default off, explicit allow only — evaluation
+    # reproducibility first; promoted by decision after dev-library validation).
+    "recall_query_fanout": "B",
     # 画像转存同为 A 型（默认生效的巩固期机制，说清楚才关）。
     "profile_promotion": "A",
     # B 白名单（manager/core 函数内）

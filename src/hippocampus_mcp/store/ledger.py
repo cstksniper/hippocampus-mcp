@@ -221,7 +221,13 @@ def reconcile_on_boot(
         begin = last if phase == "begin" else None
         if phase == "fail":
             for row in reversed(tail):
-                if row.get("phase") == "begin" and row.get("seq") == seq:
+                if (row.get("phase") == "begin" and row.get("seq") == seq
+                        and (row.get("kind") or "") == (last.get("kind") or "")):
+                    # kind-aware: V1-a autosave rows carry their own seq space
+                    # (kind-tagged), so a same-seq begin from the OTHER row
+                    # family must not be mistaken for this fail's begin. Old
+                    # rows have no kind key -> both sides normalize to "" and
+                    # match exactly as before.
                     begin = row
                     break
         begin_fps = begin.get("layer_fps") if isinstance(begin, dict) else None

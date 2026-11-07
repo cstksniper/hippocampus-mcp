@@ -433,11 +433,18 @@ async def recall(
     occurred_after: str = "", occurred_before: str = "",
 ) -> str:
     """Semantic search for prior memories.
-Combines vector search, BM25 (RRF), MMR deduplication, entity boosts, and a hard
-relevance floor. By default ``superseded`` and ``archived`` records are filtered out.
+Uses the shared scoring pipeline also used by ``brain.recall``: vector
+search with LNN temporal state, BM25 (RRF fusion), MMR, entity boosts,
+a hard relevance floor, and retired/quarantine filtering. Time-window
+and tag filtering narrow the candidate pool before scoring. Set
+``HIPPOCAMPUS_RECALL_FUSION=0`` to fall back to legacy additive scoring.
 
 Returns ``{count, memories[]}`` (not ``hits``). For assembled context, use
 ``get_memory_context``. Overly long content is reported via ``content_truncated``.
+
+``score`` is an RRF fusion score (roughly 0.01-0.09 on a real library), not a
+cosine. Use the ``similarity`` field for cosine-scale thresholds; do not gate
+on ``score > 0.3``.
 
 Args:
     query: Query text. Empty means implicit LNN temporal-state recall only.

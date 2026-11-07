@@ -345,10 +345,17 @@ class MemoryManager:
         recency_window_days: int = 0,
         w_strength: float = 0.03,
         mem_history_ring: int = 200,
+        save_ledger_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.embedding_dim = embedding_dim
         self.embedder_backend = embedder_backend
         self.auto_save = auto_save
+        # V1-a: optional ledger hook for the auto_save path (phase, info) —
+        # the brain injects a closure so every-10-steps store persists get
+        # begin/end/fail rows in save_ledger.jsonl like explicit saves do.
+        # None (default) keeps the autosave unledgered (legacy constructions
+        # and pure in-memory brains unchanged).
+        self.save_ledger_hook = save_ledger_hook
         self.backend = backend
         self.dedup_threshold = dedup_threshold
         # O8 retrieval-side staleness window (days): age > window and not pinned
@@ -927,12 +934,25 @@ class MemoryManager:
         memory_id = self.store.add(record)
         self._remember_idem(idem_key, memory_id)
 
-        # Auto-persist (optional)
+        # Auto-persist (optional). V1-a: this every-10-steps store persist used
+        # to be invisible to the save ledger (only explicit saves went through
+        # brain._save_layers), which is why process-kill damage stayed unnoticed
+        # for weeks (the 2026-11-06 audit). The injected hook gives it
+        # begin/end/fail rows so a kill mid-autosave leaves an unpaired begin
+        # on disk for boot reconciliation.
         if self.auto_save and self._step_count % 10 == 0:
+            hook = self.save_ledger_hook
+            info = {"kind": "store_autosave", "step": self._step_count}
             try:
+                if hook:
+                    hook("begin", info)
                 self.save()
                 self.last_save_error = None
+                if hook:
+                    hook("end", info)
             except Exception as e:
+                if hook:
+                    hook("fail", {**info, "error": f"{type(e).__name__}: {e}"})
                 # Does not block the main flow -- but **must never be silent**:
                 # when the concurrent-write guard rejects the save, this batch
                 # of memories exists only in memory. The host sees ingest

@@ -124,7 +124,19 @@ flowchart LR
     G --> O["结果 / 5 槽位装配"]
 ```
 
-### 打分公式（加法，默认）
+### 打分公式（默认 RRF 融合）
+
+```
+fused  = Σ_lane  w_lane / (60 + rank_lane)      # 向量路 w=1.0，字面路 w=bm25_weight
+score  = fused + 0.1 · vec_score + 0.03 · time_decay + entity_bonus(0.12)
+         （× nav_penalty / × pin 折扣，按记录字段）
+```
+
+> **尺度警告**：`score` 现在是 RRF 融合分（实测真库约 0.01–0.09），
+> **不再是余弦量级**。原始余弦在各条目的 `similarity` 字段里，两者别混用；
+> 任何依赖 `score > 0.3` 类阈值的宿主规则必须改用 `similarity`。
+
+### 回退路径（`HIPPOCAMPUS_RECALL_FUSION=0`）
 
 ```
 score = 0.95 · sim + 0.03 · time_decay − 0.02 · recall_boost
@@ -132,6 +144,7 @@ score = 0.95 · sim + 0.03 · time_decay − 0.02 · recall_boost
 
 > 加法公式在 LoCoMo 上 MRR@5 从 0.042 提升到 0.183（**4.4 倍**）。
 > 关键点是**负 recall 权重当多样性惩罚**；乘法公式已弃用。
+> 这条公式在 R1 之后只用于回退路径，默认不再走它。
 
 ### 融合后的加分与闸门
 
@@ -148,12 +161,17 @@ score = 0.95 · sim + 0.03 · time_decay − 0.02 · recall_boost
 | | `get_memory_context`（推荐） | `recall`（底层） |
 |---|---|---|
 | 检索 | 在 `recall` 之上加槽位编排 + token 预算 | 向量 + BM25(RRF) + MMR + 实体加成 + 硬门槛 |
-| 状态过滤 | 过 superseded / archived | **同样过**（`include_superseded=True` 可逃生） |
+| 状态过滤 | 过 superseded / archived | **同样过**（固定 `include_superseded=False`，MCP 工具无逃生参数） |
 | 用途 | 递给宿主的上下文 | 调试 / 程序化调用 |
 
-> `recall` **会**过滤状态：`brain/core.py` 里 `recall` 的 `include_superseded=False`
-> 与其后的状态过滤；`archived` 同样被过滤。
-> 已知缺陷：状态过滤发生在候选循环内，而 `fetch_k` 取在过滤**之前**（`brain/core.py` 的 `fetch_k` 取值处）
+> R1（2026-11-06）起两个入口共用 `retrieval/recall_pipeline.run_recall_pipeline`：
+> MCP `recall` 经 `RecallService._recall_one`，`brain.recall` 经薄壳；
+> 打分、排序、状态过滤逐位一致。差别只在呈现层——MCP 工具把结果
+> 适配成 14 键信封并关闭冲突标注。`HIPPOCAMPUS_RECALL_FUSION=0`
+> 可回退到旧的加法打分路径（此时上表右列不成立）。
+> `include_superseded` 逃生参数只存在于 `brain.recall` / `entity_profile`，
+> **不在** MCP `recall` 工具上。
+> 已知缺陷：状态过滤发生在候选循环内，而 `fetch_k` 取在过滤**之前**
 > ⇒ 作废条目多的库里，有效条数会被作废项挤掉（名额稀释）。
 
 ### 5 槽位（用层核心）

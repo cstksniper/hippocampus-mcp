@@ -35,11 +35,21 @@ import json
 import logging
 import os
 import time
+
+import numpy as np
 from typing import Any
 
+from ..common.constants import (ENTITY_BONUS, MMR_LITERAL_EXEMPT_TOPN,
+                                RELEVANCE_HARD_FLOOR, _now,
+                                strip_internal_fields)
 from ..common.params import (filter_applied, parse_str_list_lenient,
                              parse_tags_json)
-from ..common.recency import iso_date, parse_date_bound
+from ..common.recency import (in_time_window, iso_date, out_of_window,
+                              parse_date_bound, weekday_abbr)
+from ..retrieval import recall_pipeline as _recall_pipeline
+from ..retrieval import query_variants
+from ..retrieval.bm25 import rrf_fuse
+from ..store.memory import MemoryState
 from ..domain import metacog as _metacog
 from ..domain.context_slots import BLOCK_PLACEHOLDERS
 from ..domain import prospective as _prospective
@@ -60,6 +70,19 @@ USER_READ_DENIED = (
     "This workspace has none-level read access to the user library (not registered/bound; fail-closed)."
     "Register the task directory from a session in this workspace first (library_create with workspace_root), "
     "or operate from a home workspace (daily assistant host) session.")
+
+
+#: R1: the MCP ``recall`` envelope exposes exactly these 14 per-item
+#: keys. The shared pipeline returns 17 (it also carries
+#: ``source_ids`` / ``entity_ids`` / ``pin`` / ``matched_by`` /
+#: ``literal``) and lacks ``recall_count`` / ``memory_type``;
+#: :meth:`_to_mcp_item` adapts both ways so the host sees the same
+#: field surface as the legacy ``RecallResult.to_dict()`` path.
+_MCP_RECALL_ITEM_ORDER = (
+    "memory_id", "content", "score", "similarity", "timestamp",
+    "occurred_at", "weekday", "importance", "recall_count",
+    "memory_type", "source", "state", "cognitive_type", "tags",
+)
 
 
 class RecallService(BaseService):
@@ -345,39 +368,100 @@ class RecallService(BaseService):
             # 而不是误读成"库里真没有"。
             return {"count": 0, "memories": [],
                     "filter_applied": filter_applied(parsed_tags, 0, key_info)}
-        results = mgr.recall(
-            query=query if query else None,
-            top_k=top_k,
-            use_lnn=use_lnn,
-            sample=sample,
-            allow_ids=allow_ids,
-            client=client,
-            occurred_after=time_window[0],
-            occurred_before=time_window[1],
-        )
-        # RecallResult 只带检索侧字段，source/state 在本体记录上 —— 补回来。
-        # 缺 source 时"这条记忆出自哪个文件"无法回查，与 get_memory_context 口径也不一致。
-        # 这里按 id 回查代价是一次 dict 命中，不涉及重算。
-        memories = []
-        top_sim = 0.0
-        quarantined_hidden = 0
-        for r in results:
-            d = r.to_dict()
-            rec = mgr.store.get(r.memory_id)
-            # D2a 隔离门（"不进召回池"在召回面的唯一执行点）：scope=all/user
-            # 与裸 recall 全部走本执行体（mgr.recall 引擎路径），隔离排除
-            # 必须在这里——brain.recall 的 collect_recall_items 管不到本路径
-            #（E2E 实测抓到的漏点）。getattr 兜底旧记录。
-            if rec is not None and getattr(rec, "quarantine", False):
-                quarantined_hidden += 1
-                continue
-            if rec is not None:
-                d["source"] = rec.source or ""
-                d["state"] = rec.state
-                d["cognitive_type"] = rec.cognitive_type
-                d["tags"] = dict(rec.tags or {})
-            top_sim = max(top_sim, float(r.similarity))
-            memories.append(d)
+        # R1 (2026-11-06): both branches stay verbatim so the rollout switch
+        # doubles as an A/B baseline. The shared branch calls the very same
+        # side-effect-free pipeline as ``brain.recall``; disabling it restores
+        # the legacy additive ``manager.recall`` path bit-for-bit.
+        if self.recall_fusion_enabled:
+            deps = _recall_pipeline.RecallDeps(
+                fuse=rrf_fuse, exp=np.exp,
+                archived_state=MemoryState.ARCHIVED.value,
+                superseded_state=MemoryState.SUPERSEDED.value,
+                hard_floor=RELEVANCE_HARD_FLOOR,
+                entity_bonus=ENTITY_BONUS,
+                literal_topn=MMR_LITERAL_EXEMPT_TOPN,
+                now_fn=_now,
+                strip_fn=strip_internal_fields,
+                iso_fn=iso_date, weekday_fn=weekday_abbr,
+                in_window_fn=in_time_window,
+                out_window_fn=out_of_window,
+            )
+
+            def _run(q: str) -> list[dict[str, Any]]:
+                return _recall_pipeline.run_recall_pipeline(
+                    brain,
+                    _recall_pipeline.RecallRequest(
+                        query=q, top_k=top_k, use_lnn=use_lnn, sample=sample,
+                        allow_ids=allow_ids, client=client,
+                        include_superseded=False, use_mmr=True,
+                        # Conflict annotation would add three fields and break the
+                        # 14-key MCP envelope. Scoring, ordering and filtering are
+                        # still identical to brain.recall; only annotation differs.
+                        annotate_conflicts=False,
+                        occurred_after=time_window[0],
+                        occurred_before=time_window[1],
+                        # The lexical lane is mandatory: the 0.30 hard floor kills
+                        # every candidate that is neither semantic nor a BM25 hit.
+                        use_lexical=True,
+                        manager_query=q or None,
+                    ),
+                    deps,
+                )
+
+            # V2 (2026-11-07): query fanout — for natural-sentence queries a
+            # keyword variant runs the SAME pipeline and the two hit lists are
+            # merged with RRF. Opt-in (default off, evaluation
+            # reproducibility); scoring formulas are untouched (R1's
+            # territory) — fusion only reorders candidates, and every item
+            # keeps its own similarity from its source run.
+            variant = ""
+            if self.recall_query_fanout_enabled:
+                variant = query_variants.build_variant(
+                    query or "",
+                    entity_names=[
+                        e.get("name", "") for e in (brain.entities or {}).values()
+                        if isinstance(e, dict)
+                    ],
+                )
+            if variant:
+                items = query_variants.fuse_variant_items(
+                    _run(query or ""), _run(variant), top_k)
+            else:
+                items = _run(query or "")
+            memories = [self._to_mcp_item(it, mgr) for it in items]
+            # Stamp only what the host actually sees (same rule as
+            # brain.recall); stamping the candidate pool keeps stale rows alive.
+            stamp_ids = [it["memory_id"] for it in items]
+            top_sim = max((float(it["similarity"])
+                           for it in items), default=0.0)
+        else:
+            results = mgr.recall(
+                query=query if query else None,
+                top_k=top_k,
+                use_lnn=use_lnn,
+                sample=sample,
+                allow_ids=allow_ids,
+                client=client,
+                occurred_after=time_window[0],
+                occurred_before=time_window[1],
+            )
+            memories = []
+            top_sim = 0.0
+            quarantined_hidden = 0
+            for r in results:
+                d = r.to_dict()
+                rec = mgr.store.get(r.memory_id)
+                if rec is not None and getattr(rec, "quarantine", False):
+                    quarantined_hidden += 1
+                    continue
+                if rec is not None:
+                    d["source"] = rec.source or ""
+                    d["state"] = rec.state
+                    d["cognitive_type"] = rec.cognitive_type
+                    d["tags"] = dict(rec.tags or {})
+                top_sim = max(top_sim, float(r.similarity))
+                memories.append(d)
+            stamp_ids = [r.memory_id for r in results]
         memories = self._cap_contents(memories)
         # D2b masked 档：sensitive:* 卡不出流（计数自曝，绝不静默）。
         filtered_sensitive = 0
@@ -392,14 +476,14 @@ class RecallService(BaseService):
                     continue
                 kept.append(d)
             memories = kept
-        # 盖上"最后一次被召回"时间戳：本工具直连 manager.recall，不经过
-        # brain.recall，得自己记——否则走这条路径的召回不算"被召回过"，
-        # 沉寂归档只看得到 get_memory_context / session_start 那几条路。
-        mgr.stamp_recalled([r.memory_id for r in results])
+        # 盖上「最后一次被召回」时间戳：共享层刻意无副作用，记账
+        # 留在调用方壳内（与 brain.recall 同款纪律，防两条路径双记）。
+        # 融合开启时只盖最终返回条目；关时保持旧口径盖全部候选。
+        mgr.stamp_recalled(stamp_ids)
         if record_miss:
-            # 未命中留痕 + 按日召回计数：这条路径不经过
-            # brain.recall，不记的话走 MCP 工具的召回（宿主的**主要**检索
-            # 入口）在 miss_log / 按日统计里全是 0。
+            # 未命中留痕 + 按日召回计数：MCP recall 是宿主的
+            # 主要检索入口，共享层不记账，必须在这里补，否则
+            # miss_log / 按日统计里全是 0。
             if query:
                 if brain.miss_log_enabled and top_sim < brain.miss_log_threshold:
                     brain.log_miss(query, top_sim, top_k=top_k,
@@ -425,6 +509,22 @@ class RecallService(BaseService):
                 "before": iso_date(time_window[1]) if time_window[1] > 0 else None,
             }
         return out
+
+    @staticmethod
+    def _to_mcp_item(it: dict[str, Any], mgr: Any) -> dict[str, Any]:
+        """Adapt a shared-pipeline item to the 14-key MCP envelope.
+
+        Cuts the five pipeline-only attribution fields, adds the two
+        ``RecallResult`` fields read back from the stored record,
+        and rounds both floats to the legacy precision.
+        """
+        rec = mgr.store.get(it["memory_id"])
+        d = dict(it)
+        d["score"] = round(float(d["score"]), 4)
+        d["similarity"] = round(float(d["similarity"]), 4)
+        d["recall_count"] = int(getattr(rec, "recall_count", 0) or 0)
+        d["memory_type"] = str(getattr(rec, "memory_type", "") or "general")
+        return {k: d[k] for k in _MCP_RECALL_ITEM_ORDER}
 
     def _cap_contents(self, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """截断护栏：把每条命中记忆的 ``content`` 压到字符上限内。

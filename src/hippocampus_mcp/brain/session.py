@@ -240,6 +240,58 @@ def _l0_health_line(brain) -> dict | None:
     }
 
 
+#: Cap on the topic ids named in a session-end nudge. A library with hundreds
+#: of pending clusters must not turn the closing receipt into a dump.
+KNOWLEDGE_TODO_MAX_IDS = 5
+
+
+def _knowledge_todo(brain, session_memory_ids: list[str]) -> dict | None:
+    """Name the knowledge topics a session should tidy, with one runnable step.
+
+    The service deliberately does not summarise on its own (its production
+    path embeds no LLM), but "leave it to the host's initiative" turned out to
+    mean "never happens": real-library runs ended with only 3 summaries
+    applied. This is a nudge, not an execution: it reuses the layer already
+    refreshed by ``consolidate`` and never triggers first-time clustering on
+    the hot path. Returns ``None`` when nothing is pending, so a healthy
+    library keeps the exact same response shape and key order. Disable with
+    ``HIPPOCAMPUS_KNOWLEDGE_TODO=0``.
+    """
+    import os as _os
+    if _os.environ.get("HIPPOCAMPUS_KNOWLEDGE_TODO", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    try:
+        td = _topic_defaults()
+        if not td.layer_enabled:
+            return None
+        topics = getattr(brain, "knowledge", None) or {}
+        if not topics:
+            return None
+        pending = topic_mod.pending_summary_ids(topics, defaults=td)
+        if not pending:
+            return None
+        stats = topic_mod.host_summary_stats(topics)
+        written = {str(m) for m in (session_memory_ids or [])}
+        touched = [tid for tid in pending
+                   if written & {str(m) for m in
+                                 (topics.get(tid) or {}).get("member_ids") or []}]
+        return {
+            "pending_count": len(pending),
+            "from_this_session": len(touched),
+            "topic_ids": (touched or pending)[:KNOWLEDGE_TODO_MAX_IDS],
+            "host_summaries": int(stats.get("host", 0)),
+            "host_stale": int(stats.get("host_stale", 0)),
+            "action": ("""hippo_extra(action="knowledge_topic", args='{"action":"brief_batch","batch":5}')"""),
+            "then": ("""Write one conclusion per topic, then hippo_extra(action="knowledge_topic", args='{"action":"summarize_batch","items":"[...]"}')"""),
+            "done_when": "pending_count == 0",
+            "note": ("Summarising intelligence stays on the host; this "
+                     "service only prepares material, validates and stores."),
+        }
+    except Exception:  # noqa: BLE001 - a nudge must never break session_end
+        return None
+
+
 class _SessionMixin:
     """B2-3 P3：会话与写入者簇"""
 
@@ -1144,6 +1196,11 @@ class _SessionMixin:
         if _os.environ.get("HIPPOCAMPUS_HEALTH_REPORT", "1").strip().lower() not in (
                 "0", "false", "no", "off"):
             out["health"] = _health_snapshot(self)
+        # A4: name the topics this session touched and hand the host one
+        # copy-paste command; absent when nothing is pending (zero noise).
+        knowledge_todo = _knowledge_todo(self, session_mem_ids)
+        if knowledge_todo:
+            out["knowledge_todo"] = knowledge_todo
         return out
 
 

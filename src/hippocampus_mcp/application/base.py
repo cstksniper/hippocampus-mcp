@@ -32,6 +32,8 @@ class BaseService:
                  prospective_trigger: bool = True,
                  split_facts: Any = None,
                  recall_content_max_chars: int = 0,
+                 recall_fusion_enabled: bool = True,
+                 recall_query_fanout_enabled: bool = False,
                  user_write_quarantine: bool = False,
                  is_home_write: bool = True,
                  access_log_dir: str = "",
@@ -66,6 +68,14 @@ class BaseService:
         # application 不读 config ⇒ 由组合根现读注入（同 long_content_policy）；
         # 只有 RecallService.recall 用，其余方法零变化。
         self.recall_content_max_chars = int(recall_content_max_chars or 0)
+        # R1: production recall shares the evaluation scoring pipeline.
+        # application must not read config -> the composition root
+        # injects load_config().recall_fusion on every call.
+        self.recall_fusion_enabled = bool(recall_fusion_enabled)
+        # V2: query fanout (keyword variant + RRF merge) for natural-sentence
+        # queries. Default off — injected by the composition root the same
+        # way; only RecallService._recall_one consumes it.
+        self.recall_query_fanout_enabled = bool(recall_query_fanout_enabled)
         # 分句器（brain._split_facts 本体，含「短句并入上一条」等怪癖）。
         # domain 不许另写一份分句真相 ⇒ 只能注入；None 时按长度硬切并自曝。
         self.split_facts = split_facts

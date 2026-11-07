@@ -363,7 +363,17 @@ def _recall_service(library: str | None = None,
                          # 非法值/负数一律按 0（不截断）——写错等同于没写，
                          # 绝不让护栏被悄悄打开。解析在 BaseService。
                          recall_content_max_chars=_int_or_zero(
-                             s.load_config().recall_content_max_chars))
+                             s.load_config().recall_content_max_chars),
+                         # R1: shared scoring pipeline for production
+                         # recall. Default on; HIPPOCAMPUS_RECALL_FUSION=0
+                         # restores the legacy additive manager.recall.
+                         recall_fusion_enabled=(
+                             s.load_config().recall_fusion),
+                         # V2: query fanout (keyword variant + RRF merge).
+                         # Default off (evaluation reproducibility);
+                         # HIPPOCAMPUS_RECALL_QUERY_FANOUT=1 enables.
+                         recall_query_fanout_enabled=(
+                             s.load_config().recall_query_fanout))
 
 
 def _organize_service(library: str | None = None) -> OrganizeService:
