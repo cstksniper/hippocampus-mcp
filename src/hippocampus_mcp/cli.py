@@ -923,6 +923,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     profile = os.environ.get("HIPPOCAMPUS_TOOL_PROFILE", "") or "common (default)"
     print(f"{_mark(True)} Tool profile {profile}")
 
+    # Naturalization P0-3: layered hook-chain health (L1/L2 + drift).
+    try:
+        _doctor_hook_chain()
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash here
+        print(f"{_mark(False, warn=True)} L1/L2 hook-chain check failed: {exc}")
+
     # The most valuable section: **which library each host actually points
     # at**. Crossed libraries are this project's costliest pit (writing into
     # the wrong library raises no error); listing host by host is the only
@@ -1166,6 +1172,66 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # Subcommand: context
 # --------------------------------------------------------------------------
+def cmd_install(args: argparse.Namespace) -> int:
+    """Idempotent ZCode deployment: config entry + shims + hooks + skill.
+
+    Reinstall = repair (naturalization P0-2): shims are copied from the
+    versioned ``hook_shims/`` templates with token substitution; a config
+    entry that already exists is left untouched unless --force, so user
+    tuning is never silently overwritten.
+    """
+    from .installer import plan_install, apply_install
+    home = Path.home()
+    descs, actions = plan_install(home, skill=not args.no_skill,
+                                  force_entry=args.force)
+    print("hippocampus install (host=zcode)"
+          + ("  [DRY-RUN]" if args.dry_run else ""))
+    print("-" * 60)
+    for d in descs:
+        print(" plan:", d)
+    if args.dry_run:
+        print("-" * 60)
+        print("dry-run: nothing written. Re-run without --dry-run to apply.")
+        return 0
+    for line in apply_install(home, actions):
+        print(" done:", line)
+    print("-" * 60)
+    print("Next: restart the host (hook/config changes need a NEW session), "
+          "then run `hippocampus doctor` to verify the chain.")
+    return 0
+
+
+def _doctor_hook_chain() -> None:
+    """L1/L2 hook-chain health + shim mirror-constant drift (P0-3)."""
+    from .installer import hook_chain_status
+    st = hook_chain_status(Path.home())
+    entry = st["config_entry"]
+    if entry is True or (isinstance(entry, dict) and entry.get("present")):
+        launcher = entry.get("launcher") if isinstance(entry, dict) else True
+        print(f"{_mark(bool(launcher))} L1 user-level MCP entry "
+              + ("" if launcher else "(present but NOT the launcher entry)"))
+    else:
+        print(f"{_mark(False)} L1 user-level MCP entry missing "
+              f"({_config_hint()})")
+    for name in ("hippo_context.py", "hippo_stop.py", "hippo_session.py"):
+        ok = st["shims"].get(name)
+        print(f"{_mark(bool(ok))} L2 shim {name} "
+              + ("" if ok else "(missing; run `hippocampus install`)"))
+    print(f"{_mark(bool(st['hooks_enabled']))} L2 hooks.enabled "
+          + ("" if st["hooks_enabled"] else "(false/absent)"))
+    for ev, ok in st["events"].items():
+        print(f"{_mark(bool(ok))} L2 hook event {ev} registered")
+    for d in st["drift"]:
+        print(f"{_mark(False, warn=True)} L2 shim drift: {d}")
+    print("       (L3 daemon reachability: "
+          "`hippocampus context \"ping\"` answers within 6s when alive; "
+          "L4 binding: `hippocampus doctor --host zcode --project .`)")
+
+
+def _config_hint() -> str:
+    return str(Path.home() / ".zcode" / "cli" / "config.json")
+
+
 def cmd_context(args: argparse.Namespace) -> int:
     """Hook injection preview: run one query through the full hook_client
     chain.
@@ -1194,6 +1260,32 @@ def cmd_context(args: argparse.Namespace) -> int:
         for line in trace:
             print(f"  - {line}", file=sys.stderr)
         return 1
+    print(text)
+    return 0
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """SessionStart hook preview: run the read-only opening anchor through
+    fetch_bootstrap (pins / open todos / recent sessions / unfinished
+    topics; does NOT create a session and does not start the daemon)."""
+    from .hook_client import fetch_bootstrap
+    trace: list[str] = []
+    text = fetch_bootstrap(
+        str(Path(args.cwd).resolve()),
+        top_k=args.top_k, token_budget=args.budget,
+        item_max_chars=args.item_chars,
+        key_library=os.environ.get("HIPPOCAMPUS_DAEMON_LIBRARY", ""),
+        emb_model=os.environ.get("HIPPOCAMPUS_EMB_MODEL", MODEL_DEFAULT),
+        daemon_version=os.environ.get("HIPPOCAMPUS_DAEMON_VERSION", ""),
+        hello_library=os.environ.get("HIPPOCAMPUS_PERSIST_DIR", ""),
+        trace=trace)
+    if not text:
+        print("(No bootstrap content)", file=sys.stderr)
+        for line in trace:
+            print(f"  - {line}", file=sys.stderr)
+        return 1
+    if args.compact:
+        text += "\n(Context was compacted -- full-package reminder line "                 "appended by the shim)"
     print(text)
     return 0
 
@@ -1471,6 +1563,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Workspace used for host/workspace verdicts; defaults to current directory")
     sd.set_defaults(func=cmd_doctor)
 
+    si = sub.add_parser(
+        "install",
+        help="Idempotent ZCode deployment: config entry + versioned hook "
+             "shims + hooks block (+ optional user skill). Reinstall = repair.")
+    si.add_argument("--dry-run", action="store_true",
+                    help="Print the action plan without writing anything")
+    si.add_argument("--force", action="store_true",
+                    help="Overwrite an existing mcp.servers.hippocampus entry "
+                         "(default: leave an existing entry untouched)")
+    si.add_argument("--no-skill", action="store_true",
+                    help="Skip copying the hippo-memory user skill")
+    si.set_defaults(func=cmd_install)
+
     sm = sub.add_parser(
         "models", help="Inspect local model cache and reclaim unused models (no deletion by default)")
     sm.add_argument("--prune", action="store_true",
@@ -1505,6 +1610,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Embedding model component of the daemon key (defaults to env "
                          "HIPPOCAMPUS_EMB_MODEL or the built-in default)")
     cx.set_defaults(func=cmd_context)
+
+    bs = sub.add_parser(
+        "bootstrap",
+        help="SessionStart hook preview: read-only opening anchor (pins / "
+             "todos / recent sessions / topics; no session created)")
+    bs.add_argument("--cwd", default=".",
+                    help="Workspace root used for library reverse lookup")
+    bs.add_argument("--top-k", type=int, default=4)
+    bs.add_argument("--budget", type=int, default=1600)
+    bs.add_argument("--item-chars", type=int, default=200)
+    bs.add_argument("--compact", action="store_true",
+                    help="Also show the compaction reminder line the shim "
+                         "appends on source=compact")
+    bs.set_defaults(func=cmd_bootstrap)
 
     tr = sub.add_parser(
         "tree",

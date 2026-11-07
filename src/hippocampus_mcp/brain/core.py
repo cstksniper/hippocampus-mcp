@@ -383,6 +383,16 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         recency_window_days: int = 0,
         w_strength: float = 0.03,
         mem_history_ring: int = 200,
+        usage_recency_w: float = 0.0,
+        usage_recency_tau_days: float = 0.0,
+        usage_recency_cap_strength: int = 0,
+        adaptive_enabled: bool = False,
+        adaptive_expand_floor: float = 0.6,
+        adaptive_tau_stop: float = 0.1,
+        adaptive_lambda: float = 0.7,
+        adaptive_beta: float = 0.15,
+        adaptive_gamma: float = 0.1,
+        adaptive_max_k: int = 20,
     ) -> None:
         self.persist_dir = persist_dir
         # Persistence backend (json multi-file / sqlite single DB). Only the
@@ -419,6 +429,27 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         self.mem_history_ring = mem_history_ring
         self.auto_consolidate_every = auto_consolidate_every
         self.lambda_decay = lambda_decay
+        # UR usage-recency knobs (scoring-layer only; the composition root
+        # masks the numerics by the usage_recency bool). w = 0.0 (default)
+        # keeps the pipeline bit-identical to pre-UR. tau is carried in
+        # days (config symmetry) and converted to seconds at the
+        # RecallDeps construction site.
+        self.usage_recency_w = usage_recency_w
+        self.usage_recency_tau_days = usage_recency_tau_days
+        self.usage_recency_cap_strength = usage_recency_cap_strength
+        # Adaptive result-count selector knobs (2026-11-07). Default off =
+        # bit-identical to the pre-adaptive pipeline. The composition root
+        # masks the numerics by the adaptive_enabled bool (numeric envs
+        # alone must not enable the selector — B-type allow-list promise).
+        # brain.recall treats the caller's top_k as a hard CAP clamped by
+        # adaptive_max_k.
+        self.adaptive_enabled = bool(adaptive_enabled)
+        self.adaptive_expand_floor = float(adaptive_expand_floor)
+        self.adaptive_tau_stop = float(adaptive_tau_stop)
+        self.adaptive_lambda = float(adaptive_lambda)
+        self.adaptive_beta = float(adaptive_beta)
+        self.adaptive_gamma = float(adaptive_gamma)
+        self.adaptive_max_k = int(adaptive_max_k)
         self.use_bm25 = use_bm25
         self.bm25_weight = bm25_weight
         self._bm25 = BM25()
@@ -1864,6 +1895,12 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         if self.manager.store.count() == 0:
             return []
 
+        # Adaptive mode (default off): the caller's top_k becomes a hard
+        # CAP clamped by adaptive_max_k, never a quota.
+        adaptive_on = bool(self.adaptive_enabled)
+        eff_k = min(int(top_k), self.adaptive_max_k) if adaptive_on \
+            else int(top_k)
+
         allow_ids = self._ids_matching_tags(filter_tags)
         if allow_ids is not None and not allow_ids:
             # No tag matches is a real signal, not "library is empty".
@@ -1875,12 +1912,13 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         items = _recall_pipeline.run_recall_pipeline(
             self,
             _recall_pipeline.RecallRequest(
-                query=query, top_k=top_k, use_lnn=use_lnn, sample=sample,
+                query=query, top_k=eff_k, use_lnn=use_lnn, sample=sample,
                 allow_ids=allow_ids, client=client,
                 include_superseded=include_superseded, use_mmr=use_mmr,
                 annotate_conflicts=annotate_conflicts,
                 occurred_after=occurred_after,
                 occurred_before=occurred_before,
+                adaptive=adaptive_on,
             ),
             _recall_pipeline.RecallDeps(
                 fuse=rrf_fuse, exp=np.exp,
@@ -1896,6 +1934,25 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
                 iso_fn=iso_date, weekday_fn=weekday_abbr,
                 in_window_fn=in_time_window,
                 out_window_fn=out_of_window,
+                # UR usage-recency: constructor-injected (composition root
+                # masks by the usage_recency bool); tau converts from
+                # config days to pipeline seconds here. Both RecallDeps
+                # construction sites (this one and the RecallService one)
+                # must stay in lockstep or the two paths diverge when the
+                # knob is on (R1's parity promise).
+                usage_w=self.usage_recency_w,
+                usage_tau=self.usage_recency_tau_days * 86400.0,
+                usage_cap=self.usage_recency_cap_strength,
+                # Adaptive selector: same lockstep discipline as UR — the
+                # numerics ride the constructor (masked by the composition
+                # root); both construction sites must match. The branch
+                # flag rides the Request above.
+                adaptive_k_min=2,
+                adaptive_expand_floor=self.adaptive_expand_floor,
+                adaptive_tau_stop=self.adaptive_tau_stop,
+                adaptive_lambda=self.adaptive_lambda,
+                adaptive_beta=self.adaptive_beta,
+                adaptive_gamma=self.adaptive_gamma,
             ),
         )
 

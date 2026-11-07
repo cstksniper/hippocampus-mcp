@@ -186,7 +186,12 @@ def make_gated_tool() -> Any:
         def deco(fn):
             if not s._tool_enabled(fn.__name__):
                 return fn  # skip MCP registration; the definition remains, callable via internal imports
-            return original(structured_output=structured_output, **kwargs)(fn)
+            # P3-4 telemetry: time every REGISTERED call (dispatcher calls
+            # note themselves in server_runtime.dispatch). Pass-through
+            # wrapper; functools.wraps keeps schema introspection intact.
+            from . import telemetry as _telemetry
+            return original(structured_output=structured_output, **kwargs)(
+                _telemetry.timed(fn.__name__, fn))
 
         return deco
 

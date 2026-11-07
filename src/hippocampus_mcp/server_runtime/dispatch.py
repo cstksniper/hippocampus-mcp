@@ -125,7 +125,16 @@ async def _hippo_extra(action: str, args: str = "{}") -> str:
         bad = [k for k in kwargs if k not in allowed]
         if bad:
             return f"{action} accepts no arguments {bad}; available arguments: {', '.join(sorted(allowed))}"
+    import time as _time
+
+    from . import telemetry as _telemetry
+
+    t0 = _time.perf_counter()
+    ok = True
     try:
         return await fn(**kwargs)
-    except TypeError as exc:
+    except TypeError:
+        ok = False
         return f"Call {action} failed (bad arguments): {exc}"
+    finally:
+        _telemetry.note(action, (_time.perf_counter() - t0) * 1000.0, ok=ok)

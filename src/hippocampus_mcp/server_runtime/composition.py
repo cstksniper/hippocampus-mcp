@@ -135,6 +135,56 @@ def _sensitive_words() -> tuple[str, ...]:
                  if ln.strip() and not ln.strip().startswith("#"))
 
 
+class _UsageOff:
+    """Stand-in config read when ``usage_recency`` is off: the UR numeric
+    sub-knobs read zero. Returned by :func:`_usage_cfg` so the factories
+    can inject masked values unconditionally (B-type allow-list promise:
+    numeric envs alone must not enable the usage item)."""
+
+    usage_recency_w = 0.0
+    usage_recency_tau_days = 0.0
+    usage_recency_cap_strength = 0
+
+
+def _usage_cfg(s: Any) -> Any:
+    """UR usage-recency config view, MASKED by the ``usage_recency`` bool.
+
+    Read live (``s.load_config()``, same no-cache semantics as every other
+    knob). With the bool false, the numeric sub-knobs resolve to zero on
+    the returned stand-in -- setting only
+    ``HIPPOCAMPUS_USAGE_RECENCY_W`` (etc.) must not enable the item.
+    """
+    cfg = s.load_config()
+    return cfg if cfg.usage_recency else _UsageOff()
+
+
+class _AdaptiveOff:
+    """Stand-in config read when ``adaptive_recall`` is off: every adaptive
+    numeric resolves to its DISABLED value (enabled False + inert max_k=0).
+    Returned by :func:`_adaptive_cfg` so both factories can inject masked
+    values unconditionally (B-type allow-list promise: numeric envs alone
+    must not enable the selector)."""
+
+    adaptive_enabled = False
+    adaptive_expand_floor = 0.6
+    adaptive_tau_stop = 0.1
+    adaptive_lambda = 0.7
+    adaptive_beta = 0.15
+    adaptive_gamma = 0.1
+    adaptive_max_k = 0
+
+
+def _adaptive_cfg(s: Any) -> Any:
+    """Adaptive result-count config view, MASKED by ``adaptive_recall``.
+
+    Same no-cache live read as ``_usage_cfg``; with the bool false the
+    stand-in forces ``adaptive_enabled=False`` AND ``adaptive_max_k=0`` so
+    neither the service nor the brain shell can route to the selector.
+    """
+    cfg = s.load_config()
+    return cfg if cfg.adaptive_recall else _AdaptiveOff()
+
+
 def _int_or_zero(raw: str) -> int:
     """Parse a config string into a non-negative int, **0 when
     unparseable** (= no truncation).
@@ -453,7 +503,28 @@ def _recall_service(library: str | None = None,
                          # Default off (evaluation reproducibility);
                          # HIPPOCAMPUS_RECALL_QUERY_FANOUT=1 enables.
                          recall_query_fanout_enabled=(
-                             s.load_config().recall_query_fanout))
+                             s.load_config().recall_query_fanout),
+                         # UR: usage-recency scoring. The numeric sub-knobs
+                         # are MASKED by the usage_recency bool here --
+                         # setting only HIPPOCAMPUS_USAGE_RECENCY_W (etc.)
+                         # must NOT enable the item (B-type allow-list
+                         # promise: only an explicit truthy bool opens it).
+                         usage_recency_w=_usage_cfg(s).usage_recency_w,
+                         usage_recency_tau_days=_usage_cfg(
+                             s).usage_recency_tau_days,
+                         usage_recency_cap_strength=_usage_cfg(
+                             s).usage_recency_cap_strength,
+                         # Adaptive result-count selection (2026-11-07):
+                         # masked by the adaptive_recall bool, same B-type
+                         # promise as UR -- numeric envs alone stay off.
+                         adaptive_enabled=_adaptive_cfg(s).adaptive_enabled,
+                         adaptive_expand_floor=_adaptive_cfg(
+                             s).adaptive_expand_floor,
+                         adaptive_tau_stop=_adaptive_cfg(s).adaptive_tau_stop,
+                         adaptive_lambda=_adaptive_cfg(s).adaptive_lambda,
+                         adaptive_beta=_adaptive_cfg(s).adaptive_beta,
+                         adaptive_gamma=_adaptive_cfg(s).adaptive_gamma,
+                         adaptive_max_k=_adaptive_cfg(s).adaptive_max_k)
 
 
 def _organize_service(library: str | None = None) -> OrganizeService:
@@ -542,6 +613,24 @@ def _build_brain(persist_dir: str) -> HippoBrain:
         recency_window_days=s.load_config().recency_window_days,
         w_strength=s.load_config().w_strength,
         mem_history_ring=s.load_config().mem_history_ring,
+        # UR: usage-recency scoring, masked by the usage_recency bool (same
+        # B-type promise as the RecallService factory above -- numeric envs
+        # alone stay off). Must stay in lockstep with the service factory:
+        # both RecallDeps construction sites (brain shell + RecallService)
+        # need the same values or the two paths diverge when the knob is on.
+        usage_recency_w=_usage_cfg(s).usage_recency_w,
+        usage_recency_tau_days=_usage_cfg(s).usage_recency_tau_days,
+        usage_recency_cap_strength=_usage_cfg(s).usage_recency_cap_strength,
+        # Adaptive result-count selection: same masking + lockstep
+        # discipline as the RecallService factory above (both RecallDeps
+        # construction sites must match when the knob is on).
+        adaptive_enabled=_adaptive_cfg(s).adaptive_enabled,
+        adaptive_expand_floor=_adaptive_cfg(s).adaptive_expand_floor,
+        adaptive_tau_stop=_adaptive_cfg(s).adaptive_tau_stop,
+        adaptive_lambda=_adaptive_cfg(s).adaptive_lambda,
+        adaptive_beta=_adaptive_cfg(s).adaptive_beta,
+        adaptive_gamma=_adaptive_cfg(s).adaptive_gamma,
+        adaptive_max_k=_adaptive_cfg(s).adaptive_max_k,
     )
     # The effective model must be visible: the trap with the wrong model
     # was that "nobody said which model was in use".

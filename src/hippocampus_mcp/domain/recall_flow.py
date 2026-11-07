@@ -57,6 +57,7 @@ tests will catch it)**:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -221,6 +222,10 @@ class RecallCandidateContext:
         exp: ``np.exp`` itself (numpy is outside domain's dependency scope).
         now: time base (``manager._reference_time or _now()``, computed at
             call time).
+        usage_w: UR usage-recency master gate (0.0 = off, the default).
+        usage_tau: UR recency time constant in SECONDS (config carries
+            days; callers convert).
+        usage_cap: UR log1p(strength) cap (<= 0 disables the item).
     """
     allow_ids: set[str] | None
     include_superseded: bool
@@ -243,6 +248,11 @@ class RecallCandidateContext:
     embed: Callable[[Any], Any]
     exp: Callable[[float], float]
     now: float
+    # UR usage-recency (defaults keep every pre-UR construction site valid
+    # and bit-identical: w=0.0 short-circuits the whole item).
+    usage_w: float = 0.0
+    usage_tau: float = 0.0
+    usage_cap: int = 0
 
 
 def collect_recall_items(
@@ -331,6 +341,36 @@ def collect_recall_items(
         # but the entity matches)
         if hit_entity:
             score += ctx.entity_bonus
+        # UR usage-recency boost (scoring layer only -- no write-path
+        # change): "recently AND frequently recalled", anchored on
+        # ``last_recalled_at`` (written only by ``stamp_recalled``, i.e.
+        # true result-set membership) times capped retrieval strength.
+        # Fail-safe degradation to zero: disabled knob (w <= 0), illegal
+        # tau/cap, never-recalled records (last_recalled_at <= 0), zero
+        # strength, and negative delta-t (clock skew / pinned reference
+        # time -- clamped, same guard as the pinned exemption above, so
+        # exp never exceeds 1 and the cap bound holds).
+        usage_boost = 0.0
+        # getattr fallback for the three UR fields: hand-rolled fake
+        # contexts (test SimpleNamespace sites) predate the fields -- same
+        # idiom as the quarantine read above ("lacking the field = off").
+        usage_w = getattr(ctx, "usage_w", 0.0)
+        if usage_w > 0.0:
+            last_used = float(rec.last_recalled_at or 0.0)
+            strength = max(float(rec.recall_strength or 0.0), 0.0)
+            usage_tau = getattr(ctx, "usage_tau", 0.0)
+            usage_cap = getattr(ctx, "usage_cap", 0)
+            if (last_used > 0.0 and strength > 0.0
+                    and usage_tau > 0.0 and usage_cap > 0):
+                delta_t = max(ctx.now - last_used, 0.0)
+                usage_boost = usage_w * float(
+                    ctx.exp(-delta_t / usage_tau)
+                ) * math.log1p(min(strength, float(usage_cap)))
+        if usage_boost > 0.0:
+            score += usage_boost
+            # Attribution must not hide the boost (D7 matched_by spirit:
+            # "why this entry ranked here" stays explainable).
+            srcs.append("usage")
         # Navigation-content downweighting: the default penalty=1.0 is a
         # no-op; it only kicks in when the import side explicitly tagged
         # NAV_TAG_KEY and configured a discount, avoiding default-behavior

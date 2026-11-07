@@ -417,6 +417,13 @@ class RecallService(BaseService):
         # doubles as an A/B baseline. The shared branch calls the very same
         # side-effect-free pipeline as ``brain.recall``; disabling it restores
         # the legacy additive ``manager.recall`` path bit-for-bit.
+        # Adaptive mode state (fusion lane only): eff_k clamps the caller's
+        # top_k to the adaptive ceiling; _selection_reports carries the
+        # selector self-report up to the response body.
+        adaptive_on = bool(self.adaptive_enabled)
+        eff_k = min(int(top_k), self.adaptive_max_k) if adaptive_on \
+            else int(top_k)
+        _selection_reports: list[dict[str, Any]] = []
         if self.recall_fusion_enabled:
             deps = _recall_pipeline.RecallDeps(
                 fuse=rrf_fuse, exp=np.exp,
@@ -430,18 +437,46 @@ class RecallService(BaseService):
                 iso_fn=iso_date, weekday_fn=weekday_abbr,
                 in_window_fn=in_time_window,
                 out_window_fn=out_of_window,
+                # UR usage-recency: injected by the composition root
+                # (masked by the usage_recency bool); tau converts from
+                # config days to pipeline seconds here.
+                usage_w=self.usage_recency_w,
+                usage_tau=self.usage_recency_tau_days * 86400.0,
+                usage_cap=self.usage_recency_cap_strength,
+                # Adaptive result-count selector (2026-11-07): same lockstep
+                # discipline as UR — the composition root masks the
+                # numerics by adaptive_enabled; both RecallDeps construction
+                # sites must match. The branch flag rides the Request; the
+                # caller's top_k becomes a hard CAP (adaptive_max_k), never
+                # a quota.
+                adaptive_k_min=2,
+                adaptive_expand_floor=self.adaptive_expand_floor,
+                adaptive_tau_stop=self.adaptive_tau_stop,
+                adaptive_lambda=self.adaptive_lambda,
+                adaptive_beta=self.adaptive_beta,
+                adaptive_gamma=self.adaptive_gamma,
+                # Masked tier PRE-selection: safe candidates backfill the
+                # slots that sensitive records would have burned (the fixed
+                # path keeps its post-truncation filter below).
+                sensitive_pred=(
+                    (lambda rec: str(getattr(rec, "sensitivity", "") or "")
+                     .startswith("sensitive:"))
+                    if exclude_sensitive else None),
             )
 
             def _run(q: str) -> list[dict[str, Any]]:
-                return _recall_pipeline.run_recall_pipeline(
+                rep: dict[str, Any] = {}
+                out = _recall_pipeline.run_recall_pipeline(
                     brain,
                     _recall_pipeline.RecallRequest(
-                        query=q, top_k=top_k, use_lnn=use_lnn, sample=sample,
+                        query=q, top_k=eff_k, use_lnn=use_lnn, sample=sample,
                         allow_ids=allow_ids, client=client,
                         include_superseded=False, use_mmr=True,
                         # Conflict annotation would add three fields and break the
                         # 14-key MCP envelope. Scoring, ordering and filtering are
                         # still identical to brain.recall; only annotation differs.
+                        # (The adaptive branch annotates the POOL internally for
+                        # dedup decisions; _to_mcp_item drops the fields again.)
                         annotate_conflicts=False,
                         occurred_after=time_window[0],
                         occurred_before=time_window[1],
@@ -449,9 +484,14 @@ class RecallService(BaseService):
                         # every candidate that is neither semantic nor a BM25 hit.
                         use_lexical=True,
                         manager_query=q or None,
+                        adaptive=self.adaptive_enabled,
                     ),
                     deps,
+                    report_out=rep,
                 )
+                if self.adaptive_enabled and rep:
+                    _selection_reports.append(rep)
+                return out
 
             # V2 (2026-11-07): query fanout — for natural-sentence queries a
             # keyword variant runs the SAME pipeline and the two hit lists are
@@ -459,6 +499,10 @@ class RecallService(BaseService):
             # reproducibility); scoring formulas are untouched (R1's
             # territory) — fusion only reorders candidates, and every item
             # keeps its own similarity from its source run.
+            # NOTE (adaptive interaction): under adaptive each variant run
+            # already selects at the cap, so fanout+adaptive fuses two
+            # SELECTED lists — candidate-level fusion is a recorded v1
+            # limitation (design doc §6.C4), not a regression of fixed mode.
             variant = ""
             if self.recall_query_fanout_enabled:
                 variant = query_variants.build_variant(
@@ -470,7 +514,7 @@ class RecallService(BaseService):
                 )
             if variant:
                 items = query_variants.fuse_variant_items(
-                    _run(query or ""), _run(variant), top_k)
+                    _run(query or ""), _run(variant), eff_k)
             else:
                 items = _run(query or "")
             memories = [self._to_mcp_item(it, mgr) for it in items]
@@ -553,6 +597,22 @@ class RecallService(BaseService):
             # present even at 0 — tier behavior stays assertable and is not
             # confused with "no filtering happened").
             out["filtered_sensitive"] = filtered_sensitive
+        if self.adaptive_enabled and _selection_reports:
+            # Adaptive selection self-report (design doc §3.3.5): counts,
+            # budget and WHY entries were omitted — never raw scores.
+            # Fanout merges two runs: keep the primary query's report.
+            out["selection"] = _selection_reports[0]
+        if self.recall_fusion_enabled and memories and top_sim < RELEVANCE_HARD_FLOOR:
+            # Score-trap guard (naturalization review P3-3): the top hits
+            # came through the BM25/entity lane only — surface the "RRF
+            # scores are ranking points, not cosine similarities" warning
+            # exactly when it can mislead, zero standing cost otherwise.
+            out["note"] = (
+                "Top results matched via keyword/entity lanes only "
+                "(vector similarity below the %.2f relevance floor); "
+                "'score' is an RRF ranking point, not a cosine similarity "
+                "— use 'similarity' for semantic closeness."
+                % RELEVANCE_HARD_FLOOR)
         if time_window[0] > 0 or time_window[1] > 0:
             # Time-window self-report: **especially important when count=0**
             # — otherwise 「窗口内确实没有」 (truly nothing in the window) and
@@ -788,6 +848,18 @@ class RecallService(BaseService):
         allow = brain._ids_matching_tags(parsed_tags)
         ctx["filter_applied"] = filter_applied(
             parsed_tags, len(allow) if allow is not None else None, key_info)
+        # Recent-miss visibility (naturalization review P1-4 data source):
+        # how many retrieval misses this library logged in the last 24h.
+        # Additive key only — the hook turns a high count into a one-line
+        # "verify conclusions independently" hint; the field itself never
+        # blocks or reorders anything.
+        try:
+            cutoff = _now() - 86400.0
+            ctx["recent_miss_24h"] = sum(
+                1 for e in (getattr(brain, "miss_log", None) or [])
+                if float(e.get("ts") or 0.0) >= cutoff)
+        except (TypeError, ValueError):
+            ctx["recent_miss_24h"] = 0
         if scope == SCOPE_USER:
             ctx["scope"] = SCOPE_USER
             ctx["libraries"] = [self.user_library_self]

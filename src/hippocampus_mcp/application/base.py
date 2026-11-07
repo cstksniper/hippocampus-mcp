@@ -42,6 +42,16 @@ class BaseService:
                  recall_content_max_chars: int = 0,
                  recall_fusion_enabled: bool = True,
                  recall_query_fanout_enabled: bool = False,
+                 usage_recency_w: float = 0.0,
+                 usage_recency_tau_days: float = 0.0,
+                 usage_recency_cap_strength: int = 0,
+                 adaptive_enabled: bool = False,
+                 adaptive_expand_floor: float = 0.6,
+                 adaptive_tau_stop: float = 0.1,
+                 adaptive_lambda: float = 0.7,
+                 adaptive_beta: float = 0.15,
+                 adaptive_gamma: float = 0.1,
+                 adaptive_max_k: int = 20,
                  user_write_quarantine: bool = False,
                  is_home_write: bool = True,
                  access_log_dir: str = "",
@@ -95,6 +105,29 @@ class BaseService:
         # queries. Default off — injected by the composition root the same
         # way; only RecallService._recall_one consumes it.
         self.recall_query_fanout_enabled = bool(recall_query_fanout_enabled)
+        # UR: usage-recency scoring. Defaults are all zero = off and
+        # bit-identical to the pre-UR pipeline. application must not read
+        # config -> the composition root injects the numeric sub-knobs
+        # MASKED by the usage_recency bool (numeric envs alone must not
+        # enable the item — B-type allow-list promise). tau is carried in
+        # days (config symmetry) and converted to seconds where the
+        # RecallDeps are built.
+        self.usage_recency_w = float(usage_recency_w)
+        self.usage_recency_tau_days = float(usage_recency_tau_days)
+        self.usage_recency_cap_strength = int(usage_recency_cap_strength)
+        # Adaptive result-count selection (2026-11-07). Defaults keep the
+        # service bit-identical to the pre-adaptive pipeline. application
+        # must not read config -> the composition root injects the knob
+        # set MASKED by the adaptive_enabled bool (numeric envs alone must
+        # not enable the selector — same B-type allow-list promise as UR).
+        # Only RecallService consumes these.
+        self.adaptive_enabled = bool(adaptive_enabled)
+        self.adaptive_expand_floor = float(adaptive_expand_floor)
+        self.adaptive_tau_stop = float(adaptive_tau_stop)
+        self.adaptive_lambda = float(adaptive_lambda)
+        self.adaptive_beta = float(adaptive_beta)
+        self.adaptive_gamma = float(adaptive_gamma)
+        self.adaptive_max_k = int(adaptive_max_k)
         # The sentence splitter (the brain._split_facts body itself, with
         # its quirks such as "short sentence merged into the previous
         # one"). domain must not write a second copy of the splitting

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..domain import recall_flow as _recall_flow
+from ..domain import adaptive_select as _adaptive_select
 
 # Defaults come from common (allowed for retrieval as well),
 # but callers override them to preserve their own monkeypatch surface.
@@ -68,6 +69,11 @@ class RecallRequest:
     #: production service sets it to ``query or None`` to keep its old
     #: empty-query semantics without changing the brain side.
     manager_query: Any = _UNSET
+    #: Adaptive result-count branch flag (2026-11-07). Per-call behaviour
+    #: lives on the request; the numeric knobs live on ``RecallDeps``.
+    #: False (default) = fixed path, bit-identical to the pre-adaptive
+    #: pipeline. When True the caller's ``top_k`` is a hard CAP.
+    adaptive: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,17 +93,49 @@ class RecallDeps:
     weekday_fn: Callable[[float], str] = weekday_abbr
     in_window_fn: Callable[..., bool] = in_time_window
     out_window_fn: Callable[..., bool] = out_of_window
+    #: UR usage-recency knobs. ``usage_w`` is the master gate (0.0 = off,
+    #: the default -- bit-identical to the pre-UR pipeline); ``usage_tau``
+    #: is the recency time constant in SECONDS (config carries days,
+    #: callers convert at injection); ``usage_cap`` bounds the
+    #: log1p(strength) term. The pure block degrades to zero when tau/cap
+    #: are illegal (fail-safe, never raises).
+    usage_w: float = 0.0
+    usage_tau: float = 0.0
+    usage_cap: int = 0
+    #: Adaptive result-count selector numerics (2026-11-07); the branch
+    #: flag itself rides ``RecallRequest.adaptive``. Defaults mirror
+    #: ``domain/adaptive_select`` and must not drift from it.
+    adaptive_k_min: int = 2
+    adaptive_expand_floor: float = 0.6
+    adaptive_tau_stop: float = 0.1
+    adaptive_lambda: float = 0.7
+    adaptive_beta: float = 0.15
+    adaptive_gamma: float = 0.1
+    #: Masked-tier PRE-selection filter: when given, candidates whose
+    #: record matches are dropped before selection so safe candidates
+    #: backfill the freed slots. The fixed path keeps its historical
+    #: post-truncation filter order — this predicate is consumed only on
+    #: the adaptive branch.
+    sensitive_pred: Callable[[Any], bool] | None = None
+    #: Content-character budget handed to the selector (render-side
+    #: currency: Chinese ≈ 2 chars/token, same convention as render_blocks).
+    adaptive_budget_chars: int = 2400
 
 
 def run_recall_pipeline(
     brain: Any,
     req: RecallRequest,
     deps: RecallDeps,
+    report_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Compose the pure recall blocks and return the final result items.
 
     Mirrors the former ``HippoBrain.recall`` body exactly. Returns stripped
     items with ``occurred_at`` / ``weekday``; no accounting side effects.
+
+    ``report_out``: optional dict mutated in place with the adaptive
+    selector's self-report when ``deps.adaptive`` is on. Fixed-mode runs
+    never write it.
     """
     mgr = brain.manager
     qtext = req.query or ""
@@ -182,9 +220,39 @@ def run_recall_pipeline(
             embed=mgr.vector_of,
             exp=deps.exp,
             now=now,
+            usage_w=deps.usage_w,
+            usage_tau=deps.usage_tau,
+            usage_cap=deps.usage_cap,
         ))
 
-    if req.use_mmr and len(items) > req.top_k:
+    if req.adaptive:
+        # Adaptive branch (2026-11-07): conflict annotation runs on the
+        # POOL before selection — the selector must know which
+        # near-duplicates are actually conflicting accounts (never deduped
+        # against each other). Item-level conflict fields stay internal
+        # here; callers that emit raw items (brain.recall) already carried
+        # them pre-adaptive, envelope-bound callers pick their own keys.
+        if items:
+            brain._annotate_conflicts(items)
+        selected, sel_report = _adaptive_select.select_adaptive(
+            items,
+            top_k=req.top_k,
+            k_min=deps.adaptive_k_min,
+            budget_hard_chars=deps.adaptive_budget_chars,
+            expand_floor=deps.adaptive_expand_floor,
+            tau_stop=deps.adaptive_tau_stop,
+            lam=deps.adaptive_lambda,
+            beta=deps.adaptive_beta,
+            gamma=deps.adaptive_gamma,
+            query_ent_ids=query_ent_ids,
+            sensitive_pred=deps.sensitive_pred,
+            get_record=mgr.store.get,
+        )
+        items = selected
+        if report_out is not None:
+            report_out.clear()
+            report_out.update(sel_report)
+    elif req.use_mmr and len(items) > req.top_k:
         items = brain._mmr_select(items, req.top_k)
     else:
         items = sorted(items, key=lambda x: -x["score"])[:req.top_k]

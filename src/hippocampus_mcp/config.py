@@ -491,6 +491,47 @@ class Config:
     #: type B (allow-list): only an explicit 1/true enables it; a typo
     #: stays off. Scoring formulas untouched (R1's territory).
     recall_query_fanout: bool = False
+    #: UR (2026-11-07) usage-recency scoring: boost = w * exp(-dt/tau) *
+    #: log1p(min(strength, cap)), anchored on ``last_recalled_at`` (true
+    #: result-set membership) times capped retrieval strength. Default OFF,
+    #: semantic type B (allow-list): only an explicit 1/true enables it.
+    #: The numeric sub-knobs are MASKED by this bool at the composition
+    #: root -- setting only the numeric envs must NOT enable the item.
+    #: Calibration: the production fusion-path total score spans
+    #: 0.0068-0.1191 (tests/fixtures/r1_recall_golden.json), so w=0.005
+    #: caps the boost at ~0.015 (~13% of a top score) -- a tie-breaker,
+    #: not a dominant term. (The 0.30 hard floor applies to vector
+    #: SIMILARITY, not to the total score.)
+    usage_recency: bool = False
+    usage_recency_w: float = 0.005
+    usage_recency_tau_days: float = 7.0
+    usage_recency_cap_strength: int = 20
+    #: Adaptive result-count selection (2026-11-07): Stage-C selector over
+    #: the recall pipeline's hard-gated candidate pool. Replaces the fixed
+    #: "always fill top_k" MMR truncation with marginal-utility selection
+    #: (normalized relevance + redundancy + coverage - token cost), so
+    #: high-relevance low-redundancy pools return MORE entries and noisy
+    #: pools return FEWER -- top_k becomes a hard CAP, never a quota.
+    #: Default OFF, semantic type B (allow-list); numeric sub-knobs are
+    #: MASKED by this bool at the composition root (numeric envs alone must
+    #: NOT enable the selector). Design doc:
+    #: docs/design/自适应召回条数_设计书_20261107.md (repo-only).
+    adaptive_recall: bool = False
+    #: Stop expanding after k_min picks unless normalized relevance
+    #: (score / score_top, internal signal only) reaches this floor.
+    adaptive_expand_floor: float = 0.6
+    #: Marginal-utility stop threshold (normalized units).
+    adaptive_tau_stop: float = 0.1
+    #: Relevance weight in the utility formula (fixed MMR uses 0.7 too,
+    #: but against the RAW score -- here it acts on the normalized r).
+    adaptive_lambda: float = 0.7
+    #: Facet-coverage bonus weight (new query entities/tags per pick).
+    adaptive_beta: float = 0.15
+    #: Token-cost penalty weight.
+    adaptive_gamma: float = 0.1
+    #: Global ceiling on the caller's top_k when adaptive is on (top_k
+    #: stays a cap; this bounds worst-case expansion).
+    adaptive_max_k: int = 20
     #: Access-driven profile promotion. True (default) = when consolidate
     #: refreshes the profile, L1 entries that "no one pinned but keep
     #: being recalled (retrieval strength >= 3) and have lived long
@@ -620,6 +661,22 @@ ENV_MAP: dict[str, str] = {
     # --- V2: recall query fanout (keyword variant + RRF merge; default off) ---
     "HIPPOCAMPUS_RECALL_QUERY_FANOUT": "recall_query_fanout",
 
+    # --- UR: usage-recency scoring (bool + numeric sub-knobs; default off) ---
+    "HIPPOCAMPUS_USAGE_RECENCY": "usage_recency",
+    "HIPPOCAMPUS_USAGE_RECENCY_W": "usage_recency_w",
+    "HIPPOCAMPUS_USAGE_RECENCY_TAU_DAYS": "usage_recency_tau_days",
+    "HIPPOCAMPUS_USAGE_RECENCY_CAP": "usage_recency_cap_strength",
+
+    # --- Adaptive result-count selection (bool + numeric sub-knobs;
+    # --- default off; numerics masked by the bool) ---
+    "HIPPOCAMPUS_ADAPTIVE_RECALL": "adaptive_recall",
+    "HIPPOCAMPUS_ADAPTIVE_EXPAND_FLOOR": "adaptive_expand_floor",
+    "HIPPOCAMPUS_ADAPTIVE_TAU_STOP": "adaptive_tau_stop",
+    "HIPPOCAMPUS_ADAPTIVE_LAMBDA": "adaptive_lambda",
+    "HIPPOCAMPUS_ADAPTIVE_BETA": "adaptive_beta",
+    "HIPPOCAMPUS_ADAPTIVE_GAMMA": "adaptive_gamma",
+    "HIPPOCAMPUS_ADAPTIVE_MAX_K": "adaptive_max_k",
+
     # --- Sleep-window brain-side knobs (master switch in daemon) ---
     "HIPPOCAMPUS_SLEEP_REPLAY_DAYS": "sleep_replay_days",
     "HIPPOCAMPUS_SLEEP_MAX_REPLAY": "sleep_max_replay",
@@ -706,6 +763,17 @@ _BOOL_SEMANTICS: dict[str, str] = {
     # V2 query fanout (default off, explicit allow only — evaluation
     # reproducibility first; promoted by decision after dev-library validation).
     "recall_query_fanout": "B",
+    # UR usage-recency (default off, explicit allow only — same rationale
+    # as query fanout: pinned evaluation baselines first). The numeric
+    # sub-knobs (usage_recency_w / _tau_days / _cap_strength) are coerced
+    # by default type and need no entry here; the composition root masks
+    # them by ``usage_recency`` so numeric envs alone stay off.
+    "usage_recency": "B",
+    # Adaptive result-count selection (default off, explicit allow only —
+    # same rationale as query fanout / usage-recency: pinned evaluation
+    # baselines first; numeric sub-knobs masked by the bool at the
+    # composition root).
+    "adaptive_recall": "B",
     # Profile promotion is also type A (a consolidation-period mechanism
     # on by default, off only when explicitly stated).
     "profile_promotion": "A",
