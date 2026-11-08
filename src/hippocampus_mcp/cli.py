@@ -1264,6 +1264,23 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Zero-step project onboarding (usability closure WS-3): create a
+    library for the project, bind workspace_root -> library in the
+    user-level task directory, and (by default) write the memory-discipline
+    block into the project AGENTS.md. Idempotent; no daemon needed."""
+    from .init_project import run_init
+    try:
+        report = run_init(
+            args.project, name=args.name, root=args.root,
+            user_lib=args.user_lib, agents=not args.no_agents)
+    except (NotADirectoryError, RuntimeError) as exc:
+        print(f"✗ init failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     """SessionStart hook preview: run the read-only opening anchor through
     fetch_bootstrap (pins / open todos / recent sessions / unfinished
@@ -1624,6 +1641,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Also show the compaction reminder line the shim "
                          "appends on source=compact")
     bs.set_defaults(func=cmd_bootstrap)
+
+    ini = sub.add_parser(
+        "init",
+        help="Zero-step project onboarding: create a library bound to the "
+             "project workspace + write the AGENTS.md discipline block "
+             "(idempotent; no daemon needed)")
+    ini.add_argument("--project", default=".",
+                     help="Project workspace root to bind (default: cwd)")
+    ini.add_argument("--name", default="",
+                     help="Library name (default: project directory basename; "
+                          "collisions get a -2..-9 suffix)")
+    ini.add_argument("--root", default="",
+                     help="Library root override (default: first configured root)")
+    ini.add_argument("--user-lib", default="",
+                     help="User-level library override (default: "
+                          "~/.hippocampus_mcp/user)")
+    ini.add_argument("--no-agents", action="store_true",
+                     help="Skip writing the AGENTS.md discipline block")
+    ini.set_defaults(func=cmd_init)
 
     tr = sub.add_parser(
         "tree",

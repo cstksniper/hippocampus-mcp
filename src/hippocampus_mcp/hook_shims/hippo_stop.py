@@ -43,6 +43,22 @@ def main() -> None:
     except Exception:
         data = {}
 
+    # WS-1 step0 (2026-11-08): record the Stop stdin KEY SET (keys only,
+    # never values — privacy) so the observation-layer design's open question
+    # "does ZCode Stop stdin carry transcript_path?" gets answered by real
+    # events. One JSONL line per fire, fail-open, ~120 bytes.
+    try:
+        import time as _time
+        ddir = os.path.join(tempfile.gettempdir(),
+                            "hippocampus_mcp_hook_dedup")
+        os.makedirs(ddir, exist_ok=True)
+        keys = sorted(k for k in data if isinstance(data, dict))             if isinstance(data, dict) else ["<non-dict>"]
+        with open(os.path.join(ddir, "stop_stdin_keys.jsonl"), "a",
+                  encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": _time.time(), "keys": keys}) + "\n")
+    except Exception:
+        pass
+
     # ZCode already continued one round (stop_hook_active) — do not block
     # again (anti-loop).
     if data.get("stop_hook_active"):
