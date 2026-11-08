@@ -1183,7 +1183,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     from .installer import plan_install, apply_install
     home = Path.home()
     descs, actions = plan_install(home, skill=not args.no_skill,
-                                  force_entry=args.force)
+                                  force_entry=args.force,
+                                  stop_capture=args.stop_capture)
     print("hippocampus install (host=zcode)"
           + ("  [DRY-RUN]" if args.dry_run else ""))
     print("-" * 60)
@@ -1213,7 +1214,8 @@ def _doctor_hook_chain() -> None:
     else:
         print(f"{_mark(False)} L1 user-level MCP entry missing "
               f"({_config_hint()})")
-    for name in ("hippo_context.py", "hippo_stop.py", "hippo_session.py"):
+    for name in ("hippo_context.py", "hippo_stop.py", "hippo_session.py",
+                 "hippo_observe.py"):
         ok = st["shims"].get(name)
         print(f"{_mark(bool(ok))} L2 shim {name} "
               + ("" if ok else "(missing; run `hippocampus install`)"))
@@ -1591,6 +1593,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: leave an existing entry untouched)")
     si.add_argument("--no-skill", action="store_true",
                     help="Skip copying the hippo-memory user skill")
+    si.add_argument("--stop-capture", action="store_true",
+                    help="Enable the Stop observation-capture lane (WS-1, "
+                         "default OFF). Re-run install without this flag to "
+                         "turn capture back off.")
     si.set_defaults(func=cmd_install)
 
     sm = sub.add_parser(

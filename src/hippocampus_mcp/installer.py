@@ -42,7 +42,8 @@ from .launcher import daemon_key  # key parity with the runtime (single truth)
 __all__ = ["plan_install", "apply_install", "hook_chain_status",
            "HOOK_SHIM_NAMES", "HOOKS_EVENTS"]
 
-HOOK_SHIM_NAMES = ("hippo_context.py", "hippo_stop.py", "hippo_session.py")
+HOOK_SHIM_NAMES = ("hippo_context.py", "hippo_stop.py", "hippo_session.py",
+                   "hippo_observe.py")
 HOOKS_EVENTS = ("UserPromptSubmit", "Stop", "SessionStart")
 _SKILL_NAME = "hippo-memory"
 
@@ -95,13 +96,15 @@ def _mcp_entry(home: Path) -> dict[str, Any]:
     }
 
 
-def _substitute(template: str, *, entry: dict[str, Any]) -> str:
+def _substitute(template: str, *, entry: dict[str, Any],
+                stop_capture: bool = False) -> str:
     env = (entry.get("env") or {})
     return (template
             .replace("@@SRC@@", _package_src_dir())
             .replace("@@KEY_LIBRARY@@", env.get("HIPPOCAMPUS_DAEMON_LIBRARY", ""))
             .replace("@@EMB_MODEL@@", env.get("HIPPOCAMPUS_EMB_MODEL", ""))
-            .replace("@@HELLO_LIBRARY@@", env.get("HIPPOCAMPUS_PERSIST_DIR", "")))
+            .replace("@@HELLO_LIBRARY@@", env.get("HIPPOCAMPUS_PERSIST_DIR", ""))
+            .replace("@@STOP_CAPTURE@@", "1" if stop_capture else "0"))
 
 
 def _hooks_block(home: Path, entry: dict[str, Any]) -> dict[str, Any]:
@@ -119,7 +122,15 @@ def _hooks_block(home: Path, entry: dict[str, Any]) -> dict[str, Any]:
                       "type": "process", "command": py,
                       "args": ["-I", f"{hooks_dir}/hippo_stop.py"],
                       "timeoutMs": 10000,
-                      "statusMessage": "hippocampus wrap-up check"}]}],
+                      "statusMessage": "hippocampus wrap-up check"}]},
+                 # Capture lane (WS-1): fires on EVERY response end; silent
+                 # unless --stop-capture was set at install time. Never
+                 # prints — this lane stays invisible to the model.
+                 {"hooks": [{
+                     "type": "process", "command": py,
+                     "args": ["-I", f"{hooks_dir}/hippo_observe.py"],
+                     "timeoutMs": 8000,
+                     "statusMessage": "hippocampus observation capture"}]}],
         # No matcher: fires for every source (startup/resume/clear/compact);
         # the shim branches on stdin `source` for the compact reminder.
         "SessionStart": [{"hooks": [{
@@ -131,7 +142,8 @@ def _hooks_block(home: Path, entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_install(home: Path, *, skill: bool = True,
-                 force_entry: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
+                 force_entry: bool = False,
+                 stop_capture: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
     """Compute the install action list WITHOUT touching anything.
 
     Returns ``(descriptions, actions)``; ``actions`` entries are
@@ -152,7 +164,8 @@ def plan_install(home: Path, *, skill: bool = True,
     src_dir = _shims_source_dir()
     for name in HOOK_SHIM_NAMES:
         template = (src_dir / name).read_text(encoding="utf-8")
-        rendered = _substitute(template, entry=entry)
+        rendered = _substitute(template, entry=entry,
+                               stop_capture=stop_capture)
         target = _hooks_dir(home) / name
         descs.append(f"shim: {target}"
                      f" (backup .bak-<ts> when content differs)")
