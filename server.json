@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cstksniper/hippocampus-mcp",
+  "title": "HippoMCP",
+  "description": "MCP-native long-term memory for AI agents: local-first, pip-installable, native Chinese support",
+  "version": "0.2.1",
+  "repository": {
+    "url": "https://github.com/cstksniper/hippocampus-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "hippocampus-mcp",
+      "version": "0.2.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

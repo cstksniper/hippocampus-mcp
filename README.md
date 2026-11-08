@@ -1,5 +1,7 @@
 # HippoMCP
 
+<!-- mcp-name: io.github.cstksniper/hippocampus-mcp -->
+
 **A memory system built for AI agents.**
 
 **English** ｜ [简体中文](https://github.com/cstksniper/hippocampus-mcp/blob/main/README.zh-CN.md)
