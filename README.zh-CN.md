@@ -17,6 +17,24 @@ HippoMCP 为 AI Agent 提供一个本地记忆系统，用来**保存对话与�
 
 ---
 
+## 核心亮点
+
+**对 Agent 开箱即用**
+
+- 一行安装：`pip install hippocampus-mcp`，再执行 `hippocampus-mcp install` 即写入宿主配置、
+  记忆钩子与诊断；`hippocampus init --project .` 让新项目零手工步骤完成绑定。
+- **自动记忆钩子**（ZCode）：每轮上下文自动注入（带跨轮去重）、每次开场与压缩后的
+  开场锚点（钉住事实 / 待办 / 近期会话 / 未完结话题）、收尾提醒——"记得去做"由钩子承担，
+  不依赖 Agent 自觉。
+- **自适应召回条数**（默认开）：相关且不重复时多给，噪声池少给——条数是算出来的，不是写死的。
+
+**原生中文支持**
+
+中文优先而非事后翻译：中文系统自动选用 BGE 嵌入模型（768 维）；`ingest` 支持中文分句与
+按库实体词表；字面通道处理中文二元组；章/卷/年标签成为硬过滤条件。详见下文。
+
+---
+
 ## HippoMCP 的主要功能
 
 | 功能 | 解决的痛点 | 系统提供的具体能力 |
@@ -179,6 +197,11 @@ hippocampus-mcp models --prune  # 只列可回收模型文件，不删除
 HippoMCP 提供记忆工具，宿主 Agent 决定何时调用。可以把以下规则加入项目的
 `AGENTS.md` 或宿主指令：
 
+> 在 ZCode 上，`hippocampus-mcp install` 还会安装自动记忆钩子（每轮注入、开场锚点、
+> 收尾提醒），前三条规则由机制强制执行；以下规则仍是所有其他宿主的通用基线。
+> 可选的观察捕获 lane（`hippocampus-mcp install --stop-capture`）会把响应要点归档
+> 供事后整理，**默认关闭**，且自身绝不写入正式记忆。
+
 ```text
 任务开始时，带当前任务和正在修改的文件调用 session_start。
 上下文压缩后，只保留 receipt 的身份信息，凭其中的 session_id 再调 session_start，
@@ -221,10 +244,10 @@ flowchart LR
 | 记忆分层 | L0 原始 / L1 事实 / L2 摘要 / L3 画像，另有主题层与信息地图层 |
 | 来源回指 | L1 用 `source_ids` 回指 L0；文件背书来源还可做漂移审计 |
 | 事实状态机 | `active` / `superseded` / `archived`；旧事实可检查，但默认退出召回 |
-| 检索 | 白化 + BM25 混合 + 可选重排 + 实体加权 + MMR |
+| 检索 | 向量 + BM25（RRF）混合 + MMR + 实体加权 + 相关性硬门槛，并带自适应召回条数（相关且不重复时多给） |
 | 上下文装配 | `get_memory_context` 提供五个独立预算槽位；`session_start` 提供更完整的开场包 |
 | 领域词表 | 实体词库、别名候选和实体 relink，适配项目专名、别名与编号 |
-| 工具面 | 46 个 MCP 工具，按剖面裁剪；默认暴露 12 个高频工具，约 4.7k token |
+| 工具面 | 46 个 MCP 工具，按剖面裁剪；默认暴露 10 个（8 工具 + 2 派发器），描述总量从 8.3k 字符精简至 3.4k |
 
 分层、流程、评分公式和工程约束见
 [架构文档](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.zh-CN.md)。

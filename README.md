@@ -19,6 +19,29 @@ lifecycle underneath it.
 
 ---
 
+## Highlights
+
+**Usable by an agent, out of the box**
+
+- One-line install: `pip install hippocampus-mcp`, then `hippocampus-mcp install` writes the host
+  config, memory hooks, and diagnostics; `hippocampus init --project .` binds a new project with
+  zero manual steps.
+- **Automatic memory hooks** (ZCode): per-turn context injection with cross-turn deduplication,
+  a session bootstrap (pinned facts / open todos / recent sessions / unfinished topics) at every
+  start and after compaction, and a wrap-up reminder — the hooks do the remembering-to-do-it, so
+  the agent does not have to.
+- **Adaptive result count** (default on): retrieval returns more entries when they are relevant
+  and non-redundant, fewer when the pool is noisy — the count is computed, not fixed.
+
+**原生中文 · Native Chinese support**
+
+Chinese-first, not translated afterwards: on a Chinese system the embedding model auto-selects
+BGE (768-dim); ingestion handles Chinese sentence segmentation with per-library entity lexicons;
+the lexical channel handles Chinese bigrams; chapter/volume/year tags become hard filters.
+Details below.
+
+---
+
 ## What HippoMCP does
 
 | Function | Pain it addresses | What the system provides |
@@ -204,6 +227,12 @@ module-form `doctor` command above, fix the reported issue, and restart again.
 HippoMCP supplies memory tools; the host agent decides when to call them. Add rules like these
 to your project's `AGENTS.md` or host instructions:
 
+> On ZCode, `hippocampus-mcp install` also sets up automatic memory hooks (per-turn injection,
+> session bootstrap, wrap-up reminder), which enforce the first three rules mechanically. The
+> rules below remain the portable baseline for every other host. An optional observation-capture
+> lane (`hippocampus-mcp install --stop-capture`) archives response highlights for later review;
+> it is **off by default** and never writes to formal memory by itself.
+
 ```text
 At the start of a task, call session_start with the current task and working files.
 After context compaction, keep only the receipt identity and call session_start again
@@ -247,10 +276,10 @@ flowchart LR
 | Layered memory | L0 raw / L1 facts / L2 summaries / L3 profile, plus topic and information-map layers |
 | Source tracing | L1 facts point to L0 through `source_ids`; file-backed sources can also be checked for drift |
 | Fact state machine | `active` / `superseded` / `archived`; replaced facts remain inspectable but leave default recall |
-| Retrieval | Whitening + BM25 hybrid search + optional reranking + entity weighting + MMR |
+| Retrieval | Hybrid vector + BM25 (RRF) + MMR + entity weighting + a hard relevance floor, with adaptive result count (returns more when entries are relevant and non-redundant) |
 | Context assembly | `get_memory_context` provides five slots with independent budgets; `session_start` provides a broader bootstrap package |
 | Domain vocabulary | Entity lexicons, alias suggestions, and entity relinking for project-specific names and identifiers |
-| Tool surface | 46 MCP tools with profiles; the default profile exposes 12 high-frequency tools (about 4.7k tokens) |
+| Tool surface | 46 MCP tools with profiles; the default profile exposes 10 (8 tools + 2 meta-dispatchers), descriptions cut from 8.3k to 3.4k characters |
 
 See [the architecture guide](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.md)
 for layers, flows, scoring formulas, and engineering constraints.
