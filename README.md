@@ -159,7 +159,18 @@ python examples/quickstart.py --model sentence-transformers/all-MiniLM-L6-v2
 
 ### Install into an MCP host
 
-Install directly from GitHub:
+Install from PyPI (recommended):
+
+```bash
+python -m pip install hippocampus-mcp
+hippocampus-mcp models --fetch
+hippocampus-mcp install   # or: hippocampus-mcp setup --host zcode
+```
+
+> China mirrors lag new releases; if pip cannot find the package, retry with the
+> official index: `python -m pip install hippocampus-mcp -i https://pypi.org/simple`
+
+Or install directly from GitHub:
 
 ```bash
 python -m pip install "git+https://github.com/cstksniper/hippocampus-mcp.git"
