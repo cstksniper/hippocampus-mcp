@@ -512,11 +512,13 @@ class Config:
     #: (normalized relevance + redundancy + coverage - token cost), so
     #: high-relevance low-redundancy pools return MORE entries and noisy
     #: pools return FEWER -- top_k becomes a hard CAP, never a quota.
-    #: Default OFF, semantic type B (allow-list); numeric sub-knobs are
-    #: MASKED by this bool at the composition root (numeric envs alone must
-    #: NOT enable the selector). Design doc:
+    #: Default ON since 2026-11-08 (user decision after the serial AR/UR
+    #: trial: 120-question LongMemEval, AR +1.67pp Hit@5, 4 rescued / 2
+    #: lost, no-regression signal; R4 full-500 review pending, rollback =
+    #: this bool or HIPPOCAMPUS_ADAPTIVE_RECALL=0). Numeric sub-knobs are
+    #: MASKED by this bool at the composition root. Design doc:
     #: docs/design/自适应召回条数_设计书_20261107.md (repo-only).
-    adaptive_recall: bool = False
+    adaptive_recall: bool = True
     #: Stop expanding after k_min picks unless normalized relevance
     #: (score / score_top, internal signal only) reaches this floor.
     adaptive_expand_floor: float = 0.6
@@ -668,7 +670,7 @@ ENV_MAP: dict[str, str] = {
     "HIPPOCAMPUS_USAGE_RECENCY_CAP": "usage_recency_cap_strength",
 
     # --- Adaptive result-count selection (bool + numeric sub-knobs;
-    # --- default off; numerics masked by the bool) ---
+    # --- default ON since 2026-11-08; explicit 0 disables everything) ---
     "HIPPOCAMPUS_ADAPTIVE_RECALL": "adaptive_recall",
     "HIPPOCAMPUS_ADAPTIVE_EXPAND_FLOOR": "adaptive_expand_floor",
     "HIPPOCAMPUS_ADAPTIVE_TAU_STOP": "adaptive_tau_stop",
@@ -769,11 +771,13 @@ _BOOL_SEMANTICS: dict[str, str] = {
     # by default type and need no entry here; the composition root masks
     # them by ``usage_recency`` so numeric envs alone stay off.
     "usage_recency": "B",
-    # Adaptive result-count selection (default off, explicit allow only —
-    # same rationale as query fanout / usage-recency: pinned evaluation
-    # baselines first; numeric sub-knobs masked by the bool at the
-    # composition root).
-    "adaptive_recall": "B",
+    # Adaptive result-count selection — type A since 2026-11-08 (default
+    # ON after the serial AR/UR trial, off only when explicitly stated;
+    # same semantics class as profile_promotion). Was type B while the
+    # trial ran with pinned baselines. Numeric sub-knobs masked by the
+    # bool at the composition root (explicit 0 disables the selector and
+    # zeroes every sub-knob).
+    "adaptive_recall": "A",
     # Profile promotion is also type A (a consolidation-period mechanism
     # on by default, off only when explicitly stated).
     "profile_promotion": "A",

@@ -158,31 +158,36 @@ def _usage_cfg(s: Any) -> Any:
     return cfg if cfg.usage_recency else _UsageOff()
 
 
-class _AdaptiveOff:
-    """Stand-in config read when ``adaptive_recall`` is off: every adaptive
-    numeric resolves to its DISABLED value (enabled False + inert max_k=0).
-    Returned by :func:`_adaptive_cfg` so both factories can inject masked
-    values unconditionally (B-type allow-list promise: numeric envs alone
-    must not enable the selector)."""
+class _AdaptiveView:
+    """Normalized adaptive config view for both factories (service + brain
+    shell read ``adaptive_enabled`` + numerics off one shape).
 
-    adaptive_enabled = False
-    adaptive_expand_floor = 0.6
-    adaptive_tau_stop = 0.1
-    adaptive_lambda = 0.7
-    adaptive_beta = 0.15
-    adaptive_gamma = 0.1
-    adaptive_max_k = 0
+    Since 2026-11-08 the default is ON (Config.adaptive_recall=True), so
+    returning the raw ``Config`` no longer works — it never had an
+    ``adaptive_enabled`` attribute (that name belongs to the service ctor).
+    Explicit-off (env 0/false) maps to enabled=False AND max_k=0 so neither
+    factory can route to the selector; explicit-on passes the numerics
+    through unchanged."""
+
+    def __init__(self, cfg: Any) -> None:
+        enabled = bool(cfg.adaptive_recall)
+        self.adaptive_enabled = enabled
+        self.adaptive_max_k = cfg.adaptive_max_k if enabled else 0
+        self.adaptive_expand_floor = cfg.adaptive_expand_floor if enabled else 0.6
+        self.adaptive_tau_stop = cfg.adaptive_tau_stop if enabled else 0.1
+        self.adaptive_lambda = cfg.adaptive_lambda if enabled else 0.7
+        self.adaptive_beta = cfg.adaptive_beta if enabled else 0.15
+        self.adaptive_gamma = cfg.adaptive_gamma if enabled else 0.1
 
 
 def _adaptive_cfg(s: Any) -> Any:
     """Adaptive result-count config view, MASKED by ``adaptive_recall``.
 
-    Same no-cache live read as ``_usage_cfg``; with the bool false the
-    stand-in forces ``adaptive_enabled=False`` AND ``adaptive_max_k=0`` so
-    neither the service nor the brain shell can route to the selector.
+    Same no-cache live read as ``_usage_cfg``. Explicit 0/false forces
+    ``adaptive_enabled=False`` AND ``adaptive_max_k=0`` so neither the
+    service nor the brain shell can route to the selector.
     """
-    cfg = s.load_config()
-    return cfg if cfg.adaptive_recall else _AdaptiveOff()
+    return _AdaptiveView(s.load_config())
 
 
 def _int_or_zero(raw: str) -> int:
