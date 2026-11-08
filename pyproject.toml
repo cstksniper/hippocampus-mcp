@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hippocampus-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Long-term memory backend for AI hosts over MCP: 4-layer memory, slot-based context assembly, cascade-safe forgetting, CfC temporal encoding"
 readme = "README.md"
 requires-python = ">=3.11"
