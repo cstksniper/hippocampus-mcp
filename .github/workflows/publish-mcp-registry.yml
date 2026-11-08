@@ -14,37 +14,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Install cosign
-        run: |
-          set -euo pipefail
-          # GitHub releases downloads occasionally return transient 504s;
-          # curl --retry absorbs them (cosign-installer has no retry input).
-          curl --fail --retry 5 --retry-delay 15 --retry-all-errors --location --silent --show-error \
-            --output /usr/local/bin/cosign \
-            "https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64"
-          chmod +x /usr/local/bin/cosign
-          cosign version
-
       - name: Sync server.json version to tag
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
 
-      - name: Download and verify mcp-publisher
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build mcp-publisher from source
         run: |
           set -euo pipefail
-          archive="mcp-publisher_linux_amd64.tar.gz"
-          base_url="https://github.com/modelcontextprotocol/registry/releases/download/v1.8.8"
-          curl --fail --retry 5 --retry-delay 15 --retry-all-errors --location --silent --show-error --output "$archive" "$base_url/$archive"
-          curl --fail --retry 5 --retry-delay 15 --retry-all-errors --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
-          cosign verify-blob \
-            --bundle "$archive.sigstore.json" \
-            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.8" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$archive"
-          tar xzf "$archive" mcp-publisher
-          rm -f "$archive" "$archive.sigstore.json"
+          # The registry repo's release assets intermittently return 504.
+          # Building the pinned tag from source via the Go module proxy
+          # (with sum.golang.org content verification) avoids that dependency.
+          go install github.com/modelcontextprotocol/registry/cmd/publisher@v1.8.8
+          cp "$(go env GOPATH)/bin/publisher" ./mcp-publisher
+          ./mcp-publisher --help
 
       # The PyPI publish workflow (release.yml) triggers on the same tag.
       # Registry validation checks that the PyPI release exists and its
