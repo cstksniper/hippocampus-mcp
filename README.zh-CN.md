@@ -5,6 +5,7 @@
 **简体中文** ｜ [English](https://github.com/cstksniper/hippocampus-mcp/blob/main/README.md)
 
 [![CI](https://github.com/cstksniper/hippocampus-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/cstksniper/hippocampus-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/hippocampus-mcp)](https://pypi.org/project/hippocampus-mcp/)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
