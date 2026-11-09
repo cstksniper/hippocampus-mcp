@@ -3,7 +3,7 @@
   "name": "io.github.cstksniper/hippocampus-mcp",
   "title": "HippoMCP",
   "description": "MCP-native long-term memory for AI agents: local-first, pip-installable, native Chinese support",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "repository": {
     "url": "https://github.com/cstksniper/hippocampus-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "hippocampus-mcp",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "transport": {
         "type": "stdio"
       }

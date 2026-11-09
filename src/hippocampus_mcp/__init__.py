@@ -22,7 +22,17 @@ import os as _os
 # hippocampus_mcp.server always passes through here).
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
 
-__version__ = "0.1.0"
+# Single source of the version string: the installed distribution metadata
+# (dist-info). A hardcoded literal drifted across releases — PyPI 0.2.1
+# shipped __version__ "0.1.0" while the main-repo source carried a different
+# value, so three surfaces answered three different versions. The fallback
+# covers running from a bare source tree without an installed dist.
+try:
+    from importlib.metadata import version as _dist_version
+
+    __version__ = _dist_version("hippocampus-mcp")
+except Exception:  # noqa: BLE001 -- no installed dist metadata: report honestly
+    __version__ = "0.0.0+unknown"
 
 
 def __getattr__(name: str):

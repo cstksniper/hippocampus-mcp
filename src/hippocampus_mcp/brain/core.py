@@ -383,6 +383,11 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         recency_window_days: int = 0,
         w_strength: float = 0.03,
         mem_history_ring: int = 200,
+        # R1-B4 (2026-11-08): MMR dimension-scale fix. Default True = the
+        # shipped behavior (a defect fix; the golden fixtures cannot
+        # discriminate it). False restores the raw-score MMR formula
+        # bit-for-bit. Consumed where brain.recall builds RecallDeps.
+        mmr_scale_fix: bool = True,
         usage_recency_w: float = 0.0,
         usage_recency_tau_days: float = 0.0,
         usage_recency_cap_strength: int = 0,
@@ -427,6 +432,9 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
         # lives in store/mem_history, hooked into manager.update_memory /
         # store_memory's merge branch, invisible to brain).
         self.mem_history_ring = mem_history_ring
+        # R1-B4 MMR dimension-scale fix (see the ctor note): injected by the
+        # composition root like every other recall-scoring knob.
+        self.mmr_scale_fix = bool(mmr_scale_fix)
         self.auto_consolidate_every = auto_consolidate_every
         self.lambda_decay = lambda_decay
         # UR usage-recency knobs (scoring-layer only; the composition root
@@ -1929,6 +1937,9 @@ class HippoBrain(_SessionMixin, _EntityLexiconMixin, _PureMixin):
                 hard_floor=RELEVANCE_HARD_FLOOR,
                 entity_bonus=ENTITY_BONUS,
                 literal_topn=MMR_LITERAL_EXEMPT_TOPN,
+                # R1-B4: MMR dimension-scale fix (ctor-injected; both
+                # RecallDeps construction sites must stay in lockstep).
+                mmr_scale_fix=self.mmr_scale_fix,
                 now_fn=_now,
                 strip_fn=strip_internal_fields,
                 iso_fn=iso_date, weekday_fn=weekday_abbr,

@@ -164,18 +164,13 @@ The example runs **write → recall → five-slot assembly → cascade delete** 
 embedder. It downloads no embedding model and needs no API key. It is a pipeline smoke test,
 not a demonstration of semantic retrieval quality.
 
-> No model download does **not** mean no dependencies. Installation pulls the dependencies
-> declared in `pyproject.toml`, including `torch`, `numpy`, and `mcp`.
->
-> To avoid pulling multi-GB CUDA wheels, replace `python -m pip install -e .` above with
-> these two commands:
->
-> ```bash
-> python -m pip install "torch>=2.0,<3" --index-url https://download.pytorch.org/whl/cpu
-> python -m pip install -e .
-> ```
->
-> `uv` users do not need this — `pyproject.toml` already pins the CPU index.
+> The core install is **torch-free**: the default path is the ONNX embedder + the numpy
+> CfC LNN (~150 MB of dependencies, a few minutes on a typical connection). Torch and the
+> sentence-transformers backend are an optional extra — `python -m pip install -e ".[torch]"` —
+> ~600 MB more; you only need it if you prefer that embedder backend or the torch-CfC branch.
+> When installing the extra, prefer the CPU wheel index
+> (`--index-url https://download.pytorch.org/whl/cpu`); `uv` users get that pin from
+> `pyproject.toml` automatically.
 
 To try real semantic retrieval with the English MiniLM model (~90 MB on first download):
 
@@ -193,6 +188,11 @@ hippocampus-mcp models --fetch
 hippocampus-mcp install   # or: hippocampus-mcp setup --host zcode
 ```
 
+> The core install is torch-free (~150 MB of dependencies). The first model fetch
+> downloads the embedding model (90–390 MB depending on locale), and the first
+> recall after a cold start takes tens of seconds while the model loads — both are
+> one-time costs.
+>
 > China mirrors lag new releases; if pip cannot find the package, retry with the
 > official index: `python -m pip install hippocampus-mcp -i https://pypi.org/simple`
 

@@ -42,6 +42,25 @@ MMR_LAMBDA = 0.7              # MMR relevance-diversity tradeoff
 # BM25 top N (default 3) are exempt -- MMR is not switched off wholesale: the wider the exemption, the closer to
 # "no diversity", and top_k fills up with near-identical phrasings of one topic.
 MMR_LITERAL_EXEMPT_TOPN = 3
+# R1-B4 (2026-11-08, decided route "score scaling") dimension-scale fix for
+# ``_mmr_select``: the relevance it receives is a fused-domain total
+# (RRF + 0.1*vec + entity bonus + UR boost) spanning ~0.057-0.227 on a real
+# library, while the penalty term's max_sim is a native 0-1 cosine. Without
+# rescaling, 0.7*relevance loses to 0.3*max_sim by ~3.5x and sim=0 literal
+# rescues systematically displace semantically similar candidates (measured:
+# 1.73 sim=0 placeholders per query, -34% mean top-5 similarity vs the legacy
+# additive path; C=10 recovers 84% of the gap). The fix multiplies relevance
+# by this constant:
+#   val = MMR_LAMBDA * (MMR_REL_SCALE * score) - (1 - MMR_LAMBDA) * max_sim * penalty
+# Calibration anchor -- recalibrate with ONE paired probe when the upstream
+# score scale moves (RRF k=60 in retrieval/bm25.py, the brain's bm25_weight,
+# the fetch_k = 4*top_k pool multiplier, or the entity-bonus / UR-boost
+# magnitudes): per-query median of (top-pool cosine / top relevance) ~= 6.9;
+# sensitivity inflection at C ~= 7, flat within [10, 25] (±25% band spread
+# <= 0.006), so 10 keeps margin above the knee. Gate: HIPPOCAMPUS_MMR_SCALE_FIX
+# (semantic A, default on); with it off the raw score is used verbatim.
+# Design doc: docs/design/R1-B4_MMR量纲缺陷_拍板材料_20261108.md (repo-only).
+MMR_REL_SCALE = 10.0
 # Similarity floor for ingest's "possibly related" echo. No ceiling needed -- entries at or above the dedup threshold
 # (0.85) have already been **merged into** the same entry and echoed via ``merged_into``; superseded/archived memories
 # do not merge, and they are precisely where "old framings" hide -- so no ceiling: older superseded versions stay visible.
@@ -658,6 +677,7 @@ __all__ = [
     "RELEVANCE_HARD_FLOOR",
     "MMR_LAMBDA",
     "MMR_LITERAL_EXEMPT_TOPN",
+    "MMR_REL_SCALE",
     "INGEST_NEIGHBOR_MIN_SIM",
     "MISS_LOG_THRESHOLD",
     "MISS_LOG_MAX",

@@ -504,6 +504,11 @@ def _recall_service(library: str | None = None,
                          # restores the legacy additive manager.recall.
                          recall_fusion_enabled=(
                              s.load_config().recall_fusion),
+                         # R1-B4: MMR dimension-scale fix (semantic A,
+                         # default on -- injected live like recall_fusion;
+                         # both RecallDeps construction sites must stay in
+                         # lockstep).
+                         mmr_scale_fix=s.load_config().mmr_scale_fix,
                          # V2: query fanout (keyword variant + RRF merge).
                          # Default off (evaluation reproducibility);
                          # HIPPOCAMPUS_RECALL_QUERY_FANOUT=1 enables.
@@ -636,6 +641,9 @@ def _build_brain(persist_dir: str) -> HippoBrain:
         adaptive_beta=_adaptive_cfg(s).adaptive_beta,
         adaptive_gamma=_adaptive_cfg(s).adaptive_gamma,
         adaptive_max_k=_adaptive_cfg(s).adaptive_max_k,
+        # R1-B4: MMR dimension-scale fix (live read like recall_fusion;
+        # both RecallDeps construction sites must stay in lockstep).
+        mmr_scale_fix=s.load_config().mmr_scale_fix,
     )
     # The effective model must be visible: the trap with the wrong model
     # was that "nobody said which model was in use".

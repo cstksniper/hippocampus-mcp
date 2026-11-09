@@ -239,7 +239,13 @@ def _detect_host(workspace: Path) -> str:
 # --------------------------------------------------------------------------
 # Post-write verification (real handshake)
 # --------------------------------------------------------------------------
-VERIFY_TIMEOUT = 120.0
+# FZ (2026-11-08 from-zero install test): 120s lost to the first-start
+# reality on a busy machine — the spawned launcher waits up to
+# DAEMON_READY_TIMEOUT (180s default; first start loads the embedding model)
+# before falling back to inline, so a 120s verify window produces a false
+# negative while the server is still becoming ready. The verify window must
+# cover the whole ready path plus the inline-fallback margin.
+VERIFY_TIMEOUT = 240.0
 
 
 def _stderr_tail(fh) -> str:
@@ -1442,6 +1448,36 @@ def cmd_tree(args: argparse.Namespace) -> int:
         return 2
 
 
+def _daemon_target_env_ok() -> tuple[bool, str]:
+    """R8 footgun guard (2026-11-08, hit for real during the from-zero test).
+
+    The daemon key = sha1(DAEMON_LIBRARY | EMB_MODEL | DAEMON_VERSION) and
+    does NOT include PERSIST_DIR — so a bare shell (all three envs unset)
+    computes the SAME key as a host launcher whose config entry also leaves
+    them unset. ``cli stop/restart`` from that bare shell therefore stops a
+    daemon the operator did not mean to address (observed: production daemon
+    replaced by a bare-env one serving the default library + hash embedder).
+
+    Refuse when the operator has not pinned ANY of the three key envs: they
+    must state the target explicitly (e.g. ``HIPPOCAMPUS_EMB_MODEL=...``) or
+    restart the daemon from a process that carries the host config env.
+    """
+    pins = [name for name in ("HIPPOCAMPUS_DAEMON_LIBRARY",
+                              "HIPPOCAMPUS_EMB_MODEL",
+                              "HIPPOCAMPUS_DAEMON_VERSION")
+            if os.environ.get(name)]
+    if pins:
+        return True, ""
+    return False, (
+        "Refusing: this shell pins none of HIPPOCAMPUS_DAEMON_LIBRARY / "
+        "HIPPOCAMPUS_EMB_MODEL / HIPPOCAMPUS_DAEMON_VERSION, so the daemon "
+        "key is ambiguous (a bare shell and a host launcher compute the same "
+        "key while their environments differ — the daemon would be stopped "
+        "or replaced with the wrong library/embedder). Set one of those envs "
+        "explicitly, or run stop/restart from a process carrying the host "
+        "config env.")
+
+
 def cmd_stop(args) -> int:
     """Cooperative stop: write a marker and wait for a graceful, saved exit.
 
@@ -1457,6 +1493,15 @@ def cmd_stop(args) -> int:
         _clear_stop_marker(key)
         return 0
     pid = int(info["pid"])
+    # R8 guard: only a LIVE target is ambiguous (a bare shell and a host
+    # launcher compute the same key). A dead pid is a pure cleanup job —
+    # proceed regardless of env pinning (this ordering also preserves
+    # test_r2_daemon_maintenance's dead-pid cleanup semantics).
+    if launcher._pid_alive(pid):
+        ok, why = _daemon_target_env_ok()
+        if not ok:
+            print(why, file=sys.stderr)
+            return 1
     marker = launcher.stop_request_path(key)
     try:
         os.makedirs(launcher.runtime_dir(), exist_ok=True)

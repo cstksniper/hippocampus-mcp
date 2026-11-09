@@ -483,6 +483,23 @@ class Config:
     #: additive ``manager.recall`` path. Semantic type A (deny-list):
     #: only an explicit 0/false/no turns it off; a typo stays enabled.
     recall_fusion: bool = True
+    #: R1-B4 (2026-11-08) MMR dimension-scale fix: the shared pipeline's
+    #: MMR selection multiplies the fused-domain relevance by
+    #: ``common.constants.MMR_REL_SCALE`` (calibration anchor in the
+    #: constant's note) so the relevance term and the native 0-1 cosine
+    #: diversity term compete on the same order of magnitude. Default ON --
+    #: this is a defect fix, not a new scoring item: measured on a real
+    #: library the bug costs -34% mean top-5 similarity with 1.73 sim=0
+    #: literal placeholders per query, and the golden fixtures cannot
+    #: discriminate it (their candidate pools never exceed top_k, so the
+    #: MMR branch never runs there). Semantic type A (deny-list, same as
+    #: recall_fusion): only an explicit 0/false/no turns it off; a typo
+    #: stays enabled. The constant itself is deliberately NOT an env knob
+    #: (calibration surface, not a tuning knob). Rollback chain:
+    #: ``HIPPOCAMPUS_MMR_SCALE_FIX=0`` -> raw-score MMR;
+    #: ``RECALL_FUSION=0`` -> legacy additive path. Design doc:
+    #: docs/design/R1-B4_MMR量纲缺陷_拍板材料_20261108.md (repo-only).
+    mmr_scale_fix: bool = True
     #: V2 (2026-11-07) recall query fanout: for natural-sentence queries
     #: (>= 10 chars) derive a keyword variant and run the shared pipeline
     #: twice, merging the hit lists with RRF. Default OFF — recall behaviour
@@ -660,6 +677,8 @@ ENV_MAP: dict[str, str] = {
 
     # --- R1: production recall shares the evaluation scoring pipeline ---
     "HIPPOCAMPUS_RECALL_FUSION": "recall_fusion",
+    # --- R1-B4: MMR relevance/penalty dimension-scale fix (default on) ---
+    "HIPPOCAMPUS_MMR_SCALE_FIX": "mmr_scale_fix",
     # --- V2: recall query fanout (keyword variant + RRF merge; default off) ---
     "HIPPOCAMPUS_RECALL_QUERY_FANOUT": "recall_query_fanout",
 
@@ -762,6 +781,11 @@ _BOOL_SEMANTICS: dict[str, str] = {
     "novelty_gate": "A", "prospective_trigger": "A",
     # R1 production recall fusion (default on, explicit deny only).
     "recall_fusion": "A",
+    # R1-B4 MMR dimension-scale fix (default on, explicit deny only --
+    # a defect fix, same reasoning as recall_fusion; the golden fixtures
+    # cannot discriminate it, so the "pinned baselines" argument for type B
+    # does not bind here).
+    "mmr_scale_fix": "A",
     # V2 query fanout (default off, explicit allow only — evaluation
     # reproducibility first; promoted by decision after dev-library validation).
     "recall_query_fanout": "B",

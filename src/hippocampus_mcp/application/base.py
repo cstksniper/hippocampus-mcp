@@ -42,6 +42,7 @@ class BaseService:
                  recall_content_max_chars: int = 0,
                  recall_fusion_enabled: bool = True,
                  recall_query_fanout_enabled: bool = False,
+                 mmr_scale_fix: bool = True,
                  usage_recency_w: float = 0.0,
                  usage_recency_tau_days: float = 0.0,
                  usage_recency_cap_strength: int = 0,
@@ -105,6 +106,11 @@ class BaseService:
         # queries. Default off — injected by the composition root the same
         # way; only RecallService._recall_one consumes it.
         self.recall_query_fanout_enabled = bool(recall_query_fanout_enabled)
+        # R1-B4: MMR dimension-scale fix. Default True = the shipped
+        # behavior (a defect fix, golden cannot discriminate it). Injected
+        # by the composition root, same live-read discipline as
+        # recall_fusion; consumed when RecallDeps is built in _recall_one.
+        self.mmr_scale_fix = bool(mmr_scale_fix)
         # UR: usage-recency scoring. Defaults are all zero = off and
         # bit-identical to the pre-UR pipeline. application must not read
         # config -> the composition root injects the numeric sub-knobs

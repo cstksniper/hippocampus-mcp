@@ -432,6 +432,9 @@ class RecallService(BaseService):
                 hard_floor=RELEVANCE_HARD_FLOOR,
                 entity_bonus=ENTITY_BONUS,
                 literal_topn=MMR_LITERAL_EXEMPT_TOPN,
+                # R1-B4: MMR dimension-scale fix (composition-root injected;
+                # both RecallDeps construction sites must stay in lockstep).
+                mmr_scale_fix=self.mmr_scale_fix,
                 now_fn=_now,
                 strip_fn=strip_internal_fields,
                 iso_fn=iso_date, weekday_fn=weekday_abbr,

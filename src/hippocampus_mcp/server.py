@@ -418,10 +418,12 @@ _INSTRUCTIONS = (
 
 def _create_server() -> Any:
     """Absorb constructor-parameter differences across mcp SDK versions."""
+    from . import __version__ as _pkg_version
+
     try:
         return MCPServer(
             name="hippocampus-mcp",
-            version="0.1.0",
+            version=_pkg_version,
             description="Agent memory layer: four-layer memory + entity index + session lifecycle",
             instructions=_INSTRUCTIONS,
         )

@@ -87,6 +87,12 @@ class RecallDeps:
     hard_floor: float = RELEVANCE_HARD_FLOOR
     entity_bonus: float = ENTITY_BONUS
     literal_topn: int = MMR_LITERAL_EXEMPT_TOPN
+    #: R1-B4 (2026-11-08) MMR dimension-scale fix. Default True matches the
+    #: Config default (the shipped behavior); False restores the pre-fix
+    #: raw-score MMR formula bit-for-bit. The calibration constant itself
+    #: lives in common.constants.MMR_REL_SCALE and is deliberately NOT an
+    #: env knob (calibration surface, not a tuning knob).
+    mmr_scale_fix: bool = True
     now_fn: Callable[[], float] = _now
     strip_fn: Callable[[dict[str, Any]], Any] = strip_internal_fields
     iso_fn: Callable[[float], str] = iso_date
@@ -253,7 +259,8 @@ def run_recall_pipeline(
             report_out.clear()
             report_out.update(sel_report)
     elif req.use_mmr and len(items) > req.top_k:
-        items = brain._mmr_select(items, req.top_k)
+        items = brain._mmr_select(items, req.top_k,
+                                  scale_fix=deps.mmr_scale_fix)
     else:
         items = sorted(items, key=lambda x: -x["score"])[:req.top_k]
 

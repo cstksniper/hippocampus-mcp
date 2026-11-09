@@ -430,14 +430,25 @@ class _PureMixin:
 
 
 
-    def _mmr_select(self, items: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-        """MMR selection: balances relevance and diversity, suppressing duplicate content from dominating the ranking."""
+    def _mmr_select(self, items: list[dict[str, Any]], top_k: int,
+                    scale_fix: bool = True) -> list[dict[str, Any]]:
+        """MMR selection: balances relevance and diversity, suppressing duplicate content from dominating the ranking.
+
+        ``scale_fix`` (R1-B4, 2026-11-08, default on = the shipped behavior):
+        multiply the fused-domain relevance by :data:`MMR_REL_SCALE` so the
+        ``MMR_LAMBDA * relevance`` term competes with the native 0-1 cosine
+        penalty term on the same order of magnitude (calibration anchor in
+        the constant's note). ``False`` restores the pre-fix raw-score
+        formula bit-for-bit (rollback tier).
+        """
         selected: list[dict[str, Any]] = []
         pool = list(items)
         while pool and len(selected) < top_k:
             best, best_val = None, -1e9
             for cand in pool:
                 relevance = float(cand["score"])
+                if scale_fix:
+                    relevance *= MMR_REL_SCALE
                 if not selected:
                     val = relevance
                 else:

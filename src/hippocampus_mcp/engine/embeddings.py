@@ -322,6 +322,22 @@ def auto_model_selection_enabled() -> bool:
     return raw not in ("0", "false", "off", "no")
 
 
+def onnx_runtime_available() -> bool:
+    """Whether the onnxruntime dependency is importable (cheap spec check —
+    no import, no model).
+
+    FZ (2026-11-08 from-zero install test): local ONNX artifacts do NOT imply
+    this dependency — a clean install without onnxruntime mounted the ONNX
+    backend (artifacts were cached) and then crashed at first embed. The
+    mount decision must ask THIS, not artifact presence; ``_attach_onnx``
+    degrades to the torch backend (or raises for an explicit onnx request)
+    when this returns False.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("onnxruntime") is not None
+
+
 def default_model_for_system() -> tuple[str, str]:
     """Return the "application default model" based on system language, as ``(model_name, reason)``.
 
@@ -842,6 +858,24 @@ class SentenceTransformerEmbedder:
             return False
         # Is the model name "explicitly specified by the user": strict raising only when explicit
         strict = kind == "onnx" and not from_store and self.model_source != "default"
+        # FZ (2026-11-08 from-zero install test): local ONNX artifacts do NOT
+        # imply a usable ONNX backend — a clean install without onnxruntime
+        # mounted the backend (artifacts were cached) and then crashed at
+        # first embed. Check the dependency, not just the artifacts: ``auto``
+        # falls back to torch loudly; explicit ``onnx`` raises HERE with the
+        # actionable pip hint instead of crashing at embed time.
+        if not onnx_runtime_available():
+            if strict:
+                raise ImportError(
+                    "HIPPOCAMPUS_EMB_BACKEND=onnx but onnxruntime is not "
+                    "installed: `pip install onnxruntime` (it does not pull "
+                    "torch), or switch HIPPOCAMPUS_EMB_BACKEND to auto/torch."
+                )
+            logger.warning(
+                "embedding backend: torch (ONNX artifacts present but "
+                "onnxruntime is not installed — `pip install onnxruntime`, "
+                "or the [torch] extra for the sentence-transformers backend)")
+            return False
         try:
             from .onnx_embedder import OnnxEmbedder, find_onnx_artifacts
         except ImportError as e:
@@ -955,10 +989,13 @@ class SentenceTransformerEmbedder:
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as e:
+            # Lean-core era (0.2.2): sentence-transformers lives in the
+            # [torch] extra, not the core install — the hint must say so.
             raise ImportError(
-                f"无法导入 sentence_transformers。请把依赖装到当前解释器"
-                f"（pip install -e .）或项目内 libs/ 目录。\n"
-                f"错误: {e}\n"
+                "sentence_transformers is not installed in this interpreter. "
+                "Install the torch extra: `pip install \"hippocampus-mcp[torch]\"` "
+                "(or `pip install sentence-transformers` here).\n"
+                f"Error: {e}\n"
                 f"libs_path: {self._libs_path}"
             ) from e
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hippocampus-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Long-term memory backend for AI hosts over MCP: 4-layer memory, slot-based context assembly, cascade-safe forgetting, CfC temporal encoding"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,18 +28,23 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # Upper bounds are pinned to empirically verified "actually runs" values, not guesses:
-    #   mcp 2.3.0 / sentence-transformers 6.2.0 / torch 2.15.0 / transformers 5.22.1
-    #   verified in a clean venv: server imports OK, all 46 tools register, embed_batch
-    #   yields 384 dims.
-    # Without upper bounds the first users would install versions I never validated
+    # Lean core (2026-11-08, FZ from-zero install test): the DEFAULT path is
+    # the ONNX embedder + the numpy CfC LNN (lnn/numpy_cfc.py; ncps.wirings is
+    # pure numpy) — torch is NOT needed by it. The old core pulled torch
+    # (~600MB installed) + sentence-transformers through the torch backend
+    # that the default path never touches, making a from-zero install a
+    # ~25-minute, ~600MB download. Torch + sentence-transformers moved to the
+    # [torch] extra (the sentence-transformers embedder backend and the
+    # torch-CfC LNN branch); _attach_onnx degrades to torch loudly when
+    # onnxruntime is missing, and to hash when torch is absent too.
+    # Upper bounds are pinned to empirically verified "actually runs" values, not guesses
     # (hit on 2026-11-03: local machine had 1.29/5.6.1, while PyPI's latest was already
     # 2.3/6.2).
     "mcp>=1.0,<3",
-    "torch>=2.0,<3",
     "ncps>=1.0,<2",
-    "sentence-transformers>=2.0,<7",
     "numpy>=1.20,<3",
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
 ]
 
 [project.urls]
@@ -50,7 +55,7 @@ Issues = "https://github.com/cstksniper/hippocampus-mcp/issues"
 
 # --- Optional dependencies ---
 # The core service depends only on the required items above.
-# The following three are all "lazy import + explicit degradation" in this project; missing
+# The following are all "lazy import + explicit degradation" in this project; missing
 # them does not crash, the corresponding capability just degrades
 # (see the various logs and docstrings).
 [project.optional-dependencies]
@@ -60,14 +65,15 @@ llm = ["httpx>=0.24"]
 ner = ["spacy>=3.7"]
 # cross-process write lock; degrades to an optimistic lock when missing, conflicts still fail explicitly
 lock = ["filelock>=3.12"]
-# ONNX inference backend: measured startup 35.0s → 12.8s.
-# Missing it does not affect functionality — onnx_backend defaults to auto, and with the
-# dependency absent it silently falls back to torch (code path verified).
-onnx = ["onnxruntime>=1.17", "tokenizers>=0.15"]
+# torch + the sentence-transformers embedder backend (and the torch-CfC LNN
+# branch). Optional since the 0.2.2 lean-core restructure: the default path
+# is the ONNX embedder + numpy CfC, which never imports torch. ~600MB with
+# torch vs ~150MB without.
+torch = ["torch>=2.0,<3", "sentence-transformers>=2.0,<7"]
 # development / testing
 dev = ["pytest>=8.0"]
 # install everything at once
-all = ["httpx>=0.24", "spacy>=3.7", "filelock>=3.12", "onnxruntime>=1.17", "tokenizers>=0.15"]
+all = ["httpx>=0.24", "spacy>=3.7", "filelock>=3.12", "torch>=2.0,<3", "sentence-transformers>=2.0,<7"]
 
 [project.scripts]
 # points at the cli: defaults to the launcher (the daemon shares a single copy of the model),
