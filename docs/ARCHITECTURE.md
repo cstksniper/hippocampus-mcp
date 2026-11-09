@@ -250,7 +250,7 @@ flowchart LR
 | Protocol | **MCP** + FastMCP SDK | stdio + JSON-RPC, 46 tools |
 | Dense retrieval | sentence-transformers | default `all-MiniLM-L6-v2` (384D, **English evaluation setup**); for Chinese `BAAI/bge-base-zh-v1.5` (768D) |
 | Sparse retrieval | **in-house BM25 + RRF** | covers the vector lane's literal blind spots (chapter numbers, amounts, proper names) |
-| Temporal encoding | **ncps CfC** (closed-form continuous time) + AutoNCP | implicit query vectors; HippoMCP's differentiator |
+| Temporal encoding | **ncps CfC** (closed-form continuous time), pure-numpy AutoNCP | **experimental, off by default**: the CfC is untrained in production, so its query blend is disabled (`use_lnn` defaults to false) |
 | Vector store | **in-house numpy VectorStore** | blocked matmul cosine; **the only supported backend** — any other value fails loudly |
 | Rerank/dedup | MMR (with literal exemption) | retrieval failure is usually a reranking problem, not a recall problem |
 | Entity extraction | spaCy (English) + heuristics / lexicon (Chinese) | CJK skips spaCy |

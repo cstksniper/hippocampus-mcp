@@ -211,7 +211,7 @@ flowchart LR
 | 协议 | **MCP** + FastMCP SDK | stdio + JSON-RPC，46 个工具 |
 | 稠密检索 | sentence-transformers | 默认 `all-MiniLM-L6-v2`（384D，**英文评测口径**）；中文用 `BAAI/bge-base-zh-v1.5`（768D） |
 | 稀疏检索 | **自研 BM25 + RRF** | 补向量的字面盲区（章号、数额、专名） |
-| 时序编码 | **ncps CfC**（闭式连续时间）+ AutoNCP | 隐式查询向量，HippoMCP 的差异项 |
+| 时序编码 | **ncps CfC**（闭式连续时间），纯 numpy AutoNCP | **实验性，默认关闭**：生产路径未训练，查询混合默认不用（`use_lnn` 默认 false） |
 | 向量库 | **自研 numpy VectorStore** | 分块 matmul 余弦；**唯一受支持后端**，传其他值显式报错 |
 | 重排去重 | MMR（带字面豁免） | 检索失败往往是重排问题而非召回问题 |
 | 实体抽取 | spaCy（英文）+ 启发式 / 词库（中文） | CJK 跳过 spaCy |
