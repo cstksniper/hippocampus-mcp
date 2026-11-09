@@ -1,0 +1,36 @@
+# HippoMCP
+
+> MCP-native long-term memory for AI agents. Local-first, pip-installable, user and project
+> scopes, cascade-safe forgetting, native Chinese support. Requires Python 3.11+. MIT licensed.
+> MCP Registry name: io.github.cstksniper/hippocampus-mcp; PyPI package: hippocampus-mcp.
+
+This is a single-machine MCP server, not a hosted or multi-tenant service. Core ingestion does
+not call an LLM API. The published F1 is a measurement record with stated conditions, not a
+reproducible leaderboard claim: read BENCHMARKS.md before citing any number. The evaluation
+driver is not published and the benchmark datasets are not redistributed with this repository.
+
+## Start here when evaluating
+
+- [README](https://github.com/cstksniper/hippocampus-mcp/blob/main/README.md): positioning, quick start, claim-to-test map, and copy-paste prompts for an evaluating agent
+- [Selection guide](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/SELECTION.md): when to use it, when not to, alternatives, §5 boundary comparison (deployment shapes and correction semantics, no scores or rankings), and a verification checklist
+- [Benchmarks and evidence](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/BENCHMARKS.md): measurement conditions, what the number does not prove, known gaps, and a §7 checklist for evaluating on your own workload (no judge, dataset, or LLM API key required)
+
+## Integration and boundaries
+
+- [Integration guide](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/INTEGRATION.md): host matrix, lifecycle, compaction recovery, and Markdown fallback
+- [Privacy](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/PRIVACY.md): storage location, network boundary, user scope, and deletion scope
+- [Architecture](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/ARCHITECTURE.md): memory layers, flows, scoring formulas, and engineering constraints
+- [MCP server manifest](https://github.com/cstksniper/hippocampus-mcp/blob/main/server.json): registry name, PyPI package, and stdio transport
+
+## Executable evidence
+
+- [Public test suites](https://github.com/cstksniper/hippocampus-mcp/tree/main/tests): suites that pin the correctness claims
+- [run_all_tests.py](https://github.com/cstksniper/hippocampus-mcp/blob/main/scripts/run_all_tests.py): zero-dependency regression runner, no pytest required
+- [verify_install_e2e.py](https://github.com/cstksniper/hippocampus-mcp/blob/main/scripts/verify_install_e2e.py): fresh-venv install and MCP handshake acceptance
+- [CI workflow](https://github.com/cstksniper/hippocampus-mcp/blob/main/.github/workflows/ci.yml): regression, smoke, and install-e2e jobs
+- [quickstart.py](https://github.com/cstksniper/hippocampus-mcp/blob/main/examples/quickstart.py): minimal runnable example
+
+## Optional
+
+- [Contributing](https://github.com/cstksniper/hippocampus-mcp/blob/main/CONTRIBUTING.md)
+- [Chinese README](https://github.com/cstksniper/hippocampus-mcp/blob/main/README.zh-CN.md)

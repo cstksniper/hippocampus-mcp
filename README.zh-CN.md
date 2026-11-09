@@ -23,7 +23,7 @@ HippoMCP 为 AI Agent 提供一个本地记忆系统，用来**保存对话与�
 **对 Agent 开箱即用**
 
 - 一行安装：`pip install hippocampus-mcp`，再执行 `hippocampus-mcp install` 即写入宿主配置、
-  记忆钩子与诊断；`hippocampus init --project .` 让新项目零手工步骤完成绑定。
+  记忆钩子与诊断；`hippocampus-mcp init --project .` 让新项目零手工步骤完成绑定。
 - **自动记忆钩子**（ZCode）：每轮上下文自动注入（带跨轮去重）、每次开场与压缩后的
   开场锚点（钉住事实 / 待办 / 近期会话 / 未完结话题）、收尾提醒——"记得去做"由钩子承担，
   不依赖 Agent 自觉。

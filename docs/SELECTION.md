@@ -60,7 +60,46 @@ It is a memory layer, not a replacement for reasoning, retrieval evaluation, or 
 For file-backed sources, source documents can remain canonical while HippoMCP provides a derived
 retrieval layer. For conversational memories, HippoMCP keeps its own L0 raw log for tracing.
 
-## 5. Questions to answer before choosing
+## 5. Other memory approaches (boundary comparison)
+
+This compares **deployment shapes and correction semantics**, not performance. There are no
+scores, rankings, or benchmark numbers here: a cross-project comparison would require the same
+dataset, protocol, question count, and judge, and those conditions are not met.
+
+> Based on each project's public README, fetched 2026-11-09. "Not stated" means the README does
+> not describe that dimension — it does **not** mean the feature is absent. This table was not
+> produced by running the other systems. Verify against the linked repository before deciding;
+> features and defaults change, so check the date.
+
+| Dimension | HippoMCP | [mem0](https://github.com/mem0ai/mem0) | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | [basic-memory](https://github.com/basicmachines-co/basic-memory) | Plain Markdown files |
+|---|---|---|---|---|---|
+| Deployment shape | Single machine, local-first; not managed sync or multi-tenant | Library (pip/npm), self-hosted server (Docker), or cloud platform | One self-hosted service (REST / MCP / OAuth / CLI / dashboard); SQLite, Cloudflare, Hybrid, or Milvus backends | Local Markdown files; optional cloud workspace with cross-device sync | Files in the repository |
+| LLM on the write path | Not required for core ingestion | Required; `gpt-5-mini` is the default | Not required for storage; optional LLM-backed search summaries | Not stated | None |
+| Source traceability | Append-only L0 raw log; extracted facts point back to source | Not stated | Validated source references on an opt-in search feature | The Markdown file is the source | The file is the source |
+| Correction and deletion | `forget()` cascades six steps; tombstones prevent resurrection; replaced facts become `superseded` | New algorithm is single-pass ADD-only: no UPDATE/DELETE, memories accumulate | Store/delete events and consolidation with controlled forgetting; cascade semantics not stated | Edit the file directly | Edit the file directly |
+| Cross-session continuity | `session_start` bootstrap and compaction recovery | Multi-level User / Session / Agent state | Shared across agents and runs | State lives in the files | Manual |
+| Isolation model | User vs project scopes, workspace-bound libraries | `user_id` filters | Shared service; backend-dependent | Projects as directories | By file path |
+| Chinese language handling | Native: Chinese segmentation, per-library entity lexicons, BM25/FTS5 over Chinese bigrams | Not stated | Not stated | Not stated | N/A |
+| Published evidence form | Claim → test → CI job map; one-command public regression runner | Open-sourced evaluation framework | Benchmark docs with run commands | Not stated | N/A |
+| First-run cost | Python 3.11+; embedding model download | LLM API key; Docker for self-hosting | Python; local ONNX model; backend choice | Python 3.12+ via `uv` for local install | None |
+
+### How to read this table
+
+- Need cross-device sync, a hosted workspace, or team sharing → mem0's cloud platform,
+  basic-memory Cloud, or mcp-memory-service's cloud-capable backends. HippoMCP is single-machine.
+- Need a REST/OAuth service for multi-framework agent pipelines → mcp-memory-service exposes more
+  transports; HippoMCP is MCP over stdio.
+- Need built-in knowledge-graph reasoning → basic-memory (observations and wikilinks) or
+  mcp-memory-service (causal knowledge graph). HippoMCP explicitly does not provide this (§3).
+- Need local memories that must be corrected or forgotten with source traceability and native
+  Chinese handling → the `superseded` / tombstone path is HippoMCP's differentiator.
+- Small, curated, human-maintained facts → plain Markdown files remain the simplest choice (§4).
+
+The useful next step is not to pick a row. Run the
+[`BENCHMARKS.md` §7 checklist](BENCHMARKS.md#7-how-to-evaluate-hippomcp-on-your-own-workload)
+against your own corpus: it needs no judge, no published dataset, and no LLM API key.
+
+## 6. Questions to answer before choosing
 
 Before installation, answer:
 
@@ -75,7 +114,7 @@ Before installation, answer:
 If these answers point to a local, multi-session, traceable memory layer, continue with the
 integration guide. If not, keep the Markdown layer and revisit when requirements change.
 
-## 6. How to verify the claims
+## 7. How to verify the claims
 
 Do not evaluate HippoMCP from marketing text alone. Recommended reading order:
 

@@ -310,23 +310,33 @@ initialization**, not at first recall.
 | V9 pure vector + whitening + BM25 | .286 | .287 | .350 | best retrieval metrics |
 | V9b +Rerank5 | .295 | .212 | .275 | rerank lifts F1, **hurts retrieval** |
 | V9c +NER1.1 | .303 | .212 | .275 | |
-| **V9d +Rerank10+NER1.2** | **.311** | .221 | .300 | current best |
+| **V9d +Rerank10+NER1.2** | **.311** | .221 | .300 | historical best — **not** the current baseline |
 | V9e Rerank15 | .277 | .221 | .300 | too much of a good thing |
 | **V9f entity graph + 2-hop diffusion** | **.200** | .050 | .050 | **disaster** |
 
 **V9d per-class F1**: single-hop .357 / adversarial 1.0 / temporal .116 / **multi-hop .081** /
 **open-domain 0.0**
 
+> ⚠️ **This table is a historical experiment log, not the current score.** These configurations
+> were measured under a judge environment that no longer exists. They are kept for the
+> engineering post-mortem (the V9e / V9f regressions) and **must not be cited as current
+> performance — in docs, READMEs, or public posts**. The current measured baseline, with its
+> conditions, is [`BENCHMARKS.md`](BENCHMARKS.md) §1 (`F1 = 0.244 ± 0.034`, 50 QA, three runs,
+> `glm-5.3-flash`). The historical driver is not published: neither number is a one-command
+> reproduction claim. Cross-project comparison requires the same dataset, protocol, question
+> count, and judge.
+
 ### ⚠️ Three honesty statements that must stay in the open
 
 1. **The evaluation setup is non-standard**: it uses only `locomo10`'s **50 QA + 40 retrieval**
    items, while the Mem0 paper's protocol is **1,540 questions with adversarial excluded**.
    A 30× sample-size gap — **the numbers are not directly comparable**.
-2. **"Beats Mem0" holds only under our own setup**: `Mem0 0.285` is a locally reproduced value,
-   not the paper's. The paper's published Mem0 F1 is single-hop 38.72 / multi-hop 28.64 /
-   open-domain 47.65 / temporal 48.93 — in **temporal** especially, local reproduction scored
-   0.000 against the paper's 48.93. That gap must be explained up front, or it becomes the
-   first objection after open-sourcing.
+2. **"Beats Mem0" was an internal measurement, not a public comparison claim**: `Mem0 0.285`
+   is a locally reproduced value, not the paper's. The paper's published Mem0 F1 is single-hop
+   38.72 / multi-hop 28.64 / open-domain 47.65 / temporal 48.93 — in **temporal** especially,
+   local reproduction scored 0.000 against the paper's 48.93. This line is an internal
+   historical record: **do not cite it externally as evidence of beating Mem0**, and pin the
+   judge before any cross-model comparison.
 3. **The advantage is not robust**: the same configuration scores +9.1% under Judge-A and
    **−7.2%** under Judge-B (direction flips). **Cross-model comparisons must pin the LLM first.**
 

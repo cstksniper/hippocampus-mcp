@@ -4,6 +4,8 @@
 
 **A memory system built for AI agents.**
 
+**MCP name:** `io.github.cstksniper/hippocampus-mcp` · **PyPI:** `hippocampus-mcp` · **Python:** 3.11+
+
 **English** ｜ [简体中文](https://github.com/cstksniper/hippocampus-mcp/blob/main/README.zh-CN.md)
 
 [![CI](https://github.com/cstksniper/hippocampus-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/cstksniper/hippocampus-mcp/actions/workflows/ci.yml)
@@ -27,7 +29,7 @@ lifecycle underneath it.
 **Usable by an agent, out of the box**
 
 - One-line install: `pip install hippocampus-mcp`, then `hippocampus-mcp install` writes the host
-  config, memory hooks, and diagnostics; `hippocampus init --project .` binds a new project with
+  config, memory hooks, and diagnostics; `hippocampus-mcp init --project .` binds a new project with
   zero manual steps.
 - **Automatic memory hooks** (ZCode): per-turn context injection with cross-turn deduplication,
   a session bootstrap (pinned facts / open todos / recent sessions / unfinished topics) at every
@@ -302,14 +304,37 @@ comparable with published protocols using approximately 1,540 questions.
 The historical driver that produced these measurements is not currently published. Treat this
 as a measurement record with stated conditions, **not a one-command reproduction claim**.
 
-The primary correctness claims are instead covered by executable tests: cascade-safe deletion,
-superseded facts, concurrent-save merging, workspace binding, and cross-library isolation.
+The primary correctness claims are instead covered by executable tests. An evaluating agent
+can verify them in one command — no pytest, no LLM API key, no dataset download:
 
 ```bash
 python scripts/run_all_tests.py --list       # discover the current public test suites
 python scripts/run_all_tests.py -k forget    # run deletion-related suites
 python scripts/run_all_tests.py              # full regression run
 ```
+
+Each claim maps to the suite that pins it, so an agent can check a claim rather than repeat it:
+
+| Claim | Pinned by | CI job |
+|---|---|---|
+| Cascade-safe deletion; tombstones stop resurrection | [`test_forget.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_forget.py) (`test_cascade_cleanup`) | `regression` |
+| Superseded facts do not leak into recall | `test_forget.py` (`test_restore_superseded`), [`test_session_lifecycle_bcd.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_session_lifecycle_bcd.py) (`test_c1_supersede`) | `regression` |
+| Concurrent-save layer merge and backend contract | [`test_backend_contract.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_backend_contract.py) | `regression` |
+| Workspace binding; no silent cross-library leak | [`test_workspace_guide.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_workspace_guide.py) | `regression` |
+| Session bootstrap, compaction recovery, id recycling | `test_session_lifecycle_bcd.py` | `regression` |
+| Dedup merge keeps ids; write echo leads with `merged_into` | [`test_dedup_merge.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_dedup_merge.py), [`test_ingest_echo_contract.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/tests/test_ingest_echo_contract.py) | `regression` |
+| Clean install and MCP handshake from a fresh venv | [`verify_install_e2e.py`](https://github.com/cstksniper/hippocampus-mcp/blob/main/scripts/verify_install_e2e.py) | `install-e2e` |
+
+See [`ci.yml`](https://github.com/cstksniper/hippocampus-mcp/actions/workflows/ci.yml) for the
+`regression`, `smoke`, and `install-e2e` jobs.
+
+For an evaluation on your own workload, use the
+[§7 checklist in `docs/BENCHMARKS.md`](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/BENCHMARKS.md#7-how-to-evaluate-hippomcp-on-your-own-workload):
+it needs no judge, no published dataset, and no LLM API key, and is usually more informative
+than comparing small public scores across different memory systems. For deployment-shape and
+correction-semantics differences, see
+[§5 of the selection guide](https://github.com/cstksniper/hippocampus-mcp/blob/main/docs/SELECTION.md#5-other-memory-approaches-boundary-comparison)
+— it contains no scores or rankings.
 
 ---
 
